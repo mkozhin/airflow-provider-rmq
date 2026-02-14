@@ -9,9 +9,12 @@ apache_airflow_provider_rmq.egg-info/entry_points.txt
 apache_airflow_provider_rmq.egg-info/requires.txt
 apache_airflow_provider_rmq.egg-info/top_level.txt
 apache_airflow_provider_rmq/hooks/__init__.py
+apache_airflow_provider_rmq/hooks/rmq.py
 apache_airflow_provider_rmq/operators/__init__.py
+apache_airflow_provider_rmq/operators/rmq_publish.py
 apache_airflow_provider_rmq/sensors/__init__.py
 apache_airflow_provider_rmq/triggers/__init__.py
 apache_airflow_provider_rmq/utils/__init__.py
 apache_airflow_provider_rmq/utils/filters.py
 tests/test_filters.py
+tests/test_hook.py
