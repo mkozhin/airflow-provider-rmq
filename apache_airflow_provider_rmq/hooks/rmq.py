@@ -184,6 +184,15 @@ class RMQHook(BaseHook):
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
+    def __del__(self) -> None:
+        """Safety net: close connection if user forgot to call close() or use 'with'."""
+        if getattr(self, "_connection", None) and self._connection.is_open:
+            log.warning(
+                "RMQHook was garbage-collected with an open connection. "
+                "Use 'with RMQHook(...) as hook:' or call hook.close() explicitly."
+            )
+            self.close()
+
     def close(self) -> None:
         """Gracefully close channel and connection."""
         if self._channel and self._channel.is_open:
