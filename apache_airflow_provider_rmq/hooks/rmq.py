@@ -18,6 +18,10 @@ from tenacity import (
 
 log = logging.getLogger("airflow.task")
 
+# Suppress verbose pika internal logs (connection, channel, transport details).
+# Only warnings and errors from pika will be shown.
+logging.getLogger("pika").setLevel(logging.WARNING)
+
 
 class RMQHook(BaseHook):
     """Hook for interacting with RabbitMQ via pika BlockingConnection.
