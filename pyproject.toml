@@ -41,7 +41,7 @@ dev = [
 provider_info = "apache_airflow_provider_rmq.__init__:get_provider_info"
 
 [project.urls]
-Source = "https://github.com/apache/airflow-provider-rmq"
+Source = "https://github.com/mkozhin/apache-airflow-provider-rmq"
 
 [tool.setuptools.dynamic]
 version = { attr = "apache_airflow_provider_rmq.__version__" }
