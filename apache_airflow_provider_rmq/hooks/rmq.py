@@ -55,6 +55,29 @@ class RMQHook(BaseHook):
             },
         }
 
+    @staticmethod
+    def get_connection_form_widgets() -> dict[str, Any]:
+        """Returns custom connection form widgets for SSL configuration."""
+        from flask_appbuilder.fieldwidgets import BS3TextFieldWidget
+        from flask_babel import lazy_gettext
+        from wtforms import BooleanField, StringField
+
+        return {
+            "ssl_enabled": BooleanField(lazy_gettext("SSL Enabled"), default=False),
+            "ca_certs": StringField(lazy_gettext("CA Certs Path"), widget=BS3TextFieldWidget()),
+            "certfile": StringField(lazy_gettext("Client Cert Path"), widget=BS3TextFieldWidget()),
+            "keyfile": StringField(lazy_gettext("Client Key Path"), widget=BS3TextFieldWidget()),
+        }
+
+    def test_connection(self) -> tuple[bool, str]:
+        """Test the RabbitMQ connection."""
+        try:
+            conn = self._establish_connection()
+            conn.close()
+            return True, "Connection successfully tested"
+        except Exception as e:
+            return False, str(e)
+
     def __init__(
         self,
         rmq_conn_id: str = default_conn_name,

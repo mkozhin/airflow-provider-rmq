@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apache-airflow-provider-rmq"
-version = "1.0.0"
+dynamic = ["version"]
 description = "RabbitMQ provider for Apache Airflow with hooks, operators, sensors, and deferrable trigger support."
 readme = "readme.md"
 license = {text = "Apache-2.0"}
@@ -39,6 +39,12 @@ dev = [
 
 [project.entry-points."apache_airflow_provider"]
 provider_info = "apache_airflow_provider_rmq.__init__:get_provider_info"
+
+[project.urls]
+Source = "https://github.com/apache/airflow-provider-rmq"
+
+[tool.setuptools.dynamic]
+version = { attr = "apache_airflow_provider_rmq.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["apache_airflow_provider_rmq*"]
