@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl as ssl_module
 from typing import Any, AsyncIterator
 from urllib.parse import quote
 
@@ -12,6 +13,15 @@ from airflow.triggers.base import BaseTrigger, TriggerEvent
 from apache_airflow_provider_rmq.utils.filters import MessageFilter
 
 log = logging.getLogger("airflow.task")
+
+
+class _PropsShim:
+    """Shim to bridge aio_pika message headers to MessageFilter's HasHeaders protocol."""
+
+    __slots__ = ("headers",)
+
+    def __init__(self, headers: dict[str, Any]):
+        self.headers = headers
 
 
 class RMQTrigger(BaseTrigger):
@@ -47,29 +57,60 @@ class RMQTrigger(BaseTrigger):
             },
         )
 
+    def _build_ssl_context(self, extras: dict[str, Any]) -> ssl_module.SSLContext | None:
+        """Build SSLContext from Airflow connection extras, matching hook's SSL logic."""
+        if not extras.get("ssl_enabled", False):
+            return None
+
+        ssl_context = ssl_module.create_default_context()
+        ssl_opts_raw = extras.get("ssl_options", {})
+        if isinstance(ssl_opts_raw, str):
+            import json
+            ssl_opts_raw = json.loads(ssl_opts_raw)
+
+        if ssl_opts_raw.get("ca_certs"):
+            ssl_context.load_verify_locations(ssl_opts_raw["ca_certs"])
+        if ssl_opts_raw.get("certfile") and ssl_opts_raw.get("keyfile"):
+            ssl_context.load_cert_chain(
+                certfile=ssl_opts_raw["certfile"],
+                keyfile=ssl_opts_raw["keyfile"],
+            )
+        if ssl_opts_raw.get("cert_reqs") == "CERT_NONE":
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl_module.CERT_NONE
+
+        return ssl_context
+
     async def run(self) -> AsyncIterator[TriggerEvent]:
         """Main trigger loop. Polls RabbitMQ asynchronously."""
         msg_filter = MessageFilter.deserialize(self.filter_data)
 
         try:
-            conn_info = await asyncio.get_event_loop().run_in_executor(
+            conn_info = await asyncio.get_running_loop().run_in_executor(
                 None, BaseHook.get_connection, self.rmq_conn_id
             )
             extras = conn_info.extra_dejson
             ssl_enabled = extras.get("ssl_enabled", False)
+            ssl_context = self._build_ssl_context(extras)
             vhost = conn_info.schema or "/"
-            port = conn_info.port or (5671 if ssl_enabled else 5672)
+            port = conn_info.port if conn_info.port else (5671 if ssl_enabled else 5672)
 
-            # Encode vhost for URL (e.g. "/" -> "%2F")
+            # URL-encode all components
             vhost_encoded = quote(vhost, safe="")
+            login_encoded = quote(conn_info.login or "guest", safe="")
+            password_encoded = quote(conn_info.password or "guest", safe="")
 
             url = (
                 f"{'amqps' if ssl_enabled else 'amqp'}://"
-                f"{conn_info.login or 'guest'}:{conn_info.password or 'guest'}"
+                f"{login_encoded}:{password_encoded}"
                 f"@{conn_info.host or 'localhost'}:{port}/{vhost_encoded}"
             )
 
-            connection = await aio_pika.connect_robust(url)
+            connect_kwargs: dict[str, Any] = {"url": url}
+            if ssl_context is not None:
+                connect_kwargs["ssl_context"] = ssl_context
+
+            connection = await aio_pika.connect_robust(**connect_kwargs)
 
             async with connection:
                 channel = await connection.channel()
@@ -85,11 +126,6 @@ class RMQTrigger(BaseTrigger):
                     body_str = message.body.decode("utf-8")
 
                     if msg_filter.has_filters:
-
-                        class _PropsShim:
-                            def __init__(self, hdrs):
-                                self.headers = hdrs
-
                         props_shim = _PropsShim(dict(message.headers or {}))
 
                         if msg_filter.matches(props_shim, body_str):
@@ -100,11 +136,15 @@ class RMQTrigger(BaseTrigger):
                                     "body": body_str,
                                     "headers": dict(message.headers or {}),
                                     "routing_key": message.routing_key or "",
+                                    "exchange": message.exchange or "",
                                 },
                             })
                             return
                         else:
                             await message.nack(requeue=True)
+                            # Sleep then continue polling — the broker may
+                            # re-deliver the same message, but also may deliver
+                            # a different one. This avoids a tight CPU loop.
                             await asyncio.sleep(self.poll_interval)
                     else:
                         await message.ack()
@@ -114,6 +154,7 @@ class RMQTrigger(BaseTrigger):
                                 "body": body_str,
                                 "headers": dict(message.headers or {}),
                                 "routing_key": message.routing_key or "",
+                                "exchange": message.exchange or "",
                             },
                         })
                         return

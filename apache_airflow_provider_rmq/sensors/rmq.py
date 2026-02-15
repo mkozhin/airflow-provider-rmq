@@ -97,6 +97,7 @@ class RMQSensor(BaseSensorOperator):
                         "body": msg["body"],
                         "headers": dict(msg["properties"].headers or {}),
                         "routing_key": msg["method"].routing_key,
+                        "exchange": msg["method"].exchange,
                     }
                     # Nack remaining messages
                     for remaining in messages[i + 1:]:

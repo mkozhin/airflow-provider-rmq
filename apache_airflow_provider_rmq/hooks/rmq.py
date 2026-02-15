@@ -100,7 +100,7 @@ class RMQHook(BaseHook):
                 ssl_context.verify_mode = ssl.CERT_NONE
             ssl_options = pika.SSLOptions(ssl_context, conn.host)
 
-        port = conn.port or (5671 if ssl_options else 5672)
+        port = conn.port if conn.port else (5671 if ssl_options else 5672)
 
         return pika.ConnectionParameters(
             host=conn.host or "localhost",

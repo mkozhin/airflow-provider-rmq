@@ -10,7 +10,6 @@ from tests.conftest import make_method_frame, make_properties
 
 
 HOOK_PATH = "apache_airflow_provider_rmq.sensors.rmq.RMQHook"
-TRIGGER_PATH = "apache_airflow_provider_rmq.sensors.rmq.RMQTrigger"
 
 
 def _make_raw_msg(body="msg", delivery_tag=1, routing_key="rk", exchange="", headers=None):
@@ -65,6 +64,7 @@ class TestPokeNoFilter:
             "body": "hello",
             "headers": {"x": "y"},
             "routing_key": "rk",
+            "exchange": "",
         }
         hook.ack.assert_called_once_with(1)
 
@@ -183,22 +183,24 @@ class TestPokeHookClose:
 
 
 # ---------------------------------------------------------------------------
-# Execute returns _return_value
+# Execute — poke mode returns _return_value via XCom
 # ---------------------------------------------------------------------------
 class TestExecute:
-    def test_execute_returns_value(self, mock_hook):
+    def test_execute_poke_returns_value(self, mock_hook):
         _, hook = mock_hook
         hook.queue_info.return_value = {"message_count": 1, "exists": True}
         hook.consume_messages.return_value = [
-            _make_raw_msg(body="result", delivery_tag=1),
+            _make_raw_msg(body="result", delivery_tag=1, headers={"k": "v"}),
         ]
-        sensor = RMQSensor(task_id="t", queue_name="q", poke_interval=1, mode="reschedule")
-        # Simulate poke returning True
-        sensor._return_value = {"body": "result", "headers": {}, "routing_key": "rk"}
-        # execute calls super().execute() which calls poke, but we test the return
-        with patch.object(type(sensor), "execute", wraps=None) as _:
-            # Directly test that _return_value is returned
-            assert sensor._return_value == {"body": "result", "headers": {}, "routing_key": "rk"}
+        sensor = RMQSensor(task_id="t", queue_name="q", poke_interval=1)
+        # Call poke directly (execute() would call poke in a loop via BaseSensorOperator)
+        assert sensor.poke(context={}) is True
+        assert sensor._return_value == {
+            "body": "result",
+            "headers": {"k": "v"},
+            "routing_key": "rk",
+            "exchange": "",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -249,10 +251,10 @@ class TestExecuteComplete:
         sensor = RMQSensor(task_id="t", queue_name="q", poke_interval=1)
         event = {
             "status": "success",
-            "message": {"body": "data", "headers": {}, "routing_key": "rk"},
+            "message": {"body": "data", "headers": {}, "routing_key": "rk", "exchange": ""},
         }
         result = sensor.execute_complete(context={}, event=event)
-        assert result == {"body": "data", "headers": {}, "routing_key": "rk"}
+        assert result == {"body": "data", "headers": {}, "routing_key": "rk", "exchange": ""}
 
     def test_error_event_raises(self):
         sensor = RMQSensor(task_id="t", queue_name="q", poke_interval=1)

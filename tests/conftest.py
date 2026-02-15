@@ -15,7 +15,7 @@ class FakeAirflowConnection:
 
     conn_id: str = "rmq_default"
     host: str = "localhost"
-    port: int = 5672
+    port: int | None = 5672
     login: str = "guest"
     password: str = "guest"
     schema: str = "/"
