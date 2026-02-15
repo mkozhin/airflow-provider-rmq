@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Sequence
 
+import pika.exceptions
 from airflow.sensors.base import BaseSensorOperator
 
 from apache_airflow_provider_rmq.hooks.rmq import RMQHook
@@ -34,6 +35,7 @@ class RMQSensor(BaseSensorOperator):
         filter_headers: dict[str, Any] | None = None,
         filter_callable: Callable[[Any, str], bool] | None = None,
         deferrable: bool = False,
+        poke_batch_size: int = 100,
         **kwargs,
     ):
         """Create a new RMQSensor.
@@ -49,6 +51,8 @@ class RMQSensor(BaseSensorOperator):
         :type filter_callable: Callable[[Any, str], bool] | None
         :param deferrable: Run in deferrable mode using :class:`RMQTrigger`.
         :type deferrable: bool
+        :param poke_batch_size: Max messages to fetch per poke cycle.
+        :type poke_batch_size: int
         """
         super().__init__(**kwargs)
         self.queue_name = queue_name
@@ -56,6 +60,7 @@ class RMQSensor(BaseSensorOperator):
         self.filter_headers = filter_headers
         self.filter_callable = filter_callable
         self.deferrable = deferrable
+        self.poke_batch_size = poke_batch_size
         self._return_value: dict | None = None
 
         if self.deferrable and self.filter_callable is not None:
@@ -97,15 +102,17 @@ class RMQSensor(BaseSensorOperator):
             filter_callable=self.filter_callable,
         )
 
-        _POKE_BATCH_SIZE = 100
-
         hook = RMQHook(rmq_conn_id=self.rmq_conn_id)
         try:
-            messages = hook.consume_messages(
-                queue_name=self.queue_name,
-                max_messages=_POKE_BATCH_SIZE,
-                auto_ack=False,
-            )
+            try:
+                messages = hook.consume_messages(
+                    queue_name=self.queue_name,
+                    max_messages=self.poke_batch_size,
+                    auto_ack=False,
+                )
+            except pika.exceptions.ChannelClosedByBroker as e:
+                log.warning("Queue '%s' is not available: %s", self.queue_name, e)
+                return False
 
             if not messages:
                 return False

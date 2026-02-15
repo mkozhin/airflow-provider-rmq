@@ -542,7 +542,10 @@ class RMQHook(BaseHook):
             })
             if len(messages) >= max_messages:
                 break
-        channel.cancel()
+        try:
+            channel.cancel()
+        except Exception:
+            log.debug("Error cancelling consumer on channel", exc_info=True)
         return messages
 
     def ack(self, delivery_tag: int) -> None:

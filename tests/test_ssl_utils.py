@@ -135,3 +135,12 @@ class TestPartialCertChain:
                 "ssl_options": {"keyfile": "/key.pem"},
             })
             ctx.load_cert_chain.assert_not_called()
+
+
+class TestInvalidJson:
+    def test_invalid_json_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid JSON in ssl_options"):
+            build_ssl_context({
+                "ssl_enabled": True,
+                "ssl_options": "{not valid json",
+            })

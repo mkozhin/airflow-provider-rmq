@@ -173,6 +173,16 @@ class TestMaxMessages:
         hook.nack.assert_called_once_with(2, requeue=True)
 
 
+class TestChannelClosedByBroker:
+    def test_returns_empty_on_nonexistent_queue(self, mock_hook):
+        _, hook = mock_hook
+        from pika.exceptions import ChannelClosedByBroker
+        hook.consume_messages.side_effect = ChannelClosedByBroker(404, "NOT_FOUND")
+        op = RMQConsumeOperator(task_id="t", queue_name="nonexistent")
+        result = op.execute(context={})
+        assert result == []
+
+
 class TestConnectionId:
     def test_default_conn_id(self, mock_hook):
         MockHook, hook = mock_hook

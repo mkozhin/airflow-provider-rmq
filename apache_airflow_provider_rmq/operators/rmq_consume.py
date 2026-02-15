@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Sequence
 
+import pika.exceptions
 from airflow.models import BaseOperator
 
 from apache_airflow_provider_rmq.hooks.rmq import RMQHook
@@ -64,11 +65,15 @@ class RMQConsumeOperator(BaseOperator):
         matched_messages: list[dict[str, Any]] = []
 
         with RMQHook(rmq_conn_id=self.rmq_conn_id, qos=self.qos) as hook:
-            raw_messages = hook.consume_messages(
-                queue_name=self.queue_name,
-                max_messages=self.max_messages,
-                auto_ack=False,
-            )
+            try:
+                raw_messages = hook.consume_messages(
+                    queue_name=self.queue_name,
+                    max_messages=self.max_messages,
+                    auto_ack=False,
+                )
+            except pika.exceptions.ChannelClosedByBroker as e:
+                log.warning("Queue '%s' is not available: %s", self.queue_name, e)
+                return []
 
             if not raw_messages:
                 log.info("Queue '%s' is empty.", self.queue_name)

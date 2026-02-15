@@ -445,3 +445,16 @@ class TestConnectionFormWidgets:
         widgets = RMQHook.get_connection_form_widgets()
         assert isinstance(widgets, dict)
         assert set(widgets.keys()) == {"ssl_enabled", "ca_certs", "certfile", "keyfile"}
+
+
+# ---------------------------------------------------------------------------
+# consume_messages — channel.cancel() safety
+# ---------------------------------------------------------------------------
+class TestConsumeMessagesCancel:
+    def test_cancel_error_does_not_propagate(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        mock_ch.consume.return_value = iter([(None, None, None)])
+        mock_ch.cancel.side_effect = RuntimeError("cancel failed")
+        # Should not raise
+        result = hook.consume_messages("q")
+        assert result == []

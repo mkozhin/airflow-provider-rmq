@@ -177,6 +177,43 @@ class TestPokeHookClose:
 
 
 # ---------------------------------------------------------------------------
+# Poke mode — ChannelClosedByBroker
+# ---------------------------------------------------------------------------
+class TestPokeChannelClosed:
+    def test_returns_false_on_nonexistent_queue(self, mock_hook):
+        _, hook = mock_hook
+        from pika.exceptions import ChannelClosedByBroker
+        hook.consume_messages.side_effect = ChannelClosedByBroker(404, "NOT_FOUND")
+        sensor = RMQSensor(task_id="t", queue_name="nonexistent", poke_interval=1)
+        result = sensor.poke(context={})
+        assert result is False
+        hook.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Poke mode — configurable batch size
+# ---------------------------------------------------------------------------
+class TestPokeBatchSize:
+    def test_default_batch_size(self, mock_hook):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = []
+        sensor = RMQSensor(task_id="t", queue_name="q", poke_interval=1)
+        sensor.poke(context={})
+        hook.consume_messages.assert_called_once_with(
+            queue_name="q", max_messages=100, auto_ack=False,
+        )
+
+    def test_custom_batch_size(self, mock_hook):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = []
+        sensor = RMQSensor(task_id="t", queue_name="q", poke_interval=1, poke_batch_size=50)
+        sensor.poke(context={})
+        hook.consume_messages.assert_called_once_with(
+            queue_name="q", max_messages=50, auto_ack=False,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Execute — poke mode returns _return_value via XCom
 # ---------------------------------------------------------------------------
 class TestExecute:

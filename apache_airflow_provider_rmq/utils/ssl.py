@@ -33,7 +33,10 @@ def build_ssl_context(extras: dict[str, Any]) -> ssl.SSLContext | None:
     # Merge flat extras with nested ssl_options (nested takes precedence)
     ssl_opts_raw = extras.get("ssl_options", {})
     if isinstance(ssl_opts_raw, str):
-        ssl_opts_raw = json.loads(ssl_opts_raw)
+        try:
+            ssl_opts_raw = json.loads(ssl_opts_raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in ssl_options: {e}") from e
 
     def _get(key: str) -> Any:
         """Look up key in nested ssl_options first, then flat extras."""
