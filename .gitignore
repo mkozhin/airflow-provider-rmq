@@ -18,3 +18,4 @@ build/
 airflow_provider_rmq/_version.py
 /.claude/
 /docs/plans/
+/docs/adr/
