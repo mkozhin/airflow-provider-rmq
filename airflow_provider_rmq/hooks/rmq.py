@@ -129,11 +129,12 @@ class RMQHook(BaseHook):
         credentials = pika.PlainCredentials(conn.login or "guest", conn.password or "guest")
 
         from airflow_provider_rmq.utils.ssl import build_ssl_context
+        from airflow_provider_rmq.utils.amqp import AMQP_PORT, AMQPS_PORT
 
         ssl_context = build_ssl_context(extras)
         ssl_options = pika.SSLOptions(ssl_context, conn.host) if ssl_context else None
 
-        port = conn.port if conn.port else (5671 if ssl_context else 5672)
+        port = conn.port if conn.port else (AMQPS_PORT if ssl_context else AMQP_PORT)
 
         return pika.ConnectionParameters(
             host=conn.host or "localhost",

@@ -8,18 +8,10 @@ import aio_pika
 from airflow.hooks.base import BaseHook
 from airflow.triggers.base import BaseTrigger, TriggerEvent
 
+from airflow_provider_rmq.utils.amqp import build_amqp_connection, match_and_ack
 from airflow_provider_rmq.utils.filters import MessageFilter
 
 log = logging.getLogger("airflow.task")
-
-
-class _PropsShim:
-    """Shim to bridge aio_pika message headers to MessageFilter's HasHeaders protocol."""
-
-    __slots__ = ("headers",)
-
-    def __init__(self, headers: dict[str, Any]):
-        self.headers = headers
 
 
 class RMQTrigger(BaseTrigger):
@@ -95,23 +87,18 @@ class RMQTrigger(BaseTrigger):
 
         Returns a success payload dict on match, or None if the message did not match.
         """
-        body_str = message.body.decode("utf-8")
-        props_shim = _PropsShim(dict(message.headers or {}))
-
-        if not msg_filter.has_filters or msg_filter.matches(props_shim, body_str):
-            await message.ack()
-            return {
-                "status": "success",
-                "message": {
-                    "body": body_str,
-                    "headers": dict(message.headers or {}),
-                    "routing_key": message.routing_key or "",
-                    "exchange": message.exchange or "",
-                },
-            }
-        else:
-            await message.nack(requeue=True)
+        matched = await match_and_ack(message, msg_filter)
+        if not matched:
             return None
+        return {
+            "status": "success",
+            "message": {
+                "body": message.body.decode("utf-8"),
+                "headers": dict(message.headers or {}),
+                "routing_key": message.routing_key or "",
+                "exchange": message.exchange or "",
+            },
+        }
 
     async def _run_push(
         self,
@@ -144,23 +131,7 @@ class RMQTrigger(BaseTrigger):
             conn_info = await asyncio.get_running_loop().run_in_executor(
                 None, BaseHook.get_connection, self.rmq_conn_id
             )
-            extras = conn_info.extra_dejson
-            from airflow_provider_rmq.utils.ssl import build_ssl_context
-            ssl_context = build_ssl_context(extras)
-            vhost = conn_info.schema or "/"
-            port = conn_info.port if conn_info.port else (5671 if ssl_context else 5672)
-
-            from urllib.parse import quote
-            vhost_encoded = quote(vhost, safe="")
-            login_encoded = quote(conn_info.login or "guest", safe="")
-            password_encoded = quote(conn_info.password or "guest", safe="")
-
-            url = (
-                f"{'amqps' if ssl_context else 'amqp'}://"
-                f"{login_encoded}:{password_encoded}"
-                f"@{conn_info.host or 'localhost'}:{port}/{vhost_encoded}"
-            )
-
+            url, ssl_context = build_amqp_connection(conn_info)
             connect_kwargs: dict[str, Any] = {"url": url}
             if ssl_context is not None:
                 connect_kwargs["ssl_context"] = ssl_context
@@ -194,11 +165,7 @@ class RMQTrigger(BaseTrigger):
                     if result is not None:
                         yield TriggerEvent(result)
                         return
-                    else:
-                        # Short delay to avoid a tight CPU loop while skipping
-                        # non-matching messages. poll_interval is only used when
-                        # the queue is empty.
-                        await asyncio.sleep(0.1)
+                    # sleep(0.1) after NACK is handled inside match_and_ack
 
         except Exception as e:
             log.exception("RMQTrigger encountered an error")
