@@ -2,7 +2,7 @@
 
 ## v2.0.2
 
-- **Fixed:** `RMQWatcherView` raising `KeyError: 'can_subscriptions'` on Airflow 2.9+ — replaced `@has_access` with `@login_required`; Airflow's security manager only accepts standard FAB actions (`can_read`, `can_edit`, `can_create`, `can_delete`) and raises `KeyError` for custom method names
+- **Fixed:** `RMQWatcherView` raising `KeyError: 'can_subscriptions'` on Airflow 2.9+ — added `method_permission_name`, `class_permission_name`, and `base_permissions` to map view methods to standard FAB actions (`can_read`, `can_edit`, `can_create`, `can_delete`); RBAC enforced via `@has_access`
 - **Changed:** minimum Airflow version bumped from 2.7.0 to 2.9.0
 
 ## v2.0.1

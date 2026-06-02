@@ -5,7 +5,7 @@ import logging
 
 from flask import flash, redirect, request, url_for
 from flask_appbuilder import BaseView, expose
-from flask_login import login_required
+from flask_appbuilder.security.decorators import has_access
 
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -20,9 +20,18 @@ log = logging.getLogger(__name__)
 class RMQWatcherView(BaseView):
     route_base = "/rmq-watcher"
     default_view = "subscriptions"
+    class_permission_name = "RMQ Subscriptions"
+    base_permissions = ["can_read", "can_edit", "can_create", "can_delete"]
+    method_permission_name = {
+        "subscriptions": "read",
+        "create": "create",
+        "edit": "edit",
+        "delete": "delete",
+        "toggle": "edit",
+    }
 
     @expose("/subscriptions")
-    @login_required
+    @has_access
     def subscriptions(self):
         with WatcherSession() as session:
             subs = session.query(RMQSubscription).order_by(RMQSubscription.dag_id).all()
@@ -34,7 +43,7 @@ class RMQWatcherView(BaseView):
         )
 
     @expose("/subscriptions/create", methods=["GET", "POST"])
-    @login_required
+    @has_access
     def create(self):
         if request.method == "POST":
             dag_id = request.form.get("dag_id", "").strip()
@@ -71,7 +80,7 @@ class RMQWatcherView(BaseView):
         return self.render_template("rmq_watcher/subscription_form.html", sub=None)
 
     @expose("/subscriptions/<int:sub_id>/edit", methods=["GET", "POST"])
-    @login_required
+    @has_access
     def edit(self, sub_id: int):
         with WatcherSession() as session:
             sub = session.query(RMQSubscription).filter_by(id=sub_id).first()
@@ -123,7 +132,7 @@ class RMQWatcherView(BaseView):
             )
 
     @expose("/subscriptions/<int:sub_id>/delete", methods=["POST"])
-    @login_required
+    @has_access
     def delete(self, sub_id: int):
         with WatcherSession() as session:
             sub = session.query(RMQSubscription).filter_by(id=sub_id).first()
@@ -146,7 +155,7 @@ class RMQWatcherView(BaseView):
         return redirect(url_for("RMQWatcherView.subscriptions"))
 
     @expose("/subscriptions/<int:sub_id>/toggle", methods=["POST"])
-    @login_required
+    @has_access
     def toggle(self, sub_id: int):
         with WatcherSession() as session:
             sub = session.query(RMQSubscription).filter_by(id=sub_id).first()
