@@ -15,7 +15,7 @@
 
 ---
 
-> **AI Disclosure:** This provider was developed with the assistance of **Claude Code** (Anthropic, model **Claude Opus 4.6**). The code, tests, and documentation were co-authored by a human developer and an LLM. Please evaluate the code quality on its own merits and make informed decisions about whether to use it in your projects.
+*Powered by [Claude Code](https://claude.ai/code)*
 
 ---
 
@@ -27,6 +27,7 @@
 - Consuming messages with header-based and callable-based filtering
 - Waiting for specific messages with sensors (classic poke and deferrable mode)
 - Deferrable sensor in **pull mode** (periodic polling) and **push mode** (broker-delivered via `basic_consume`) — choose based on latency requirements
+- **Reactive DAG triggering** — RMQ Watcher Plugin starts DAGs automatically when messages arrive, with no polling and no worker slots consumed
 - Full queue and exchange management (declare, delete, purge, bind, unbind)
 - SSL/TLS connections
 - Dead Letter Queue (DLQ) setup helpers
@@ -524,6 +525,71 @@ Both can be combined (AND logic: both must pass).
 
 ---
 
+## RMQ Watcher Plugin
+
+The **RMQ Watcher Plugin** inverts the usual sensor pattern: instead of a DAG waiting for a message, a RabbitMQ message *causes* the DAG to start automatically — without polling, without `deferred` task slots, without worker resources.
+
+### How it works
+
+The Scheduler process runs a background asyncio loop (via Airflow Listener API) that subscribes to queues via AMQP `basic_consume`. When a matching message arrives, `trigger_dag()` is called directly inside the process. One `connect_robust` connection per `conn_id` is shared across all subscriptions to that cluster.
+
+Every 60 seconds (configurable via Airflow Variable `rmq_watcher_reconcile_interval`) a reconciliation loop re-scans DAG files for `@rmq_trigger` decorators (mtime-based — only changed files are re-parsed) and syncs subscriptions to the database.
+
+### Quick Start
+
+**Step 1 — annotate your DAG:**
+
+```python
+from airflow.decorators import dag, task
+from airflow_provider_rmq.watcher.decorators import rmq_trigger
+
+@rmq_trigger(queue="orders", conn_id="rmq_default")
+@dag(schedule=None)
+def orders_dag():
+    @task
+    def process(**context):
+        conf = context["dag_run"].conf
+        print(f"Body: {conf['body']}, Headers: {conf['headers']}")
+    process()
+
+orders_dag()
+```
+
+**Step 2** — restart the Scheduler. The plugin activates automatically; no extra configuration is needed.
+
+**Step 3** — publish a message to `orders` — the DAG starts within seconds.
+
+### Payload passed to the DAG
+
+```python
+conf = context["dag_run"].conf
+# {
+#     "body":            "<UTF-8 decoded message body>",
+#     "headers":         {"key": "value", ...},
+#     "routing_key":     "orders.created",
+#     "queue":           "orders",
+#     "subscription_id": 42,
+# }
+```
+
+### Subscription Management
+
+| Method | Description |
+|---|---|
+| `@rmq_trigger` decorator | Infrastructure as Code — subscription lives in the DAG file, managed by git |
+| Airflow UI at `/rmq-watcher/subscriptions` | Create, edit, toggle, delete (UI-created subscriptions only) |
+| Direct DB insert | For automation via Terraform / scripts (`source='ui'`) |
+
+`dag_file` subscriptions are **read-only** in the UI — reconciliation overwrites DB from code every 60 s. Only the `enabled` toggle can be changed via UI for code-managed subscriptions.
+
+### Best Practices
+
+- Use a **dedicated queue** per DAG trigger (e.g. `orders.airflow-trigger` separate from `orders`). Avoids NACK hot-loops on quorum queues and interference with other consumers.
+- To pause message consumption without stopping the DAG: **toggle the subscription off** in the UI rather than pausing the DAG. Pausing the DAG acks messages silently.
+- In **multi-scheduler HA** deployments each active scheduler runs its own consumer, which may cause duplicate runs. Set `max_active_runs=1` as a lightweight mitigation.
+
+---
+
 ## Example DAGs
 
 The package includes several example DAGs in `docs/example_dags/`. All examples use the **TaskFlow API** (`@dag` / `@task` decorators) and demonstrate how to **process consumed messages** in downstream tasks via XCom.
@@ -535,6 +601,7 @@ The package includes several example DAGs in `docs/example_dags/`. All examples 
 | `rmq_consume_with_filters` | Header filters, body-path filters, callable filters, QoS — with per-step message processing |
 | `rmq_sensor_deferrable` | Deferrable sensor in pull mode with header filtering and message processing |
 | `rmq_sensor_push` | Deferrable sensor in **push mode** — broker delivers messages instantly via `basic_consume` |
+| `rmq_watcher_demo` | **RMQ Watcher Plugin** — DAG triggered reactively by RabbitMQ messages via `@rmq_trigger`; also runs on daily schedule |
 | `rmq_pipeline_start` / `rmq_pipeline_finish` | Pipeline lock pattern — prevent concurrent executions |
 | `rmq_dlq_setup` | Dead Letter Queue infrastructure setup with DLX, TTL, exchange-to-exchange bindings |
 
@@ -557,8 +624,16 @@ airflow-provider-rmq/
 │   ├── triggers/
 │   │   └── rmq.py                   # RMQTrigger
 │   ├── utils/
+│   │   ├── amqp.py                  # build_amqp_connection(), match_and_ack()
 │   │   ├── filters.py               # MessageFilter
 │   │   └── ssl.py                   # build_ssl_context()
+│   └── watcher/
+│       ├── decorators.py            # @rmq_trigger
+│       ├── models.py                # RMQSubscription, RMQConnStatus, WatcherSession
+│       ├── consumer.py              # RMQConsumerManager
+│       ├── listener.py              # RMQWatcherListener (Scheduler Listener)
+│       ├── views.py                 # RMQWatcherView (Flask-AppBuilder UI)
+│       └── plugin.py                # RMQWatcherPlugin (AirflowPlugin)
 ├── docs/
 │   └── example_dags/                # Example DAGs
 ├── tests/                           # Unit tests
