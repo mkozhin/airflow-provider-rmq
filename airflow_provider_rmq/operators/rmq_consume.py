@@ -85,8 +85,8 @@ class RMQConsumeOperator(BaseOperator):
                     matched_messages.append({
                         "body": msg["body"],
                         "headers": dict(msg["properties"].headers or {}),
-                        "routing_key": msg["method"].routing_key,
-                        "exchange": msg["method"].exchange,
+                        "routing_key": msg["method"].routing_key or "",
+                        "exchange": msg["method"].exchange or "",
                     })
                 else:
                     hook.nack(msg["method"].delivery_tag, requeue=True)
