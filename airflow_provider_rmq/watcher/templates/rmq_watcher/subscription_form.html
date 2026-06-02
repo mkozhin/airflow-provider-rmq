@@ -1,0 +1,97 @@
+{% extends base_template %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="page-header">
+    <h2>
+      {% if sub %}Edit{% else %}Create{% endif %} RMQ Subscription
+      {% if is_dag_file %}
+        <small class="text-muted"> — dag_file source (read-only fields managed by code)</small>
+      {% endif %}
+    </h2>
+  </div>
+
+  {# Flash messages #}
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ 'danger' if category == 'error' else category }}">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  {% if is_dag_file %}
+  <div class="alert alert-info">
+    This subscription is defined in a DAG file via <code>@rmq_trigger</code>.
+    Only the <strong>Enabled</strong> toggle can be changed here.
+    To modify other fields, update the DAG file.
+  </div>
+  {% endif %}
+
+  <div class="panel panel-default">
+    <div class="panel-body">
+      <form method="post" class="form-horizontal">
+        {{ csrf_token() }}
+
+        <div class="form-group">
+          <label class="col-sm-2 control-label">DAG ID</label>
+          <div class="col-sm-6">
+            <input type="text" name="dag_id" class="form-control"
+                   value="{{ sub.dag_id if sub else '' }}"
+                   {% if is_dag_file %}readonly{% else %}required{% endif %}>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="col-sm-2 control-label">Queue Name</label>
+          <div class="col-sm-6">
+            <input type="text" name="queue_name" class="form-control"
+                   value="{{ sub.queue_name if sub else '' }}"
+                   {% if is_dag_file %}readonly{% else %}required{% endif %}>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="col-sm-2 control-label">Connection ID</label>
+          <div class="col-sm-6">
+            <input type="text" name="conn_id" class="form-control"
+                   value="{{ sub.conn_id if sub else 'rmq_default' }}"
+                   {% if is_dag_file %}readonly{% endif %}>
+            <p class="help-block">Airflow connection ID pointing to the RabbitMQ instance.</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="col-sm-2 control-label">Filter Data (JSON)</label>
+          <div class="col-sm-6">
+            <textarea name="filter_data" class="form-control" rows="4"
+                      {% if is_dag_file %}readonly{% endif %}>{{ sub.filter_data | tojson(indent=2) if sub and sub.filter_data else '' }}</textarea>
+            <p class="help-block">
+              Optional message filter in format <code>{"filter_headers": {"key": "value"}}</code>.
+              Leave empty to trigger on any message.
+            </p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <div class="col-sm-offset-2 col-sm-6">
+            <div class="checkbox">
+              <label>
+                <input type="checkbox" name="enabled"
+                       {% if (sub is none) or sub.enabled %}checked{% endif %}>
+                Enabled
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <div class="col-sm-offset-2 col-sm-6">
+            <button type="submit" class="btn btn-primary">Save</button>
+            <a href="{{ url_for('RMQWatcherView.subscriptions') }}" class="btn btn-default">Cancel</a>
+          </div>
+        </div>
+
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

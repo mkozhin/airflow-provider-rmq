@@ -51,4 +51,10 @@ def get_provider_info():
                 "connection-type": "amqp",
             },
         ],
+        "plugins": [
+            {
+                "name": "rmq_watcher",
+                "plugin-class": "airflow_provider_rmq.watcher.plugin.RMQWatcherPlugin",
+            },
+        ],
     }

@@ -1,0 +1,132 @@
+{% extends base_template %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="page-header">
+    <h2>RMQ Watcher — Subscriptions</h2>
+  </div>
+
+  {# Flash messages #}
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ 'danger' if category == 'error' else category }}">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  {# --- Connections block --- #}
+  <div class="panel panel-default">
+    <div class="panel-heading"><h4>Connections</h4></div>
+    <div class="panel-body">
+      {% if conn_statuses %}
+      <table class="table table-condensed table-bordered">
+        <thead>
+          <tr><th>conn_id</th><th>Status</th><th>Consumers</th><th>Last Error</th></tr>
+        </thead>
+        <tbody>
+        {% for cs in conn_statuses %}
+        <tr>
+          <td><strong>{{ cs.conn_id }}</strong></td>
+          <td>
+            {% if cs.status == 'connected' %}
+              <span class="label label-success">● connected</span>
+            {% elif cs.status == 'error' %}
+              <span class="label label-danger">✕ error</span>
+            {% elif cs.status == 'connecting' %}
+              <span class="label label-warning">○ connecting</span>
+            {% else %}
+              <span class="label label-default">○ {{ cs.status }}</span>
+            {% endif %}
+          </td>
+          <td>{{ cs.consumer_count }}</td>
+          <td>{{ cs.last_error or '—' }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="text-muted">No connections established yet.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  {# --- Subscriptions table --- #}
+  <div class="panel panel-default">
+    <div class="panel-heading">
+      <h4>Subscriptions
+        <a href="{{ url_for('RMQWatcherView.create') }}" class="btn btn-sm btn-primary pull-right">
+          + Create subscription
+        </a>
+      </h4>
+    </div>
+    <div class="panel-body">
+      {% if subscriptions %}
+      <table class="table table-hover table-bordered">
+        <thead>
+          <tr>
+            <th>DAG</th>
+            <th>Queue</th>
+            <th>conn_id</th>
+            <th>Source</th>
+            <th>Status</th>
+            <th>Last Error</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for sub in subscriptions %}
+        <tr class="{{ 'text-muted' if not sub.enabled else '' }}">
+          <td>{{ sub.dag_id }}</td>
+          <td>{{ sub.queue_name }}</td>
+          <td>{{ sub.conn_id }}</td>
+          <td>
+            {% if sub.source == 'dag_file' %}
+              <span class="label label-info">dag_file</span>
+            {% else %}
+              <span class="label label-default">ui</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if not sub.enabled %}
+              <span class="label label-default">disabled</span>
+            {% elif sub.consumer_status == 'listening' %}
+              <span class="label label-success">listening</span>
+            {% elif sub.consumer_status == 'connecting' %}
+              <span class="label label-warning">connecting</span>
+            {% elif sub.consumer_status == 'error' %}
+              <span class="label label-danger">error</span>
+            {% else %}
+              <span class="label label-default">{{ sub.consumer_status }}</span>
+            {% endif %}
+          </td>
+          <td>{{ sub.last_error or '—' }}</td>
+          <td>
+            <form method="post" action="{{ url_for('RMQWatcherView.toggle', sub_id=sub.id) }}" style="display:inline">
+              {{ csrf_token() }}
+              <button type="submit" class="btn btn-xs btn-default">
+                {% if sub.enabled %}Disable{% else %}Enable{% endif %}
+              </button>
+            </form>
+            <a href="{{ url_for('RMQWatcherView.edit', sub_id=sub.id) }}" class="btn btn-xs btn-info">Edit</a>
+            {% if sub.source == 'ui' %}
+            <form method="post" action="{{ url_for('RMQWatcherView.delete', sub_id=sub.id) }}" style="display:inline"
+                  onsubmit="return confirm('Delete subscription for DAG {{ sub.dag_id }}?')">
+              {{ csrf_token() }}
+              <button type="submit" class="btn btn-xs btn-danger">Delete</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="text-muted">
+        No subscriptions yet.
+        <a href="{{ url_for('RMQWatcherView.create') }}">Create the first one</a>
+        or add <code>@rmq_trigger</code> to a DAG file.
+      </p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
