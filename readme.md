@@ -2,7 +2,7 @@
   Apache Airflow Provider for RabbitMQ
 </h1>
 <h3 align="center">
-  Hooks, operators, sensors, and deferrable triggers for RabbitMQ integration in Apache Airflow.
+  Trigger Airflow DAGs reactively from RabbitMQ queues — plus hooks, operators, sensors, and deferrable triggers.
 </h3>
 
 <p align="center">
@@ -21,13 +21,13 @@
 
 ## Overview
 
-`airflow-provider-rmq` is a community provider package that enables Apache Airflow to interact with RabbitMQ. It supports:
+`airflow-provider-rmq` is a community provider package for Apache Airflow × RabbitMQ. It supports:
 
+- **Reactive DAG triggering** — [RMQ Watcher Plugin](#rmq-watcher-plugin) starts DAGs automatically when messages arrive in a queue, with no polling and no worker slots consumed
 - Publishing messages to exchanges and queues
 - Consuming messages with header-based and callable-based filtering
 - Waiting for specific messages with sensors (classic poke and deferrable mode)
 - Deferrable sensor in **pull mode** (periodic polling) and **push mode** (broker-delivered via `basic_consume`) — choose based on latency requirements
-- **Reactive DAG triggering** — RMQ Watcher Plugin starts DAGs automatically when messages arrive, with no polling and no worker slots consumed
 - Full queue and exchange management (declare, delete, purge, bind, unbind)
 - SSL/TLS connections
 - Dead Letter Queue (DLQ) setup helpers

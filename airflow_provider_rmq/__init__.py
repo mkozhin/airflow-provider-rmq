@@ -8,7 +8,10 @@ def get_provider_info():
     return {
         "package-name": "airflow-provider-rmq",
         "name": "RabbitMQ",
-        "description": "`RabbitMQ <https://www.rabbitmq.com/>`__ provider for Apache Airflow with hooks, operators, sensors, and triggers.",
+        "description": "`RabbitMQ <https://www.rabbitmq.com/>`__ provider for Apache Airflow. "
+            "Reactively trigger DAGs from queue messages via the RMQ Watcher Plugin — "
+            "no polling, no worker slots. "
+            "Also includes hooks, operators, sensors, and deferrable triggers.",
         "versions": [__version__],
         "integrations": [
             {

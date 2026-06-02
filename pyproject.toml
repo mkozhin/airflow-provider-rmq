@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "airflow-provider-rmq"
 dynamic = ["version"]
-description = "RabbitMQ provider for Apache Airflow with hooks, operators, sensors, and deferrable trigger support."
+description = "RabbitMQ provider for Apache Airflow — reactive DAG triggering from queues, hooks, operators, sensors, and deferrable triggers."
 readme = "readme.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
