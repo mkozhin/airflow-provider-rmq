@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import glob
 import logging
@@ -18,6 +19,53 @@ from airflow_provider_rmq.watcher.models import (
 log = logging.getLogger(__name__)
 
 _DEFAULT_RECONCILE_INTERVAL = 60
+
+
+def _parse_rmq_trigger_decorator(node: ast.expr) -> dict | None:
+    """Return subscription dict if node is an rmq_trigger(...) call, else None.
+
+    Handles both bare name ``rmq_trigger(...)`` and attribute access
+    ``decorators.rmq_trigger(...)``.  Only literal argument values are extracted;
+    non-literal expressions are skipped (subscription won't be registered from
+    AST scan — user should create it via the UI instead).
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    is_rmq = (
+        (isinstance(func, ast.Name) and func.id == "rmq_trigger")
+        or (isinstance(func, ast.Attribute) and func.attr == "rmq_trigger")
+    )
+    if not is_rmq:
+        return None
+
+    kwargs: dict = {}
+    # positional: rmq_trigger("queue_name")
+    if node.args:
+        val = node.args[0]
+        if isinstance(val, ast.Constant) and isinstance(val.value, str):
+            kwargs["queue_name"] = val.value
+    # keyword arguments
+    for kw in node.keywords:
+        if kw.arg not in ("queue", "conn_id", "filter_data"):
+            continue
+        try:
+            value = ast.literal_eval(kw.value)
+        except (ValueError, TypeError):
+            continue
+        if kw.arg == "queue":
+            kwargs["queue_name"] = value
+        else:
+            kwargs[kw.arg] = value
+
+    if "queue_name" not in kwargs:
+        return None
+
+    return {
+        "queue_name": kwargs["queue_name"],
+        "conn_id": kwargs.get("conn_id", "rmq_default"),
+        "filter_data": kwargs.get("filter_data", {}),
+    }
 
 
 class RMQWatcherListener:
@@ -161,23 +209,36 @@ class RMQWatcherListener:
         return result
 
     def _extract_subscriptions_from_file(self, path: str) -> list[dict]:
-        """Parse a single DAG file and return its @rmq_trigger subscriptions."""
+        """Extract @rmq_trigger subscriptions from a DAG file via AST parsing.
+
+        AST parsing never executes the file and never acquires the Python import
+        lock, so it is safe to call from a background thread inside the Scheduler
+        process.  DagBag would acquire the import lock and could deadlock with the
+        Scheduler's own import activity, causing heartbeat failures and tasks being
+        marked as killed externally.
+
+        Limitation: dag_id is taken from the decorated function name. If the user
+        passes an explicit dag_id= to @dag(...), the function name is still used.
+        In practice most TaskFlow DAGs use the function name as dag_id.
+        """
         try:
-            from airflow.models import DagBag
-            bag = DagBag(dag_folder=path, include_examples=False)
-            result: list[dict] = []
-            for dag_id, dag in bag.dags.items():
-                for sub in getattr(dag, "_rmq_subscriptions", []):
-                    result.append({
-                        "dag_id": dag_id,
-                        "queue_name": sub["queue_name"],
-                        "conn_id": sub.get("conn_id", "rmq_default"),
-                        "filter_data": sub.get("filter_data", {}),
-                    })
-            return result
-        except Exception as exc:
-            log.warning("Failed to parse DAG file %s: %s", path, exc)
+            with open(path, encoding="utf-8") as f:
+                source = f.read()
+            tree = ast.parse(source, filename=path)
+        except (SyntaxError, OSError, UnicodeDecodeError) as exc:
+            log.warning("Failed to read/parse DAG file %s: %s", path, exc)
             return []
+
+        result: list[dict] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                sub = _parse_rmq_trigger_decorator(decorator)
+                if sub is not None:
+                    sub["dag_id"] = node.name
+                    result.append(sub)
+        return result
 
     # ------------------------------------------------------------------
     # DB synchronisation

@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.0.4
+
+- **Changed:** `_extract_subscriptions_from_file` now uses AST parsing instead of `DagBag` — eliminates risk of Python import-lock deadlock when scanning DAG files from a background thread inside the Scheduler process
+
 ## v2.0.3
 
 - **Fixed:** `TemplateNotFound: rmq_watcher/subscriptions.html` — registered a Flask Blueprint with `template_folder` via `flask_blueprints` so Airflow's Jinja2 loader finds the package templates
