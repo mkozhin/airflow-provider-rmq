@@ -157,6 +157,14 @@ class TestScanSubscriptions:
 
         assert result == []
 
+    def test_extract_subscriptions_returns_empty_list_on_dagbag_error(self):
+        listener = RMQWatcherListener()
+
+        with patch("airflow.models.DagBag", side_effect=Exception("SyntaxError in DAG")):
+            result = listener._extract_subscriptions_from_file("/dags/broken.py")
+
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
 # _sync_to_db
