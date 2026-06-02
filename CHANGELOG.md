@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.0.2
+
+- **Fixed:** `RMQWatcherView` raising `KeyError: 'can_subscriptions'` on Airflow 2.9+ — replaced `@has_access` with `@login_required`; Airflow's security manager only accepts standard FAB actions (`can_read`, `can_edit`, `can_create`, `can_delete`) and raises `KeyError` for custom method names
+- **Changed:** minimum Airflow version bumped from 2.7.0 to 2.9.0
+
 ## v2.0.1
 
 - **Fixed:** `RMQWatcherPlugin` not appearing in Airflow UI — registered via `airflow.plugins` entry point so the plugin is loaded by `load_entrypoint_plugins()` regardless of `lazy_discover_providers` (defaults to `True` since Airflow 2.8)

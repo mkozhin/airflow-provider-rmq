@@ -5,7 +5,7 @@ import logging
 
 from flask import flash, redirect, request, url_for
 from flask_appbuilder import BaseView, expose
-from flask_appbuilder.security.decorators import has_access
+from flask_login import login_required
 
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -22,7 +22,7 @@ class RMQWatcherView(BaseView):
     default_view = "subscriptions"
 
     @expose("/subscriptions")
-    @has_access
+    @login_required
     def subscriptions(self):
         with WatcherSession() as session:
             subs = session.query(RMQSubscription).order_by(RMQSubscription.dag_id).all()
@@ -34,7 +34,7 @@ class RMQWatcherView(BaseView):
         )
 
     @expose("/subscriptions/create", methods=["GET", "POST"])
-    @has_access
+    @login_required
     def create(self):
         if request.method == "POST":
             dag_id = request.form.get("dag_id", "").strip()
@@ -71,7 +71,7 @@ class RMQWatcherView(BaseView):
         return self.render_template("rmq_watcher/subscription_form.html", sub=None)
 
     @expose("/subscriptions/<int:sub_id>/edit", methods=["GET", "POST"])
-    @has_access
+    @login_required
     def edit(self, sub_id: int):
         with WatcherSession() as session:
             sub = session.query(RMQSubscription).filter_by(id=sub_id).first()
@@ -123,7 +123,7 @@ class RMQWatcherView(BaseView):
             )
 
     @expose("/subscriptions/<int:sub_id>/delete", methods=["POST"])
-    @has_access
+    @login_required
     def delete(self, sub_id: int):
         with WatcherSession() as session:
             sub = session.query(RMQSubscription).filter_by(id=sub_id).first()
@@ -146,7 +146,7 @@ class RMQWatcherView(BaseView):
         return redirect(url_for("RMQWatcherView.subscriptions"))
 
     @expose("/subscriptions/<int:sub_id>/toggle", methods=["POST"])
-    @has_access
+    @login_required
     def toggle(self, sub_id: int):
         with WatcherSession() as session:
             sub = session.query(RMQSubscription).filter_by(id=sub_id).first()
