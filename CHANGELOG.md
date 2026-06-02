@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.0.0
+
+**RMQ Watcher Plugin** — reactive DAG triggering from RabbitMQ (fully backwards compatible with 1.x)
+
+- **Added:** `RMQWatcherPlugin` — Airflow plugin that starts a background RabbitMQ consumer inside the Scheduler process. Incoming messages automatically trigger associated DAGs without polling, sensor tasks, or worker slots
+- **Added:** `@rmq_trigger(queue, conn_id, filter_data)` decorator — attach RabbitMQ queue subscriptions directly to DAG definitions (Infrastructure as Code). Supports stacking multiple queues on one DAG
+- **Added:** Scheduler Listener (`RMQWatcherListener`) — uses Airflow Listener API (`on_starting`/`before_stopping`) to run an asyncio consumer loop in a background daemon thread; one `connect_robust` connection per `conn_id` shared across all subscriptions to that cluster
+- **Added:** Reconciliation loop — every 60 s (configurable via Airflow Variable `rmq_watcher_reconcile_interval`) re-scans DAG files with mtime-based incremental parsing and syncs subscriptions to DB; only changed files are re-parsed
+- **Added:** `RMQWatcherView` — Flask-AppBuilder page at `/rmq-watcher/subscriptions` to create, edit, toggle and delete subscriptions; connection and consumer status with colored badges
+- **Added:** DB tables `rmq_watcher_subscriptions` and `rmq_watcher_conn_status`, created automatically via `plugin.on_load()` (`checkfirst=True` — safe to call from multiple containers)
+- **Added:** Example DAG `docs/example_dags/rmq_watcher_triggered_dag.py`
+- **Changed:** Version bump to 2.0.0 — new reactive infrastructure (Scheduler Listener, background asyncio loop, DB tables, Airflow UI) represents a qualitatively new capability; all 1.x components (`RMQHook`, `RMQSensor`, `RMQTrigger`, operators) are unchanged and fully backwards compatible
+
 ## v1.2.1
 
 - **Fixed:** `arguments` added to `template_fields` in `RMQQueueManagementOperator` — `x-*` arguments (e.g., `alternate-exchange`, DLQ settings) now support Jinja templates and XCom
