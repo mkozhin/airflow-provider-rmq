@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.0.3
+
+- **Fixed:** `TemplateNotFound: rmq_watcher/subscriptions.html` — registered a Flask Blueprint with `template_folder` via `flask_blueprints` so Airflow's Jinja2 loader finds the package templates
+
 ## v2.0.2
 
 - **Fixed:** `RMQWatcherView` raising `KeyError: 'can_subscriptions'` on Airflow 2.9+ — added `method_permission_name`, `class_permission_name`, and `base_permissions` to map view methods to standard FAB actions (`can_read`, `can_edit`, `can_create`, `can_delete`); RBAC enforced via `@has_access`
