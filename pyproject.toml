@@ -44,6 +44,9 @@ dev = [
 [project.entry-points."apache_airflow_provider"]
 provider_info = "airflow_provider_rmq.__init__:get_provider_info"
 
+[project.entry-points."airflow.plugins"]
+rmq_watcher = "airflow_provider_rmq.watcher.plugin:RMQWatcherPlugin"
+
 [project.urls]
 Homepage = "https://github.com/mkozhin/airflow-provider-rmq"
 Documentation = "https://github.com/mkozhin/airflow-provider-rmq#readme"

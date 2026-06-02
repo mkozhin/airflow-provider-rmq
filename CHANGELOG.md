@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.0.1
+
+- **Fixed:** `RMQWatcherPlugin` not appearing in Airflow UI — registered via `airflow.plugins` entry point so the plugin is loaded by `load_entrypoint_plugins()` regardless of `lazy_discover_providers` (defaults to `True` since Airflow 2.8)
+
 ## v2.0.0
 
 **RMQ Watcher Plugin** — reactive DAG triggering from RabbitMQ (fully backwards compatible with 1.x)
