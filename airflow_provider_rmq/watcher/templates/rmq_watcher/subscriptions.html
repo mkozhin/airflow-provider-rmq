@@ -109,7 +109,7 @@
             <a href="{{ url_for('RMQWatcherView.edit', sub_id=sub.id) }}" class="btn btn-xs btn-info">Edit</a>
             {% if sub.source == 'ui' %}
             <form method="post" action="{{ url_for('RMQWatcherView.delete', sub_id=sub.id) }}" style="display:inline"
-                  onsubmit="return confirm('Delete subscription for DAG {{ sub.dag_id }}?')">
+                  onsubmit="return confirm('Delete subscription for DAG ' + {{ sub.dag_id | tojson }} + '?')">
               {{ csrf_token() }}
               <button type="submit" class="btn btn-xs btn-danger">Delete</button>
             </form>
