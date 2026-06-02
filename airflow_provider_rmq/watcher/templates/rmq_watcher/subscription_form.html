@@ -29,7 +29,7 @@
   <div class="panel panel-default">
     <div class="panel-body">
       <form method="post" class="form-horizontal">
-        {{ csrf_token() }}
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
         <div class="form-group">
           <label class="col-sm-2 control-label">DAG ID</label>

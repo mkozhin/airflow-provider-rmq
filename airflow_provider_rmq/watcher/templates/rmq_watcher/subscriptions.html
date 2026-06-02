@@ -101,7 +101,7 @@
           <td>{{ sub.last_error or '—' }}</td>
           <td>
             <form method="post" action="{{ url_for('RMQWatcherView.toggle', sub_id=sub.id) }}" style="display:inline">
-              {{ csrf_token() }}
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button type="submit" class="btn btn-xs btn-default">
                 {% if sub.enabled %}Disable{% else %}Enable{% endif %}
               </button>
@@ -110,7 +110,7 @@
             {% if sub.source == 'ui' %}
             <form method="post" action="{{ url_for('RMQWatcherView.delete', sub_id=sub.id) }}" style="display:inline"
                   onsubmit="return confirm('Delete subscription for DAG ' + {{ sub.dag_id | tojson }} + '?')">
-              {{ csrf_token() }}
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button type="submit" class="btn btn-xs btn-danger">Delete</button>
             </form>
             {% endif %}
