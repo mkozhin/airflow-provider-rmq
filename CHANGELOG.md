@@ -3,6 +3,8 @@
 ## v2.0.9
 
 - **Fixed:** AST parser used the Python function name as `dag_id` even when `@dag(dag_id='...')` specified an explicit value — caused subscriptions to point at the wrong DAG. Now reads `dag_id` from the `@dag` decorator when it is a string literal; falls back to the function name for non-literal values (e.g. `dag_id=VARIABLE`)
+- **Changed:** Airflow UI menu category renamed from `RabbitMQ Watcher` to `RabbitMQ`
+- **Changed:** minimum Airflow version corrected to `>=2.9.0` in README (pyproject.toml was already correct)
 
 ## v2.0.8
 
