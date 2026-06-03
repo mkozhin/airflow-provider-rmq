@@ -6,6 +6,7 @@ import glob
 import logging
 import os
 import threading
+import traceback
 from typing import Any
 
 from airflow.listeners import hookimpl
@@ -96,9 +97,19 @@ class RMQWatcherListener:
     @hookimpl
     def on_starting(self, component: Any) -> None:
         name = type(component).__name__
-        job_type = getattr(component, 'job_type', '')
-        log.info("RMQWatcherListener.on_starting: component=%s (job_type=%s)", name, job_type)
-        if "Scheduler" in name or "Scheduler" in str(job_type):
+        job_type = getattr(component, 'job_type', '') or ''
+        # In Airflow 2.9+, on_starting fires inside Job.__init__() before super().__init__()
+        # sets job_type, so job_type is always None here. The class is renamed from
+        # SchedulerJobRunner to Job (ORM model). Detect scheduler via call-stack:
+        # scheduler_command.py is present for the scheduler, triggerer_command.py for the triggerer.
+        stack_files = [frame.filename for frame in traceback.extract_stack()]
+        is_scheduler_stack = any('scheduler_command' in f for f in stack_files)
+        is_scheduler = "Scheduler" in name or "Scheduler" in job_type or is_scheduler_stack
+        log.info(
+            "RMQWatcherListener.on_starting: component=%s (job_type=%s, is_scheduler=%s)",
+            name, job_type, is_scheduler,
+        )
+        if is_scheduler:
             self._start()
 
     @hookimpl

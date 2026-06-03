@@ -83,6 +83,36 @@ class TestListenerLifecycle:
             listener.on_starting(Job())
         mock_start.assert_not_called()
 
+    def test_on_starting_airflow29_scheduler_command_in_stack(self):
+        """Airflow 2.9+: component=Job(job_type=None), определяем шедулер по стеку вызовов."""
+        class Job:
+            job_type = None
+
+        fake_frame = MagicMock()
+        fake_frame.filename = "/opt/airflow/airflow/cli/commands/scheduler_command.py"
+
+        listener = RMQWatcherListener()
+        with patch("airflow_provider_rmq.watcher.listener.traceback.extract_stack",
+                   return_value=[fake_frame]), \
+             patch.object(listener, "_start") as mock_start:
+            listener.on_starting(Job())
+        mock_start.assert_called_once()
+
+    def test_on_starting_airflow29_triggerer_command_not_scheduler(self):
+        """Airflow 2.9+: component=Job(job_type=None) из triggerer — не запускает watcher."""
+        class Job:
+            job_type = None
+
+        fake_frame = MagicMock()
+        fake_frame.filename = "/opt/airflow/airflow/cli/commands/triggerer_command.py"
+
+        listener = RMQWatcherListener()
+        with patch("airflow_provider_rmq.watcher.listener.traceback.extract_stack",
+                   return_value=[fake_frame]), \
+             patch.object(listener, "_start") as mock_start:
+            listener.on_starting(Job())
+        mock_start.assert_not_called()
+
     def test_duplicate_on_starting_creates_only_one_thread(self):
         """L2: второй on_starting при живом потоке должен игнорироваться."""
         class SchedulerJobRunner:

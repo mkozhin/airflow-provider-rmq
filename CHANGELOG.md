@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.0.8
+
+- **Fixed:** `RMQWatcherListener.on_starting` still never started the consumer thread on Airflow 2.9+. Root cause: `on_starting` is called inside `Job.__init__()` **before** `super().__init__()` sets the SQLAlchemy column values, so `job_type` is always `None` at that point — the v2.0.7 `job_type` check was ineffective. Fixed by inspecting the Python call stack: `scheduler_command.py` is present in the stack when the scheduler starts, and absent for the triggerer and other components.
+
 ## v2.0.7
 
 - **Fixed:** `RMQWatcherListener.on_starting` never started the consumer thread on Airflow 2.9+ — in that version the component class is named `Job` (ORM model) rather than `SchedulerJobRunner`, so the guard `"Scheduler" in name` was always `False`. Now also checks `job_type` attribute: starts when `"Scheduler" in job_type` (e.g. `job_type="SchedulerJob"`)
