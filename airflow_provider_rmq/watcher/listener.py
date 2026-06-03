@@ -24,6 +24,32 @@ log = logging.getLogger(__name__)
 _DEFAULT_RECONCILE_INTERVAL = 60
 
 
+def _extract_dag_id_from_decorators(decorators: list[ast.expr]) -> str | None:
+    """Return explicit dag_id from @dag(dag_id='...') or None to fall back to the function name."""
+    for dec in decorators:
+        if not isinstance(dec, ast.Call):
+            continue
+        func = dec.func
+        is_dag = (
+            (isinstance(func, ast.Name) and func.id == "dag")
+            or (isinstance(func, ast.Attribute) and func.attr == "dag")
+        )
+        if not is_dag:
+            continue
+        for kw in dec.keywords:
+            if kw.arg == "dag_id":
+                try:
+                    value = ast.literal_eval(kw.value)
+                    if isinstance(value, str):
+                        return value
+                except (ValueError, TypeError):
+                    log.warning(
+                        "rmq_trigger: dag_id= is not a string literal — falling back to function name"
+                    )
+                break
+    return None
+
+
 def _parse_rmq_trigger_decorator(node: ast.expr) -> dict | None:
     """Return subscription dict if node is an rmq_trigger(...) call, else None.
 
@@ -244,9 +270,8 @@ class RMQWatcherListener:
         Scheduler's own import activity, causing heartbeat failures and tasks being
         marked as killed externally.
 
-        Limitation: dag_id is taken from the decorated function name. If the user
-        passes an explicit dag_id= to @dag(...), the function name is still used.
-        In practice most TaskFlow DAGs use the function name as dag_id.
+        dag_id is taken from the explicit dag_id= argument of @dag(...) when it is
+        a string literal; otherwise falls back to the decorated function name.
         """
         try:
             with open(path, encoding="utf-8") as f:
@@ -263,7 +288,7 @@ class RMQWatcherListener:
             for decorator in node.decorator_list:
                 sub = _parse_rmq_trigger_decorator(decorator)
                 if sub is not None:
-                    sub["dag_id"] = node.name
+                    sub["dag_id"] = _extract_dag_id_from_decorators(node.decorator_list) or node.name
                     result.append(sub)
         return result
 

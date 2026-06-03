@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.0.9
+
+- **Fixed:** AST parser used the Python function name as `dag_id` even when `@dag(dag_id='...')` specified an explicit value — caused subscriptions to point at the wrong DAG. Now reads `dag_id` from the `@dag` decorator when it is a string literal; falls back to the function name for non-literal values (e.g. `dag_id=VARIABLE`)
+
 ## v2.0.8
 
 - **Fixed:** `RMQWatcherListener.on_starting` still never started the consumer thread on Airflow 2.9+. Root cause: `on_starting` is called inside `Job.__init__()` **before** `super().__init__()` sets the SQLAlchemy column values, so `job_type` is always `None` at that point — the v2.0.7 `job_type` check was ineffective. Fixed by inspecting the Python call stack: `scheduler_command.py` is present in the stack when the scheduler starts, and absent for the triggerer and other components.

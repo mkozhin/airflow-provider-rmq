@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from airflow_provider_rmq.watcher.listener import RMQWatcherListener
+from airflow_provider_rmq.watcher.listener import (
+    RMQWatcherListener,
+    _extract_dag_id_from_decorators,
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _decorators(src: str) -> list:
+    """Parse a one-function snippet and return its decorator_list."""
+    return ast.parse(src).body[0].decorator_list
 
 def _make_session_ctx(existing_subs=None):
     """Return (ctx, session) where ctx is a mock context manager for WatcherSession."""
@@ -23,6 +32,44 @@ def _make_session_ctx(existing_subs=None):
     ctx.__enter__ = MagicMock(return_value=session)
     ctx.__exit__ = MagicMock(return_value=False)
     return ctx, session
+
+
+# ---------------------------------------------------------------------------
+# _extract_dag_id_from_decorators
+# ---------------------------------------------------------------------------
+
+class TestExtractDagId:
+    def test_string_literal_dag_id(self):
+        decs = _decorators("@dag(dag_id='my_dag')\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) == "my_dag"
+
+    def test_attribute_access_dag(self):
+        decs = _decorators("@decorators.dag(dag_id='my_dag')\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) == "my_dag"
+
+    def test_no_dag_id_kwarg_returns_none(self):
+        decs = _decorators("@dag(schedule_interval=None)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is None
+
+    def test_no_dag_decorator_returns_none(self):
+        decs = _decorators("@some_other_decorator\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is None
+
+    def test_non_literal_dag_id_returns_none(self):
+        decs = _decorators("@dag(dag_id=VARIABLE)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is None
+
+    def test_non_string_literal_dag_id_returns_none(self):
+        decs = _decorators("@dag(dag_id=123)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is None
+
+    def test_async_function_with_explicit_dag_id(self):
+        src = "@dag(dag_id='async_dag')\nasync def f(): pass"
+        decs = ast.parse(src).body[0].decorator_list
+        assert _extract_dag_id_from_decorators(decs) == "async_dag"
+
+    def test_empty_decorator_list_returns_none(self):
+        assert _extract_dag_id_from_decorators([]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +301,56 @@ class TestScanSubscriptions:
         listener = RMQWatcherListener()
         result = listener._extract_subscriptions_from_file("/nonexistent/broken.py")
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _extract_subscriptions_from_file — интеграционные тесты с реальными файлами
+# ---------------------------------------------------------------------------
+
+class TestExtractSubscriptionsFromFile:
+    def test_explicit_dag_id_used_over_function_name(self, tmp_path):
+        dag_file = tmp_path / "my_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q1')\n"
+            "@dag(dag_id='explicit_name')\n"
+            "def get_params_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "explicit_name"
+        assert result[0]["queue_name"] == "q1"
+
+    def test_fallback_to_function_name_when_no_dag_id(self, tmp_path):
+        dag_file = tmp_path / "my_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q2')\n"
+            "@dag(schedule_interval=None)\n"
+            "def my_function(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "my_function"
+
+    def test_fallback_to_function_name_when_dag_id_is_variable(self, tmp_path):
+        dag_file = tmp_path / "my_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "DAG_ID = 'runtime_name'\n"
+            "@rmq_trigger(queue='q3')\n"
+            "@dag(dag_id=DAG_ID)\n"
+            "def variable_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "variable_dag"
 
 
 # ---------------------------------------------------------------------------
