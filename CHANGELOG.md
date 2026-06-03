@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.0.7
+
+- **Fixed:** `RMQWatcherListener.on_starting` never started the consumer thread on Airflow 2.9+ — in that version the component class is named `Job` (ORM model) rather than `SchedulerJobRunner`, so the guard `"Scheduler" in name` was always `False`. Now also checks `job_type` attribute: starts when `"Scheduler" in job_type` (e.g. `job_type="SchedulerJob"`)
+
 ## v2.0.6
 
 - **Fixed:** `on_starting` called twice (e.g. Scheduler restart) spawned a second parallel consumer loop — `_start()` now checks `_thread.is_alive()` and ignores duplicate calls; if the previous lifecycle is shutting down, waits up to 10 s before starting fresh (L2)
