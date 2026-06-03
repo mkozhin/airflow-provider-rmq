@@ -8,6 +8,8 @@ import os
 import threading
 from typing import Any
 
+from airflow.listeners import hookimpl
+
 from airflow_provider_rmq.watcher.consumer import RMQConsumerManager
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -91,12 +93,14 @@ class RMQWatcherListener:
     # Listener API
     # ------------------------------------------------------------------
 
+    @hookimpl
     def on_starting(self, component: Any) -> None:
         name = type(component).__name__
         log.info("RMQWatcherListener.on_starting: component=%s", name)
         if "Scheduler" in name:
             self._start()
 
+    @hookimpl
     def before_stopping(self, component: Any) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
