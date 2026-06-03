@@ -63,6 +63,26 @@ class TestListenerLifecycle:
         # Regression: ensure the substring check works for Airflow 2.7+ class name
         assert "Scheduler" in "SchedulerJobRunner"
 
+    def test_on_starting_with_job_type_scheduler_starts_thread(self):
+        """Airflow 2.9+: component class is 'Job' but job_type='SchedulerJob'."""
+        class Job:
+            job_type = "SchedulerJob"
+
+        listener = RMQWatcherListener()
+        with patch.object(listener, "_start") as mock_start:
+            listener.on_starting(Job())
+        mock_start.assert_called_once()
+
+    def test_on_starting_with_job_type_triggerer_ignores(self):
+        """Triggerer job имеет job_type='TriggererJob' — не должен запускать watcher."""
+        class Job:
+            job_type = "TriggererJob"
+
+        listener = RMQWatcherListener()
+        with patch.object(listener, "_start") as mock_start:
+            listener.on_starting(Job())
+        mock_start.assert_not_called()
+
     def test_duplicate_on_starting_creates_only_one_thread(self):
         """L2: второй on_starting при живом потоке должен игнорироваться."""
         class SchedulerJobRunner:

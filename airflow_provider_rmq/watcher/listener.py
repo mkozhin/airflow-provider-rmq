@@ -96,8 +96,9 @@ class RMQWatcherListener:
     @hookimpl
     def on_starting(self, component: Any) -> None:
         name = type(component).__name__
-        log.info("RMQWatcherListener.on_starting: component=%s", name)
-        if "Scheduler" in name:
+        job_type = getattr(component, 'job_type', '')
+        log.info("RMQWatcherListener.on_starting: component=%s (job_type=%s)", name, job_type)
+        if "Scheduler" in name or "Scheduler" in str(job_type):
             self._start()
 
     @hookimpl
