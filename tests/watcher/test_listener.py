@@ -107,7 +107,7 @@ class TestListenerLifecycle:
         listener.before_stopping(MagicMock())
 
     def test_scheduler_component_name_matches(self):
-        # Regression: ensure the substring check works for Airflow 2.7+ class name
+        # Regression: ensure the substring check works for Airflow 2.9+ class name
         assert "Scheduler" in "SchedulerJobRunner"
 
     def test_on_starting_with_job_type_scheduler_starts_thread(self):

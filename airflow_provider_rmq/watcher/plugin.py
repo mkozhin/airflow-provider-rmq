@@ -26,7 +26,7 @@ class RMQWatcherPlugin(AirflowPlugin):
     appbuilder_views = [
         {
             "name": "Subscriptions",
-            "category": "RabbitMQ Watcher",
+            "category": "RabbitMQ",
             "view": RMQWatcherView(),
         }
     ]

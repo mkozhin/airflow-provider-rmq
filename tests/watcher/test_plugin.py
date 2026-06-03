@@ -19,7 +19,7 @@ def test_plugin_has_appbuilder_view():
     views = RMQWatcherPlugin.appbuilder_views
     assert len(views) == 1
     assert views[0]["name"] == "Subscriptions"
-    assert views[0]["category"] == "RabbitMQ Watcher"
+    assert views[0]["category"] == "RabbitMQ"
     assert type(views[0]["view"]).__name__ == "RMQWatcherView"
 
 
