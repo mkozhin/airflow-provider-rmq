@@ -110,6 +110,13 @@ class RMQWatcherListener:
     # ------------------------------------------------------------------
 
     def _start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            if self._stop_event is None or not self._stop_event.is_set():
+                log.warning("RMQ Watcher thread already running — ignoring duplicate on_starting")
+                return
+            # Previous lifecycle is shutting down — wait briefly then start fresh
+            log.info("RMQ Watcher: waiting for previous thread to stop...")
+            self._thread.join(timeout=10)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -119,14 +126,18 @@ class RMQWatcherListener:
         self._thread.start()
 
     def _run_loop(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._main())
-        except Exception:
-            log.exception("RMQ Watcher loop terminated with error")
-        finally:
-            loop.close()
+        while not self._stop_event.is_set():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._main())
+            except Exception:
+                log.exception("RMQ Watcher loop crashed — restarting in 30s")
+            finally:
+                loop.close()
+            if not self._stop_event.is_set():
+                self._stop_event.wait(timeout=30)
+        log.info("RMQ Watcher loop stopped")
 
     async def _main(self) -> None:
         self._manager = RMQConsumerManager()

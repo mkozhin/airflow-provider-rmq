@@ -1,6 +1,8 @@
 """Tests for RMQWatcherPlugin registration."""
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from airflow_provider_rmq.watcher.plugin import RMQWatcherPlugin
 
 
@@ -35,3 +37,12 @@ def test_plugin_has_blueprint_with_templates():
 def test_rmq_trigger_importable_from_watcher():
     from airflow_provider_rmq.watcher import rmq_trigger
     assert callable(rmq_trigger)
+
+
+def test_on_load_does_not_raise_on_ensure_table_error():
+    """P1: исключение в ensure_table_exists не должно всплывать из on_load."""
+    with patch(
+        "airflow_provider_rmq.watcher.plugin.ensure_table_exists",
+        side_effect=Exception("DB unavailable"),
+    ):
+        RMQWatcherPlugin.on_load()  # не должен бросить исключение

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -61,6 +62,48 @@ class TestListenerLifecycle:
     def test_scheduler_component_name_matches(self):
         # Regression: ensure the substring check works for Airflow 2.7+ class name
         assert "Scheduler" in "SchedulerJobRunner"
+
+    def test_duplicate_on_starting_creates_only_one_thread(self):
+        """L2: второй on_starting при живом потоке должен игнорироваться."""
+        class SchedulerJobRunner:
+            pass
+
+        listener = RMQWatcherListener()
+
+        with patch("threading.Thread") as mock_thread_cls:
+            mock_thread = MagicMock()
+            mock_thread.is_alive.return_value = True
+            mock_thread_cls.return_value = mock_thread
+
+            # Первый вызов — создаёт поток
+            listener._start()
+            # Имитируем, что поток запущен и stop_event не выставлен
+            listener._thread = mock_thread
+            listener._stop_event = threading.Event()
+
+            # Второй вызов — поток жив, stop_event не выставлен → игнор
+            listener._start()
+
+        # Thread() конструктор вызван ровно один раз
+        assert mock_thread_cls.call_count == 1
+
+    def test_run_loop_restarts_after_crash(self):
+        """L3: _run_loop должен перезапускать _main() после исключения."""
+        listener = RMQWatcherListener()
+        listener._stop_event = threading.Event()
+        call_count = {"n": 0}
+
+        async def mock_main():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("simulated crash")
+            # На второй итерации останавливаем цикл
+            listener._stop_event.set()
+
+        with patch.object(listener, "_main", side_effect=mock_main):
+            listener._run_loop()
+
+        assert call_count["n"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -157,12 +200,9 @@ class TestScanSubscriptions:
 
         assert result == []
 
-    def test_extract_subscriptions_returns_empty_list_on_dagbag_error(self):
+    def test_extract_subscriptions_returns_empty_list_on_ioerror(self):
         listener = RMQWatcherListener()
-
-        with patch("airflow.models.DagBag", side_effect=Exception("SyntaxError in DAG")):
-            result = listener._extract_subscriptions_from_file("/dags/broken.py")
-
+        result = listener._extract_subscriptions_from_file("/nonexistent/broken.py")
         assert result == []
 
 

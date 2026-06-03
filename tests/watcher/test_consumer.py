@@ -10,6 +10,7 @@ from airflow_provider_rmq.watcher.consumer import (
     RMQConsumerManager,
     _ConsumerState,
     _RECONNECT_DELAY,
+    _build_run_id,
     _sync_trigger,
 )
 
@@ -536,3 +537,91 @@ class TestConsumeSubscription:
             await asyncio.gather(task1, task2, return_exceptions=True)
 
         assert mock_connect.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for C5 (binary body) and C3 (status reset on reconcile removal)
+# ---------------------------------------------------------------------------
+
+class TestTriggerDagBinaryBody:
+    @pytest.mark.asyncio
+    async def test_binary_body_does_not_raise(self):
+        """C5: невалидный UTF-8 в теле сообщения не должен бросать исключение."""
+        manager = RMQConsumerManager()
+        msg = _make_fake_message(body=b"\xff\xfe invalid utf-8")
+
+        captured_conf = {}
+
+        async def mock_executor(loop_or_none, func, *args):
+            captured_conf.update(args[1])  # conf is 2nd positional arg to _sync_trigger
+
+        with patch("airflow_provider_rmq.watcher.consumer.WatcherSession",
+                   return_value=_mock_session()[0]), \
+             patch("asyncio.AbstractEventLoop.run_in_executor",
+                   side_effect=mock_executor):
+            # Патчим loop.run_in_executor через patch объекта
+            loop = asyncio.get_running_loop()
+            original = loop.run_in_executor
+            conf_result = {}
+
+            async def capture_executor(executor, func, *args):
+                conf_result.update(args[1])  # conf dict
+                return None
+
+            loop.run_in_executor = capture_executor
+            try:
+                await manager._trigger_dag("dag", "q", 1, msg)
+            finally:
+                loop.run_in_executor = original
+
+        assert isinstance(conf_result.get("body"), str)
+
+    @pytest.mark.asyncio
+    async def test_binary_body_replaced_chars(self):
+        """C5: невалидные байты заменяются replacement char, результат — строка."""
+        manager = RMQConsumerManager()
+        msg = _make_fake_message(body=b"\xff\xfe")
+
+        loop = asyncio.get_running_loop()
+        conf_result = {}
+
+        async def capture_executor(executor, func, *args):
+            conf_result.update(args[1])
+            return None
+
+        loop.run_in_executor = capture_executor
+        try:
+            await manager._trigger_dag("dag", "q", 1, msg)
+        finally:
+            del loop.run_in_executor
+
+        assert isinstance(conf_result["body"], str)
+        assert "�" in conf_result["body"]
+
+
+class TestReconcileStatusReset:
+    @pytest.mark.asyncio
+    async def test_reconcile_sets_disconnected_on_removal(self):
+        """C3: при удалении подписки из reconcile статус должен сбрасываться в disconnected."""
+        manager = RMQConsumerManager()
+
+        async def blocking_consume(sub):
+            await asyncio.Future()
+
+        set_status_calls = []
+
+        def mock_set_consumer_status(session, sub_id, status, last_error=None):
+            set_status_calls.append((sub_id, status))
+
+        ctx, session = _mock_session()
+
+        with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch("airflow_provider_rmq.watcher.consumer.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=mock_set_consumer_status):
+            await manager.reconcile([_sub(id=1)])
+            await manager.reconcile([])  # удаляем подписку
+
+        assert any(sub_id == 1 and status == "disconnected"
+                   for sub_id, status in set_status_calls)

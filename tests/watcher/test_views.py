@@ -187,8 +187,22 @@ class TestCreateSubscription:
         flash_args = mock_flash.call_args.args
         assert "required" in flash_args[0]
         view.render_template.assert_called_once_with(
-            "rmq_watcher/subscription_form.html", sub=None
+            "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
         )
+
+    def test_create_subscription_post_invalid_includes_is_dag_file_false(self, app, view):
+        """V1: render_template при ошибке валидации получает is_dag_file=False."""
+        with app.test_request_context(
+            "/subscriptions/create",
+            method="POST",
+            data={"dag_id": "", "queue_name": "q1"},
+        ), \
+             patch("airflow_provider_rmq.watcher.views.flash"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession"):
+            view.create()
+
+        kwargs = view.render_template.call_args.kwargs
+        assert kwargs.get("is_dag_file") is False
 
     def test_create_subscription_get_renders_form(self, app, view):
         """GET renders empty form."""
@@ -196,7 +210,7 @@ class TestCreateSubscription:
             view.create()
 
         view.render_template.assert_called_once_with(
-            "rmq_watcher/subscription_form.html", sub=None
+            "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
         )
 
 

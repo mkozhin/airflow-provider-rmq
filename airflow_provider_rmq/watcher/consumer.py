@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import aio_pika
@@ -25,7 +25,7 @@ _RECONNECT_DELAY = 5.0
 
 
 def _build_run_id(queue_name: str) -> str:
-    return f"rmq__{queue_name}__{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}"
+    return f"rmq__{queue_name}__{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
 
 
 def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> None:
@@ -122,6 +122,12 @@ class RMQConsumerManager:
                 return_exceptions=True,
             )
             for sub_id in to_remove:
+                try:
+                    with WatcherSession() as session:
+                        set_consumer_status(session, sub_id, "disconnected")
+                        session.commit()
+                except Exception:
+                    pass
                 self._sub_conn_ids.pop(sub_id, None)
 
         # start tasks for new subscriptions or dead ones (fatal exit → reconciliation restarts)
@@ -248,7 +254,7 @@ class RMQConsumerManager:
         message: Any,
     ) -> None:
         conf = {
-            "body": message.body.decode("utf-8"),
+            "body": message.body.decode("utf-8", errors="replace"),
             "headers": dict(message.headers or {}),
             "routing_key": getattr(message, "routing_key", "") or "",
             "queue": queue_name,

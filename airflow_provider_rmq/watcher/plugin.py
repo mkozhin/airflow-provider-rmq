@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 
 from flask import Blueprint
 from airflow.plugins_manager import AirflowPlugin
+
+log = logging.getLogger(__name__)
 
 from airflow_provider_rmq.watcher.listener import RMQWatcherListener
 from airflow_provider_rmq.watcher.models import ensure_table_exists
@@ -31,4 +34,7 @@ class RMQWatcherPlugin(AirflowPlugin):
     @classmethod
     def on_load(cls, *args, **kwargs):
         """Create rmq_watcher_* tables when the plugin is first loaded."""
-        ensure_table_exists()
+        try:
+            ensure_table_exists()
+        except Exception:
+            log.exception("RMQ Watcher: failed to create DB tables on plugin load")

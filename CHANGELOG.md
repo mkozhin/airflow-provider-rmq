@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.0.6
+
+- **Fixed:** `on_starting` called twice (e.g. Scheduler restart) spawned a second parallel consumer loop — `_start()` now checks `_thread.is_alive()` and ignores duplicate calls; if the previous lifecycle is shutting down, waits up to 10 s before starting fresh (L2)
+- **Fixed:** Unhandled exception outside the inner `try` in `_run_loop` (e.g. asyncio loop crash, `_manager.start()` failure) silently killed the background thread — `_run_loop` now restarts `_main()` after any exception with a 30 s back-off (L3)
+- **Fixed:** `upsert_subscription` unconditionally overwrote `enabled` from the `dag_file` reconcile default (`True`), reverting UI toggle changes — `enabled` is now only updated when `source="ui"`; dag_file reconciles preserve the current DB value (M2)
+- **Fixed:** Binary or non-UTF-8 message bodies raised `UnicodeDecodeError` in `_trigger_dag`, causing infinite redelivery — body is now decoded with `errors="replace"` (C5)
+- **Fixed:** `is_dag_file` not passed to `render_template` in `create()` error paths — Jinja2 received an `Undefined` variable; all three early-return render calls now explicitly pass `is_dag_file=False` (V1)
+- **Fixed:** `ensure_table_exists()` in `plugin.on_load` had no error handling — a DB unavailability at plugin load time crashed the Scheduler startup; wrapped in `try/except` with `log.exception` (P1)
+- **Fixed:** `consumer_status` stayed `"listening"` after a subscription was removed or disabled via reconcile — status is now set to `"disconnected"` after task cancellation (C3)
+- **Changed:** `datetime.utcnow()` replaced with `datetime.now(timezone.utc)` in `_build_run_id` — eliminates `DeprecationWarning` on Python 3.12+ (C4)
+
 ## v2.0.5
 
 - **Fixed:** CSRF token not submitted on form POST — `{{ csrf_token() }}` replaced with `<input type="hidden">` in `subscription_form.html` and `subscriptions.html`

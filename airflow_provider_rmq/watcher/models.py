@@ -99,11 +99,14 @@ def upsert_subscription(
             dag_id=dag_id,
             queue_name=queue_name,
             conn_id=conn_id,
+            enabled=enabled,
         )
         session.add(sub)
+    elif source == "ui":
+        sub.enabled = enabled
+    # dag_file source: preserve current enabled value from DB
     sub.filter_data = filter_data or {}
     sub.source = source
-    sub.enabled = enabled
     sub.trigger_mode = trigger_mode
     sub.group_key = group_key
     sub.cooldown = cooldown

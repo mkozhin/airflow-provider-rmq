@@ -99,6 +99,40 @@ class TestDelete:
         assert remaining[0].source == "ui"
 
 
+class TestUpsertEnabled:
+    def test_dag_file_upsert_preserves_disabled(self, session):
+        """M2: dag_file reconcile не должен перетирать enabled=False, выставленный через UI."""
+        sub = upsert_subscription(session, dag_id="d", queue_name="q", source="dag_file", enabled=True)
+        session.commit()
+        sub.enabled = False
+        session.commit()
+
+        upsert_subscription(session, dag_id="d", queue_name="q", source="dag_file", enabled=True)
+        session.commit()
+
+        row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+        assert row.enabled is False
+
+    def test_ui_upsert_updates_enabled(self, session):
+        """M2: ui источник должен обновлять enabled."""
+        sub = upsert_subscription(session, dag_id="d", queue_name="q", source="ui", enabled=False)
+        session.commit()
+
+        upsert_subscription(session, dag_id="d", queue_name="q", source="ui", enabled=True)
+        session.commit()
+
+        row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+        assert row.enabled is True
+
+    def test_new_dag_file_subscription_uses_enabled_arg(self, session):
+        """Новая запись от dag_file должна брать enabled из аргумента."""
+        upsert_subscription(session, dag_id="d", queue_name="q", source="dag_file", enabled=False)
+        session.commit()
+
+        row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+        assert row.enabled is False
+
+
 class TestGetEnabled:
     def test_get_enabled_subscriptions_filters_disabled(self, session):
         upsert_subscription(session, dag_id="d1", queue_name="q1", enabled=True)

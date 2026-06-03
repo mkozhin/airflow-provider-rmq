@@ -54,13 +54,13 @@ class RMQWatcherView(BaseView):
 
             if not dag_id or not queue_name:
                 flash("dag_id and queue_name are required", "error")
-                return self.render_template("rmq_watcher/subscription_form.html", sub=None)
+                return self.render_template("rmq_watcher/subscription_form.html", sub=None, is_dag_file=False)
 
             try:
                 filter_data = json.loads(filter_data_raw) if filter_data_raw else {}
             except json.JSONDecodeError:
                 flash("filter_data must be valid JSON", "error")
-                return self.render_template("rmq_watcher/subscription_form.html", sub=None)
+                return self.render_template("rmq_watcher/subscription_form.html", sub=None, is_dag_file=False)
 
             with WatcherSession() as session:
                 upsert_subscription(
@@ -77,7 +77,7 @@ class RMQWatcherView(BaseView):
             flash(f"Subscription for DAG '{dag_id}' created", "success")
             return redirect(url_for("RMQWatcherView.subscriptions"))
 
-        return self.render_template("rmq_watcher/subscription_form.html", sub=None)
+        return self.render_template("rmq_watcher/subscription_form.html", sub=None, is_dag_file=False)
 
     @expose("/subscriptions/<int:sub_id>/edit", methods=["GET", "POST"])
     @has_access
