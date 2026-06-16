@@ -64,8 +64,9 @@
         <thead>
           <tr>
             <th>DAG</th>
-            <th>Queue</th>
+            <th>Queue(s)</th>
             <th>conn_id</th>
+            <th>Cooldown</th>
             <th>Source</th>
             <th>Status</th>
             <th>Last Error</th>
@@ -73,49 +74,110 @@
           </tr>
         </thead>
         <tbody>
-        {% for sub in subscriptions %}
-        <tr class="{{ 'text-muted' if not sub.enabled else '' }}">
-          <td>{{ sub.dag_id }}</td>
-          <td>{{ sub.queue_name }}</td>
-          <td>{{ sub.conn_id }}</td>
-          <td>
-            {% if sub.source == 'dag_file' %}
-              <span class="label label-info">dag_file</span>
-            {% else %}
-              <span class="label label-default">ui</span>
-            {% endif %}
-          </td>
-          <td>
-            {% if not sub.enabled %}
-              <span class="label label-default">disabled</span>
-            {% elif sub.consumer_status == 'listening' %}
-              <span class="label label-success">listening</span>
-            {% elif sub.consumer_status == 'connecting' %}
-              <span class="label label-warning">connecting</span>
-            {% elif sub.consumer_status == 'error' %}
-              <span class="label label-danger">error</span>
-            {% else %}
-              <span class="label label-default">{{ sub.consumer_status }}</span>
-            {% endif %}
-          </td>
-          <td>{{ sub.last_error or '—' }}</td>
-          <td>
-            <form method="post" action="{{ url_for('RMQWatcherView.toggle', sub_id=sub.id) }}" style="display:inline">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-              <button type="submit" class="btn btn-xs btn-default">
-                {% if sub.enabled %}Disable{% else %}Enable{% endif %}
-              </button>
-            </form>
-            <a href="{{ url_for('RMQWatcherView.edit', sub_id=sub.id) }}" class="btn btn-xs btn-info">Edit</a>
-            {% if sub.source == 'ui' %}
-            <form method="post" action="{{ url_for('RMQWatcherView.delete', sub_id=sub.id) }}" style="display:inline"
-                  onsubmit="return confirm('Delete subscription for DAG ' + {{ sub.dag_id | tojson }} + '?')">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-              <button type="submit" class="btn btn-xs btn-danger">Delete</button>
-            </form>
-            {% endif %}
-          </td>
-        </tr>
+        {% for item in subscriptions %}
+          {% if item.is_group is defined and item.is_group %}
+          {# ---- Grouped row (multiple queues, shared cooldown) ---- #}
+          <tr class="{{ 'text-muted' if not item.enabled else '' }}">
+            <td>{{ item.dag_id }}</td>
+            <td>
+              {% for q in item.queue_names %}
+                <span class="label label-default">{{ q }}</span>
+              {% endfor %}
+            </td>
+            <td>{{ item.conn_id }}</td>
+            <td>
+              {% if item.cooldown %}
+                <span class="text-info">{{ item.cooldown }}s</span>
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td>
+              {% if item.source == 'dag_file' %}
+                <span class="label label-info">dag_file</span>
+              {% else %}
+                <span class="label label-default">ui</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if not item.enabled %}
+                <span class="label label-default">disabled</span>
+              {% else %}
+                <span class="label label-{{ 'success' if item.listening_count == item.total_count else 'warning' }}">
+                  {{ item.display_status }}
+                </span>
+              {% endif %}
+            </td>
+            <td>{{ item.last_error or '—' }}</td>
+            <td>
+              <form method="post" action="{{ url_for('RMQWatcherView.toggle_group', group_key=item.group_key) }}" style="display:inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-xs btn-default">
+                  {% if item.enabled %}Disable{% else %}Enable{% endif %}
+                </button>
+              </form>
+              <a href="{{ url_for('RMQWatcherView.edit_group', group_key=item.group_key) }}" class="btn btn-xs btn-info">Edit</a>
+              {% if item.source == 'ui' %}
+              <form method="post" action="{{ url_for('RMQWatcherView.delete_group', group_key=item.group_key) }}" style="display:inline"
+                    onsubmit="return confirm('Delete all subscriptions in group ' + {{ item.group_key | tojson }} + '?')">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-xs btn-danger">Delete</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          {# ---- Single-queue row (no group_key) ---- #}
+          <tr class="{{ 'text-muted' if not item.enabled else '' }}">
+            <td>{{ item.dag_id }}</td>
+            <td>{{ item.queue_name }}</td>
+            <td>{{ item.conn_id }}</td>
+            <td>
+              {% if item.cooldown %}
+                <span class="text-info">{{ item.cooldown }}s</span>
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td>
+              {% if item.source == 'dag_file' %}
+                <span class="label label-info">dag_file</span>
+              {% else %}
+                <span class="label label-default">ui</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if not item.enabled %}
+                <span class="label label-default">disabled</span>
+              {% elif item.consumer_status == 'listening' %}
+                <span class="label label-success">listening</span>
+              {% elif item.consumer_status == 'connecting' %}
+                <span class="label label-warning">connecting</span>
+              {% elif item.consumer_status == 'error' %}
+                <span class="label label-danger">error</span>
+              {% else %}
+                <span class="label label-default">{{ item.consumer_status }}</span>
+              {% endif %}
+            </td>
+            <td>{{ item.last_error or '—' }}</td>
+            <td>
+              <form method="post" action="{{ url_for('RMQWatcherView.toggle', sub_id=item.id) }}" style="display:inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-xs btn-default">
+                  {% if item.enabled %}Disable{% else %}Enable{% endif %}
+                </button>
+              </form>
+              <a href="{{ url_for('RMQWatcherView.edit', sub_id=item.id) }}" class="btn btn-xs btn-info">Edit</a>
+              {% if item.source == 'ui' %}
+              <form method="post" action="{{ url_for('RMQWatcherView.delete', sub_id=item.id) }}" style="display:inline"
+                    onsubmit="return confirm('Delete subscription for DAG ' + {{ item.dag_id | tojson }} + '?')">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-xs btn-danger">Delete</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endif %}
         {% endfor %}
         </tbody>
       </table>
