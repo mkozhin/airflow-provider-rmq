@@ -50,25 +50,35 @@ def _extract_dag_id_from_decorators(decorators: list[ast.expr]) -> str | None:
     return None
 
 
-def _parse_rmq_trigger_decorator(node: ast.expr) -> dict | None:
-    """Return subscription dict if node is an rmq_trigger(...) call, else None.
+def _parse_rmq_trigger_decorator(node: ast.expr) -> list[dict]:
+    """Return list of subscription dicts if node is an rmq_trigger(...) call, else [].
 
     Handles both bare name ``rmq_trigger(...)`` and attribute access
     ``decorators.rmq_trigger(...)``.  Only literal argument values are extracted;
     non-literal expressions are skipped (subscription won't be registered from
     AST scan — user should create it via the UI instead).
+
+    Returns a list:
+    - empty list if node is not an rmq_trigger call or required args are missing
+    - one dict for ``queue=`` (single queue)
+    - N dicts for ``queues=[...]`` (one per queue in the list)
+
+    Each dict contains: queue_name, conn_id, filter_data, cooldown.
+    ``group_key`` is NOT set here — it is set in _extract_subscriptions_from_file
+    where dag_id is known.
     """
     if not isinstance(node, ast.Call):
-        return None
+        return []
     func = node.func
     is_rmq = (
         (isinstance(func, ast.Name) and func.id == "rmq_trigger")
         or (isinstance(func, ast.Attribute) and func.attr == "rmq_trigger")
     )
     if not is_rmq:
-        return None
+        return []
 
     kwargs: dict = {}
+    queues_list: list[str] | None = None
     # positional: rmq_trigger("queue_name")
     if node.args:
         val = node.args[0]
@@ -76,7 +86,7 @@ def _parse_rmq_trigger_decorator(node: ast.expr) -> dict | None:
             kwargs["queue_name"] = val.value
     # keyword arguments
     for kw in node.keywords:
-        if kw.arg not in ("queue", "conn_id", "filter_data"):
+        if kw.arg not in ("queue", "queues", "conn_id", "filter_data", "cooldown"):
             continue
         try:
             value = ast.literal_eval(kw.value)
@@ -84,17 +94,41 @@ def _parse_rmq_trigger_decorator(node: ast.expr) -> dict | None:
             continue
         if kw.arg == "queue":
             kwargs["queue_name"] = value
+        elif kw.arg == "queues":
+            if isinstance(value, list) and all(isinstance(q, str) for q in value):
+                queues_list = value
+        elif kw.arg == "cooldown":
+            if isinstance(value, int):
+                kwargs["cooldown"] = value
         else:
             kwargs[kw.arg] = value
 
-    if "queue_name" not in kwargs:
-        return None
+    conn_id = kwargs.get("conn_id", "rmq_default")
+    filter_data = kwargs.get("filter_data", {})
+    cooldown = kwargs.get("cooldown", 0)
 
-    return {
-        "queue_name": kwargs["queue_name"],
-        "conn_id": kwargs.get("conn_id", "rmq_default"),
-        "filter_data": kwargs.get("filter_data", {}),
-    }
+    if queues_list is not None:
+        return [
+            {
+                "queue_name": q,
+                "conn_id": conn_id,
+                "filter_data": filter_data,
+                "cooldown": cooldown,
+            }
+            for q in queues_list
+        ]
+
+    if "queue_name" not in kwargs:
+        return []
+
+    return [
+        {
+            "queue_name": kwargs["queue_name"],
+            "conn_id": conn_id,
+            "filter_data": filter_data,
+            "cooldown": cooldown,
+        }
+    ]
 
 
 class RMQWatcherListener:
@@ -194,6 +228,7 @@ class RMQWatcherListener:
                                 "queue_name": sub.queue_name,
                                 "conn_id": sub.conn_id,
                                 "filter_data": sub.filter_data or {},
+                                "cooldown": sub.cooldown or 0,
                             }
                             for sub in get_enabled_subscriptions(session)
                         ]
@@ -285,10 +320,11 @@ class RMQWatcherListener:
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+            dag_id = _extract_dag_id_from_decorators(node.decorator_list) or node.name
             for decorator in node.decorator_list:
-                sub = _parse_rmq_trigger_decorator(decorator)
-                if sub is not None:
-                    sub["dag_id"] = _extract_dag_id_from_decorators(node.decorator_list) or node.name
+                for sub in _parse_rmq_trigger_decorator(decorator):
+                    sub["dag_id"] = dag_id
+                    sub["group_key"] = dag_id if sub.get("cooldown", 0) > 0 else None
                     result.append(sub)
         return result
 
@@ -333,6 +369,8 @@ class RMQWatcherListener:
                     conn_id=s.get("conn_id", "rmq_default"),
                     filter_data=s.get("filter_data", {}),
                     source="dag_file",
+                    cooldown=s.get("cooldown", 0) or None,
+                    group_key=s.get("group_key"),
                 )
 
             session.commit()

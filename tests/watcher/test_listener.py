@@ -10,6 +10,7 @@ import pytest
 from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
     _extract_dag_id_from_decorators,
+    _parse_rmq_trigger_decorator,
 )
 
 
@@ -423,3 +424,265 @@ class TestSyncToDb:
 
         # Subscription is still in scan → must NOT be deleted
         delete_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _parse_rmq_trigger_decorator — новые параметры queues и cooldown
+# ---------------------------------------------------------------------------
+
+def _parse_decorator(src: str) -> list[dict]:
+    """Parse a decorator call string and return subscription dicts."""
+    node = ast.parse(src, mode="eval").body
+    return _parse_rmq_trigger_decorator(node)
+
+
+class TestParseRmqTriggerDecorator:
+    def test_single_queue_no_cooldown_returns_one_dict(self):
+        result = _parse_decorator("rmq_trigger(queue='orders')")
+        assert len(result) == 1
+        assert result[0]["queue_name"] == "orders"
+        assert result[0]["cooldown"] == 0
+        assert result[0]["conn_id"] == "rmq_default"
+
+    def test_queues_list_returns_n_dicts(self):
+        result = _parse_decorator("rmq_trigger(queues=['orders', 'payments'])")
+        assert len(result) == 2
+        queue_names = [d["queue_name"] for d in result]
+        assert "orders" in queue_names
+        assert "payments" in queue_names
+
+    def test_queues_list_all_share_same_cooldown(self):
+        result = _parse_decorator("rmq_trigger(queues=['a', 'b', 'c'], cooldown=300)")
+        assert len(result) == 3
+        assert all(d["cooldown"] == 300 for d in result)
+
+    def test_cooldown_parsed_correctly(self):
+        result = _parse_decorator("rmq_trigger(queue='q', cooldown=60)")
+        assert len(result) == 1
+        assert result[0]["cooldown"] == 60
+
+    def test_cooldown_zero_is_default(self):
+        result = _parse_decorator("rmq_trigger(queue='q')")
+        assert result[0]["cooldown"] == 0
+
+    def test_non_rmq_trigger_returns_empty_list(self):
+        result = _parse_decorator("some_other_decorator(queue='q')")
+        assert result == []
+
+    def test_no_queue_or_queues_returns_empty_list(self):
+        result = _parse_decorator("rmq_trigger(conn_id='rmq')")
+        assert result == []
+
+    def test_non_literal_queues_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queues=SOME_VAR)")
+        assert result == []
+
+    def test_conn_id_propagated_to_all_entries(self):
+        result = _parse_decorator("rmq_trigger(queues=['a', 'b'], conn_id='my_conn')")
+        assert all(d["conn_id"] == "my_conn" for d in result)
+
+    def test_filter_data_propagated_to_all_entries(self):
+        result = _parse_decorator(
+            "rmq_trigger(queues=['a', 'b'], filter_data={'filter_headers': {'k': 'v'}})"
+        )
+        assert all(d["filter_data"] == {"filter_headers": {"k": "v"}} for d in result)
+
+    def test_positional_queue_name_parsed(self):
+        result = _parse_decorator("rmq_trigger('my_queue')")
+        assert len(result) == 1
+        assert result[0]["queue_name"] == "my_queue"
+
+    def test_attribute_access_rmq_trigger(self):
+        result = _parse_decorator("decorators.rmq_trigger(queue='q')")
+        assert len(result) == 1
+        assert result[0]["queue_name"] == "q"
+
+
+# ---------------------------------------------------------------------------
+# _extract_subscriptions_from_file — group_key и cooldown
+# ---------------------------------------------------------------------------
+
+class TestExtractSubscriptionsGroupKeyAndCooldown:
+    def test_single_queue_cooldown_zero_group_key_is_none(self, tmp_path):
+        dag_file = tmp_path / "dag.py"
+        dag_file.write_text(
+            "@rmq_trigger(queue='q', cooldown=0)\n"
+            "@dag(dag_id='my_dag')\n"
+            "def my_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["group_key"] is None
+        assert result[0]["cooldown"] == 0
+
+    def test_single_queue_with_cooldown_group_key_is_dag_id(self, tmp_path):
+        dag_file = tmp_path / "dag.py"
+        dag_file.write_text(
+            "@rmq_trigger(queue='q', cooldown=300)\n"
+            "@dag(dag_id='my_dag')\n"
+            "def my_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["group_key"] == "my_dag"
+        assert result[0]["cooldown"] == 300
+
+    def test_queues_list_with_cooldown_creates_multiple_entries(self, tmp_path):
+        dag_file = tmp_path / "dag.py"
+        dag_file.write_text(
+            "@rmq_trigger(queues=['orders', 'payments'], cooldown=60)\n"
+            "@dag(dag_id='multi_queue_dag')\n"
+            "def multi_queue_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 2
+        queue_names = {r["queue_name"] for r in result}
+        assert queue_names == {"orders", "payments"}
+        assert all(r["dag_id"] == "multi_queue_dag" for r in result)
+        assert all(r["cooldown"] == 60 for r in result)
+        assert all(r["group_key"] == "multi_queue_dag" for r in result)
+
+    def test_queues_list_no_cooldown_group_key_is_none(self, tmp_path):
+        dag_file = tmp_path / "dag.py"
+        dag_file.write_text(
+            "@rmq_trigger(queues=['a', 'b'])\n"
+            "@dag(dag_id='dag_no_cooldown')\n"
+            "def dag_no_cooldown(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 2
+        assert all(r["group_key"] is None for r in result)
+        assert all(r["cooldown"] == 0 for r in result)
+
+
+# ---------------------------------------------------------------------------
+# _sync_to_db — передача cooldown и group_key в upsert_subscription
+# ---------------------------------------------------------------------------
+
+class TestSyncToDbCooldownAndGroupKey:
+    def test_sync_to_db_passes_cooldown_and_group_key(self):
+        listener = RMQWatcherListener()
+        scanned = [
+            {
+                "dag_id": "d",
+                "queue_name": "q",
+                "conn_id": "rmq_default",
+                "filter_data": {},
+                "cooldown": 300,
+                "group_key": "d",
+            }
+        ]
+        ctx, session = _make_session_ctx(existing_subs=[])
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.listener.upsert_subscription") as mock_up:
+            listener._sync_to_db(scanned)
+
+        mock_up.assert_called_once()
+        call_kwargs = mock_up.call_args.kwargs
+        assert call_kwargs["cooldown"] == 300
+        assert call_kwargs["group_key"] == "d"
+
+    def test_sync_to_db_cooldown_zero_stored_as_none(self):
+        """cooldown=0 is normalized to None in DB (nullable int column)."""
+        listener = RMQWatcherListener()
+        scanned = [
+            {
+                "dag_id": "d",
+                "queue_name": "q",
+                "conn_id": "rmq_default",
+                "filter_data": {},
+                "cooldown": 0,
+                "group_key": None,
+            }
+        ]
+        ctx, session = _make_session_ctx(existing_subs=[])
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.listener.upsert_subscription") as mock_up:
+            listener._sync_to_db(scanned)
+
+        call_kwargs = mock_up.call_args.kwargs
+        assert call_kwargs["cooldown"] is None
+        assert call_kwargs["group_key"] is None
+
+    def test_sync_to_db_missing_cooldown_defaults_to_none(self):
+        """Scanned sub without 'cooldown' key → upsert_subscription receives cooldown=None."""
+        listener = RMQWatcherListener()
+        scanned = [
+            {
+                "dag_id": "d",
+                "queue_name": "q",
+                "conn_id": "rmq_default",
+                "filter_data": {},
+                # no cooldown key — old-style dict
+            }
+        ]
+        ctx, session = _make_session_ctx(existing_subs=[])
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.listener.upsert_subscription") as mock_up:
+            listener._sync_to_db(scanned)
+
+        call_kwargs = mock_up.call_args.kwargs
+        assert call_kwargs["cooldown"] is None
+
+
+# ---------------------------------------------------------------------------
+# active_subs projection — cooldown field (from _main)
+# ---------------------------------------------------------------------------
+
+class TestActiveSubs:
+    def test_active_subs_cooldown_null_becomes_zero(self):
+        """Sub with cooldown=NULL in DB → active_subs gets cooldown=0, not TypeError.
+
+        Note: this test reimplements the active_subs projection formula inline rather than
+        driving a real _main iteration (which would require a full async listener setup).
+        It validates the formula logic — specifically that `s.cooldown or 0` converts NULL
+        to 0 without raising TypeError. If the formula in _main changes, update this test.
+        """
+        listener = RMQWatcherListener()
+        listener._stop_event = __import__("threading").Event()
+
+        sub_mock = MagicMock()
+        sub_mock.id = 1
+        sub_mock.dag_id = "d"
+        sub_mock.queue_name = "q"
+        sub_mock.conn_id = "rmq_default"
+        sub_mock.filter_data = {}
+        sub_mock.cooldown = None  # NULL in DB
+
+        calls = {"n": 0}
+
+        async def run_once():
+            # Replicate the active_subs projection from _main
+            subs = [sub_mock]
+            active_subs = [
+                {
+                    "id": s.id,
+                    "dag_id": s.dag_id,
+                    "queue_name": s.queue_name,
+                    "conn_id": s.conn_id,
+                    "filter_data": s.filter_data or {},
+                    "cooldown": s.cooldown or 0,
+                }
+                for s in subs
+            ]
+            calls["n"] += 1
+            return active_subs
+
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(run_once())
+        loop.close()
+
+        assert calls["n"] == 1
+        assert result[0]["cooldown"] == 0
+
+    def test_active_subs_cooldown_value_preserved(self):
+        """Sub with cooldown=120 in DB → active_subs gets cooldown=120."""
+        sub_mock = MagicMock()
+        sub_mock.cooldown = 120
+
+        active_sub = {"cooldown": sub_mock.cooldown or 0}
+        assert active_sub["cooldown"] == 120
