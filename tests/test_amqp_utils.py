@@ -8,6 +8,8 @@ import pytest
 from airflow_provider_rmq.utils.amqp import (
     AMQP_PORT,
     AMQPS_PORT,
+    match as _match,
+    nack_and_sleep as _nack_and_sleep,
     build_amqp_connection,
     match_and_ack,
 )
@@ -142,3 +144,79 @@ class TestMatchAndAck:
         with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             await match_and_ack(msg, f)
         mock_sleep.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _match (pure predicate, no side effects)
+# ---------------------------------------------------------------------------
+
+class TestMatch:
+    def test_match_returns_true_when_no_filters(self):
+        msg = _make_aio_message(body=b"any")
+        result = _match(msg, MessageFilter())
+        assert result is True
+
+    def test_match_returns_true_when_headers_match(self):
+        msg = _make_aio_message(headers={"type": "order"})
+        result = _match(msg, MessageFilter(filter_headers={"type": "order"}))
+        assert result is True
+
+    def test_match_returns_false_when_headers_differ(self):
+        msg = _make_aio_message(headers={"type": "payment"})
+        result = _match(msg, MessageFilter(filter_headers={"type": "order"}))
+        assert result is False
+
+    def test_match_does_not_call_ack(self):
+        msg = _make_aio_message(headers={"type": "order"})
+        _match(msg, MessageFilter(filter_headers={"type": "order"}))
+        msg.ack.assert_not_called()
+        msg.nack.assert_not_called()
+
+    def test_match_does_not_call_nack_on_miss(self):
+        msg = _make_aio_message(headers={"type": "other"})
+        _match(msg, MessageFilter(filter_headers={"type": "order"}))
+        msg.nack.assert_not_called()
+        msg.ack.assert_not_called()
+
+    def test_match_binary_body_does_not_raise(self):
+        """Non-UTF-8 binary body must not raise UnicodeDecodeError (errors='replace')."""
+        binary_body = b"\xff\xfe\x00invalid utf-8 \x80\x81\x82"
+        msg = _make_aio_message(body=binary_body)
+        # Should not raise — filter has no body filter so result is True regardless
+        result = _match(msg, MessageFilter())
+        assert result is True
+
+    def test_match_binary_body_with_callable_filter_does_not_raise(self):
+        """Binary body with a callable filter — replacement chars used, no exception."""
+        binary_body = b"\xff\xfe"
+        msg = _make_aio_message(body=binary_body)
+        # Callable checks body text; body contains replacement chars, not "hello"
+        result = _match(msg, MessageFilter(filter_callable=lambda props, body: "hello" in body))
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _nack_and_sleep
+# ---------------------------------------------------------------------------
+
+class TestNackAndSleep:
+    @pytest.mark.asyncio
+    async def test_nack_called_with_requeue_true(self):
+        msg = _make_aio_message()
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            await _nack_and_sleep(msg)
+        msg.nack.assert_awaited_once_with(requeue=True)
+
+    @pytest.mark.asyncio
+    async def test_sleep_called_with_01(self):
+        msg = _make_aio_message()
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await _nack_and_sleep(msg)
+        mock_sleep.assert_awaited_once_with(0.1)
+
+    @pytest.mark.asyncio
+    async def test_ack_not_called(self):
+        msg = _make_aio_message()
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            await _nack_and_sleep(msg)
+        msg.ack.assert_not_called()

@@ -43,6 +43,32 @@ def build_amqp_connection(
     return url, ssl_context
 
 
+def match(message: Any, msg_filter: MessageFilter) -> bool:
+    """Evaluate message body and headers against filter without any ACK/NACK side-effects.
+
+    :param message: An ``aio_pika`` message (must have ``.body`` and ``.headers``).
+    :param msg_filter: Pre-built :class:`~airflow_provider_rmq.utils.filters.MessageFilter`.
+    :returns: ``True`` if the message matches (or there are no filters), ``False`` otherwise.
+
+    Non-UTF-8 bytes in the body are replaced with the Unicode replacement character
+    (``errors="replace"``) so binary payloads never raise :exc:`UnicodeDecodeError`.
+    """
+    body_str = message.body.decode("utf-8", errors="replace")
+    props = _PropsShim(dict(message.headers or {}))
+    return not msg_filter.has_filters or msg_filter.matches(props, body_str)
+
+
+
+async def nack_and_sleep(message: Any) -> None:
+    """NACK a message with requeue=True and sleep 0.1 s to prevent a hot redelivery loop.
+
+    :param message: An ``aio_pika`` message (must have ``.nack()`` async method).
+    """
+    await message.nack(requeue=True)
+    await asyncio.sleep(0.1)
+
+
+
 async def match_and_ack(message: Any, msg_filter: MessageFilter) -> bool:
     """Evaluate message against filter, ACK on match, NACK+requeue on miss.
 
@@ -58,11 +84,8 @@ async def match_and_ack(message: Any, msg_filter: MessageFilter) -> bool:
         of 20 by default — non-matching messages are dead-lettered after 20 redeliveries.
         Use dedicated queues per DAG to avoid unintended message loss.
     """
-    body_str = message.body.decode("utf-8")
-    props = _PropsShim(dict(message.headers or {}))
-    if not msg_filter.has_filters or msg_filter.matches(props, body_str):
+    if match(message, msg_filter):
         await message.ack()
         return True
-    await message.nack(requeue=True)
-    await asyncio.sleep(0.1)
+    await nack_and_sleep(message)
     return False
