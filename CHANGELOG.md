@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.1.0
+
+- **Added:** `queues=[...]` parameter in `@rmq_trigger` — subscribe a single DAG to multiple RabbitMQ queues; a message from any of them triggers the DAG
+- **Added:** `cooldown=N` parameter in `@rmq_trigger` — after the first matching message the DAG starts exactly once after N seconds; all messages in the cooldown window are ACKed silently; `cooldown=0` (default) keeps the existing immediate-trigger behaviour
+- **Added:** DLX-based cooldown mechanism — no writes to Airflow DB; uses `rmq_watcher.pending.{dag_id}` (topic DLX queue, x-max-length=1) as a per-message TTL timer and `rmq_watcher.fire` (topic exchange + queue) as the trigger; RMQ infrastructure is created automatically by the plugin on startup
+- **Added:** Fire consumer — subscribes to `rmq_watcher.fire`, extracts `dag_id` from `routing_key`, and calls `trigger_dag()` with an idempotent run_id (`rmq_cooldown__{dag_id}__{message_id}`) to prevent duplicates on redelivery
+- **Added:** Hot-reload — changes to `cooldown` or `filter_data` in a DAG file are picked up on the next reconcile cycle without restarting the Scheduler
+- **Added:** Orphaned pending-queue warnings — when a cooldown subscription is removed the plugin logs a WARNING with the queue name and the `rabbitmqadmin` delete command; subsequent reconcile cycles are silent
+- **Added:** UI grouping — subscriptions sharing the same `group_key` (= dag_id when cooldown > 0) are shown as a single group row; `Cooldown` column added; Enable/Disable/Delete apply to all queues in the group
+- **Added:** Multi-queue form — subscription form supports a dynamic list of queues (+ Add / ✕ remove); creates one DB row per queue within the same group
+- **Changed:** `_ActiveSub` dataclass replaces parallel `_tasks` / `_sub_conn_ids` dicts in `RMQConsumerManager` — snapshot of the full sub dict drives change detection and hot-reload
+- **Limitation:** when cooldown is active `conf["body"]` and `conf["headers"]` in the triggered DAG run are empty — original message data is not preserved through the DLX chain
+
 ## v2.0.9
 
 - **Fixed:** AST parser used the Python function name as `dag_id` even when `@dag(dag_id='...')` specified an explicit value — caused subscriptions to point at the wrong DAG. Now reads `dag_id` from the `@dag` decorator when it is a string literal; falls back to the function name for non-literal values (e.g. `dag_id=VARIABLE`)

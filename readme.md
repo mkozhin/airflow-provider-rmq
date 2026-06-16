@@ -559,16 +559,78 @@ orders_dag()
 
 **Step 3** — publish a message to `orders` — the DAG starts within seconds.
 
+### Multi-Queue and Cooldown
+
+Subscribe one DAG to several queues and throttle repeated triggers with `cooldown`:
+
+```python
+from airflow.decorators import dag, task
+from airflow_provider_rmq.watcher.decorators import rmq_trigger
+
+@rmq_trigger(
+    queues=["orders", "payments"],  # message from any queue starts the DAG
+    cooldown=300,                    # 300 s cooldown — DAG runs once per window
+    conn_id="rmq_default",
+)
+@dag(dag_id="my_dag", schedule=None)
+def my_dag():
+    @task
+    def process(**context):
+        conf = context["dag_run"].conf
+        # conf["source"] == "cooldown" when triggered via cooldown mechanism
+        # conf["body"] and conf["headers"] are empty — original data is not
+        # preserved through the DLX chain
+        print(conf["source"])
+    process()
+
+my_dag()
+```
+
+**How cooldown works:**
+
+- When the first matching message arrives, the plugin publishes a TTL marker to `rmq_watcher.pending.{dag_id}` (a no-consumer queue with `x-max-length=1` and DLX to `rmq_watcher.fire`).
+- After N seconds the marker expires and is routed to `rmq_watcher.fire`; the fire consumer calls `trigger_dag()` with an idempotent run_id.
+- Additional messages arriving during the cooldown window are ACKed silently — the pending queue rejects the duplicate publish (`x-overflow=reject-publish`).
+- All RMQ infrastructure (`rmq_watcher.fire` exchange, queue, and per-DAG `rmq_watcher.pending.*` queues) is created automatically by the plugin on startup.
+
+**Limitations:**
+- All cooldown subscriptions for a DAG share one pending queue and one timer.
+- All cooldown DAGs must use the same `conn_id` / vhost.
+- `conf["body"]` and `conf["headers"]` in the DAG run conf are empty when triggered via cooldown — original message data is lost in the DLX chain.
+- Changing `cooldown` in a DAG file takes effect on the next reconcile cycle (default 60 s); already-running timers in RMQ are not affected.
+
+**RabbitMQ Permissions (cooldown only):**
+
+When `cooldown > 0` is used, the Airflow RMQ user needs configure/write/read permissions on the `rmq_watcher.*` resource pattern in addition to permissions on your application queues:
+
+```
+rabbitmqctl set_permissions -p <vhost> <user> "^(rmq_watcher\\..*|your-queue.*)$" "^(rmq_watcher\\..*|your-queue.*)$" "^(rmq_watcher\\..*|your-queue.*)$"
+```
+
+This covers the `rmq_watcher.fire` exchange, `rmq_watcher.fire` queue and `rmq_watcher.pending.<dag_id>` queues that the cooldown mechanism creates automatically.
+
 ### Payload passed to the DAG
 
 ```python
 conf = context["dag_run"].conf
+# Immediate trigger (cooldown=0 or no cooldown):
 # {
+#     "source":          "immediate",
 #     "body":            "<UTF-8 decoded message body>",
 #     "headers":         {"key": "value", ...},
 #     "routing_key":     "orders.created",
 #     "queue":           "orders",
 #     "subscription_id": 42,
+# }
+#
+# Cooldown trigger (fired after TTL expires in rmq_watcher.fire):
+# {
+#     "source":          "cooldown",
+#     "body":            "",        # empty — original message body not preserved
+#     "headers":         {},        # empty — original headers not preserved
+#     "routing_key":     "<dag_id>",
+#     "queue":           "rmq_watcher.fire",
+#     "subscription_id": None,
 # }
 ```
 
@@ -586,7 +648,7 @@ conf = context["dag_run"].conf
 
 - Use a **dedicated queue** per DAG trigger (e.g. `orders.airflow-trigger` separate from `orders`). Avoids NACK hot-loops on quorum queues and interference with other consumers.
 - To pause message consumption without stopping the DAG: **toggle the subscription off** in the UI rather than pausing the DAG. Pausing the DAG acks messages silently.
-- In **multi-scheduler HA** deployments each active scheduler runs its own consumer, which may cause duplicate runs. Set `max_active_runs=1` as a lightweight mitigation.
+- In **multi-scheduler HA** deployments each active scheduler runs its own consumer, which may cause duplicate runs. Set `max_active_runs=1` as a lightweight mitigation. Exception: subscriptions with `cooldown > 0` are inherently idempotent — the deterministic `run_id` (`rmq_cooldown__{dag_id}__{message_id}`) prevents duplicate DAG runs even across multiple schedulers. Subscriptions with `cooldown=0` still need `max_active_runs=1`.
 
 ---
 
