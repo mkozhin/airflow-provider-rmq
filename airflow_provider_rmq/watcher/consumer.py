@@ -195,6 +195,11 @@ class RMQConsumerManager:
                     self._fire_task = asyncio.create_task(
                         self._consume_fire_queue(connection)
                     )
+                else:
+                    log.warning(
+                        "Fire task cannot start: connection %s not available after provisioning",
+                        fire_conn_id,
+                    )
         elif not cooldown_dag_ids:
             if self._fire_task is not None and not self._fire_task.done():
                 self._fire_task.cancel()
@@ -419,7 +424,13 @@ class RMQConsumerManager:
                             )
                             await message.ack()
                             continue
-                        run_id = f"rmq_cooldown__{dag_id}__{message.message_id or str(uuid.uuid4())}"
+                        if not message.message_id:
+                            log.warning(
+                                "Fire queue message has no message_id — skipping (idempotency broken)"
+                            )
+                            await message.ack()
+                            continue
+                        run_id = f"rmq_cooldown__{dag_id}__{message.message_id}"
                         conf = {
                             "source": "cooldown",
                             "dag_id": dag_id,

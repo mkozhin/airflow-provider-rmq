@@ -61,7 +61,7 @@ def _group_subscriptions(subs: list[RMQSubscription]) -> list[Any]:
     ungrouped: list[RMQSubscription] = []
 
     for sub in subs:
-        if sub.group_key and isinstance(sub.group_key, str):
+        if sub.group_key:
             key = sub.group_key
             if key not in grouped:
                 grouped[key] = SubscriptionGroup(

@@ -1519,6 +1519,42 @@ class TestConsumeFireQueue:
         assert not trigger_called.is_set()
 
     @pytest.mark.asyncio
+    async def test_fire_consumer_skips_message_with_missing_message_id(self):
+        """Message with no message_id is ACKed and skipped (no trigger_dag) — idempotency guard."""
+        manager = RMQConsumerManager()
+        msg = _make_fire_message(routing_key="my_dag", message_id=None)
+        connection = self._make_connection_with_queue([msg])
+
+        trigger_called = asyncio.Event()
+        acked = asyncio.Event()
+
+        async def capture_ack(*args, **kwargs):
+            acked.set()
+
+        msg.ack = capture_ack
+
+        async def fail_if_called(executor, func, *args):
+            trigger_called.set()
+            return None
+
+        loop = asyncio.get_running_loop()
+        original_run = loop.run_in_executor
+        loop.run_in_executor = fail_if_called
+        try:
+            task = asyncio.create_task(manager._consume_fire_queue(connection))
+            await asyncio.wait_for(acked.wait(), timeout=2.0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            loop.run_in_executor = original_run
+
+        assert acked.is_set()
+        assert not trigger_called.is_set()
+
+    @pytest.mark.asyncio
     async def test_fire_consumer_channel_not_found_exits(self):
         """ChannelNotFoundEntity → fire consumer exits (fatal, no retry)."""
         manager = RMQConsumerManager()
@@ -1631,3 +1667,31 @@ class TestConsumeFireQueue:
             await manager.reconcile([])
             assert fire_task.done()
             assert manager._fire_task is None
+
+    @pytest.mark.asyncio
+    async def test_reconcile_warns_when_fire_connection_unavailable_after_provisioning(self):
+        """reconcile() logs WARNING and leaves _fire_task unset if the connection for
+        fire_conn_id is still missing from self._connections after _provision_cooldown
+        runs (e.g. provisioning failed to establish/store the connection)."""
+        manager = RMQConsumerManager()
+
+        async def blocking_consume(sub):
+            await asyncio.Future()
+
+        with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_provision_cooldown"), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            # _connections has no entry for "rmq_default" — simulates provisioning
+            # failing to establish/store the connection.
+            await manager.reconcile([_sub(id=1, cooldown=300)])
+            await asyncio.sleep(0)
+
+            assert manager._fire_task is None
+            warning_messages = [str(c) for c in mock_log.warning.call_args_list]
+            assert any("rmq_default" in m and "not available" in m for m in warning_messages), (
+                f"Expected warning about unavailable connection, got: {warning_messages}"
+            )
+
+        manager._active[1].task.cancel()
+        await asyncio.gather(manager._active[1].task, return_exceptions=True)
