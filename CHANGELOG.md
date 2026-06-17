@@ -11,6 +11,8 @@
 - **Added:** UI grouping — subscriptions sharing the same `group_key` (= dag_id when cooldown > 0) are shown as a single group row; `Cooldown` column added; Enable/Disable/Delete apply to all queues in the group
 - **Added:** Multi-queue form — subscription form supports a dynamic list of queues (+ Add / ✕ remove); creates one DB row per queue within the same group
 - **Changed:** `_ActiveSub` dataclass replaces parallel `_tasks` / `_sub_conn_ids` dicts in `RMQConsumerManager` — snapshot of the full sub dict drives change detection and hot-reload
+- **Fixed:** fire consumer treated a missing `message_id` by generating a fallback UUID, which broke the idempotency guarantee on redelivery — now logs a warning and ACKs/skips the message instead
+- **Fixed:** `reconcile()` silently skipped starting the fire task when its connection wasn't available right after provisioning — now logs a warning so the condition is visible
 - **Limitation:** when cooldown is active `conf["body"]` and `conf["headers"]` in the triggered DAG run are empty — original message data is not preserved through the DLX chain
 
 ## v2.0.9
