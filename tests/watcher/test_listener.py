@@ -835,3 +835,152 @@ class TestActiveSubs:
 
         active_sub = {"cooldown": sub_mock.cooldown or 0}
         assert active_sub["cooldown"] == 120
+
+
+# ---------------------------------------------------------------------------
+# _main — merging exchange/routing_keys metadata into active_subs (Task 3)
+# ---------------------------------------------------------------------------
+
+def _make_db_sub(dag_id, queue_name, conn_id="rmq_default", cooldown=0, filter_data=None):
+    sub = MagicMock()
+    sub.id = 1
+    sub.dag_id = dag_id
+    sub.queue_name = queue_name
+    sub.conn_id = conn_id
+    sub.filter_data = filter_data or {}
+    sub.cooldown = cooldown
+    return sub
+
+
+class TestMainExchangeMetaMerge:
+    """Drives a single `_main()` reconcile iteration end-to-end with mocked
+    DB/manager/scan, asserting the in-memory exchange/routing_keys merge
+    described in the plan (Task 3) — the DB row itself never carries this
+    metadata (see Technical Details → "Почему миграция БД не нужна")."""
+
+    def _run_one_iteration(self, listener, scanned, db_subs):
+        """Run `_main()` for exactly one reconcile cycle and capture the
+        `active_subs` list passed to `RMQConsumerManager.reconcile`."""
+        listener._stop_event = threading.Event()
+        listener._scan_subscriptions = MagicMock(return_value=scanned)
+        listener._sync_to_db = MagicMock()
+
+        ctx, session = _make_session_ctx()
+
+        captured = {}
+
+        manager = MagicMock()
+        manager.start = AsyncMock()
+        manager.stop = AsyncMock()
+
+        async def fake_reconcile(active_subs):
+            captured["active_subs"] = active_subs
+            # Stop the loop after the first iteration so _main returns.
+            listener._stop_event.set()
+
+        manager.reconcile = AsyncMock(side_effect=fake_reconcile)
+
+        with patch(
+            "airflow_provider_rmq.watcher.listener.RMQConsumerManager",
+            return_value=manager,
+        ), patch(
+            "airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx
+        ), patch(
+            "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
+            return_value=db_subs,
+        ), patch(
+            "asyncio.sleep", new=AsyncMock()
+        ):
+            asyncio.run(listener._main())
+
+        return captured["active_subs"]
+
+    def test_exchange_db_row_gets_merged_metadata(self):
+        """DB row matching a scanned exchange subscription gets exchange/routing_keys merged in."""
+        listener = RMQWatcherListener()
+        scanned = [
+            {
+                "dag_id": "jetstat_dag",
+                "queue_name": "rmq_watcher.sub.jetstat_dag",
+                "conn_id": "rmq_default",
+                "filter_data": {},
+                "cooldown": 0,
+                "exchange": "jetstat.airflow",
+                "routing_keys": ["abc123.succeeded"],
+            }
+        ]
+        db_sub = _make_db_sub("jetstat_dag", "rmq_watcher.sub.jetstat_dag")
+
+        active_subs = self._run_one_iteration(listener, scanned, [db_sub])
+
+        assert len(active_subs) == 1
+        entry = active_subs[0]
+        assert entry["exchange"] == "jetstat.airflow"
+        assert entry["routing_keys"] == ["abc123.succeeded"]
+        # Core queue-consumption fields are still present and correct.
+        assert entry["dag_id"] == "jetstat_dag"
+        assert entry["queue_name"] == "rmq_watcher.sub.jetstat_dag"
+        assert entry["conn_id"] == "rmq_default"
+
+    def test_plain_queue_db_row_not_affected(self):
+        """A regular queue= subscription has no scanned exchange counterpart → no exchange key."""
+        listener = RMQWatcherListener()
+        scanned = [
+            {
+                "dag_id": "plain_dag",
+                "queue_name": "orders",
+                "conn_id": "rmq_default",
+                "filter_data": {},
+                "cooldown": 0,
+            }
+        ]
+        db_sub = _make_db_sub("plain_dag", "orders")
+
+        active_subs = self._run_one_iteration(listener, scanned, [db_sub])
+
+        assert len(active_subs) == 1
+        entry = active_subs[0]
+        assert "exchange" not in entry
+        assert "routing_keys" not in entry
+        assert entry["dag_id"] == "plain_dag"
+        assert entry["queue_name"] == "orders"
+
+    def test_ui_subscription_never_gets_exchange_metadata(self):
+        """A UI-sourced subscription has no entry in `scanned` at all (it isn't
+        produced by AST parsing), so it can never match `exchange_meta` and
+        never gets exchange/routing_keys merged in."""
+        listener = RMQWatcherListener()
+        scanned: list[dict] = []  # nothing scanned from DAG files this cycle
+        db_sub = _make_db_sub("ui_dag", "ui_queue")
+
+        active_subs = self._run_one_iteration(listener, scanned, [db_sub])
+
+        assert len(active_subs) == 1
+        entry = active_subs[0]
+        assert "exchange" not in entry
+        assert "routing_keys" not in entry
+        assert entry["dag_id"] == "ui_dag"
+        assert entry["queue_name"] == "ui_queue"
+
+    def test_exchange_meta_keyed_by_conn_id_does_not_cross_match(self):
+        """Same dag_id/queue_name but different conn_id must not be merged —
+        the lookup key includes conn_id, matching the unique constraint on
+        RMQSubscription."""
+        listener = RMQWatcherListener()
+        scanned = [
+            {
+                "dag_id": "d",
+                "queue_name": "rmq_watcher.sub.d",
+                "conn_id": "other_conn",
+                "filter_data": {},
+                "cooldown": 0,
+                "exchange": "ex",
+                "routing_keys": ["k"],
+            }
+        ]
+        db_sub = _make_db_sub("d", "rmq_watcher.sub.d", conn_id="rmq_default")
+
+        active_subs = self._run_one_iteration(listener, scanned, [db_sub])
+
+        assert len(active_subs) == 1
+        assert "exchange" not in active_subs[0]

@@ -217,9 +217,24 @@ class RMQWatcherListener:
                     scanned = self._scan_subscriptions()
                     self._sync_to_db(scanned)
 
+                    # Exchange/routing_keys metadata is never persisted to the DB (see
+                    # plan Technical Details → "Почему миграция БД не нужна") — it only
+                    # lives in-memory in the AST scan cache, re-derived every cycle. Build
+                    # a lookup keyed the same way as the unique constraint on
+                    # RMQSubscription so it can be merged back onto DB rows below.
+                    exchange_meta = {
+                        (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default")): {
+                            "exchange": s["exchange"],
+                            "routing_keys": s["routing_keys"],
+                        }
+                        for s in scanned
+                        if "exchange" in s
+                    }
+
                     with WatcherSession() as session:
-                        active_subs = [
-                            {
+                        active_subs = []
+                        for sub in get_enabled_subscriptions(session):
+                            entry = {
                                 "id": sub.id,
                                 "dag_id": sub.dag_id,
                                 "queue_name": sub.queue_name,
@@ -227,8 +242,12 @@ class RMQWatcherListener:
                                 "filter_data": sub.filter_data or {},
                                 "cooldown": sub.cooldown or 0,
                             }
-                            for sub in get_enabled_subscriptions(session)
-                        ]
+                            meta = exchange_meta.get(
+                                (sub.dag_id, sub.queue_name, sub.conn_id)
+                            )
+                            if meta is not None:
+                                entry.update(meta)
+                            active_subs.append(entry)
 
                     await self._manager.reconcile(active_subs)
                 except Exception:
