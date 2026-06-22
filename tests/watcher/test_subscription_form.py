@@ -35,3 +35,11 @@ class TestParseFilterData:
     def test_invalid_json_raises_value_error(self):
         with pytest.raises(ValueError):
             parse_filter_data("{not valid json")
+
+    def test_json_string_raises_value_error(self):
+        with pytest.raises(ValueError):
+            parse_filter_data('"hello"')
+
+    def test_json_list_raises_value_error(self):
+        with pytest.raises(ValueError):
+            parse_filter_data("[1,2]")

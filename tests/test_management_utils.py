@@ -32,6 +32,14 @@ class TestGetManagementUrl:
         conn = FakeAirflowConnection(extra='{"management_url": ""}')
         assert get_management_url(conn) is None
 
+    def test_returns_none_when_non_string_int(self):
+        conn = FakeAirflowConnection(extra='{"management_url": 123}')
+        assert get_management_url(conn) is None
+
+    def test_returns_none_when_non_string_bool(self):
+        conn = FakeAirflowConnection(extra='{"management_url": true}')
+        assert get_management_url(conn) is None
+
 
 # ---------------------------------------------------------------------------
 # get_current_bindings

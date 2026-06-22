@@ -142,7 +142,7 @@ def rmq_trigger(
 
         if has_exchange_conflict(dag._rmq_subscriptions, new_subs):
             raise ValueError(
-                f"Multiple @rmq_trigger(exchange=...) decorators on DAG "
+                "Multiple @rmq_trigger(exchange=...) decorators on DAG "
                 f"{dag.dag_id!r} are not supported — they would all resolve to "
                 f"the same 'rmq_watcher.sub.{dag.dag_id}' queue. Use one "
                 "decorator call with the union of routing keys instead."

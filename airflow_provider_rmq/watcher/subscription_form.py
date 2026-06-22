@@ -28,11 +28,14 @@ def parse_filter_data(raw: str) -> dict:
     """Parse the ``filter_data`` form field.
 
     Empty string means "no filter" → ``{}``. Raises ``ValueError`` if the
-    value is not valid JSON.
+    value is not valid JSON, or if it does not decode to a JSON object.
     """
     if not raw:
         return {}
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError("filter_data must be valid JSON") from exc
+    if not isinstance(result, dict):
+        raise ValueError("filter_data JSON must decode to an object/dict.")
+    return result

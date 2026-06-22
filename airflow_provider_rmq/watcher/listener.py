@@ -330,6 +330,19 @@ class RMQWatcherListener:
         decorator raises ``ValueError`` for this case (it can abort the
         decorator call); the AST parser cannot abort a DAG import, so it logs a
         WARNING and skips the duplicate, keeping the first one parsed.
+
+        Defense in depth: the whole function body is wrapped in a broad
+        ``except Exception`` (in addition to the read/parse-specific except
+        below). ``_parse_rmq_trigger_decorator`` already turns validation
+        failures from ``build_subscriptions`` into a graceful per-decorator
+        WARNING+skip via its own ``except ValueError`` — but if a future bug
+        ever lets an unexpected exception type leak past that (e.g. a
+        non-str/non-list literal reaching a helper that isn't guarded yet),
+        it must still only cost this one DAG file's subscriptions, not crash
+        the entire reconcile cycle for every other DAG. ``_scan_subscriptions``
+        relies on this function never raising so it can still record the
+        file's mtime — without that, a permanently malformed file would be
+        re-parsed (and re-crash) on every single cycle forever.
         """
         try:
             with open(path, encoding="utf-8") as f:
@@ -339,27 +352,35 @@ class RMQWatcherListener:
             log.warning("Failed to read/parse DAG file %s: %s", path, exc)
             return []
 
-        result: list[dict] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            dag_id = _extract_dag_id_from_decorators(node.decorator_list) or node.name
-            dag_subs: list[dict] = []
-            for decorator in node.decorator_list:
-                for sub in _parse_rmq_trigger_decorator(decorator, dag_id):
-                    if has_exchange_conflict(dag_subs, [sub]):
-                        log.warning(
-                            "rmq_trigger: dag_id=%s already has an exchange= subscription — "
-                            "skipping duplicate (stacking multiple exchange= decorators on one "
-                            "DAG is not supported)",
-                            dag_id,
-                        )
-                        continue
-                    sub["dag_id"] = dag_id
-                    sub["group_key"] = dag_id if sub.get("cooldown", 0) > 0 else None
-                    dag_subs.append(sub)
-            result.extend(dag_subs)
-        return result
+        try:
+            result: list[dict] = []
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                dag_id = _extract_dag_id_from_decorators(node.decorator_list) or node.name
+                dag_subs: list[dict] = []
+                for decorator in node.decorator_list:
+                    for sub in _parse_rmq_trigger_decorator(decorator, dag_id):
+                        if has_exchange_conflict(dag_subs, [sub]):
+                            log.warning(
+                                "rmq_trigger: dag_id=%s already has an exchange= subscription — "
+                                "skipping duplicate (stacking multiple exchange= decorators on one "
+                                "DAG is not supported)",
+                                dag_id,
+                            )
+                            continue
+                        sub["dag_id"] = dag_id
+                        sub["group_key"] = dag_id if sub.get("cooldown", 0) > 0 else None
+                        dag_subs.append(sub)
+                result.extend(dag_subs)
+            return result
+        except Exception:
+            log.exception(
+                "Unexpected error extracting @rmq_trigger subscriptions from DAG file %s — "
+                "skipping this file's subscriptions for this cycle",
+                path,
+            )
+            return []
 
     # ------------------------------------------------------------------
     # DB synchronisation

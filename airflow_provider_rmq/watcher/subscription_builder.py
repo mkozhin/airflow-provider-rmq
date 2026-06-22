@@ -13,12 +13,15 @@ from __future__ import annotations
 
 from typing import Any
 
-_SUB_QUEUE_PREFIX = "rmq_watcher."
+_RESERVED_EXCHANGE_PREFIX = "rmq_watcher."
+_SUB_QUEUE_PREFIX = "rmq_watcher.sub."
 
 
 def _normalize_status(routing_key_status: str | list[str]) -> list[str]:
     if isinstance(routing_key_status, str):
         return [routing_key_status]
+    if not isinstance(routing_key_status, list):
+        raise ValueError("'routing_key_status' must be a string or a list of strings.")
     return list(routing_key_status)
 
 
@@ -58,15 +61,32 @@ def build_subscriptions(
     if modes_given != 1:
         raise ValueError("Specify exactly one of 'queue', 'queues', or 'exchange'.")
 
+    if not isinstance(cooldown, int) or isinstance(cooldown, bool):
+        raise ValueError("'cooldown' must be an int.")
     if cooldown < 0:
         raise ValueError("'cooldown' must be >= 0.")
+
+    if queue is not None and not isinstance(queue, str):
+        raise ValueError("'queue' must be a string.")
+    if queues is not None:
+        if not isinstance(queues, list):
+            raise ValueError("'queues' must be a list of strings.")
+        if len(queues) == 0:
+            raise ValueError("'queues' must not be an empty list.")
+        for q in queues:
+            if not isinstance(q, str) or q == "":
+                raise ValueError("Each entry in 'queues' must be a non-empty string.")
 
     filter_data = filter_data or {}
 
     if exchange is not None:
-        if exchange.startswith(_SUB_QUEUE_PREFIX):
+        if not isinstance(exchange, str):
+            raise ValueError("'exchange' must be a string.")
+        if exchange == "":
+            raise ValueError("'exchange' must be a non-empty string.")
+        if exchange.startswith(_RESERVED_EXCHANGE_PREFIX):
             raise ValueError(
-                f"'exchange' must not start with {_SUB_QUEUE_PREFIX!r} — "
+                f"'exchange' must not start with {_RESERVED_EXCHANGE_PREFIX!r} — "
                 "that namespace is reserved for rmq_watcher's own cooldown/fire "
                 "infrastructure (rmq_watcher.fire / rmq_watcher.pending.* / "
                 "rmq_watcher.sub.*)."
@@ -80,6 +100,8 @@ def build_subscriptions(
 
         literal_keys: list[str] = []
         if routing_keys is not None:
+            if not isinstance(routing_keys, list):
+                raise ValueError("'routing_keys' must be a list of strings.")
             if len(routing_keys) == 0:
                 raise ValueError("'routing_keys' must not be an empty list.")
             for key in routing_keys:
@@ -89,6 +111,8 @@ def build_subscriptions(
 
         from_ids: list[str] = []
         if routing_key_ids is not None:
+            if not isinstance(routing_key_ids, list):
+                raise ValueError("'routing_key_ids' must be a list of strings.")
             if len(routing_key_ids) == 0:
                 raise ValueError("'routing_key_ids' must not be an empty list.")
             statuses = _normalize_status(routing_key_status)
@@ -115,9 +139,15 @@ def build_subscriptions(
         # Union, preserving first-seen order, de-duplicated.
         final_keys = list(dict.fromkeys(literal_keys + from_ids))
 
+        if not final_keys:
+            raise ValueError(
+                "Resulting routing key set is empty after expansion — check "
+                "'routing_key_status' is not an empty list."
+            )
+
         return [
             {
-                "queue_name": f"rmq_watcher.sub.{dag_id}",
+                "queue_name": f"{_SUB_QUEUE_PREFIX}{dag_id}",
                 "conn_id": conn_id,
                 "filter_data": filter_data,
                 "cooldown": cooldown,

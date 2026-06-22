@@ -45,6 +45,61 @@ class TestBuildSubscriptionsCooldown:
         subs = build_subscriptions(dag_id="d", queue="q", cooldown=0)
         assert subs[0]["cooldown"] == 0
 
+    def test_non_int_cooldown_string_raises_value_error(self):
+        with pytest.raises(ValueError, match="cooldown"):
+            build_subscriptions(dag_id="d", queue="q", cooldown="abc")
+
+    def test_non_int_cooldown_list_raises_value_error(self):
+        with pytest.raises(ValueError, match="cooldown"):
+            build_subscriptions(dag_id="d", queue="q", cooldown=[1, 2])
+
+    def test_non_int_cooldown_float_raises_value_error(self):
+        with pytest.raises(ValueError, match="cooldown"):
+            build_subscriptions(dag_id="d", queue="q", cooldown=1.5)
+
+    def test_bool_cooldown_raises_value_error(self):
+        # bool is a subclass of int in Python — explicitly rejected so
+        # cooldown=True/False can't silently slip through as 1/0.
+        with pytest.raises(ValueError, match="cooldown"):
+            build_subscriptions(dag_id="d", queue="q", cooldown=True)
+
+
+class TestBuildSubscriptionsQueueItemTypes:
+    def test_non_string_queue_raises(self):
+        with pytest.raises(ValueError, match="queue"):
+            build_subscriptions(dag_id="d", queue=123)
+
+    def test_queues_with_non_string_items_raises(self):
+        with pytest.raises(ValueError, match="queues"):
+            build_subscriptions(dag_id="d", queues=[1, 2, 3])
+
+    def test_queues_with_mixed_string_and_non_string_raises(self):
+        with pytest.raises(ValueError, match="queues"):
+            build_subscriptions(dag_id="d", queues=["a", 2])
+
+    def test_queues_with_empty_string_item_raises(self):
+        with pytest.raises(ValueError, match="queues"):
+            build_subscriptions(dag_id="d", queues=["a", ""])
+
+    def test_queues_as_plain_string_raises(self):
+        # A plausible typo — forgetting the list brackets — must not be
+        # silently accepted: iterating a str yields one-character strings,
+        # which would expand into bogus per-character subscriptions instead
+        # of raising.
+        with pytest.raises(ValueError, match="queues"):
+            build_subscriptions(dag_id="d", queues="abc")
+
+    def test_queues_as_dict_raises(self):
+        with pytest.raises(ValueError, match="queues"):
+            build_subscriptions(dag_id="d", queues={"a": 1, "b": 2})
+
+    def test_queues_empty_list_raises(self):
+        # queues=[] passes the queue/queues/exchange mutex check (it is not
+        # None) but must not silently produce zero subscriptions — that is
+        # config loss with no warning anywhere in the pipeline.
+        with pytest.raises(ValueError, match="queues"):
+            build_subscriptions(dag_id="d", queues=[])
+
 
 class TestBuildSubscriptionsExchangeValidation:
     def test_no_routing_keys_or_ids_raises(self):
@@ -62,6 +117,13 @@ class TestBuildSubscriptionsExchangeValidation:
     def test_routing_keys_with_empty_string_raises(self):
         with pytest.raises(ValueError, match="non-empty string"):
             build_subscriptions(dag_id="d", exchange="ex", routing_keys=["", "valid.key"])
+
+    def test_empty_string_exchange_raises(self):
+        # An empty exchange name is the AMQP default exchange — declaring it
+        # would fail far downstream at the broker with a confusing error
+        # instead of failing fast and clearly at decoration time.
+        with pytest.raises(ValueError, match="exchange"):
+            build_subscriptions(dag_id="d", exchange="", routing_keys=["a.b"])
 
     def test_exchange_reserved_prefix_raises(self):
         with pytest.raises(ValueError, match="rmq_watcher\\."):
@@ -87,6 +149,55 @@ class TestBuildSubscriptionsExchangeValidation:
             dag_id="d", exchange="ex", routing_keys=["region.eu.alert"]
         )
         assert subs[0]["routing_keys"] == ["region.eu.alert"]
+
+    def test_routing_key_ids_with_empty_status_list_raises(self):
+        # routing_key_status=[] collapses the id x status cross-product to
+        # nothing — without this guard the function would silently return
+        # routing_keys=[], which downstream unbinds every existing routing
+        # key from the sub queue and binds none (full silent unsubscribe).
+        with pytest.raises(ValueError, match="routing key"):
+            build_subscriptions(
+                dag_id="d",
+                exchange="jetstat.airflow",
+                routing_key_ids=["abc123"],
+                routing_key_status=[],
+            )
+
+    def test_non_string_exchange_raises_value_error(self):
+        # exchange=123 (e.g. a typo'd literal) must not reach
+        # exchange.startswith(...) and raise an uncaught AttributeError —
+        # that would propagate out of the AST parser's except ValueError
+        # and crash the entire reconcile cycle for every DAG, forever
+        # (the broken file's mtime never gets recorded as "seen").
+        with pytest.raises(ValueError, match="exchange"):
+            build_subscriptions(dag_id="d", exchange=123, routing_keys=["a.b"])
+
+    def test_non_string_non_list_routing_key_status_raises_value_error(self):
+        # routing_key_status=123 must not reach list(routing_key_status) and
+        # raise an uncaught TypeError for the same reason as above.
+        with pytest.raises(ValueError, match="routing_key_status"):
+            build_subscriptions(
+                dag_id="d",
+                exchange="ex",
+                routing_key_ids=["abc"],
+                routing_key_status=123,
+            )
+
+    def test_routing_keys_as_plain_string_raises_value_error(self):
+        # A plausible typo — forgetting the list brackets — must not be
+        # silently accepted: iterating a str yields one-character strings,
+        # which would expand into a massive over-match of single-character
+        # wildcard routing keys (e.g. "l.*", "i.*", "t.*", ...).
+        with pytest.raises(ValueError, match="routing_keys"):
+            build_subscriptions(dag_id="d", exchange="ex", routing_keys="literal.string")
+
+    def test_routing_key_ids_as_plain_string_raises_value_error(self):
+        with pytest.raises(ValueError, match="routing_key_ids"):
+            build_subscriptions(
+                dag_id="d",
+                exchange="jetstat.airflow",
+                routing_key_ids="670f877702775c2de8325b1f",
+            )
 
 
 class TestBuildSubscriptionsExchangeRoutingKeys:

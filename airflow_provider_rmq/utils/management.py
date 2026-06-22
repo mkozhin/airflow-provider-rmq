@@ -11,10 +11,10 @@ def get_management_url(conn_info: Any) -> str | None:
 
     :param conn_info: Airflow Connection object (``airflow.models.Connection``).
     :returns: The configured Management API base URL with any trailing slash stripped,
-        or ``None`` if the extra is not set.
+        or ``None`` if the extra is not set or is not a string.
     """
     management_url = conn_info.extra_dejson.get("management_url")
-    if not management_url:
+    if not management_url or not isinstance(management_url, str):
         return None
     return management_url.rstrip("/")
 

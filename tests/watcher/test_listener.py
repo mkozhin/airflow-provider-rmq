@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -303,6 +304,28 @@ class TestScanSubscriptions:
         result = listener._extract_subscriptions_from_file("/nonexistent/broken.py")
         assert result == []
 
+    def test_mtime_recorded_even_when_extraction_raises(self):
+        # Regression for the permanent-DoS scenario: if a single DAG file's
+        # @rmq_trigger(...) decorator can't be parsed and somehow raised
+        # instead of returning [] (defense in depth — see
+        # _extract_subscriptions_from_file's broad except Exception), its
+        # mtime must still be recorded as "seen". Otherwise this file would
+        # be re-parsed (and re-crash) on every single reconcile cycle
+        # forever, instead of just once until the file is fixed.
+        listener = self._listener()
+        file = "/dags/broken.py"
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[file]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1000.0), \
+             patch.object(
+                 listener, "_extract_subscriptions_from_file", return_value=[]
+             ) as mock_ex:
+            listener._scan_subscriptions()
+            listener._scan_subscriptions()  # same mtime — must NOT re-parse
+
+        assert file in listener._last_mtimes
+        assert mock_ex.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # _extract_subscriptions_from_file — интеграционные тесты с реальными файлами
@@ -374,8 +397,6 @@ class TestExtractSubscriptionsFromFile:
         assert sub["group_key"] is None
 
     def test_two_exchange_decorators_on_same_function_second_skipped(self, tmp_path, caplog):
-        import logging as _logging
-
         dag_file = tmp_path / "double_exchange_dag.py"
         dag_file.write_text(
             "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
@@ -386,13 +407,56 @@ class TestExtractSubscriptionsFromFile:
             "def double_exchange_dag(): pass\n"
         )
         listener = RMQWatcherListener()
-        with caplog.at_level(_logging.WARNING):
+        with caplog.at_level(logging.WARNING):
             result = listener._extract_subscriptions_from_file(str(dag_file))
 
         assert len(result) == 1
         # ast.walk visits decorator_list in source order — first decorator parsed wins
         assert result[0]["exchange"] == "exchange.one"
         assert any("double_exchange_dag" in r.message for r in caplog.records)
+
+    def test_unexpected_exception_during_extraction_returns_empty_not_raises(self, tmp_path):
+        # Regression: if _parse_rmq_trigger_decorator (or build_subscriptions)
+        # ever lets an unexpected exception type leak past its own
+        # except ValueError, _extract_subscriptions_from_file must still not
+        # raise — one malformed DAG file must never crash the whole reconcile
+        # cycle for every other DAG (see _main's broad except Exception,
+        # which would otherwise skip _sync_to_db/reconcile() for ALL DAGs).
+        dag_file = tmp_path / "broken_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag(dag_id='broken_dag')\n"
+            "def broken_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with patch(
+            "airflow_provider_rmq.watcher.listener._parse_rmq_trigger_decorator",
+            side_effect=AttributeError("boom"),
+        ):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert result == []
+
+    def test_unexpected_exception_during_extraction_logs_and_does_not_propagate(
+        self, tmp_path, caplog
+    ):
+        dag_file = tmp_path / "broken_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag(dag_id='broken_dag')\n"
+            "def broken_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.ERROR), patch(
+            "airflow_provider_rmq.watcher.listener._parse_rmq_trigger_decorator",
+            side_effect=TypeError("boom"),
+        ):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert result == []
+        assert any(str(dag_file) in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -543,10 +607,46 @@ class TestParseRmqTriggerDecorator:
         assert result == []
 
     def test_negative_cooldown_logs_warning(self, caplog):
-        import logging as _logging
-        with caplog.at_level(_logging.WARNING):
+        with caplog.at_level(logging.WARNING):
             _parse_decorator("rmq_trigger(queue='q', cooldown=-1)", dag_id="neg_dag")
         assert any("neg_dag" in r.message for r in caplog.records)
+
+    def test_string_cooldown_skipped_returns_empty(self):
+        # A typo'd literal like cooldown="abc" passes ast.literal_eval (it's a
+        # valid string literal) but is semantically invalid — must be skipped
+        # gracefully, not raise an uncaught TypeError out of this function.
+        result = _parse_decorator("rmq_trigger(queue='q', cooldown='abc')")
+        assert result == []
+
+    def test_string_cooldown_logs_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(queue='q', cooldown='abc')", dag_id="str_cooldown_dag")
+        assert any("str_cooldown_dag" in r.message for r in caplog.records)
+
+    def test_list_cooldown_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queue='q', cooldown=[1, 2])")
+        assert result == []
+
+    def test_float_cooldown_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queue='q', cooldown=1.5)")
+        assert result == []
+
+    def test_bool_cooldown_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queue='q', cooldown=True)")
+        assert result == []
+
+    def test_queues_with_non_string_items_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queues=[1, 2, 3])")
+        assert result == []
+
+    def test_queues_with_mixed_string_and_int_items_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queues=['a', 2])")
+        assert result == []
+
+    def test_queues_with_non_string_items_logs_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(queues=[1, 2, 3])", dag_id="bad_queues_dag")
+        assert any("bad_queues_dag" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +743,58 @@ class TestParseRmqTriggerDecoratorExchange:
     def test_exchange_reserved_prefix_skipped(self):
         result = _parse_decorator(
             "rmq_trigger(exchange='rmq_watcher.something', routing_keys=['a.b'])"
+        )
+        assert result == []
+
+    def test_exchange_empty_routing_key_status_list_skipped(self):
+        # routing_key_status=[] collapses the routing_key_ids cross-product to
+        # an empty set — build_subscriptions raises ValueError, which must be
+        # caught and turned into a graceful skip, not propagate.
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
+            "routing_key_status=[])"
+        )
+        assert result == []
+
+    def test_non_string_exchange_skipped_returns_empty(self):
+        # exchange=123 is a valid ast.literal_eval() result (an int literal)
+        # but semantically invalid — must be turned into a graceful WARNING+
+        # skip by build_subscriptions raising ValueError, not propagate as an
+        # uncaught AttributeError from exchange.startswith(...). An uncaught
+        # exception here would crash the whole reconcile cycle, not just this
+        # DAG (see _extract_subscriptions_from_file's broad except Exception).
+        result = _parse_decorator("rmq_trigger(exchange=123, routing_keys=['a.b'])")
+        assert result == []
+
+    def test_non_string_exchange_logs_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator(
+                "rmq_trigger(exchange=123, routing_keys=['a.b'])", dag_id="bad_exchange_dag"
+            )
+        assert any("bad_exchange_dag" in r.message for r in caplog.records)
+
+    def test_non_str_non_list_routing_key_status_skipped_returns_empty(self):
+        # routing_key_status=123 must not reach list(routing_key_status) and
+        # raise an uncaught TypeError.
+        result = _parse_decorator(
+            "rmq_trigger(exchange='ex', routing_key_ids=['abc'], routing_key_status=123)"
+        )
+        assert result == []
+
+    def test_routing_keys_as_plain_string_skipped_returns_empty(self):
+        # Forgetting list brackets (routing_keys="literal.string" instead of
+        # routing_keys=["literal.string"]) must not silently expand into
+        # one-character wildcard routing keys — build_subscriptions rejects
+        # non-list routing_keys with ValueError, which is caught here.
+        result = _parse_decorator(
+            "rmq_trigger(exchange='ex', routing_keys='literal.string')"
+        )
+        assert result == []
+
+    def test_routing_key_ids_as_plain_string_skipped_returns_empty(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', "
+            "routing_key_ids='670f877702775c2de8325b1f')"
         )
         assert result == []
 

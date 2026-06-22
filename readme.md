@@ -41,6 +41,7 @@
 | pika | `>=1.3.0, <2.0.0` |
 | aio-pika | `>=9.0.0, <10.0.0` |
 | tenacity | `>=8.0.0` |
+| httpx | `>=0.27` |
 | Python | `>=3.10` |
 
 ---
@@ -696,6 +697,9 @@ conf = context["dag_run"].conf
 #     "queue":           "orders",
 #     "subscription_id": 42,
 # }
+# Exchange-mode triggers (exchange=) reuse this exact "immediate" shape — "queue" is
+# always rmq_watcher.sub.{dag_id} (not the exchange name), and "routing_key" is the
+# actual matched routing key (e.g. "<id>.<status>" for the routing_key_ids form).
 #
 # Cooldown trigger (fired after TTL expires in rmq_watcher.fire):
 # {
@@ -717,6 +721,8 @@ conf = context["dag_run"].conf
 | Direct DB insert | For automation via Terraform / scripts (`source='ui'`) |
 
 `dag_file` subscriptions are **read-only** in the UI — reconciliation overwrites DB from code every 60 s. Only the `enabled` toggle can be changed via UI for code-managed subscriptions.
+
+Exchange-mode subscriptions show up in the UI like any other `dag_file` subscription — by their queue name (`rmq_watcher.sub.{dag_id}`) only. The `exchange`/`routing_keys` metadata is not displayed there; the DAG source file is the single source of truth for that.
 
 ### Best Practices
 
@@ -762,11 +768,15 @@ airflow-provider-rmq/
 │   ├── utils/
 │   │   ├── amqp.py                  # build_amqp_connection(), match_and_ack()
 │   │   ├── filters.py               # MessageFilter
+│   │   ├── management.py            # Management HTTP API client (get_current_bindings)
 │   │   └── ssl.py                   # build_ssl_context()
 │   └── watcher/
 │       ├── decorators.py            # @rmq_trigger
+│       ├── subscription_builder.py  # build_subscriptions(), has_exchange_conflict()
+│       ├── subscription_form.py     # parse_cooldown(), parse_filter_data() (UI form parsing)
 │       ├── models.py                # RMQSubscription, RMQConnStatus, WatcherSession
 │       ├── consumer.py              # RMQConsumerManager
+│       ├── orphan_tracker.py        # OrphanTracker (cooldown + exchange-mode orphan detection)
 │       ├── listener.py              # RMQWatcherListener (Scheduler Listener)
 │       ├── views.py                 # RMQWatcherView (Flask-AppBuilder UI)
 │       └── plugin.py                # RMQWatcherPlugin (AirflowPlugin)

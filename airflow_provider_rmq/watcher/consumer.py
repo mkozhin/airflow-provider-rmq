@@ -28,6 +28,7 @@ from airflow_provider_rmq.watcher.models import (
     upsert_conn_status,
 )
 from airflow_provider_rmq.watcher.orphan_tracker import OrphanTracker
+from airflow_provider_rmq.watcher.subscription_builder import _SUB_QUEUE_PREFIX
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +37,6 @@ _RECONNECT_DELAY = 5.0
 _FIRE_EXCHANGE = "rmq_watcher.fire"
 _FIRE_QUEUE = "rmq_watcher.fire"
 _PENDING_QUEUE_PREFIX = "rmq_watcher.pending."
-_SUB_QUEUE_PREFIX = "rmq_watcher.sub."
 _EXCHANGE_TTL_MS = 28800000  # 8h — safety net against unbounded orphan queue growth
 
 
@@ -396,6 +396,82 @@ class RMQConsumerManager:
 
             return connection
 
+    async def _provision_one_exchange_sub(
+        self,
+        setup_channel: Any,
+        exchange: str,
+        sub: dict,
+        http_client: httpx.AsyncClient,
+        loop: asyncio.AbstractEventLoop,
+    ) -> bool:
+        """Provision the sub queue + bind-diff for a single exchange-mode subscription.
+
+        Returns ``True`` if ``dag_id`` should be marked provisioned, ``False`` otherwise.
+        Raises ``aio_pika.exceptions.ChannelClosed`` (and all its subclasses, e.g.
+        ``ChannelPreconditionFailed``, ``ChannelNotFoundEntity``, ``DuplicateConsumerTag``)
+        unchanged so the caller can reopen ``setup_channel`` — any broker-side channel
+        close (not just PRECONDITION_FAILED) makes the channel unusable for every
+        subsequent RPC — every other exception is caught and logged here, isolated to
+        this one subscription.
+        """
+        dag_id = sub["dag_id"]
+        conn_id = sub["conn_id"]
+        try:
+            queue = await _ensure_sub_queue(setup_channel, dag_id)
+
+            conn_info = await loop.run_in_executor(None, BaseHook.get_connection, conn_id)
+            vhost = conn_info.schema or "/"
+            management_url = get_management_url(conn_info)
+            if management_url is None:
+                log.error(
+                    "management_url not set on connection %r — skipping "
+                    "bind-diff for DAG %r (queue %s%s still declared, will "
+                    "retry next cycle)",
+                    conn_id, dag_id, _SUB_QUEUE_PREFIX, dag_id,
+                )
+                return True
+
+            if conn_info.login is None or conn_info.password is None:
+                log.error(
+                    "Connection %r has no login/password set — skipping "
+                    "bind-diff for DAG %r (queue %s%s still declared, will "
+                    "retry next cycle)",
+                    conn_id, dag_id, _SUB_QUEUE_PREFIX, dag_id,
+                )
+                return False
+
+            auth = (conn_info.login, conn_info.password)
+            queue_name = f"{_SUB_QUEUE_PREFIX}{dag_id}"
+            try:
+                current = await get_current_bindings(
+                    http_client, management_url, vhost, queue_name, exchange, auth,
+                )
+            except Exception as exc:
+                log.error(
+                    "Management API bind-diff failed for DAG %r (queue %s, "
+                    "exchange %r): %s — skipping bind-diff this cycle, queue "
+                    "still declared",
+                    dag_id, queue_name, exchange, exc,
+                )
+                return True
+
+            desired = set(sub.get("routing_keys") or [])
+            await _sync_bindings(queue, exchange, desired, current)
+        except asyncio.CancelledError:
+            raise
+        except aio_pika.exceptions.ChannelClosed:
+            raise
+        except Exception as exc:
+            log.error(
+                "Failed to provision sub queue for DAG %r (exchange=%r, "
+                "conn_id=%r): %s. Other DAGs in this exchange group "
+                "continue. Will retry on next reconcile cycle.",
+                dag_id, exchange, conn_id, exc,
+            )
+            return False
+        else:
+            return True
+
     async def _provision_exchange_subs(self, exchange_subs: list[dict]) -> None:
         """Provision exchange/sub-queue infrastructure and sync bindings for all
         ``exchange=`` subscriptions.
@@ -436,39 +512,49 @@ class RMQConsumerManager:
 
                     for sub in group:
                         dag_id = sub["dag_id"]
-                        queue = await _ensure_sub_queue(setup_channel, dag_id)
-
-                        conn_info = await loop.run_in_executor(
-                            None, BaseHook.get_connection, conn_id
-                        )
-                        vhost = conn_info.schema or "/"
-                        management_url = get_management_url(conn_info)
-                        if management_url is None:
-                            log.error(
-                                "management_url not set on connection %r — skipping bind-diff "
-                                "for DAG %r (queue %s%s still declared, will retry next cycle)",
-                                conn_id, dag_id, _SUB_QUEUE_PREFIX, dag_id,
-                            )
-                            continue
-
-                        auth = (conn_info.login, conn_info.password)
-                        queue_name = f"{_SUB_QUEUE_PREFIX}{dag_id}"
                         try:
-                            current = await get_current_bindings(
-                                http_client, management_url, vhost,
-                                queue_name, exchange, auth,
+                            provisioned = await self._provision_one_exchange_sub(
+                                setup_channel, exchange, sub, http_client, loop,
                             )
-                        except Exception as exc:
-                            log.error(
-                                "Management API bind-diff failed for DAG %r (queue %s, "
-                                "exchange %r): %s — skipping bind-diff this cycle, queue "
-                                "still declared",
-                                dag_id, queue_name, exchange, exc,
-                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except aio_pika.exceptions.ChannelClosed as exc:
+                            if isinstance(exc, aio_pika.exceptions.ChannelPreconditionFailed):
+                                log.error(
+                                    "Sub queue %s%s already exists with conflicting "
+                                    "properties (PRECONDITION_FAILED) on conn_id=%r: %s. "
+                                    "This DAG's subscription is not provisioned this "
+                                    "cycle. Will retry on next reconcile cycle.",
+                                    _SUB_QUEUE_PREFIX, dag_id, conn_id, exc,
+                                )
+                            else:
+                                log.error(
+                                    "Broker closed the channel while provisioning sub "
+                                    "queue %s%s (exchange=%r, conn_id=%r): %s. This DAG's "
+                                    "subscription is not provisioned this cycle. Will "
+                                    "retry on next reconcile cycle.",
+                                    _SUB_QUEUE_PREFIX, dag_id, exchange, conn_id, exc,
+                                )
+                            # Any ChannelClosed subclass (PRECONDITION_FAILED,
+                            # ChannelNotFoundEntity, DuplicateConsumerTag, etc.) closes
+                            # the entire broker-side channel — any further RPC on
+                            # setup_channel would raise for every remaining DAG in this
+                            # group. Open a fresh channel so subsequent subscriptions in
+                            # the same (conn_id, exchange) group are not collaterally
+                            # broken by this one DAG's conflict.
+                            try:
+                                setup_channel = await connection.channel()
+                            except Exception as reopen_exc:
+                                log.error(
+                                    "Failed to reopen channel on conn_id=%r after "
+                                    "channel close: %s. Remaining DAGs in this "
+                                    "exchange group (%r) cannot be provisioned this cycle.",
+                                    conn_id, reopen_exc, exchange,
+                                )
+                                break
                             continue
-
-                        desired = set(sub.get("routing_keys") or [])
-                        await _sync_bindings(queue, exchange, desired, current)
+                        if provisioned:
+                            self._exchange_tracker.mark_provisioned({dag_id})
                 finally:
                     try:
                         await setup_channel.close()
@@ -476,13 +562,22 @@ class RMQConsumerManager:
                         pass
             except asyncio.CancelledError:
                 raise
-            except aio_pika.exceptions.ChannelPreconditionFailed as exc:
-                log.error(
-                    "Exchange %r already exists with conflicting properties "
-                    "(PRECONDITION_FAILED) on conn_id=%r: %s. Sub queues for this group are "
-                    "not provisioned. Will retry on next reconcile cycle.",
-                    exchange, conn_id, exc,
-                )
+            except aio_pika.exceptions.ChannelClosed as exc:
+                if isinstance(exc, aio_pika.exceptions.ChannelPreconditionFailed):
+                    log.error(
+                        "Exchange %r already exists with conflicting properties "
+                        "(PRECONDITION_FAILED) on conn_id=%r: %s. Sub queues for this "
+                        "group are not provisioned. Will retry on next reconcile cycle.",
+                        exchange, conn_id, exc,
+                    )
+                else:
+                    log.error(
+                        "Broker closed the channel while declaring exchange "
+                        "infrastructure (exchange=%r, conn_id=%r): %s. Sub queues for "
+                        "this group are not provisioned. Will retry on next reconcile "
+                        "cycle.",
+                        exchange, conn_id, exc,
+                    )
                 continue
             except Exception as exc:
                 log.error(
@@ -491,8 +586,6 @@ class RMQConsumerManager:
                     exchange, conn_id, exc,
                 )
                 continue
-
-            self._exchange_tracker.mark_provisioned({sub["dag_id"] for sub in group})
 
     async def _consume_subscription(self, sub: dict) -> None:
         sub_id: int = sub["id"]

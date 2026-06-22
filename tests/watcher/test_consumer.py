@@ -2107,6 +2107,55 @@ class TestProvisionExchangeSubs:
         assert "test_dag" in manager._exchange_tracker._provisioned
 
     @pytest.mark.asyncio
+    async def test_missing_login_logs_error_and_returns_false_without_raising(self):
+        manager = RMQConsumerManager()
+        manager._http_client = AsyncMock()
+        connection, setup_channel, queue_mock = self._make_setup()
+        conn_info = self._conn_info()
+        conn_info.login = None
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             patch("airflow_provider_rmq.watcher.consumer.get_current_bindings",
+                   new=AsyncMock()) as mock_get_bindings, \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            # Must not raise despite conn_info.login being None
+            await manager._provision_exchange_subs([
+                _exchange_sub(id=1, dag_id="test_dag", exchange="jetstat.airflow"),
+            ])
+
+        mock_get_bindings.assert_not_awaited()
+        error_messages = [str(c) for c in mock_log.error.call_args_list]
+        assert any("login" in m or "password" in m for m in error_messages)
+        # Auth fields missing → provisioning of this DAG is treated as failed.
+        assert "test_dag" not in manager._exchange_tracker._provisioned
+
+    @pytest.mark.asyncio
+    async def test_missing_password_logs_error_and_returns_false_without_raising(self):
+        manager = RMQConsumerManager()
+        manager._http_client = AsyncMock()
+        connection, setup_channel, queue_mock = self._make_setup()
+        conn_info = self._conn_info()
+        conn_info.password = None
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             patch("airflow_provider_rmq.watcher.consumer.get_current_bindings",
+                   new=AsyncMock()) as mock_get_bindings, \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            # Must not raise despite conn_info.password being None
+            await manager._provision_exchange_subs([
+                _exchange_sub(id=1, dag_id="test_dag", exchange="jetstat.airflow"),
+            ])
+
+        mock_get_bindings.assert_not_awaited()
+        error_messages = [str(c) for c in mock_log.error.call_args_list]
+        assert any("login" in m or "password" in m for m in error_messages)
+        assert "test_dag" not in manager._exchange_tracker._provisioned
+
+    @pytest.mark.asyncio
     async def test_management_api_error_logged_and_skipped_does_not_affect_other_groups(self):
         manager = RMQConsumerManager()
         manager._http_client = AsyncMock()
@@ -2253,6 +2302,199 @@ class TestProvisionExchangeSubs:
         assert exchange_call_names.count("jetstat.airflow") == 1
         assert "dag_one" in manager._exchange_tracker._provisioned
         assert "dag_two" in manager._exchange_tracker._provisioned
+
+    @pytest.mark.asyncio
+    async def test_per_subscription_failure_does_not_block_mark_provisioned_for_others(self):
+        """If _ensure_sub_queue/bind-diff raises for the second DAG in a shared-exchange
+        group, the first DAG's already-successful provisioning must still be recorded —
+        otherwise it would never trip the orphan-detection safety net later (see
+        Implementation agent finding 1, code review iteration 2)."""
+        manager = RMQConsumerManager()
+        manager._http_client = AsyncMock()
+        connection, setup_channel, queue_mock = self._make_setup()
+        conn_info = self._conn_info()
+
+        async def declare_queue(name, **kwargs):
+            if name == f"{_SUB_QUEUE_PREFIX}dag_two":
+                raise aio_pika.exceptions.ChannelPreconditionFailed(
+                    "406", "PRECONDITION_FAILED - inequivalent arg"
+                )
+            return await setup_channel._declare_queue_orig(name, **kwargs)
+
+        setup_channel._declare_queue_orig = setup_channel.declare_queue
+        setup_channel.declare_queue = AsyncMock(side_effect=declare_queue)
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             patch("airflow_provider_rmq.watcher.consumer.get_current_bindings",
+                   new=AsyncMock(return_value=set())), \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            await manager._provision_exchange_subs([
+                _exchange_sub(id=1, dag_id="dag_one", exchange="jetstat.airflow",
+                              conn_id="rmq_default"),
+                _exchange_sub(id=2, dag_id="dag_two", exchange="jetstat.airflow",
+                              conn_id="rmq_default"),
+            ])
+
+        # dag_one succeeded earlier in the loop — must be marked provisioned despite
+        # dag_two's failure later in the same group.
+        assert "dag_one" in manager._exchange_tracker._provisioned
+        assert "dag_two" not in manager._exchange_tracker._provisioned
+        error_messages = [str(c) for c in mock_log.error.call_args_list]
+        assert any("dag_two" in m and "PRECONDITION_FAILED" in m for m in error_messages)
+
+    @pytest.mark.asyncio
+    async def test_channel_reopened_after_precondition_failed_so_third_dag_still_succeeds(self):
+        """In real AMQP, PRECONDITION_FAILED closes the entire broker-side channel —
+        ChannelPreconditionFailed is a ChannelClosed subclass, and aiormq raises for ANY
+        further RPC on a closed channel. This test simulates that: once dag_two's declare
+        raises ChannelPreconditionFailed on the first channel, that SAME channel object is
+        made permanently unusable (any further call raises ChannelInvalidStateError-like
+        error). dag_three must still succeed, proving the code requests a fresh channel via
+        connection.channel() instead of reusing the dead one (see code review iteration 4)."""
+        manager = RMQConsumerManager()
+        manager._http_client = AsyncMock()
+        conn_info = self._conn_info()
+
+        first_connection, first_setup_channel, _ = self._make_setup()
+        second_connection, second_setup_channel, queue_three = self._make_setup()
+        # second_setup_channel's declare_queue already resolves dag_three's queue via
+        # _make_setup's generic declare_queue side_effect.
+
+        channel_call_count = 0
+
+        async def connection_channel():
+            nonlocal channel_call_count
+            channel_call_count += 1
+            return first_setup_channel if channel_call_count == 1 else second_setup_channel
+
+        connection = AsyncMock()
+        connection.channel = AsyncMock(side_effect=connection_channel)
+
+        first_channel_dead = False
+
+        async def declare_queue_first_channel(name, **kwargs):
+            nonlocal first_channel_dead
+            if first_channel_dead:
+                # Broker-side channel is closed — any further RPC on it raises.
+                raise aio_pika.exceptions.ChannelInvalidStateError(
+                    "channel closed due to prior PRECONDITION_FAILED"
+                )
+            if name == f"{_SUB_QUEUE_PREFIX}dag_two":
+                first_channel_dead = True
+                raise aio_pika.exceptions.ChannelPreconditionFailed(
+                    "406", "PRECONDITION_FAILED - inequivalent arg"
+                )
+            return await first_setup_channel._declare_queue_orig(name, **kwargs)
+
+        first_setup_channel._declare_queue_orig = first_setup_channel.declare_queue
+        first_setup_channel.declare_queue = AsyncMock(side_effect=declare_queue_first_channel)
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             patch("airflow_provider_rmq.watcher.consumer.get_current_bindings",
+                   new=AsyncMock(return_value=set())), \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            await manager._provision_exchange_subs([
+                _exchange_sub(id=1, dag_id="dag_one", exchange="jetstat.airflow",
+                              conn_id="rmq_default"),
+                _exchange_sub(id=2, dag_id="dag_two", exchange="jetstat.airflow",
+                              conn_id="rmq_default"),
+                _exchange_sub(id=3, dag_id="dag_three", exchange="jetstat.airflow",
+                              conn_id="rmq_default"),
+            ])
+
+        # A fresh channel was requested after the PRECONDITION_FAILED (2 total: original +
+        # reopened one for dag_three).
+        assert channel_call_count == 2
+        assert "dag_one" in manager._exchange_tracker._provisioned
+        assert "dag_two" not in manager._exchange_tracker._provisioned
+        assert "dag_three" in manager._exchange_tracker._provisioned
+        # dag_three's queue was declared on the SECOND (fresh) channel, not the dead one.
+        declared_on_second = [
+            c.args[0] for c in second_setup_channel.declare_queue.call_args_list
+        ]
+        assert f"{_SUB_QUEUE_PREFIX}dag_three" in declared_on_second
+        error_messages = [str(c) for c in mock_log.error.call_args_list]
+        assert any("dag_two" in m and "PRECONDITION_FAILED" in m for m in error_messages)
+
+    @pytest.mark.asyncio
+    async def test_channel_reopened_after_other_channel_closed_subtype(self):
+        """ChannelPreconditionFailed is not the only exception that closes the broker-side
+        channel — ChannelNotFoundEntity and DuplicateConsumerTag are sibling ChannelClosed
+        subclasses (NOT subclasses of ChannelPreconditionFailed) raised by declare_queue/
+        queue.bind/queue.unbind on a broker-rejected operation (e.g. a permissions gap
+        raising ChannelAccessRefused in real AMQP). This test uses ChannelNotFoundEntity to
+        prove the channel-reopen path is not narrowly scoped to ChannelPreconditionFailed
+        (see code review phase 1 iteration 5 / phase 4 finding)."""
+        manager = RMQConsumerManager()
+        manager._http_client = AsyncMock()
+        conn_info = self._conn_info()
+
+        first_connection, first_setup_channel, _ = self._make_setup()
+        second_connection, second_setup_channel, queue_three = self._make_setup()
+
+        channel_call_count = 0
+
+        async def connection_channel():
+            nonlocal channel_call_count
+            channel_call_count += 1
+            return first_setup_channel if channel_call_count == 1 else second_setup_channel
+
+        connection = AsyncMock()
+        connection.channel = AsyncMock(side_effect=connection_channel)
+
+        first_channel_dead = False
+
+        async def declare_queue_first_channel(name, **kwargs):
+            nonlocal first_channel_dead
+            if first_channel_dead:
+                raise aio_pika.exceptions.ChannelInvalidStateError(
+                    "channel closed due to prior ChannelClosed subtype"
+                )
+            if name == f"{_SUB_QUEUE_PREFIX}dag_two":
+                first_channel_dead = True
+                raise aio_pika.exceptions.ChannelNotFoundEntity(
+                    "404", "NOT_FOUND - no queue 'rmq_watcher.sub.dag_two' in vhost '/'"
+                )
+            return await first_setup_channel._declare_queue_orig(name, **kwargs)
+
+        first_setup_channel._declare_queue_orig = first_setup_channel.declare_queue
+        first_setup_channel.declare_queue = AsyncMock(side_effect=declare_queue_first_channel)
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             patch("airflow_provider_rmq.watcher.consumer.get_current_bindings",
+                   new=AsyncMock(return_value=set())), \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            await manager._provision_exchange_subs([
+                _exchange_sub(id=1, dag_id="dag_one", exchange="jetstat.airflow",
+                              conn_id="rmq_default"),
+                _exchange_sub(id=2, dag_id="dag_two", exchange="jetstat.airflow",
+                              conn_id="rmq_default"),
+                _exchange_sub(id=3, dag_id="dag_three", exchange="jetstat.airflow",
+                              conn_id="rmq_default"),
+            ])
+
+        # A fresh channel was requested after the non-PRECONDITION_FAILED ChannelClosed
+        # subtype (2 total: original + reopened one for dag_three).
+        assert channel_call_count == 2
+        assert "dag_one" in manager._exchange_tracker._provisioned
+        assert "dag_two" not in manager._exchange_tracker._provisioned
+        assert "dag_three" in manager._exchange_tracker._provisioned
+        declared_on_second = [
+            c.args[0] for c in second_setup_channel.declare_queue.call_args_list
+        ]
+        assert f"{_SUB_QUEUE_PREFIX}dag_three" in declared_on_second
+        error_messages = [str(c) for c in mock_log.error.call_args_list]
+        assert any("dag_two" in m for m in error_messages)
+        # Must NOT use the PRECONDITION_FAILED-specific wording for this subtype.
+        assert not any(
+            "dag_two" in m and "PRECONDITION_FAILED" in m for m in error_messages
+        )
 
 
 # ---------------------------------------------------------------------------
