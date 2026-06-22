@@ -18,6 +18,10 @@ from airflow_provider_rmq.watcher.models import (
     get_enabled_subscriptions,
     upsert_subscription,
 )
+from airflow_provider_rmq.watcher.subscription_builder import (
+    build_subscriptions,
+    has_exchange_conflict,
+)
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +54,20 @@ def _extract_dag_id_from_decorators(decorators: list[ast.expr]) -> str | None:
     return None
 
 
-def _parse_rmq_trigger_decorator(node: ast.expr) -> list[dict]:
+_RMQ_TRIGGER_KWARGS = (
+    "queue",
+    "queues",
+    "exchange",
+    "routing_keys",
+    "routing_key_ids",
+    "routing_key_status",
+    "conn_id",
+    "filter_data",
+    "cooldown",
+)
+
+
+def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
     """Return list of subscription dicts if node is an rmq_trigger(...) call, else [].
 
     Handles both bare name ``rmq_trigger(...)`` and attribute access
@@ -58,12 +75,20 @@ def _parse_rmq_trigger_decorator(node: ast.expr) -> list[dict]:
     non-literal expressions are skipped (subscription won't be registered from
     AST scan — user should create it via the UI instead).
 
+    Validation/construction of the subscription dict is delegated to
+    ``build_subscriptions()`` (``subscription_builder.py``) — this function is
+    only responsible for the AST-specific part: extracting literal kwarg values
+    via ``ast.literal_eval``. Any ``ValueError`` raised by ``build_subscriptions``
+    (mutex violation, empty lists, dots in ids/status, negative cooldown, ...)
+    is logged as a WARNING and the subscription is skipped — the same graceful
+    degradation pattern already used for non-literal values.
+
     Returns a list:
-    - empty list if node is not an rmq_trigger call or required args are missing
-    - one dict for ``queue=`` (single queue)
+    - empty list if node is not an rmq_trigger call, required args are missing,
+      or validation failed
+    - one dict for ``queue=``/``exchange=`` (single subscription)
     - N dicts for ``queues=[...]`` (one per queue in the list)
 
-    Each dict contains: queue_name, conn_id, filter_data, cooldown.
     ``group_key`` is NOT set here — it is set in _extract_subscriptions_from_file
     where dag_id is known.
     """
@@ -78,57 +103,29 @@ def _parse_rmq_trigger_decorator(node: ast.expr) -> list[dict]:
         return []
 
     kwargs: dict = {}
-    queues_list: list[str] | None = None
     # positional: rmq_trigger("queue_name")
     if node.args:
         val = node.args[0]
         if isinstance(val, ast.Constant) and isinstance(val.value, str):
-            kwargs["queue_name"] = val.value
+            kwargs["queue"] = val.value
     # keyword arguments
     for kw in node.keywords:
-        if kw.arg not in ("queue", "queues", "conn_id", "filter_data", "cooldown"):
+        if kw.arg not in _RMQ_TRIGGER_KWARGS:
             continue
         try:
             value = ast.literal_eval(kw.value)
         except (ValueError, TypeError):
             continue
-        if kw.arg == "queue":
-            kwargs["queue_name"] = value
-        elif kw.arg == "queues":
-            if isinstance(value, list) and all(isinstance(q, str) for q in value):
-                queues_list = value
-        elif kw.arg == "cooldown":
-            if isinstance(value, int):
-                kwargs["cooldown"] = value
-        else:
-            kwargs[kw.arg] = value
+        kwargs[kw.arg] = value
 
-    conn_id = kwargs.get("conn_id", "rmq_default")
-    filter_data = kwargs.get("filter_data", {})
-    cooldown = kwargs.get("cooldown", 0)
-
-    if queues_list is not None:
-        return [
-            {
-                "queue_name": q,
-                "conn_id": conn_id,
-                "filter_data": filter_data,
-                "cooldown": cooldown,
-            }
-            for q in queues_list
-        ]
-
-    if "queue_name" not in kwargs:
+    if "queue" not in kwargs and "queues" not in kwargs and "exchange" not in kwargs:
         return []
 
-    return [
-        {
-            "queue_name": kwargs["queue_name"],
-            "conn_id": conn_id,
-            "filter_data": filter_data,
-            "cooldown": cooldown,
-        }
-    ]
+    try:
+        return build_subscriptions(dag_id=dag_id, **kwargs)
+    except ValueError as exc:
+        log.warning("rmq_trigger: skipping invalid subscription for dag_id=%s: %s", dag_id, exc)
+        return []
 
 
 class RMQWatcherListener:
@@ -307,6 +304,13 @@ class RMQWatcherListener:
 
         dag_id is taken from the explicit dag_id= argument of @dag(...) when it is
         a string literal; otherwise falls back to the decorated function name.
+
+        Multiple ``@rmq_trigger(exchange=...)`` decorators on the same DAG are
+        not supported (see ``subscription_builder.has_exchange_conflict`` /
+        Technical Details → "Стекинг exchange= на одном DAG" in the plan). The
+        decorator raises ``ValueError`` for this case (it can abort the
+        decorator call); the AST parser cannot abort a DAG import, so it logs a
+        WARNING and skips the duplicate, keeping the first one parsed.
         """
         try:
             with open(path, encoding="utf-8") as f:
@@ -321,11 +325,21 @@ class RMQWatcherListener:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             dag_id = _extract_dag_id_from_decorators(node.decorator_list) or node.name
+            dag_subs: list[dict] = []
             for decorator in node.decorator_list:
-                for sub in _parse_rmq_trigger_decorator(decorator):
+                for sub in _parse_rmq_trigger_decorator(decorator, dag_id):
+                    if has_exchange_conflict(dag_subs, [sub]):
+                        log.warning(
+                            "rmq_trigger: dag_id=%s already has an exchange= subscription — "
+                            "skipping duplicate (stacking multiple exchange= decorators on one "
+                            "DAG is not supported)",
+                            dag_id,
+                        )
+                        continue
                     sub["dag_id"] = dag_id
                     sub["group_key"] = dag_id if sub.get("cooldown", 0) > 0 else None
-                    result.append(sub)
+                    dag_subs.append(sub)
+            result.extend(dag_subs)
         return result
 
     # ------------------------------------------------------------------

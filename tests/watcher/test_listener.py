@@ -353,6 +353,47 @@ class TestExtractSubscriptionsFromFile:
         assert len(result) == 1
         assert result[0]["dag_id"] == "variable_dag"
 
+    def test_exchange_subscription_gets_correct_queue_name_and_group_key(self, tmp_path):
+        dag_file = tmp_path / "exchange_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'])\n"
+            "@dag(dag_id='jetstat_dag')\n"
+            "def jetstat_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        sub = result[0]
+        assert sub["dag_id"] == "jetstat_dag"
+        assert sub["queue_name"] == "rmq_watcher.sub.jetstat_dag"
+        assert sub["exchange"] == "jetstat.airflow"
+        assert sub["routing_keys"] == ["abc123.*"]
+        # cooldown defaults to 0 → group_key is None, same rule as queue= mode
+        assert sub["group_key"] is None
+
+    def test_two_exchange_decorators_on_same_function_second_skipped(self, tmp_path, caplog):
+        import logging as _logging
+
+        dag_file = tmp_path / "double_exchange_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(exchange='exchange.one', routing_keys=['a.b'])\n"
+            "@rmq_trigger(exchange='exchange.two', routing_keys=['c.d'])\n"
+            "@dag(dag_id='double_exchange_dag')\n"
+            "def double_exchange_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(_logging.WARNING):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+
+        assert len(result) == 1
+        # ast.walk visits decorator_list in source order — first decorator parsed wins
+        assert result[0]["exchange"] == "exchange.one"
+        assert any("double_exchange_dag" in r.message for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # _sync_to_db
@@ -430,10 +471,10 @@ class TestSyncToDb:
 # _parse_rmq_trigger_decorator — новые параметры queues и cooldown
 # ---------------------------------------------------------------------------
 
-def _parse_decorator(src: str) -> list[dict]:
+def _parse_decorator(src: str, dag_id: str = "test_dag") -> list[dict]:
     """Parse a decorator call string and return subscription dicts."""
     node = ast.parse(src, mode="eval").body
-    return _parse_rmq_trigger_decorator(node)
+    return _parse_rmq_trigger_decorator(node, dag_id)
 
 
 class TestParseRmqTriggerDecorator:
@@ -496,6 +537,114 @@ class TestParseRmqTriggerDecorator:
         result = _parse_decorator("decorators.rmq_trigger(queue='q')")
         assert len(result) == 1
         assert result[0]["queue_name"] == "q"
+
+    def test_negative_cooldown_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queue='q', cooldown=-1)")
+        assert result == []
+
+    def test_negative_cooldown_logs_warning(self, caplog):
+        import logging as _logging
+        with caplog.at_level(_logging.WARNING):
+            _parse_decorator("rmq_trigger(queue='q', cooldown=-1)", dag_id="neg_dag")
+        assert any("neg_dag" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _parse_rmq_trigger_decorator — exchange-mode (Task 2)
+# ---------------------------------------------------------------------------
+
+
+class TestParseRmqTriggerDecoratorExchange:
+    def test_exchange_with_routing_key_ids_literal_list(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'])",
+            dag_id="my_dag",
+        )
+        assert len(result) == 1
+        sub = result[0]
+        assert sub["exchange"] == "jetstat.airflow"
+        assert sub["queue_name"] == "rmq_watcher.sub.my_dag"
+        assert sub["routing_keys"] == ["abc123.*"]
+
+    def test_exchange_default_routing_key_status_is_wildcard(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'])"
+        )
+        assert result[0]["routing_keys"] == ["abc123.*"]
+
+    def test_exchange_explicit_string_routing_key_status(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
+            "routing_key_status='succeeded')"
+        )
+        assert result[0]["routing_keys"] == ["abc123.succeeded"]
+
+    def test_exchange_explicit_list_routing_key_status(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
+            "routing_key_status=['succeeded', 'failed'])"
+        )
+        assert set(result[0]["routing_keys"]) == {"abc123.succeeded", "abc123.failed"}
+
+    def test_exchange_with_literal_routing_keys_directly(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='some.other.exchange', routing_keys=['region.eu.alert'])"
+        )
+        assert len(result) == 1
+        assert result[0]["exchange"] == "some.other.exchange"
+        assert result[0]["routing_keys"] == ["region.eu.alert"]
+
+    def test_exchange_routing_keys_and_routing_key_ids_union(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_keys=['literal.key'], "
+            "routing_key_ids=['abc123'])"
+        )
+        assert set(result[0]["routing_keys"]) == {"literal.key", "abc123.*"}
+
+    def test_non_literal_routing_key_ids_skipped(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=SOME_VAR)"
+        )
+        # routing_key_ids not extracted (non-literal) → neither routing_keys nor
+        # routing_key_ids present → build_subscriptions raises → skipped
+        assert result == []
+
+    def test_non_literal_routing_keys_skipped(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_keys=SOME_VAR)"
+        )
+        assert result == []
+
+    def test_non_literal_routing_key_status_falls_back_to_default(self):
+        # routing_key_status is non-literal → not extracted → build_subscriptions
+        # falls back to its own default ("*"); routing_key_ids is still literal
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
+            "routing_key_status=SOME_VAR)"
+        )
+        assert result[0]["routing_keys"] == ["abc123.*"]
+
+    def test_exchange_and_queue_mutex_violation_skipped(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', queue='q', routing_keys=['a.b'])"
+        )
+        assert result == []
+
+    def test_exchange_without_routing_keys_skipped(self):
+        result = _parse_decorator("rmq_trigger(exchange='jetstat.airflow')")
+        assert result == []
+
+    def test_exchange_dot_in_routing_key_id_skipped(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc.123'])"
+        )
+        assert result == []
+
+    def test_exchange_reserved_prefix_skipped(self):
+        result = _parse_decorator(
+            "rmq_trigger(exchange='rmq_watcher.something', routing_keys=['a.b'])"
+        )
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
