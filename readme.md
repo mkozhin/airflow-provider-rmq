@@ -609,6 +609,80 @@ rabbitmqctl set_permissions -p <vhost> <user> "^(rmq_watcher\\..*|your-queue.*)$
 
 This covers the `rmq_watcher.fire` exchange, `rmq_watcher.fire` queue and `rmq_watcher.pending.<dag_id>` queues that the cooldown mechanism creates automatically.
 
+### Exchange-mode triggers
+
+Instead of subscribing to a pre-existing, manually-bound queue (`queue=`/`queues=`), a DAG can subscribe directly to a topic exchange. When `exchange=` is given, the provider owns the RMQ infrastructure end-to-end — no manual queue creation, no external YAML route table:
+
+```python
+from airflow.decorators import dag, task
+from airflow_provider_rmq.watcher.decorators import rmq_trigger
+
+# Jetstat-shaped routing keys: id × status cross-product
+@rmq_trigger(
+    exchange="jetstat.airflow",
+    routing_key_ids=["670f877702775c2de8325b1f"],
+    routing_key_status="succeeded",   # defaults to "*" = any status
+)
+@dag(dag_id="jetstat_succeeded", schedule=None)
+def jetstat_succeeded_dag():
+    @task
+    def process(**context):
+        conf = context["dag_run"].conf
+        print(conf["routing_key"])  # "670f877702775c2de8325b1f.succeeded"
+    process()
+
+jetstat_succeeded_dag()
+
+# Literal routing keys of any shape (not tied to the id/status form)
+@rmq_trigger(exchange="some.other.exchange", routing_keys=["region.eu.alert"])
+@dag(dag_id="region_alerts", schedule=None)
+def region_alerts_dag():
+    ...
+```
+
+Both forms can be combined on the same call — the final routing key set is the union of `routing_keys` and the `routing_key_ids` × `routing_key_status` cross-product.
+
+**What the provider provisions automatically** on every reconcile cycle:
+
+- The exchange itself (topic, durable, with an `alternate-exchange` for unroutable messages)
+- A dedicated queue `rmq_watcher.sub.{dag_id}` — **one shared queue per DAG**, consumed exactly like any `queue=` subscription
+- Bindings between that queue and the exchange, kept in sync with the routing keys currently declared in the decorator (diffed against RabbitMQ's actual binding state via the Management HTTP API — not against anything stored in the Airflow DB)
+- Safety nets: unroutable messages land in `{exchange}.unrouted` (TTL 8h); every routed message is mirrored into `{exchange}.log` (catch-all `#` binding, TTL 8h) for downstream logging/auditing
+
+**Connection extra — `management_url`:** exchange-mode requires a Management HTTP API endpoint to read current bindings (AMQP 0-9-1 has no "show my bindings" operation). Add it to the same Airflow Connection used for AMQP:
+
+```json
+{
+  "management_url": "https://rabbitmq.example.com"
+}
+```
+
+The same `login`/`password` from the connection are reused for the Management API call. If `management_url` is not set, bind-diff is skipped on every cycle (logged as ERROR) — the queue is still declared and consumed normally, but bindings never get created/updated.
+
+**No stacking — one DAG, one exchange.** Multiple `@rmq_trigger(exchange=...)` decorators on the same DAG raise `ValueError` at decoration time — they would all resolve to the same `rmq_watcher.sub.{dag_id}` queue, and the last one parsed would silently win. Use a single decorator call with the union of routing keys, or subscribe to multiple exchanges across multiple DAGs. To consume from several exchanges on the same DAG, fall back to `queue=`/`queues=` with manually created and bound queues.
+
+**RabbitMQ permissions (exchange-mode only):** in addition to the `rmq_watcher\..*` pattern already required for cooldown, the Airflow RMQ user needs:
+
+```
+# configure: declare the exchange / alternate-exchange / its queues
+rabbitmqctl set_permissions -p <vhost> <user> "^(rmq_watcher\\..*|jetstat\\.airflow(\\.unrouted|\\.log)?|...)$" \
+  "^(rmq_watcher\\..*|jetstat\\.airflow(\\.unrouted|\\.log)?|...)$" \
+  "^(rmq_watcher\\..*|jetstat\\.airflow(\\.unrouted)?|...)$"
+```
+
+`configure`/`write` are needed on `{exchange}(.unrouted|.log)?`; `read` is additionally needed on `{exchange}(.unrouted)?` because binding a queue *from* an exchange requires read access on the source exchange, not just configure on the destination queue. Replace `jetstat.airflow` with whatever name is actually passed to `exchange=`.
+
+**Migrating from `queue=` to `exchange=`:** switching an existing subscription does not clean up after itself — the old, manually-created queue is **not** deleted automatically and is left without a consumer once the DAG file is redeployed with `exchange=`. Remove it manually once the migration is confirmed working.
+
+**Renaming the DAG:** changing `dag_id` provisions a new `rmq_watcher.sub.{new_dag_id}` queue/bindings on the next reconcile cycle. The old `rmq_watcher.sub.{old_dag_id}` becomes orphaned (its subscription metadata no longer exists in any parsed DAG file — see ADR-0005) and is **not** removed automatically. Delete it manually.
+
+**Monitoring:**
+
+- RabbitMQ Management UI — `rmq_watcher.sub.{dag_id}` should show `consumer count > 0` when the DAG's subscription is active
+- Airflow logs — WARNING for orphaned `rmq_watcher.sub.*` queues/bindings (with a `rabbitmqadmin delete queue ...` hint); ERROR for a skipped bind-diff (Management API unreachable) or for an exchange property conflict (`PRECONDITION_FAILED` — the exchange name is already used by something else with different properties)
+
+**Rollback:** remove `exchange=`/`routing_keys=`/`routing_key_ids=`/`routing_key_status=` from the decorator and redeploy. `rmq_watcher.sub.{dag_id}` becomes orphaned — a WARNING appears in the logs, the TTL (8h) caps unbounded growth, and manual cleanup follows the hint in the WARNING text. The exchange itself and its `.unrouted`/`.log` queues are **not** touched by rollback (other DAGs may still be using them).
+
 ### Payload passed to the DAG
 
 ```python

@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.2.0
+
+- **Added:** `exchange=`/`routing_keys=`/`routing_key_ids=`/`routing_key_status=` parameters in `@rmq_trigger` — subscribe a DAG directly to a topic exchange instead of a pre-existing queue; the provider declares the exchange, its `.unrouted`/`.log` safety-net queues, a dedicated `rmq_watcher.sub.{dag_id}` queue, and keeps its bindings in sync with the routing keys declared in the decorator on every reconcile cycle
+- **Added:** Connection extra `management_url` — RabbitMQ Management HTTP API endpoint used to read current bindings for bind-diff (AMQP has no native "show my bindings" operation); reuses the connection's existing `login`/`password`
+- **Added:** dependency `httpx` — async HTTP client for the Management API calls
+
 ## v2.1.0
 
 - **Added:** `queues=[...]` parameter in `@rmq_trigger` — subscribe a single DAG to multiple RabbitMQ queues; a message from any of them triggers the DAG
