@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +14,7 @@ from airflow_provider_rmq.watcher.models import (
     get_conn_statuses,
     upsert_subscription,
 )
+from airflow_provider_rmq.watcher.subscription_form import parse_cooldown, parse_filter_data
 
 log = logging.getLogger(__name__)
 
@@ -139,18 +139,16 @@ class RMQWatcherView(BaseView):
                 )
 
             try:
-                cooldown = int(cooldown_raw) if cooldown_raw else 0
-                if cooldown < 0:
-                    raise ValueError("cooldown must be >= 0")
-            except (ValueError, TypeError):
+                cooldown = parse_cooldown(cooldown_raw)
+            except ValueError:
                 flash("cooldown must be a non-negative integer", "error")
                 return self.render_template(
                     "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
                 )
 
             try:
-                filter_data = json.loads(filter_data_raw) if filter_data_raw else {}
-            except json.JSONDecodeError:
+                filter_data = parse_filter_data(filter_data_raw)
+            except ValueError:
                 flash("filter_data must be valid JSON", "error")
                 return self.render_template(
                     "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
@@ -209,18 +207,16 @@ class RMQWatcherView(BaseView):
                         )
 
                     try:
-                        cooldown = int(cooldown_raw) if cooldown_raw else 0
-                        if cooldown < 0:
-                            raise ValueError("cooldown must be >= 0")
-                    except (ValueError, TypeError):
+                        cooldown = parse_cooldown(cooldown_raw)
+                    except ValueError:
                         flash("cooldown must be a non-negative integer", "error")
                         return self.render_template(
                             "rmq_watcher/subscription_form.html", sub=sub
                         )
 
                     try:
-                        filter_data = json.loads(filter_data_raw) if filter_data_raw else {}
-                    except json.JSONDecodeError:
+                        filter_data = parse_filter_data(filter_data_raw)
+                    except ValueError:
                         flash("filter_data must be valid JSON", "error")
                         return self.render_template(
                             "rmq_watcher/subscription_form.html", sub=sub
@@ -374,10 +370,8 @@ class RMQWatcherView(BaseView):
                         )
 
                     try:
-                        cooldown = int(cooldown_raw) if cooldown_raw else 0
-                        if cooldown < 0:
-                            raise ValueError("cooldown must be >= 0")
-                    except (ValueError, TypeError):
+                        cooldown = parse_cooldown(cooldown_raw)
+                    except ValueError:
                         flash("cooldown must be a non-negative integer", "error")
                         return self.render_template(
                             "rmq_watcher/subscription_form.html",
@@ -387,8 +381,8 @@ class RMQWatcherView(BaseView):
                         )
 
                     try:
-                        filter_data = json.loads(filter_data_raw) if filter_data_raw else {}
-                    except json.JSONDecodeError:
+                        filter_data = parse_filter_data(filter_data_raw)
+                    except ValueError:
                         flash("filter_data must be valid JSON", "error")
                         return self.render_template(
                             "rmq_watcher/subscription_form.html",
