@@ -126,19 +126,63 @@ class TestRmqTriggerDecorator:
         for sub in dag._rmq_subscriptions:
             assert "group_key" not in sub
 
-    # --- validation ---
+    # --- validation (delegated to build_subscriptions; just verify it surfaces as-is) ---
 
     def test_queue_and_queues_mutually_exclusive(self):
-        with pytest.raises(ValueError, match="not both"):
-            rmq_trigger(queue="q", queues=["q"])
+        dag = _make_dag()
+        with pytest.raises(ValueError, match="exactly one"):
+            rmq_trigger(queue="q", queues=["q"])(dag)
 
     def test_neither_queue_nor_queues_raises(self):
-        with pytest.raises(ValueError, match="Either"):
-            rmq_trigger()
+        dag = _make_dag()
+        with pytest.raises(ValueError, match="exactly one"):
+            rmq_trigger()(dag)
 
     def test_negative_cooldown_raises(self):
+        dag = _make_dag()
         with pytest.raises(ValueError, match="cooldown"):
-            rmq_trigger(queue="q", cooldown=-1)
+            rmq_trigger(queue="q", cooldown=-1)(dag)
+
+    def test_exchange_validation_error_surfaces(self):
+        """A ValueError raised by build_subscriptions (e.g. missing routing keys)
+        propagates unchanged through the decorator."""
+        dag = _make_dag()
+        with pytest.raises(ValueError, match="routing_keys"):
+            rmq_trigger(exchange="jetstat.airflow")(dag)
+
+    # --- exchange stacking conflict ---
+
+    def test_stacking_exchange_on_same_dag_raises(self):
+        dag = _make_dag()
+        rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"])(dag)
+        with pytest.raises(ValueError, match="not supported"):
+            rmq_trigger(exchange="jetstat.other", routing_keys=["c.d"])(dag)
+
+    def test_stacking_exchange_does_not_partially_mutate(self):
+        """A rejected second exchange decorator must not leave the first
+        subscription's metadata corrupted."""
+        dag = _make_dag()
+        rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"])(dag)
+        with pytest.raises(ValueError):
+            rmq_trigger(exchange="jetstat.other", routing_keys=["c.d"])(dag)
+        assert len(dag._rmq_subscriptions) == 1
+        assert dag._rmq_subscriptions[0]["exchange"] == "jetstat.airflow"
+
+    def test_exchange_subscription_dict_shape(self):
+        dag = _make_dag(dag_id="my_dag")
+        rmq_trigger(exchange="jetstat.airflow", routing_key_ids=["abc"])(dag)
+        sub = dag._rmq_subscriptions[0]
+        assert sub["queue_name"] == "rmq_watcher.sub.my_dag"
+        assert sub["exchange"] == "jetstat.airflow"
+        assert sub["routing_keys"] == ["abc.*"]
+
+    def test_queue_and_exchange_does_not_conflict(self):
+        """A queue-mode subscription followed by an exchange-mode subscription
+        is fine — conflict only triggers when both entries carry 'exchange'."""
+        dag = _make_dag()
+        rmq_trigger(queue="q1")(dag)
+        rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"])(dag)
+        assert len(dag._rmq_subscriptions) == 2
 
     # --- backward compatibility ---
 
