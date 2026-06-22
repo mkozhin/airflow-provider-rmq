@@ -9,6 +9,7 @@ from typing import Any
 
 import aio_pika
 import aio_pika.exceptions
+import httpx
 from airflow.hooks.base import BaseHook
 from airflow.models import DagModel
 from sqlalchemy.exc import IntegrityError
@@ -20,11 +21,13 @@ from airflow_provider_rmq.utils.amqp import (
     nack_and_sleep as _nack_and_sleep,
 )
 from airflow_provider_rmq.utils.filters import MessageFilter
+from airflow_provider_rmq.utils.management import get_current_bindings, get_management_url
 from airflow_provider_rmq.watcher.models import (
     WatcherSession,
     set_consumer_status,
     upsert_conn_status,
 )
+from airflow_provider_rmq.watcher.orphan_tracker import OrphanTracker
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +36,8 @@ _RECONNECT_DELAY = 5.0
 _FIRE_EXCHANGE = "rmq_watcher.fire"
 _FIRE_QUEUE = "rmq_watcher.fire"
 _PENDING_QUEUE_PREFIX = "rmq_watcher.pending."
+_SUB_QUEUE_PREFIX = "rmq_watcher.sub."
+_EXCHANGE_TTL_MS = 28800000  # 8h — safety net against unbounded orphan queue growth
 
 
 def _build_run_id(queue_name: str) -> str:
@@ -104,11 +109,13 @@ class RMQConsumerManager:
         self._connections: dict[str, Any] = {}  # conn_id → RobustConnection
         self._conn_lock = asyncio.Lock()  # prevents duplicate connections on concurrent starts
         self._fire_task: asyncio.Task | None = None
-        self._cooldown_dag_ids: set[str] = set()  # dag_ids for which pending queues were created
-        self._orphaned_pending_dag_ids: set[str] = set()  # dag_ids without active subscriptions
+        self._cooldown_tracker = OrphanTracker()  # dag_ids for which pending queues were created
+        self._exchange_tracker = OrphanTracker()  # dag_ids for which sub queues/bindings were created
+        self._http_client: httpx.AsyncClient | None = None  # Management API client
 
     async def start(self) -> None:
-        """No-op: connections and tasks are created on demand."""
+        """Create the shared Management API HTTP client. Connections/tasks are created on demand."""
+        self._http_client = httpx.AsyncClient(timeout=5.0)
 
     async def stop(self) -> None:
         tasks_to_cancel: list[asyncio.Task] = [
@@ -132,13 +139,30 @@ class RMQConsumerManager:
         self._active.clear()
         self._connections.clear()
 
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
+            self._http_client = None
+
     async def reconcile(self, subscriptions: list[dict]) -> None:
         """Sync running tasks with the current subscription list.
 
         Cancels tasks for removed subscriptions, starts tasks for new ones,
         and restarts tasks that exited due to fatal errors (task.done()).
-        Also manages cooldown infrastructure (fire exchange/queue, pending queues).
+        Also manages cooldown infrastructure (fire exchange/queue, pending queues) and
+        exchange-mode infrastructure (exchange/sub queue/bindings).
+
+        Exchange provisioning runs (awaited) before the cancel/start consumer block below:
+        exchange-mode queues are created by this provider (unlike ``queue=`` mode, where the
+        queue is created out-of-band and ``_consume_subscription`` always passive-declares
+        it) — running provisioning first avoids a brand-new consumer task fatally failing a
+        passive declare against a queue that doesn't exist yet.
         """
+        exchange_subs = [s for s in subscriptions if s.get("exchange")]
+        await self._provision_exchange_subs(exchange_subs)
+
         new_ids = {sub["id"] for sub in subscriptions}
 
         # cancel tasks for removed subscriptions
@@ -211,6 +235,11 @@ class RMQConsumerManager:
         # fails (i.e. _provision_cooldown returns early in its except block).
         self._check_orphaned_pending_queues(cooldown_dag_ids)
 
+        # Same unconditional-orphan-check rationale as cooldown above, applied to
+        # exchange-mode sub queues/bindings.
+        active_exchange_dag_ids = {s["dag_id"] for s in exchange_subs}
+        self._check_orphaned_exchange_bindings(active_exchange_dag_ids)
+
         self._update_all_conn_counts(subscriptions)
 
     def _subs_changed(self, sub_id: int, new_sub: dict) -> bool:
@@ -260,7 +289,7 @@ class RMQConsumerManager:
             return
 
         # Update tracking: accumulate all dag_ids that ever had cooldown infra provisioned
-        self._cooldown_dag_ids.update(cooldown_dag_ids)
+        self._cooldown_tracker.mark_provisioned(cooldown_dag_ids)
 
     def _check_orphaned_pending_queues(self, active_cooldown_dag_ids: set[str]) -> None:
         """Log WARNING for pending queues that no longer have an active cooldown subscription.
@@ -268,9 +297,8 @@ class RMQConsumerManager:
         Called unconditionally at the end of reconcile() — regardless of whether RMQ
         provisioning succeeded — so orphan detection always fires even when RMQ is down.
         """
-        # Orphan tracking: dag_ids that had pending queues but no longer have subscriptions
-        orphaned = self._cooldown_dag_ids - active_cooldown_dag_ids
-        newly_orphaned = orphaned - self._orphaned_pending_dag_ids
+        newly_orphaned, restored = self._cooldown_tracker.diff(active_cooldown_dag_ids)
+
         if newly_orphaned:
             for dag_id in sorted(newly_orphaned):
                 log.warning(
@@ -279,17 +307,45 @@ class RMQConsumerManager:
                     "rabbitmqadmin delete queue name=rmq_watcher.pending.%s",
                     dag_id, dag_id,
                 )
-            self._orphaned_pending_dag_ids.update(newly_orphaned)
 
-        # Remove from orphaned set if subscription was restored
-        restored = self._orphaned_pending_dag_ids & active_cooldown_dag_ids
         if restored:
             for dag_id in sorted(restored):
                 log.info(
                     "Subscription for DAG %r restored — removing from orphaned pending set.",
                     dag_id,
                 )
-            self._orphaned_pending_dag_ids -= restored
+
+    def _check_orphaned_exchange_bindings(self, active_exchange_dag_ids: set[str]) -> None:
+        """Log WARNING for exchange-mode sub queues/bindings that no longer have an active
+        ``exchange=`` subscription.
+
+        Called unconditionally at the end of reconcile() — regardless of whether
+        ``_provision_exchange_subs`` succeeded — so orphan detection always fires even when
+        RMQ or the Management API is down.
+
+        Bindings are NOT unbound automatically when a dag_id becomes orphaned — see
+        ADR-0005: auto-unbind was rejected because it can't distinguish a transient
+        AST-parse failure (DAG comes back with no loss — the queue TTL bounds growth) from
+        a permanent DAG removal/rename (then this is a bounded leak until manual cleanup).
+        """
+        newly_orphaned, restored = self._exchange_tracker.diff(active_exchange_dag_ids)
+
+        if newly_orphaned:
+            for dag_id in sorted(newly_orphaned):
+                log.warning(
+                    "Sub queue %s%s is now orphaned (exchange= subscription removed). "
+                    "Bindings are not removed automatically; the TTL safety net continues in "
+                    "RMQ. To clean up manually: rabbitmqadmin delete queue name=%s%s",
+                    _SUB_QUEUE_PREFIX, dag_id, _SUB_QUEUE_PREFIX, dag_id,
+                )
+
+        if restored:
+            for dag_id in sorted(restored):
+                log.info(
+                    "Exchange subscription for DAG %r restored — removing from orphaned "
+                    "sub queue set.",
+                    dag_id,
+                )
 
     def _update_all_conn_counts(self, subscriptions: list[dict]) -> None:
         counts: dict[str, int] = {}
@@ -339,6 +395,104 @@ class RMQConsumerManager:
                 raise
 
             return connection
+
+    async def _provision_exchange_subs(self, exchange_subs: list[dict]) -> None:
+        """Provision exchange/sub-queue infrastructure and sync bindings for all
+        ``exchange=`` subscriptions.
+
+        Idempotent — safe to call on every reconcile cycle. Subscriptions are grouped by
+        ``(conn_id, exchange)`` so the exchange/AE/log infrastructure is declared once per
+        group, and the sub queue + bind-diff is handled once per subscription within the
+        group. Errors in one group (connection failure, RMQ unavailable, Management API
+        unavailable, conflicting exchange properties) are logged and do not prevent other
+        groups — or the ordinary ``queue=`` consumer start-up that follows in
+        ``reconcile()`` — from proceeding.
+        """
+        if not exchange_subs:
+            return
+
+        http_client = self._http_client
+        if http_client is None:
+            log.error(
+                "Management API HTTP client not initialized (start() not called?) — "
+                "skipping provisioning for %d exchange-mode subscription(s) this cycle",
+                len(exchange_subs),
+            )
+            return
+
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for sub in exchange_subs:
+            key = (sub["conn_id"], sub["exchange"])
+            groups.setdefault(key, []).append(sub)
+
+        loop = asyncio.get_running_loop()
+
+        for (conn_id, exchange), group in groups.items():
+            try:
+                connection = await self._get_or_create_connection(conn_id)
+                setup_channel = await connection.channel()
+                try:
+                    await _ensure_exchange_infrastructure(setup_channel, exchange)
+
+                    for sub in group:
+                        dag_id = sub["dag_id"]
+                        queue = await _ensure_sub_queue(setup_channel, dag_id)
+
+                        conn_info = await loop.run_in_executor(
+                            None, BaseHook.get_connection, conn_id
+                        )
+                        vhost = conn_info.schema or "/"
+                        management_url = get_management_url(conn_info)
+                        if management_url is None:
+                            log.error(
+                                "management_url not set on connection %r — skipping bind-diff "
+                                "for DAG %r (queue %s%s still declared, will retry next cycle)",
+                                conn_id, dag_id, _SUB_QUEUE_PREFIX, dag_id,
+                            )
+                            continue
+
+                        auth = (conn_info.login, conn_info.password)
+                        queue_name = f"{_SUB_QUEUE_PREFIX}{dag_id}"
+                        try:
+                            current = await get_current_bindings(
+                                http_client, management_url, vhost,
+                                queue_name, exchange, auth,
+                            )
+                        except Exception as exc:
+                            log.error(
+                                "Management API bind-diff failed for DAG %r (queue %s, "
+                                "exchange %r): %s — skipping bind-diff this cycle, queue "
+                                "still declared",
+                                dag_id, queue_name, exchange, exc,
+                            )
+                            continue
+
+                        desired = set(sub.get("routing_keys") or [])
+                        await _sync_bindings(queue, exchange, desired, current)
+                finally:
+                    try:
+                        await setup_channel.close()
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except aio_pika.exceptions.ChannelPreconditionFailed as exc:
+                log.error(
+                    "Exchange %r already exists with conflicting properties "
+                    "(PRECONDITION_FAILED) on conn_id=%r: %s. Sub queues for this group are "
+                    "not provisioned. Will retry on next reconcile cycle.",
+                    exchange, conn_id, exc,
+                )
+                continue
+            except Exception as exc:
+                log.error(
+                    "Failed to provision exchange infrastructure (exchange=%r, conn_id=%r): "
+                    "%s. Ordinary consumers continue. Will retry on next reconcile cycle.",
+                    exchange, conn_id, exc,
+                )
+                continue
+
+            self._exchange_tracker.mark_provisioned({sub["dag_id"] for sub in group})
 
     async def _consume_subscription(self, sub: dict) -> None:
         sub_id: int = sub["id"]
@@ -538,3 +692,96 @@ async def _ensure_pending_queue(channel: Any, dag_id: str) -> None:
             "x-overflow": "reject-publish",
         },
     )
+
+
+async def _ensure_exchange_infrastructure(channel: Any, exchange: str) -> None:
+    """Declare the exchange-mode RMQ infrastructure for a given exchange, idempotently.
+
+    - Exchange ``{exchange}``: topic, durable, ``arguments={"alternate-exchange": "{exchange}.unrouted"}``
+    - Exchange ``{exchange}.unrouted``: fanout, durable (alternate-exchange target)
+    - Queue ``{exchange}.unrouted``: durable, ``x-message-ttl=_EXCHANGE_TTL_MS`` (8h),
+      bound to the fanout exchange above with no routing key
+    - Queue ``{exchange}.log``: durable, ``x-message-ttl=_EXCHANGE_TTL_MS`` (8h), bound to
+      ``{exchange}`` with routing key ``#`` (catch-all mirror of every routed message)
+
+    All declares are active (no ``passive=True``) — safe to repeat every reconcile cycle,
+    same pattern as ``_ensure_fire_infrastructure``. If ``exchange`` already exists with
+    different properties (declared outside this provider), RabbitMQ raises
+    ``aio_pika.exceptions.ChannelPreconditionFailed`` (reply code 406) — left to the caller
+    to catch and log distinctly from generic errors.
+    """
+    unrouted_exchange_name = f"{exchange}.unrouted"
+    log_queue_name = f"{exchange}.log"
+
+    exchange_obj = await channel.declare_exchange(
+        exchange,
+        type=aio_pika.ExchangeType.TOPIC,
+        durable=True,
+        arguments={"alternate-exchange": unrouted_exchange_name},
+    )
+
+    unrouted_exchange_obj = await channel.declare_exchange(
+        unrouted_exchange_name,
+        type=aio_pika.ExchangeType.FANOUT,
+        durable=True,
+    )
+    unrouted_queue = await channel.declare_queue(
+        unrouted_exchange_name,
+        durable=True,
+        arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+    )
+    await unrouted_queue.bind(unrouted_exchange_obj)
+
+    log_queue = await channel.declare_queue(
+        log_queue_name,
+        durable=True,
+        arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+    )
+    await log_queue.bind(exchange_obj, routing_key="#")
+
+
+async def _ensure_sub_queue(channel: Any, dag_id: str) -> Any:
+    """Declare the per-DAG exchange-mode sub queue idempotently and return it.
+
+    Queue: ``rmq_watcher.sub.{dag_id}`` — durable, ``x-message-ttl=_EXCHANGE_TTL_MS`` (8h).
+
+    Unlike the cooldown pending queue, this queue is actively consumed by a live consumer
+    (the same ``_consume_subscription`` used for ``queue=`` mode) — the TTL here is purely a
+    safety net against unbounded growth if the subscription becomes orphaned (see
+    ADR-0005), not a timer mechanism.
+    """
+    queue_name = f"{_SUB_QUEUE_PREFIX}{dag_id}"
+    return await channel.declare_queue(
+        queue_name,
+        durable=True,
+        arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+    )
+
+
+async def _sync_bindings(
+    queue: Any,
+    exchange: str,
+    desired: set[str],
+    current: set[str],
+) -> None:
+    """Bind/unbind a queue to an exchange so its live bindings match ``desired``.
+
+    Binds every routing key in ``desired - current`` and unbinds every routing key in
+    ``current - desired``; logs each change on INFO. No-op when ``desired == current``.
+    """
+    to_bind = desired - current
+    to_unbind = current - desired
+
+    for routing_key in sorted(to_bind):
+        await queue.bind(exchange, routing_key=routing_key)
+        log.info(
+            "Bound queue %s to exchange %r with routing_key=%r",
+            queue.name, exchange, routing_key,
+        )
+
+    for routing_key in sorted(to_unbind):
+        await queue.unbind(exchange, routing_key=routing_key)
+        log.info(
+            "Unbound queue %s from exchange %r with routing_key=%r",
+            queue.name, exchange, routing_key,
+        )
