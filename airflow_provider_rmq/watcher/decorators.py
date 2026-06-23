@@ -63,7 +63,12 @@ def rmq_trigger(
         **Stacking multiple ``@rmq_trigger(exchange=...)`` on the same DAG is
         not supported** and raises ``ValueError`` — they would all resolve to
         the same ``rmq_watcher.sub.{dag_id}`` queue; use one decorator call
-        with the union of routing keys instead.
+        with the union of routing keys instead. The timing of this error
+        depends on which branch below applies: immediate, at decoration
+        time, for a ready ``DAG`` instance; deferred until the wrapper is
+        called, for an uncalled TaskFlow factory (see "Decorator order and
+        DAG types" below) — either way it always surfaces during DAG file
+        import, before the DAG is registered.
     :param routing_keys: Literal topic routing keys of any shape, used as-is.
         Can be combined with ``routing_key_ids``; the final routing key set
         is the union of both (see ADR-0004). Only valid together with

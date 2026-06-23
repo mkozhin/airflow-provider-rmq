@@ -556,6 +556,8 @@ def orders_dag():
 orders_dag()
 ```
 
+`@rmq_trigger` must be the outermost decorator, directly above `@dag(...)` (as shown) — putting it below raises a `TypeError` at import time instead of silently doing nothing.
+
 **Step 2** — restart the Scheduler. The plugin activates automatically; no extra configuration is needed.
 
 **Step 3** — publish a message to `orders` — the DAG starts within seconds.
@@ -660,7 +662,7 @@ Both forms can be combined on the same call — the final routing key set is the
 
 The same `login`/`password` from the connection are reused for the Management API call. If `management_url` is not set, bind-diff is skipped on every cycle (logged as ERROR) — the queue is still declared and consumed normally, but bindings never get created/updated.
 
-**No stacking — one DAG, one exchange.** Multiple `@rmq_trigger(exchange=...)` decorators on the same DAG raise `ValueError` at decoration time — they would all resolve to the same `rmq_watcher.sub.{dag_id}` queue, and the last one parsed would silently win. Use a single decorator call with the union of routing keys, or subscribe to multiple exchanges across multiple DAGs. To consume from several exchanges on the same DAG, fall back to `queue=`/`queues=` with manually created and bound queues.
+**No stacking — one DAG, one exchange.** Multiple `@rmq_trigger(exchange=...)` decorators on the same DAG raise `ValueError` — they would all resolve to the same `rmq_watcher.sub.{dag_id}` queue, and the last one parsed would silently win. The error fires as soon as the DAG object actually exists: immediately at decoration time for a direct `DAG` instance, or when the `@dag(...)` factory is called (e.g. `jetstat_succeeded_dag()` at the end of the file, as in the example above) for TaskFlow style — either way, always during import, before the DAG is registered. Use a single decorator call with the union of routing keys, or subscribe to multiple exchanges across multiple DAGs. To consume from several exchanges on the same DAG, fall back to `queue=`/`queues=` with manually created and bound queues.
 
 **RabbitMQ permissions (exchange-mode only):** in addition to the `rmq_watcher\..*` pattern already required for cooldown, the Airflow RMQ user needs:
 

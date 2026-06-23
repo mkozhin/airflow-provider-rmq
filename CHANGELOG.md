@@ -5,6 +5,7 @@
 - **Added:** `exchange=`/`routing_keys=`/`routing_key_ids=`/`routing_key_status=` parameters in `@rmq_trigger` — subscribe a DAG directly to a topic exchange instead of a pre-existing queue; the provider declares the exchange, its `.unrouted`/`.log` safety-net queues, a dedicated `rmq_watcher.sub.{dag_id}` queue, and keeps its bindings in sync with the routing keys declared in the decorator on every reconcile cycle
 - **Added:** Connection extra `management_url` — RabbitMQ Management HTTP API endpoint used to read current bindings for bind-diff (AMQP has no native "show my bindings" operation); reuses the connection's existing `login`/`password`
 - **Added:** dependency `httpx` — async HTTP client for the Management API calls
+- **Fixed:** `@rmq_trigger` stacked above a TaskFlow `@dag(...)` factory (the pattern used in every example DAG and in the README) crashed DAG import with `AttributeError: 'function' object has no attribute 'dag_id'` — `@dag(...)` returns an uncalled factory function, not a `DAG` instance, until invoked at the bottom of the file. The decorator now detects this case and defers subscription attachment to a wrapper that runs after the factory produces the real `DAG`; a clear `TypeError` is raised if decorator order is reversed or the input is neither a `DAG` nor a callable
 
 ## v2.1.0
 

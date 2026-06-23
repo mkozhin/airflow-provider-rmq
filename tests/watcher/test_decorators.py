@@ -229,6 +229,31 @@ class TestRmqTriggerTaskFlowFactory:
         assert len(dag._rmq_subscriptions) == 1
         assert dag._rmq_subscriptions[0]["queue_name"] == "orders"
 
+    def test_stacking_multiple_queues_on_factory(self):
+        dag = _make_dag(dag_id="factory_dag")
+
+        def factory():
+            return dag
+
+        wrapped = rmq_trigger(queue="q1")(factory)
+        wrapped = rmq_trigger(queue="q2", conn_id="rmq_alt")(wrapped)
+
+        result = wrapped()
+        assert result is dag
+        assert len(dag._rmq_subscriptions) == 2
+        queue_names = {s["queue_name"] for s in dag._rmq_subscriptions}
+        assert queue_names == {"q1", "q2"}
+
+    def test_wraps_preserves_factory_metadata(self):
+        def factory():
+            """Factory docstring."""
+            return _make_dag(dag_id="factory_dag")
+
+        wrapped = rmq_trigger(queue="orders")(factory)
+        assert wrapped.__name__ == "factory"
+        assert wrapped.__doc__ == "Factory docstring."
+        assert wrapped.__wrapped__ is factory
+
     def test_stacking_exchange_conflict_on_factory_raises_at_call_time(self):
         dag = _make_dag(dag_id="factory_dag")
 
@@ -276,9 +301,9 @@ class TestRmqTriggerTaskFlowFactory:
             wrapped()
 
     def test_invalid_input_none_raises_type_error(self):
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="DAG instance or a callable"):
             rmq_trigger(queue="orders")(None)
 
     def test_invalid_input_string_raises_type_error(self):
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="DAG instance or a callable"):
             rmq_trigger(queue="orders")("not a dag or callable")

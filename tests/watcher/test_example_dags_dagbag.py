@@ -9,12 +9,12 @@ unvalidated object — because the AST-based subscription scanner in
 ``listener.py`` (``_extract_subscriptions_from_file``) never imports DAG
 files at all; it only parses source text.
 
-``docs/example_dags/rmq_dlq_setup.py`` is intentionally excluded: it has a
-pre-existing, unrelated import error (``TypeError: unsupported operand
-type(s) for >>: 'list' and 'list'`` from chaining two task-list bitshifts)
-that has nothing to do with ``@rmq_trigger`` or subscriptions. See the
-"Post-Completion" section of
-``docs/plans/20260623-rmq-trigger-taskflow-dag-fix.md``.
+Note: ``docs/example_dags/rmq_dlq_setup.py`` has a pre-existing, unrelated
+import error (``TypeError: unsupported operand type(s) for >>: 'list' and
+'list'`` from chaining two task-list bitshifts), but it never mentions
+``rmq_trigger`` in its source, so it is naturally excluded by the discovery
+filter below and needs no special-casing here. See the "Post-Completion"
+section of ``docs/plans/20260623-rmq-trigger-taskflow-dag-fix.md``.
 """
 from __future__ import annotations
 
@@ -23,11 +23,6 @@ from pathlib import Path
 import pytest
 
 EXAMPLE_DAGS_DIR = Path(__file__).resolve().parents[2] / "docs" / "example_dags"
-
-# Pre-existing, unrelated bug (list >> list in a TaskFlow DAG body) — not
-# connected to @rmq_trigger/subscriptions. Tracked separately; see the plan's
-# Post-Completion section.
-KNOWN_UNRELATED_IMPORT_ERRORS = {"rmq_dlq_setup.py"}
 
 
 def _rmq_trigger_example_dag_files() -> list[Path]:
@@ -68,22 +63,12 @@ class TestExampleDagsImportCleanly:
 
         errored_files = {Path(path).name for path in dagbag.import_errors}
 
-        unexpected_errors = (errored_files & rmq_trigger_files) - KNOWN_UNRELATED_IMPORT_ERRORS
+        unexpected_errors = errored_files & rmq_trigger_files
         assert not unexpected_errors, (
             f"@rmq_trigger example DAG(s) failed to import via real DagBag: "
             f"{sorted(unexpected_errors)}. Errors: "
             f"{ {k: v for k, v in dagbag.import_errors.items() if Path(k).name in unexpected_errors} }"
         )
-
-    def test_known_unrelated_dlq_setup_error_is_still_present(self, dagbag):
-        """Documents that rmq_dlq_setup.py's failure is known and unrelated.
-
-        If this ever starts passing (e.g. someone fixes the list >> list bug),
-        update KNOWN_UNRELATED_IMPORT_ERRORS and this test together — don't
-        let an unrelated fix silently widen what this regression test ignores.
-        """
-        errored_files = {Path(path).name for path in dagbag.import_errors}
-        assert KNOWN_UNRELATED_IMPORT_ERRORS & errored_files == KNOWN_UNRELATED_IMPORT_ERRORS
 
     def test_rmq_trigger_dags_actually_registered(self, dagbag):
         """Each @rmq_trigger example DAG file must produce at least one DAG.
@@ -96,8 +81,6 @@ class TestExampleDagsImportCleanly:
         rmq_trigger_files = _rmq_trigger_example_dag_files()
 
         for path in rmq_trigger_files:
-            if path.name in KNOWN_UNRELATED_IMPORT_ERRORS:
-                continue
-            assert str(path) in dag_file_paths or any(
+            assert any(
                 Path(p).name == path.name for p in dag_file_paths
             ), f"{path.name} produced no DAGs in the DagBag"
