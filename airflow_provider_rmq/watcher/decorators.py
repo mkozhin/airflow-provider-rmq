@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 from airflow_provider_rmq.watcher.subscription_builder import (
@@ -121,11 +122,40 @@ def rmq_trigger(
     Best practice: use a dedicated queue per DAG trigger (e.g.
     ``orders.airflow-trigger`` separate from ``orders``) to avoid interference
     with other consumers on the same queue.
+
+    Decorator order and DAG types
+    ------------------------------
+    ``@rmq_trigger`` supports two ways of decorating a DAG:
+
+    * **A ready ``DAG`` instance** — the classic ``with DAG(...) as dag:``
+      style. Subscriptions are attached immediately, at decoration time.
+    * **An uncalled TaskFlow factory from ``@dag(...)``** — the style used
+      throughout this repository's examples and README::
+
+          @rmq_trigger(queue="orders")
+          @dag(dag_id="my_dag", schedule=None)
+          def my_dag():
+              ...
+
+          my_dag()
+
+      ``airflow.decorators.dag(...)`` returns a plain factory function, not a
+      ``DAG`` — the real ``DAG`` only exists after the factory is called
+      (``my_dag()`` at the end of the file). In this case ``@rmq_trigger``
+      wraps the factory and defers attaching subscriptions until the wrapper
+      itself is called, then returns the resulting ``DAG``.
+
+    **``@rmq_trigger`` must be the outermost decorator, placed above
+    ``@dag(...)``, never below it.** Putting it below (i.e.
+    ``@dag(...)`` then ``@rmq_trigger(...)`` then the function) makes
+    ``@rmq_trigger`` decorate a plain function instead of a DAG/factory,
+    which raises ``TypeError`` at decoration time with a hint about the
+    correct order.
     """
 
-    def decorator(dag):
+    def _attach(dag_obj):
         new_subs = build_subscriptions(
-            dag_id=dag.dag_id,
+            dag_id=dag_obj.dag_id,
             queue=queue,
             queues=queues,
             exchange=exchange,
@@ -137,18 +167,41 @@ def rmq_trigger(
             cooldown=cooldown,
         )
 
-        if not hasattr(dag, "_rmq_subscriptions"):
-            dag._rmq_subscriptions = []
+        if not hasattr(dag_obj, "_rmq_subscriptions"):
+            dag_obj._rmq_subscriptions = []
 
-        if has_exchange_conflict(dag._rmq_subscriptions, new_subs):
+        if has_exchange_conflict(dag_obj._rmq_subscriptions, new_subs):
             raise ValueError(
                 "Multiple @rmq_trigger(exchange=...) decorators on DAG "
-                f"{dag.dag_id!r} are not supported — they would all resolve to "
-                f"the same 'rmq_watcher.sub.{dag.dag_id}' queue. Use one "
+                f"{dag_obj.dag_id!r} are not supported — they would all resolve "
+                f"to the same 'rmq_watcher.sub.{dag_obj.dag_id}' queue. Use one "
                 "decorator call with the union of routing keys instead."
             )
 
-        dag._rmq_subscriptions.extend(new_subs)
-        return dag
+        dag_obj._rmq_subscriptions.extend(new_subs)
+        return dag_obj
+
+    def decorator(dag_or_factory):
+        if hasattr(dag_or_factory, "dag_id"):
+            return _attach(dag_or_factory)
+
+        if not callable(dag_or_factory):
+            raise TypeError(
+                "@rmq_trigger must decorate a DAG instance or a callable "
+                f"@dag(...) factory function, got {type(dag_or_factory)!r}."
+            )
+
+        @functools.wraps(dag_or_factory)
+        def wrapper(*args, **kwargs):
+            result = dag_or_factory(*args, **kwargs)
+            if not hasattr(result, "dag_id"):
+                raise TypeError(
+                    "@rmq_trigger wrapped a callable that did not produce a DAG "
+                    f"instance (got {type(result)!r}). Make sure @rmq_trigger is "
+                    "the outermost decorator, placed above @dag(...), not below it."
+                )
+            return _attach(result)
+
+        return wrapper
 
     return decorator

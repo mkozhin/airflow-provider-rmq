@@ -196,3 +196,89 @@ class TestRmqTriggerDecorator:
         assert sub["filter_data"] == {}
         assert sub["cooldown"] == 0
         assert len(dag._rmq_subscriptions) == 1
+
+
+class TestRmqTriggerTaskFlowFactory:
+    """@rmq_trigger stacked above an uncalled @dag(...)-style factory.
+
+    These tests cover the lazy-wrapping branch added to support the
+    TaskFlow pattern used throughout this repository's examples/README:
+
+        @rmq_trigger(queue="orders")
+        @dag(dag_id="my_dag", schedule=None)
+        def my_dag():
+            ...
+
+        my_dag()
+    """
+
+    def test_uncalled_factory_is_wrapped_not_attached_immediately(self):
+        dag = _make_dag(dag_id="factory_dag")
+
+        def factory():
+            return dag
+
+        wrapped = rmq_trigger(queue="orders")(factory)
+        # Decoration alone must not produce a DAG or touch _rmq_subscriptions.
+        assert callable(wrapped)
+        assert not hasattr(dag, "_rmq_subscriptions")
+
+        result = wrapped()
+        assert result is dag
+        assert hasattr(dag, "_rmq_subscriptions")
+        assert len(dag._rmq_subscriptions) == 1
+        assert dag._rmq_subscriptions[0]["queue_name"] == "orders"
+
+    def test_stacking_exchange_conflict_on_factory_raises_at_call_time(self):
+        dag = _make_dag(dag_id="factory_dag")
+
+        def factory():
+            return dag
+
+        wrapped = rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"])(factory)
+        wrapped = rmq_trigger(exchange="jetstat.other", routing_keys=["c.d"])(wrapped)
+
+        # No error at decoration time — only when the wrapper chain is invoked.
+        with pytest.raises(ValueError, match="not supported"):
+            wrapped()
+
+    def test_parametrized_factory_called_twice_creates_independent_dags(self):
+        def make_factory():
+            def factory(dag_id):
+                return _make_dag(dag_id=dag_id)
+
+            return factory
+
+        wrapped = rmq_trigger(queue="orders")(make_factory())
+
+        dag_a = wrapped("dag_a")
+        dag_b = wrapped("dag_b")
+
+        assert dag_a is not dag_b
+        assert dag_a.dag_id == "dag_a"
+        assert dag_b.dag_id == "dag_b"
+        assert len(dag_a._rmq_subscriptions) == 1
+        assert len(dag_b._rmq_subscriptions) == 1
+        # Independent lists, not shared/aliased state.
+        dag_a._rmq_subscriptions.append({"sentinel": True})
+        assert len(dag_b._rmq_subscriptions) == 1
+
+    def test_wrong_decorator_order_raises_type_error_not_attribute_error(self):
+        """@dag(...) below @rmq_trigger(...) means rmq_trigger decorates a
+        plain function that does not return a DAG — must raise a clear
+        TypeError, not an AttributeError deep inside DAG construction."""
+
+        def plain_function():
+            return "not a dag"
+
+        wrapped = rmq_trigger(queue="orders")(plain_function)
+        with pytest.raises(TypeError, match="did not produce a DAG"):
+            wrapped()
+
+    def test_invalid_input_none_raises_type_error(self):
+        with pytest.raises(TypeError):
+            rmq_trigger(queue="orders")(None)
+
+    def test_invalid_input_string_raises_type_error(self):
+        with pytest.raises(TypeError):
+            rmq_trigger(queue="orders")("not a dag or callable")
