@@ -608,6 +608,80 @@ rabbitmqctl set_permissions -p <vhost> <user> "^(rmq_watcher\\..*|your-queue.*)$
 
 Это охватывает exchange `rmq_watcher.fire`, очередь `rmq_watcher.fire` и очереди `rmq_watcher.pending.<dag_id>`, которые создаёт механизм cooldown.
 
+### Триггеры в режиме exchange
+
+Вместо подписки на заранее созданную и привязанную вручную очередь (`queue=`/`queues=`), DAG может подписаться напрямую на topic-обменник. Когда указан `exchange=`, провайдер полностью берёт на себя RMQ-инфраструктуру — ручное создание очереди и внешняя YAML-таблица маршрутов не нужны:
+
+```python
+from airflow.decorators import dag, task
+from airflow_provider_rmq.watcher.decorators import rmq_trigger
+
+# Routing key в форме Jetstat: декартово произведение id × status
+@rmq_trigger(
+    exchange="jetstat.airflow",
+    routing_key_ids=["670f877702775c2de8325b1f"],
+    routing_key_status="succeeded",   # по умолчанию "*" = любой статус
+)
+@dag(dag_id="jetstat_succeeded", schedule=None)
+def jetstat_succeeded_dag():
+    @task
+    def process(**context):
+        conf = context["dag_run"].conf
+        print(conf["routing_key"])  # "670f877702775c2de8325b1f.succeeded"
+    process()
+
+jetstat_succeeded_dag()
+
+# Произвольные routing key любой формы (не привязаны к форме id/status)
+@rmq_trigger(exchange="some.other.exchange", routing_keys=["region.eu.alert"])
+@dag(dag_id="region_alerts", schedule=None)
+def region_alerts_dag():
+    ...
+```
+
+Обе формы можно комбинировать в одном вызове — итоговый набор routing key является объединением `routing_keys` и декартова произведения `routing_key_ids` × `routing_key_status`.
+
+**Что провайдер создаёт автоматически** на каждом reconcile-цикле:
+
+- Сам обменник (topic, durable, с `alternate-exchange` для немаршрутизируемых сообщений)
+- Выделенную очередь `rmq_watcher.sub.{dag_id}` — **одна общая очередь на DAG**, потребляется точно так же, как любая подписка через `queue=`
+- Привязки (bindings) между этой очередью и обменником, синхронизированные с routing key, объявленными в декораторе на текущий момент (сравниваются с реальным состоянием привязок в RabbitMQ через Management HTTP API — а не с тем, что хранится в БД Airflow)
+- Страховочные механизмы: немаршрутизируемые сообщения попадают в `{exchange}.unrouted` (TTL 8ч); каждое промаршрутизированное сообщение зеркалируется в `{exchange}.log` (catch-all привязка `#`, TTL 8ч) для последующего логирования/аудита
+
+**Extra-параметр подключения — `management_url`:** режим exchange требует эндпоинт Management HTTP API для чтения текущих привязок (в AMQP 0-9-1 нет операции «показать мои привязки»). Добавьте его в тот же Airflow Connection, который используется для AMQP:
+
+```json
+{
+  "management_url": "https://rabbitmq.example.com"
+}
+```
+
+Те же `login`/`password` из подключения повторно используются для вызова Management API. Если `management_url` не задан, bind-diff пропускается на каждом цикле (логируется как ERROR) — очередь всё равно объявляется и потребляется как обычно, но привязки никогда не создаются/обновляются.
+
+**Без стекинга — один DAG, один обменник.** Несколько декораторов `@rmq_trigger(exchange=...)` на одном DAG вызывают `ValueError` на этапе декорирования — все они привели бы к одной и той же очереди `rmq_watcher.sub.{dag_id}`, и последний обработанный декоратор молча победил бы. Используйте один вызов декоратора с объединением routing key, либо подписывайтесь на разные обменники из разных DAG. Чтобы потреблять из нескольких обменников в одном DAG, используйте `queue=`/`queues=` с очередями, созданными и привязанными вручную.
+
+**Права RabbitMQ (только для режима exchange):** в дополнение к шаблону `rmq_watcher\..*`, уже требуемому для cooldown, пользователю Airflow в RMQ нужны:
+
+```
+# configure: объявление обменника / alternate-exchange / его очередей
+rabbitmqctl set_permissions -p <vhost> <user> "^(rmq_watcher\\..*|jetstat\\.airflow(\\.unrouted|\\.log)?|...)$" \
+  "^(rmq_watcher\\..*|jetstat\\.airflow(\\.unrouted|\\.log)?|...)$" \
+  "^(rmq_watcher\\..*|jetstat\\.airflow(\\.unrouted)?|...)$"
+```
+
+`configure`/`write` нужны на `{exchange}(.unrouted|.log)?`; `read` дополнительно нужен на `{exchange}(.unrouted)?`, потому что привязка очереди *от* обменника требует права read на обменник-источник, а не только configure на целевую очередь. Замените `jetstat.airflow` на имя, которое реально передаётся в `exchange=`.
+
+**Миграция с `queue=` на `exchange=`:** переключение существующей подписки не убирает за собой старую инфраструктуру — старая, созданная вручную очередь **не** удаляется автоматически и остаётся без консьюмера после повторного деплоя DAG-файла с `exchange=`. Удалите её вручную после того, как убедитесь, что миграция работает корректно.
+
+**Переименование DAG:** изменение `dag_id` приводит к созданию новой очереди/привязок `rmq_watcher.sub.{new_dag_id}` на следующем reconcile-цикле. Старая `rmq_watcher.sub.{old_dag_id}` становится сиротой (orphan) — её метаданных подписки больше нет ни в одном распарсенном DAG-файле (см. ADR-0005) — и **не** удаляется автоматически. Удалите её вручную.
+
+**Мониторинг:**
+
+- RabbitMQ Management UI — `rmq_watcher.sub.{dag_id}` должна показывать `consumer count > 0`, когда подписка DAG активна
+- Логи Airflow — WARNING для осиротевших очередей/привязок `rmq_watcher.sub.*` (с подсказкой `rabbitmqadmin delete queue ...`); ERROR для пропущенного bind-diff (Management API недоступен) или конфликта свойств обменника (`PRECONDITION_FAILED` — имя обменника уже занято чем-то другим с другими свойствами)
+
+**Откат (rollback):** удалите `exchange=`/`routing_keys=`/`routing_key_ids=`/`routing_key_status=` из декоратора и передеплойте. `rmq_watcher.sub.{dag_id}` становится сиротой — в логах появляется WARNING, TTL (8ч) ограничивает неконтролируемый рост, а ручная очистка выполняется по подсказке из текста WARNING. Сам обменник и его очереди `.unrouted`/`.log` откатом **не** затрагиваются (ими могут всё ещё пользоваться другие DAG).
+
 ### Payload, передаваемый в DAG
 
 ```python
@@ -621,6 +695,9 @@ conf = context["dag_run"].conf
 #     "queue":           "orders",
 #     "subscription_id": 42,
 # }
+# Триггеры в режиме exchange (exchange=) используют точно такую же форму "immediate" —
+# "queue" — это всегда rmq_watcher.sub.{dag_id} (а не имя обменника), а "routing_key" —
+# это фактический подошедший routing key (например, "<id>.<status>" для формы routing_key_ids).
 #
 # Cooldown-запуск (после истечения TTL в rmq_watcher.fire):
 # {
@@ -642,6 +719,8 @@ conf = context["dag_run"].conf
 | Прямая запись в БД | Для автоматизации через Terraform / скрипты (`source='ui'`) |
 
 Подписки типа `dag_file` — **только для чтения** в UI: reconciliation перезаписывает БД из кода каждые 60 с. Через UI можно изменить только переключатель `enabled`.
+
+Подписки в режиме exchange отображаются в UI как любая другая подписка `dag_file` — только по имени их очереди (`rmq_watcher.sub.{dag_id}`). Метаданные `exchange`/`routing_keys` там не показываются; единственным источником истины для них остаётся файл DAG.
 
 ### Лучшие практики
 
