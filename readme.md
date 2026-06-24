@@ -748,6 +748,8 @@ The package includes several example DAGs in `docs/example_dags/`. All examples 
 | `rmq_watcher_demo` | **RMQ Watcher Plugin** — DAG triggered reactively by RabbitMQ messages via `@rmq_trigger`; also runs on daily schedule |
 | `rmq_pipeline_start` / `rmq_pipeline_finish` | Pipeline lock pattern — prevent concurrent executions |
 | `rmq_dlq_setup` | Dead Letter Queue infrastructure setup with DLX, TTL, exchange-to-exchange bindings |
+| `rmq_watcher_orders_payments_cooldown` | Cooldown trigger shared across multiple queues — debounce bursts into one DAG run |
+| `rmq_watcher_jetstat_report_succeeded` | Exchange-mode trigger — subscribe directly to a topic exchange (Jetstat id × status routing keys) |
 
 ---
 

@@ -746,6 +746,8 @@ conf = context["dag_run"].conf
 | `rmq_watcher_demo` | **Плагин RMQ Watcher** — DAG, запускаемый реактивно сообщениями из RabbitMQ через `@rmq_trigger`; также работает по расписанию |
 | `rmq_pipeline_start` / `rmq_pipeline_finish` | Паттерн блокировки пайплайна — предотвращение параллельных запусков |
 | `rmq_dlq_setup` | Настройка инфраструктуры Dead Letter Queue с DLX, TTL, exchange-to-exchange привязками |
+| `rmq_watcher_orders_payments_cooldown` | Cooldown-триггер на несколько очередей — debounce всплеска сообщений в один запуск DAG |
+| `rmq_watcher_jetstat_report_succeeded` | Exchange-mode триггер — подписка прямо на topic exchange (routing key вида id × status для Jetstat) |
 
 ---
 
