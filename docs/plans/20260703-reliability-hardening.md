@@ -318,7 +318,8 @@ class RMQLeaderLock:
 
 - [ ] `_sync_trigger`: возвращает `"triggered" | "skipped" | "duplicate"`; **`DagRunAlreadyExists`** (основной случай редоставки, см. Technical Details) и `IntegrityError` (гонка) → INFO + `"duplicate"`; прочие исключения пробрасываются
 - [ ] `_build_run_id(queue_name, message_id)`: детерминированный `rmq__{queue}__{message_id}` при наличии message_id, иначе timestamp-формат
-- [ ] immediate-ветка `_consume_subscription`: `_match` (без ack) → `_trigger_dag` → `message.ack()`; исключение из триггера → WARNING + `_nack_and_sleep`
+- [ ] immediate-ветка `_consume_subscription`: не совпало → `_nack_and_sleep` + continue (как сейчас); совпало → `_match` (без ack) → `_trigger_dag` → `message.ack()`; исключение из триггера → WARNING + `_nack_and_sleep`
+- [ ] убрать ставший неиспользуемым импорт `match_and_ack` из consumer.py (используется только в заменяемой ветке)
 - [ ] `_trigger_dag`: принимает message_id, возвращает исход
 - [ ] тест: успешный триггер → ack после trigger_dag (порядок вызовов)
 - [ ] тест: trigger_dag бросает → nack+requeue, ack не вызван
@@ -335,7 +336,7 @@ class RMQLeaderLock:
 
 - [ ] `reconcile`: `fire_conn_id = sorted({conn_id cooldown-подписок})[0]`, вычисление **перенести в начало `reconcile`** — сейчас оно стоит после цикла старта консьюмеров (consumer.py:206–212), а фильтрация должна сработать до него
 - [ ] invalid cooldown-подписки (`cooldown > 0` и `conn_id != fire_conn_id`) исключаются из **desired active set до** формирования `new_ids` — тогда существующий cancel-блок «удалённых» подписок снимает их **уже запущенные** consumer-таски (reconcile удаляет таски только по отсутствующим sub_id; простой фильтр в цикле старта оставил бы работающий консьюмер активным после смены конфигурации)
-- [ ] invalid-подписки: `consumer_status='error'` + объясняющий `last_error`, ERROR-лог
+- [ ] invalid-подписки: `consumer_status='error'` + объясняющий `last_error`, ERROR-лог; запись `error` — **после** cancel-блока удалённых подписок, иначе его запись `disconnected` перезатрёт `error`
 - [ ] восстановление: приведение conn_id к общему → подписка стартует на следующем цикле
 - [ ] тест: два cooldown conn_id → детерминированный выбор арбитра, вторая подписка в error
 - [ ] тест: подписка была запущена, затем стала invalid (сменился состав conn_id) → её consumer-таск отменён, статус error
