@@ -257,11 +257,44 @@ def _extract_dag_id_from_decorators(
     module-level constants may be shadowed by a local binding of the same
     name (see ``_extract_subscriptions_from_file``).
 
-    Note: only ``dec.keywords`` is examined here — a positional
-    ``@dag("my_id")`` and ``**kwargs``/``*args`` unpacking are handled by
-    later extensions to this function, not by this contract.
+    ``dag_id`` in Airflow's own ``@dag(...)`` signature is the first
+    parameter and is ``POSITIONAL_OR_KEYWORD``, so a positional call such as
+    ``@dag("my_id", schedule=None)`` is just as legal as the keyword form
+    and is resolved the same way: if ``dec.args`` is non-empty, its first
+    element is the ``dag_id`` value node; otherwise ``dag_id=`` is looked up
+    among ``dec.keywords`` as before. Whichever source it comes from, the
+    exact same resolution ladder (string literal → constant lookup →
+    ``_UNRESOLVED_DAG_ID``) and the same falsy rule apply.
+
+    ``ast.Starred`` among ``dec.args`` (i.e. ``@dag(*ARGS, ...)``) is checked
+    **before** looking at ``dec.args[0]`` — the value at that position is
+    statically undecidable, so it must return ``_UNRESOLVED_DAG_ID``
+    immediately rather than being treated as if it were the ``dag_id`` value
+    node. Full ``**kwargs``-unpacking detection (``dec.keywords`` entries
+    with ``kw.arg is None``) is a later extension to this function, not part
+    of this contract.
     """
     constants = constants or {}
+
+    def _resolve(value_node: ast.expr) -> str | _DagIdSentinel | None:
+        if isinstance(value_node, ast.Name):
+            if value_node.id in constants:
+                return constants[value_node.id]
+            return _UNRESOLVED_DAG_ID
+        try:
+            value = ast.literal_eval(value_node)
+        except (ValueError, TypeError):
+            return _UNRESOLVED_DAG_ID
+        # Falsy check comes FIRST — an empty string is falsy too, and per
+        # the falsy asymmetry documented above, ANY falsy literal
+        # (including "") must fall back to the function name, not be
+        # returned verbatim.
+        if not value:
+            return None
+        if isinstance(value, str):
+            return value
+        return _UNRESOLVED_DAG_ID
+
     for dec in decorators:
         if not isinstance(dec, ast.Call):
             continue
@@ -272,27 +305,17 @@ def _extract_dag_id_from_decorators(
         )
         if not is_dag:
             continue
+        # Priority check: a Starred positional arg (`@dag(*ARGS, ...)`) makes
+        # the value at dec.args[0] undecidable — must be ruled out BEFORE
+        # treating dec.args[0] as the dag_id value node.
+        if any(isinstance(arg, ast.Starred) for arg in dec.args):
+            return _UNRESOLVED_DAG_ID
+        if dec.args:
+            return _resolve(dec.args[0])
         for kw in dec.keywords:
             if kw.arg != "dag_id":
                 continue
-            value_node = kw.value
-            if isinstance(value_node, ast.Name):
-                if value_node.id in constants:
-                    return constants[value_node.id]
-                return _UNRESOLVED_DAG_ID
-            try:
-                value = ast.literal_eval(value_node)
-            except (ValueError, TypeError):
-                return _UNRESOLVED_DAG_ID
-            # Falsy check comes FIRST — an empty string is falsy too, and per
-            # the falsy asymmetry documented above, ANY falsy literal
-            # (including "") must fall back to the function name, not be
-            # returned verbatim.
-            if not value:
-                return None
-            if isinstance(value, str):
-                return value
-            return _UNRESOLVED_DAG_ID
+            return _resolve(kw.value)
         # Recognized @dag(...) call, but no dag_id= keyword at all.
         return None
     # No recognized @dag(...) call among decorators.

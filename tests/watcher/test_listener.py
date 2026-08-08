@@ -290,6 +290,24 @@ class TestExtractDagIdConstants:
         assert _extract_dag_id_from_decorators(decs) is None
 
 
+class TestExtractDagIdPositional:
+    def test_positional_string_literal_dag_id(self):
+        decs = _decorators("@dag('my_dag')\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) == "my_dag"
+
+    def test_positional_variable_dag_id_resolved_via_constants(self):
+        decs = _decorators("@dag(DAG_NAME)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs, {"DAG_NAME": "resolved"}) == "resolved"
+
+    def test_positional_unresolvable_dag_id_returns_unresolved(self):
+        decs = _decorators("@dag(SOME_VAR)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+
+    def test_positional_empty_string_dag_id_returns_none(self):
+        decs = _decorators("@dag('')\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is None
+
+
 # ---------------------------------------------------------------------------
 # on_starting / before_stopping
 # ---------------------------------------------------------------------------
@@ -595,6 +613,41 @@ class TestExtractSubscriptionsFromFile:
         result = listener._extract_subscriptions_from_file(str(dag_file))
         assert len(result) == 1
         assert result[0]["dag_id"] == "runtime_name"
+
+    def test_positional_literal_dag_id_from_file(self, tmp_path):
+        # @dag("real_id") — positional dag_id, decorated function has a
+        # DIFFERENT name, so a name-fallback would silently register the
+        # wrong dag_id.
+        dag_file = tmp_path / "my_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag('real_id')\n"
+            "def get_params_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "real_id"
+
+    def test_positional_constant_dag_id_from_file(self, tmp_path):
+        # DAG_ID referenced positionally (@dag(DAG_ID)) rather than via
+        # dag_id=DAG_ID — exercises the same module-constant resolution as
+        # the keyword form, through the full file pipeline.
+        dag_file = tmp_path / "my_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "DAG_ID = 'real_id'\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag(DAG_ID)\n"
+            "def variable_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "real_id"
 
     def test_exchange_subscription_gets_correct_queue_name_and_group_key(self, tmp_path):
         dag_file = tmp_path / "exchange_dag.py"
