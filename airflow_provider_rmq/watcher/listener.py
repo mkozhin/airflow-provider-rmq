@@ -270,9 +270,16 @@ def _extract_dag_id_from_decorators(
     **before** looking at ``dec.args[0]`` — the value at that position is
     statically undecidable, so it must return ``_UNRESOLVED_DAG_ID``
     immediately rather than being treated as if it were the ``dag_id`` value
-    node. Full ``**kwargs``-unpacking detection (``dec.keywords`` entries
-    with ``kw.arg is None``) is a later extension to this function, not part
-    of this contract.
+    node.
+
+    ``**``-unpacking in ``dec.keywords`` (``@dag(**{"dag_id": "x"})`` or
+    ``@dag(**DAG_KWARGS)``) produces a ``keyword`` entry with ``arg is
+    None`` — a search by ``kw.arg == "dag_id"`` never matches it. If no
+    explicit ``dag_id=`` keyword is found and such an entry is present, the
+    absence of ``dag_id=`` cannot be proven (the unpacked dict could contain
+    it), so ``_UNRESOLVED_DAG_ID`` is returned instead of ``None``. Parsing
+    the unpacked contents (even a literal ``**{"dag_id": ...}``) is out of
+    scope — only the presence of unpacking is detected.
     """
     constants = constants or {}
 
@@ -316,6 +323,11 @@ def _extract_dag_id_from_decorators(
             if kw.arg != "dag_id":
                 continue
             return _resolve(kw.value)
+        # No explicit dag_id= keyword found. If the call also unpacks an
+        # unknown dict (`@dag(**kwargs)`), the absence of dag_id= cannot be
+        # proven — the dict could contain it.
+        if any(kw.arg is None for kw in dec.keywords):
+            return _UNRESOLVED_DAG_ID
         # Recognized @dag(...) call, but no dag_id= keyword at all.
         return None
     # No recognized @dag(...) call among decorators.

@@ -308,6 +308,20 @@ class TestExtractDagIdPositional:
         assert _extract_dag_id_from_decorators(decs) is None
 
 
+class TestExtractDagIdUnpacking:
+    def test_dict_unpacking_returns_unresolved(self):
+        decs = _decorators('@dag(**{"dag_id": "real"})\ndef f(): pass')
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+
+    def test_name_unpacking_returns_unresolved(self):
+        decs = _decorators("@dag(**DAG_KWARGS)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+
+    def test_star_args_returns_unresolved(self):
+        decs = _decorators("@dag(*ARGS)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+
+
 # ---------------------------------------------------------------------------
 # on_starting / before_stopping
 # ---------------------------------------------------------------------------
@@ -784,6 +798,28 @@ class TestExtractSubscriptionsUnresolvedDagId:
             r.levelname == "WARNING"
             and str(dag_file) in r.message
             and "unresolvable_dag" in r.message
+            and "UI" in r.message
+            for r in caplog.records
+        )
+
+    def test_kwargs_unpacking_skips_and_warns(self, tmp_path, caplog):
+        dag_file = tmp_path / "kwargs_unpacking_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "DAG_KWARGS = {'schedule': None}\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag(**DAG_KWARGS)\n"
+            "def kwargs_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert result == []
+        assert any(
+            r.levelname == "WARNING"
+            and str(dag_file) in r.message
+            and "kwargs_dag" in r.message
             and "UI" in r.message
             for r in caplog.records
         )

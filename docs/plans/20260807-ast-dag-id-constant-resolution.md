@@ -802,10 +802,10 @@ Details одной таблицей, и реализовывать его пол
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] в `_extract_dag_id_from_decorators`: если явный `dag_id` не найден, но есть `**`-распаковка (`any(kw.arg is None for kw in dec.keywords)`) — вернуть `_UNRESOLVED_DAG_ID`, а не `None`. (`*args` уже покрыт приоритетной проверкой `ast.Starred` из Task 4 — здесь дублировать не нужно, только добавить тест.) `@dag(**{"dag_id": "real_id"})` и `@dag(**DAG_KWARGS)` в AST дают `keyword(arg=None, ...)` (проверено), поиск по `kw.arg` их не видит, и без этого правила получится откат на имя функции — тот же тихий баг
-- [ ] unit-тесты: `test_dict_unpacking_returns_unresolved` (`@dag(**{"dag_id": "real"})`), `test_name_unpacking_returns_unresolved` (`@dag(**DAG_KWARGS)`), `test_star_args_returns_unresolved` (`@dag(*ARGS)`) → все `_UNRESOLVED_DAG_ID`
-- [ ] file-level тест `test_kwargs_unpacking_skips_and_warns` — `@rmq_trigger(...)` + `@dag(**DAG_KWARGS)` → `result == []` и WARNING (а не тихая регистрация под именем функции)
-- [ ] прогнать `pytest tests/watcher/test_listener.py` — должно проходить перед Task 6
+- [x] в `_extract_dag_id_from_decorators`: если явный `dag_id` не найден, но есть `**`-распаковка (`any(kw.arg is None for kw in dec.keywords)`) — вернуть `_UNRESOLVED_DAG_ID`, а не `None`. (`*args` уже покрыт приоритетной проверкой `ast.Starred` из Task 4 — здесь дублировать не нужно, только добавить тест.) `@dag(**{"dag_id": "real_id"})` и `@dag(**DAG_KWARGS)` в AST дают `keyword(arg=None, ...)` (проверено), поиск по `kw.arg` их не видит, и без этого правила получится откат на имя функции — тот же тихий баг
+- [x] unit-тесты: `test_dict_unpacking_returns_unresolved` (`@dag(**{"dag_id": "real"})`), `test_name_unpacking_returns_unresolved` (`@dag(**DAG_KWARGS)`), `test_star_args_returns_unresolved` (`@dag(*ARGS)`) → все `_UNRESOLVED_DAG_ID`
+- [x] file-level тест `test_kwargs_unpacking_skips_and_warns` — `@rmq_trigger(...)` + `@dag(**DAG_KWARGS)` → `result == []` и WARNING (а не тихая регистрация под именем функции)
+- [x] прогнать `pytest tests/watcher/test_listener.py` — должно проходить перед Task 6
 
 ### Task 6: Проверка критериев приёмки
 
