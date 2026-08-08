@@ -48,7 +48,7 @@ def _make_session_ctx(existing_subs=None):
 def _constants(src: str) -> dict:
     """Parse a module-level source snippet and return its constant map."""
     tree = ast.parse(src)
-    return _collect_module_constants(tree)
+    return _collect_module_constants(tree)[0]
 
 
 class TestCollectModuleConstantsBaseCases:
@@ -157,6 +157,18 @@ class TestCollectModuleConstantsExoticBindingForms:
 class TestCollectModuleConstantsWildcardImport:
     def test_wildcard_import_disables_resolution_entirely(self):
         result = _constants("DAG_ID = 'local'\nfrom settings import *\n")
+        assert result == {}
+
+    def test_wildcard_import_disables_unrelated_constant_too(self):
+        # With only one constant name in the file, "DAG_ID absent" is
+        # ambiguous between "wildcard poisons file-wide" and "wildcard only
+        # poisons names that plausibly collide with its exports". A second,
+        # entirely unrelated constant name proves it's the former: the
+        # wildcard import disables resolution for the WHOLE file
+        # unconditionally, not just for names that happen to collide.
+        result = _constants(
+            "DAG_ID = 'local'\nUNRELATED_NAME = 'other'\nfrom settings import *\n"
+        )
         assert result == {}
 
 
@@ -281,6 +293,14 @@ class TestExtractDagIdConstants:
         decs = _decorators("@dag(dag_id=DAG_ID)\ndef f(): pass")
         assert _extract_dag_id_from_decorators(decs, {"OTHER": "x"}) is _UNRESOLVED_DAG_ID
 
+    def test_empty_string_constant_returns_none(self):
+        # Regression: DAG_ID = "" (a str, so it IS collected into `constants`
+        # by _collect_module_constants) referenced via dag_id=DAG_ID must
+        # fall back to the function name (None), not be returned verbatim as
+        # "" — matching the falsy rule already applied to the literal branch.
+        decs = _decorators("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs, {"DAG_ID": ""}) is None
+
     @pytest.mark.parametrize(
         "literal_src",
         ["''", "None", "False", "0", "0.0", "[]", "{}", "()"],
@@ -306,6 +326,17 @@ class TestExtractDagIdPositional:
     def test_positional_empty_string_dag_id_returns_none(self):
         decs = _decorators("@dag('')\ndef f(): pass")
         assert _extract_dag_id_from_decorators(decs) is None
+
+    def test_positional_truthy_non_string_literal_returns_unresolved(self):
+        decs = _decorators("@dag(123)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+
+    def test_positional_and_keyword_dag_id_conflict_returns_unresolved(self):
+        # @dag("a", dag_id="b") is invalid Python at call time (TypeError:
+        # multiple values for argument 'dag_id') — must not resolve to
+        # either value.
+        decs = _decorators("@dag('a', dag_id='b')\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
 
 
 class TestExtractDagIdUnpacking:
@@ -628,6 +659,51 @@ class TestExtractSubscriptionsFromFile:
         assert len(result) == 1
         assert result[0]["dag_id"] == "runtime_name"
 
+    def test_empty_string_module_constant_falls_back_to_function_name(self, tmp_path):
+        # Regression: a module-level constant DAG_ID = "" referenced via
+        # dag_id=DAG_ID must fall back to the function name (matching
+        # Airflow's own dag_id or f.__name__), NOT silently register a
+        # subscription with dag_id="".
+        dag_file = tmp_path / "my_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "DAG_ID = ''\n"
+            "@rmq_trigger(queue='q3')\n"
+            "@dag(dag_id=DAG_ID)\n"
+            "def empty_const_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "empty_const_dag"
+
+    def test_nested_function_with_literal_dag_id_still_resolves(self, tmp_path):
+        # A nested/factory function using a LITERAL dag_id (not a name
+        # reference) must still resolve correctly — the nested-function
+        # guard only refuses module-constant lookups (which could be
+        # shadowed by a local binding), not string literals, which need no
+        # scope information at all. Guards against a future "simplification"
+        # that blanket-skips all nested FunctionDefs.
+        dag_file = tmp_path / "factory_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "\n"
+            "def make_dag():\n"
+            "    @rmq_trigger(queue='q')\n"
+            "    @dag(dag_id='literal_id')\n"
+            "    def data_proc(): pass\n"
+            "\n"
+            "    return data_proc\n"
+            "\n"
+            "built_dag = make_dag()\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "literal_id"
+
     def test_positional_literal_dag_id_from_file(self, tmp_path):
         # @dag("real_id") — positional dag_id, decorated function has a
         # DIFFERENT name, so a name-fallback would silently register the
@@ -662,6 +738,35 @@ class TestExtractSubscriptionsFromFile:
         result = listener._extract_subscriptions_from_file(str(dag_file))
         assert len(result) == 1
         assert result[0]["dag_id"] == "real_id"
+
+    def test_use_before_definition_isolated_across_multiple_functions(self, tmp_path):
+        # Two functions, each relying on a DIFFERENT module constant defined
+        # at a different file position. early_dag uses FIRST_DAG (defined
+        # before it) and resolves fine. late_dag uses SECOND_DAG (defined
+        # between the two functions, i.e. after early_dag but before
+        # late_dag) — it must resolve for late_dag only; if the position
+        # filter leaked across functions (e.g. used the full/final constant
+        # map for every function instead of one filtered per function's own
+        # line), early_dag would incorrectly see SECOND_DAG too.
+        dag_file = tmp_path / "my_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "FIRST_DAG = 'first_id'\n"
+            "@rmq_trigger(queue='q1')\n"
+            "@dag(dag_id=FIRST_DAG)\n"
+            "def early_dag(): pass\n"
+            "SECOND_DAG = 'second_id'\n"
+            "@rmq_trigger(queue='q2')\n"
+            "@dag(dag_id=SECOND_DAG)\n"
+            "def late_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        by_queue = {sub["queue_name"]: sub for sub in result}
+        assert len(result) == 2
+        assert by_queue["q1"]["dag_id"] == "first_id"
+        assert by_queue["q2"]["dag_id"] == "second_id"
 
     def test_exchange_subscription_gets_correct_queue_name_and_group_key(self, tmp_path):
         dag_file = tmp_path / "exchange_dag.py"

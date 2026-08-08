@@ -92,11 +92,21 @@ def _module_scope_nodes(tree: ast.Module) -> Iterator[ast.AST]:
         stack.extend(ast.iter_child_nodes(node))
 
 
-def _collect_module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
+def _collect_module_constants(
+    tree: ast.Module,
+) -> tuple[dict[str, tuple[str, int]], set[int]]:
     """Collect simple top-level ``NAME = "literal string"`` assignments
     (plus annotated ``NAME: str = "literal"``), each paired with its line
     number so callers can enforce "only usable before this point in the
     file" — see the wiring below.
+
+    Returns ``(constants, module_scope_function_ids)``. The second element
+    is ``id()`` of every ``FunctionDef``/``AsyncFunctionDef`` whose
+    decorators execute in module scope, collected from the SAME
+    ``_module_scope_nodes(tree)`` pass used to build ``constants`` — the
+    caller (``_extract_subscriptions_from_file``) needs this set to decide
+    whether a nested function may use ``constants`` at all, and reusing this
+    pass avoids walking the tree a second time just for that.
 
     A name is kept only if it is bound **exactly once** in the module's own
     scope, and that one binding is the top-level literal assignment itself.
@@ -127,6 +137,7 @@ def _collect_module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
     """
     binding_counts: dict[str, int] = {}
     has_wildcard_import = False
+    module_scope_function_ids: set[int] = set()
 
     def _bump(name: str) -> None:
         binding_counts[name] = binding_counts.get(name, 0) + 1
@@ -141,6 +152,8 @@ def _collect_module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
                 _bump(node.asname or node.name.split(".")[0])
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             _bump(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                module_scope_function_ids.add(id(node))
         elif isinstance(node, ast.ExceptHandler) and node.name:
             _bump(node.name)
         elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
@@ -163,7 +176,7 @@ def _collect_module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
             _bump(node.target.id)
 
     if has_wildcard_import:
-        return {}
+        return {}, module_scope_function_ids
 
     constants: dict[str, tuple[str, int]] = {}
     for node in tree.body:  # value extraction: top-level ONLY, unconditional
@@ -188,7 +201,7 @@ def _collect_module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
             continue
         if isinstance(value, str):
             constants[name] = (value, node.lineno)
-    return constants
+    return constants, module_scope_function_ids
 
 
 # Sentinel distinguishing "dag_id= is set but cannot be statically resolved"
@@ -232,16 +245,12 @@ def _extract_dag_id_from_decorators(
       Airflow DAG — the caller must skip registration and log a warning
       instead (see ``_extract_subscriptions_from_file``).
 
-    **Deliberate falsy asymmetry**: a literal ``@dag(dag_id=None)`` returns
-    ``None`` (falls back to the function name, matching Airflow's own
-    default), but ``DAG_ID = None`` followed by ``dag_id=DAG_ID`` returns
-    ``_UNRESOLVED_DAG_ID`` instead — only ``str`` values are ever collected
-    into ``constants`` by ``_collect_module_constants``, so a module-level
-    ``None``/``False``/``0``/``""`` constant is never present in
-    ``constants`` and its reference is treated the same as any other
-    unresolvable name. This is intentional, not a bug: the direction of the
-    asymmetry is the safe one (it skips + warns rather than silently
-    resolving to a guess).
+    **Deliberate falsy asymmetry**: any falsy value that was actually
+    resolved (a literal or a module constant — both always ``str`` here)
+    returns ``None`` and falls back to the function name; a name that
+    could not be resolved at all stays ``_UNRESOLVED_DAG_ID``. See the two
+    ``_resolve()`` branches below for exactly why this makes
+    ``DAG_ID = None`` behave differently from ``DAG_ID = ""``.
 
     No logging happens inside this function — the caller decides whether an
     ``_UNRESOLVED_DAG_ID`` deserves a WARNING, because only it knows the
@@ -272,6 +281,15 @@ def _extract_dag_id_from_decorators(
     immediately rather than being treated as if it were the ``dag_id`` value
     node.
 
+    If ``dec.args`` is non-empty (a positional ``dag_id`` value is present)
+    **and** an explicit ``dag_id=`` keyword is also present in the same call
+    (``@dag("a", dag_id="b")``), the call is invalid Python: ``dag_id`` is
+    ``POSITIONAL_OR_KEYWORD``, so the decorator call would raise ``TypeError:
+    dag() got multiple values for argument 'dag_id'`` at import time and the
+    DAG would never actually be created. Picking either value would silently
+    register a subscription for a ``dag_id`` that can never exist, so this
+    returns ``_UNRESOLVED_DAG_ID`` instead of guessing.
+
     ``**``-unpacking in ``dec.keywords`` (``@dag(**{"dag_id": "x"})`` or
     ``@dag(**DAG_KWARGS)``) produces a ``keyword`` entry with ``arg is
     None`` — a search by ``kw.arg == "dag_id"`` never matches it. If no
@@ -286,7 +304,12 @@ def _extract_dag_id_from_decorators(
     def _resolve(value_node: ast.expr) -> str | _DagIdSentinel | None:
         if isinstance(value_node, ast.Name):
             if value_node.id in constants:
-                return constants[value_node.id]
+                # Same falsy rule as the literal branch below — a module
+                # constant IS a str (per _collect_module_constants), so an
+                # empty-string constant must fall back to the function name
+                # too, not be returned verbatim.
+                resolved = constants[value_node.id]
+                return resolved if resolved else None
             return _UNRESOLVED_DAG_ID
         try:
             value = ast.literal_eval(value_node)
@@ -306,6 +329,11 @@ def _extract_dag_id_from_decorators(
         if not isinstance(dec, ast.Call):
             continue
         func = dec.func
+        # Structurally identical to _is_rmq_trigger_call, but kept inline: this
+        # check has exactly one call site (here), unlike _is_rmq_trigger_call
+        # which is shared between _parse_rmq_trigger_decorator and
+        # _extract_subscriptions_from_file — extracting a helper for a single
+        # use site would add indirection without enabling reuse.
         is_dag = (
             (isinstance(func, ast.Name) and func.id == "dag")
             or (isinstance(func, ast.Attribute) and func.attr == "dag")
@@ -318,6 +346,12 @@ def _extract_dag_id_from_decorators(
         if any(isinstance(arg, ast.Starred) for arg in dec.args):
             return _UNRESOLVED_DAG_ID
         if dec.args:
+            # A positional dag_id value AND an explicit dag_id= keyword in
+            # the same call is invalid Python (TypeError: multiple values
+            # for argument 'dag_id') — the DAG would never actually get
+            # created, so neither value can be trusted; see docstring.
+            if any(kw.arg == "dag_id" for kw in dec.keywords):
+                return _UNRESOLVED_DAG_ID
             return _resolve(dec.args[0])
         for kw in dec.keywords:
             if kw.arg != "dag_id":
@@ -416,6 +450,61 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
     except ValueError as exc:
         log.warning("rmq_trigger: skipping invalid subscription for dag_id=%s: %s", dag_id, exc)
         return []
+
+
+def _resolve_function_dag_id(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_constants: dict[str, tuple[str, int]],
+    module_scope_function_ids: set[int],
+    path: str,
+) -> str | None:
+    """Resolve the dag_id to use for one decorated function, or None to skip it.
+
+    Combines three steps that ``_extract_subscriptions_from_file`` previously
+    inlined: (1) scope-eligibility filtering — module-level constants are only
+    handed to functions whose decorators actually execute in module scope
+    (nested functions get an empty map, since a local binding of the same name
+    could shadow the module-level one — see that method's docstring), with a
+    use-before-definition line filter for the eligible case; (2) dag_id
+    resolution via ``_extract_dag_id_from_decorators``'s three-way contract;
+    (3) the warn-if-``@rmq_trigger``-is-present policy for an unresolvable
+    dag_id=.
+
+    Returns ``None`` when this function's subscriptions must not be
+    registered (dag_id unresolvable); otherwise returns the dag_id string to
+    use, already carrying the "no dag_id= at all -> function name" fallback.
+    """
+    if id(node) not in module_scope_function_ids:
+        usable_constants: dict[str, str] = {}  # nested: refuse to resolve
+    else:
+        # Position filter: a constant assigned AFTER this function's own
+        # line must not be used to resolve its dag_id= — real Python
+        # would NameError at import time in that case (use-before-
+        # definition), so statically resolving it would be a false
+        # positive.
+        usable_constants = {
+            name: value
+            for name, (value, lineno) in module_constants.items()
+            if lineno < node.lineno
+        }
+    dag_id = _extract_dag_id_from_decorators(node.decorator_list, usable_constants)
+    if dag_id is _UNRESOLVED_DAG_ID:
+        if any(_is_rmq_trigger_call(d) for d in node.decorator_list):
+            log.warning(
+                "rmq_trigger: cannot statically resolve dag_id for function %r "
+                "in %s — dag_id= is not a string literal or a simple "
+                "module-level string constant defined earlier in the file. "
+                "Subscription NOT registered from dag_file; for queue=/queues= "
+                "subscriptions, create it manually via the RMQ Watcher UI "
+                "(source='ui') instead — the UI form does not support "
+                "exchange=/routing-key subscriptions, so for those dag_id= "
+                "must be made statically resolvable.",
+                node.name, path,
+            )
+        return None
+    if dag_id is None:
+        return node.name
+    return dag_id
 
 
 class RMQWatcherListener:
@@ -659,51 +748,23 @@ class RMQWatcherListener:
             return []
 
         try:
-            module_constants = _collect_module_constants(tree)  # {name: (value, lineno)}
-            # Only functions whose decorators are evaluated in module scope may use
-            # the module-level constant map. A nested function (or a method) can be
-            # shadowed by a local/class-scope binding of the same name, in which case
-            # the module value is simply wrong — see this function's docstring above.
-            module_scope_function_ids = {
-                id(node)
-                for node in _module_scope_nodes(tree)
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            }
+            # module_constants: {name: (value, lineno)}; module_scope_function_ids:
+            # id() of functions whose decorators are evaluated in module scope, so a
+            # nested function (or a method) — which could be shadowed by a
+            # local/class-scope binding of the same name, making the module value
+            # simply wrong — never gets handed the module-level constant map. See
+            # this method's docstring above and _resolve_function_dag_id below.
+            module_constants, module_scope_function_ids = _collect_module_constants(tree)
 
             result: list[dict] = []
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                if id(node) not in module_scope_function_ids:
-                    usable_constants: dict[str, str] = {}  # nested: refuse to resolve
-                else:
-                    # Position filter: a constant assigned AFTER this function's own
-                    # line must not be used to resolve its dag_id= — real Python
-                    # would NameError at import time in that case (use-before-
-                    # definition), so statically resolving it would be a false
-                    # positive.
-                    usable_constants = {
-                        name: value
-                        for name, (value, lineno) in module_constants.items()
-                        if lineno < node.lineno
-                    }
-                dag_id = _extract_dag_id_from_decorators(node.decorator_list, usable_constants)
-                if dag_id is _UNRESOLVED_DAG_ID:
-                    if any(_is_rmq_trigger_call(d) for d in node.decorator_list):
-                        log.warning(
-                            "rmq_trigger: cannot statically resolve dag_id for function %r "
-                            "in %s — dag_id= is not a string literal or a simple "
-                            "module-level string constant defined earlier in the file. "
-                            "Subscription NOT registered from dag_file; for queue=/queues= "
-                            "subscriptions, create it manually via the RMQ Watcher UI "
-                            "(source='ui') instead — the UI form does not support "
-                            "exchange=/routing-key subscriptions, so for those dag_id= "
-                            "must be made statically resolvable.",
-                            node.name, path,
-                        )
-                    continue
+                dag_id = _resolve_function_dag_id(
+                    node, module_constants, module_scope_function_ids, path
+                )
                 if dag_id is None:
-                    dag_id = node.name
+                    continue
                 dag_subs: list[dict] = []
                 for decorator in node.decorator_list:
                     for sub in _parse_rmq_trigger_decorator(decorator, dag_id):
