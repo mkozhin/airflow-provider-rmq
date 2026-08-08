@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import sys
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +11,7 @@ import pytest
 
 from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
+    _collect_module_constants,
     _extract_dag_id_from_decorators,
     _parse_rmq_trigger_decorator,
 )
@@ -34,6 +36,200 @@ def _make_session_ctx(existing_subs=None):
     ctx.__enter__ = MagicMock(return_value=session)
     ctx.__exit__ = MagicMock(return_value=False)
     return ctx, session
+
+
+# ---------------------------------------------------------------------------
+# _collect_module_constants
+# ---------------------------------------------------------------------------
+
+
+def _constants(src: str) -> dict:
+    """Parse a module-level source snippet and return its constant map."""
+    tree = ast.parse(src)
+    return _collect_module_constants(tree)
+
+
+class TestCollectModuleConstantsBaseCases:
+    def test_single_string_constant_resolves_with_correct_lineno(self):
+        result = _constants("DAG_ID = 'my_dag'\n")
+        assert result == {"DAG_ID": ("my_dag", 1)}
+
+    def test_single_string_constant_lineno_matches_assignment_line(self):
+        result = _constants("\n\nDAG_ID = 'my_dag'\n")
+        assert result["DAG_ID"] == ("my_dag", 3)
+
+    def test_annotated_assignment_resolves(self):
+        result = _constants("DAG_ID: str = 'my_dag'\n")
+        assert result == {"DAG_ID": ("my_dag", 1)}
+
+    def test_non_string_constant_ignored(self):
+        result = _constants("DAG_ID = 123\n")
+        assert result == {}
+
+    def test_non_literal_rhs_ignored(self):
+        result = _constants("DAG_ID = some_func()\n")
+        assert result == {}
+
+
+class TestCollectModuleConstantsReassignment:
+    """All of these forms poison the constant → empty map."""
+
+    def test_re_literal_assignment(self):
+        result = _constants("DAG_ID = 'first'\nDAG_ID = 'second'\n")
+        assert result == {}
+
+    def test_aug_assign(self):
+        result = _constants("DAG_ID = 'first'\nDAG_ID += '_daily'\n")
+        assert result == {}
+
+    def test_tuple_unpacking(self):
+        result = _constants("DAG_ID, Q = 'real', 'q'\n")
+        assert result == {}
+
+    def test_chained_assignment(self):
+        result = _constants("DAG_ID = OTHER = 'real'\n")
+        assert result == {}
+
+    def test_re_import(self):
+        result = _constants("DAG_ID = 'real'\nfrom settings import DAG_ID\n")
+        assert result == {}
+
+    def test_import_as(self):
+        result = _constants("DAG_ID = 'real'\nimport x as DAG_ID\n")
+        assert result == {}
+
+    def test_def_with_same_name(self):
+        result = _constants("DAG_ID = 'real'\ndef DAG_ID(): pass\n")
+        assert result == {}
+
+    def test_class_with_same_name(self):
+        result = _constants("DAG_ID = 'real'\nclass DAG_ID: pass\n")
+        assert result == {}
+
+    def test_del(self):
+        result = _constants("DAG_ID = 'real'\ndel DAG_ID\n")
+        assert result == {}
+
+    def test_top_level_for_target(self):
+        result = _constants("DAG_ID = 'real'\nfor DAG_ID in range(3): pass\n")
+        assert result == {}
+
+    def test_with_as(self):
+        result = _constants("DAG_ID = 'real'\nwith open('x') as DAG_ID: pass\n")
+        assert result == {}
+
+    def test_conditional_reassignment_inside_if(self):
+        result = _constants("DAG_ID = 'old'\nif True:\n    DAG_ID = 'new'\n")
+        assert result == {}
+
+
+class TestCollectModuleConstantsExoticBindingForms:
+    """Module-scope binding forms that earlier, less complete enumerations
+    of binding forms missed — all must poison the constant."""
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "DAG_ID = 'real'\ntry:\n    pass\nexcept Exception as DAG_ID:\n    pass\n",
+            "DAG_ID = 'real'\ndef f():\n    global DAG_ID\n    DAG_ID = 'local'\n",
+            "DAG_ID = 'real'\nif (DAG_ID := 'walrus'):\n    pass\n",
+            "DAG_ID = 'real'\nmatch 1:\n    case DAG_ID:\n        pass\n",
+            "DAG_ID = 'real'\nmatch [1, 2]:\n    case [*DAG_ID]:\n        pass\n",
+            "DAG_ID = 'real'\nmatch {'k': 1}:\n    case {'k': _, **DAG_ID}:\n        pass\n",
+            "DAG_ID = 'real'\nif True:\n    for DAG_ID in range(3):\n        pass\n",
+        ],
+        ids=[
+            "except_as",
+            "global_plus_function_assign",
+            "walrus_in_if",
+            "match_as",
+            "match_star",
+            "match_mapping_rest",
+            "nested_for_inside_if",
+        ],
+    )
+    def test_exotic_binding_forms_poison_constant(self, src):
+        assert _constants(src) == {}
+
+
+class TestCollectModuleConstantsWildcardImport:
+    def test_wildcard_import_disables_resolution_entirely(self):
+        result = _constants("DAG_ID = 'local'\nfrom settings import *\n")
+        assert result == {}
+
+
+class TestCollectModuleConstantsWalrusInNestedScope:
+    """Cases that only _outer_parts (traversing the enclosing-scope parts of
+    a scope-boundary node) catches — a naive scope-pruned walk that skipped
+    these entirely would miss the walrus poisoning."""
+
+    def test_walrus_inside_comprehension(self):
+        result = _constants("DAG_ID = 'real'\nxs = [(DAG_ID := i) for i in range(3)]\n")
+        assert result == {}
+
+    def test_walrus_in_parameter_default(self):
+        result = _constants(
+            "DAG_ID = 'real'\ndef g(x=(DAG_ID := 'other')): pass\n"
+        )
+        assert result == {}
+
+    def test_walrus_in_decorator_expression(self):
+        result = _constants(
+            "DAG_ID = 'real'\n@deco(DAG_ID := 'n')\ndef f(): pass\n"
+        )
+        assert result == {}
+
+
+class TestCollectModuleConstantsForeignScopeDoesNotPoison:
+    """Binding a same-named identifier in a FOREIGN (nested) scope must NOT
+    poison the module-level constant — this is the payoff of the
+    scope-aware walk over a scope-blind ast.walk."""
+
+    def test_same_named_function_parameter(self):
+        result = _constants("DAG_NAME = 'real'\ndef process(DAG_NAME): pass\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+    def test_class_body_attribute(self):
+        result = _constants("DAG_NAME = 'real'\nclass C:\n    DAG_NAME = 'b'\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+    def test_local_variable_inside_function(self):
+        result = _constants("DAG_NAME = 'real'\ndef f():\n    DAG_NAME = 'loc'\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+    def test_comprehension_target(self):
+        result = _constants("DAG_NAME = 'real'\nys = [DAG_NAME for DAG_NAME in range(3)]\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+    def test_lambda_parameter(self):
+        result = _constants("DAG_NAME = 'real'\nf = lambda DAG_NAME: DAG_NAME\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+
+class TestCollectModuleConstantsDonstroyRegression:
+    def test_module_constant_used_as_parameter_default_value_resolves(self):
+        # Matches the real donstroy_pipeline_spark_all.py shape: the module
+        # constant is referenced (Name/Load, not a binding) as a parameter
+        # default value elsewhere in the file — it must still resolve.
+        src = (
+            "DAG_NAME = 'donstroy_pipeline_spark_all'\n"
+            "def create_cluster(x, dag_name: str = DAG_NAME): pass\n"
+        )
+        result = _constants(src)
+        assert result == {"DAG_NAME": ("donstroy_pipeline_spark_all", 1)}
+
+
+class TestCollectModuleConstantsPep695:
+    # PEP 695 `type X = ...` binds the alias name via an ordinary ast.Name
+    # in Store context, already covered by the first poison branch — no
+    # separate handling needed. Raw 3.12 syntax cannot appear directly in
+    # this file's body since CI also runs 3.10/3.11 (SyntaxError at parse
+    # time), so the snippet is parsed from a string instead.
+    @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 `type` statement requires 3.12+")
+    def test_pep695_type_alias_with_same_name_poisons_constant(self):
+        src = "DAG_ID = 'real'\ntype DAG_ID = int\n"
+        result = _constants(src)
+        assert result == {}
 
 
 # ---------------------------------------------------------------------------

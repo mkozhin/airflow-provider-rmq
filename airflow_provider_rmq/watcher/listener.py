@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import traceback
+from collections.abc import Iterator
 from typing import Any
 
 from airflow.listeners import hookimpl
@@ -26,6 +27,167 @@ from airflow_provider_rmq.watcher.subscription_builder import (
 log = logging.getLogger(__name__)
 
 _DEFAULT_RECONCILE_INTERVAL = 60
+
+
+# ---------------------------------------------------------------------------
+# Module-level constant collection (for resolving dag_id=NAME references)
+# ---------------------------------------------------------------------------
+
+# Nodes whose body is a separate scope: the node's own name binds in the
+# enclosing scope, but its contents do not affect module scope.
+_SCOPE_BOUNDARIES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Lambda,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
+
+def _outer_parts(node: ast.AST) -> Iterator[ast.AST]:
+    """Sub-expressions of a scope-boundary node that still evaluate in the
+    ENCLOSING scope — decorators, parameter defaults, class bases/keywords,
+    return annotations, and a comprehension's outermost iterable. Everything
+    else inside the boundary belongs to the new scope.
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        yield from node.decorator_list
+        yield from node.args.defaults
+        yield from (d for d in node.args.kw_defaults if d is not None)
+        if node.returns is not None:
+            yield node.returns
+    elif isinstance(node, ast.ClassDef):
+        yield from node.decorator_list
+        yield from node.bases
+        yield from (kw.value for kw in node.keywords)
+    elif isinstance(node, ast.Lambda):
+        yield from node.args.defaults
+        yield from (d for d in node.args.kw_defaults if d is not None)
+    elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        if node.generators:
+            yield node.generators[0].iter   # evaluated in the enclosing scope
+
+
+def _module_scope_nodes(tree: ast.Module) -> Iterator[ast.AST]:
+    """Yield every node that executes in the module's own scope.
+
+    Like ``ast.walk``, but prunes at nested-scope boundaries: a
+    ``FunctionDef``/``ClassDef``/``Lambda``/comprehension node is yielded
+    itself (so the name it binds in the enclosing scope is counted) and its
+    ``_outer_parts`` are still traversed, but its body is not — bindings in
+    there belong to a different scope and must not poison a module-level
+    constant.
+    """
+    stack: list[ast.AST] = list(tree.body)
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, _SCOPE_BOUNDARIES):
+            stack.extend(_outer_parts(node))
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _collect_module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
+    """Collect simple top-level ``NAME = "literal string"`` assignments
+    (plus annotated ``NAME: str = "literal"``), each paired with its line
+    number so callers can enforce "only usable before this point in the
+    file" — see the wiring below.
+
+    A name is kept only if it is bound **exactly once** in the module's own
+    scope, and that one binding is the top-level literal assignment itself.
+    The binding forms counted below are the complete set of ``ast`` fields
+    that can bind a name (derived by introspecting every ``ast.AST``
+    subclass's ``_fields`` for name-bearing entries, not by guessing):
+    ``Name`` in ``Store``/``Del`` (``=``, ``+=``, tuple-unpack, chained
+    assignment, ``for`` targets, ``with ... as``, walrus, ``del``, and the
+    PEP 695 ``type X = ...`` alias name, which is itself a ``Name`` in
+    ``Store``), ``alias`` (imports), ``FunctionDef``/``AsyncFunctionDef``/
+    ``ClassDef`` names, ``ExceptHandler.name``, ``MatchAs``/``MatchStar``
+    names, ``MatchMapping.rest``. ``arg`` (parameters) is deliberately NOT
+    counted — parameters live in the function's own scope, which
+    ``_module_scope_nodes`` already excludes.
+
+    Three cases the scope-pruned walk would otherwise miss are handled
+    explicitly: ``global NAME`` anywhere in the file (a function may rebind a
+    module-level name) and walrus ``:=`` anywhere (PEP 572 binds it in the
+    *enclosing* scope, so one inside a comprehension still hits module level)
+    both always poison; ``from module import *`` disables constant
+    resolution for the whole file — the imported names are
+    statically unknown, so any earlier literal could have been silently
+    replaced.
+
+    Refusing to resolve an ambiguous name is safe (the caller skips
+    registration and logs a WARNING); guessing wrong is not — same principle
+    as ``_UNRESOLVED_DAG_ID`` below.
+    """
+    binding_counts: dict[str, int] = {}
+    has_wildcard_import = False
+
+    def _bump(name: str) -> None:
+        binding_counts[name] = binding_counts.get(name, 0) + 1
+
+    for node in _module_scope_nodes(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            _bump(node.id)
+        elif isinstance(node, ast.alias):
+            if node.name == "*" and node.asname is None:
+                has_wildcard_import = True
+            else:
+                _bump(node.asname or node.name.split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _bump(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            _bump(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            _bump(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            _bump(node.rest)
+
+    # Two forms that a scope-pruned walk cannot see reliably, both scanned
+    # over the WHOLE tree (over-counting here is safe — it only turns a
+    # constant unresolvable):
+    #   * `global NAME` — a function may rebind a module-level name;
+    #   * walrus `:=` — per PEP 572 it binds in the ENCLOSING scope, so a
+    #     walrus inside a comprehension binds at module level even though
+    #     the comprehension body itself is a separate scope.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            for name in node.names:
+                _bump(name)
+        elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+            _bump(node.target.id)
+
+    if has_wildcard_import:
+        return {}
+
+    constants: dict[str, tuple[str, int]] = {}
+    for node in tree.body:  # value extraction: top-level ONLY, unconditional
+        if isinstance(node, ast.Assign):
+            if len(node.targets) != 1:
+                continue
+            target, value_node = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is None:
+                continue
+            target, value_node = node.target, node.value
+        else:
+            continue
+        if not isinstance(target, ast.Name):
+            continue
+        name = target.id
+        if binding_counts.get(name, 0) != 1:
+            continue
+        try:
+            value = ast.literal_eval(value_node)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, str):
+            constants[name] = (value, node.lineno)
+    return constants
 
 
 def _extract_dag_id_from_decorators(decorators: list[ast.expr]) -> str | None:
