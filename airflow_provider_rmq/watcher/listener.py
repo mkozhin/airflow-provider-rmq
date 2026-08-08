@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import enum
 import glob
 import logging
 import os
@@ -190,8 +191,77 @@ def _collect_module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
     return constants
 
 
-def _extract_dag_id_from_decorators(decorators: list[ast.expr]) -> str | None:
-    """Return explicit dag_id from @dag(dag_id='...') or None to fall back to the function name."""
+# Sentinel distinguishing "dag_id= is set but cannot be statically resolved"
+# from "dag_id= was never set at all" (see _extract_dag_id_from_decorators).
+# An enum member (rather than a bare object()) so mypy narrows
+# `str | _DagIdSentinel | None` correctly after `is` comparisons.
+class _DagIdSentinel(enum.Enum):
+    UNRESOLVED = enum.auto()
+
+
+_UNRESOLVED_DAG_ID = _DagIdSentinel.UNRESOLVED
+
+
+def _extract_dag_id_from_decorators(
+    decorators: list[ast.expr], constants: dict[str, str] | None = None
+) -> str | _DagIdSentinel | None:
+    """Resolve the ``dag_id`` a recognized ``@dag(...)`` call among ``decorators`` would produce.
+
+    Three-way return contract:
+
+    - ``str`` — the resolved dag_id, either a string literal (``dag_id='x'``)
+      or a module-level string constant referenced by name and found in
+      ``constants`` (``dag_id=NAME`` with ``constants={"NAME": "x"}``).
+    - ``None`` — a recognized ``@dag(...)`` call was found, and EITHER no
+      ``dag_id=`` keyword was set at all (Airflow's own default behaviour is
+      to fall back to the decorated function's name in this case, so it is
+      safe for the caller to do the same), OR ``dag_id=`` resolved to a
+      falsy value (``""``, ``None``, ``False``, ``0``, and generally
+      anything falsy ``ast.literal_eval`` can produce — this mirrors
+      Airflow's own ``dag_id or f.__name__`` in ``airflow/models/dag.py``).
+      Falling back to the function name is only ever safe for this ``None``
+      case.
+    - ``_UNRESOLVED_DAG_ID`` — ``dag_id=`` is set to something that cannot
+      be statically proven (a non-literal expression whose name is not in
+      ``constants``, or a truthy non-string literal such as ``dag_id=123``),
+      OR no recognized ``@dag(...)`` call exists among ``decorators`` at all
+      (e.g. an aliased import — ``from airflow.decorators import dag as
+      airflow_dag`` — is not matched by the ``is_dag`` predicate below).
+      Guessing the function name here would silently register a
+      subscription under a ``dag_id`` that does not correspond to any real
+      Airflow DAG — the caller must skip registration and log a warning
+      instead (see ``_extract_subscriptions_from_file``).
+
+    **Deliberate falsy asymmetry**: a literal ``@dag(dag_id=None)`` returns
+    ``None`` (falls back to the function name, matching Airflow's own
+    default), but ``DAG_ID = None`` followed by ``dag_id=DAG_ID`` returns
+    ``_UNRESOLVED_DAG_ID`` instead — only ``str`` values are ever collected
+    into ``constants`` by ``_collect_module_constants``, so a module-level
+    ``None``/``False``/``0``/``""`` constant is never present in
+    ``constants`` and its reference is treated the same as any other
+    unresolvable name. This is intentional, not a bug: the direction of the
+    asymmetry is the safe one (it skips + warns rather than silently
+    resolving to a guess).
+
+    No logging happens inside this function — the caller decides whether an
+    ``_UNRESOLVED_DAG_ID`` deserves a WARNING, because only it knows the
+    file path and whether ``@rmq_trigger`` is actually present (an
+    unresolvable ``dag_id=`` on a DAG with no ``@rmq_trigger`` at all is not
+    this plugin's concern and must stay silent).
+
+    ``constants`` is a flat ``dict[str, str]`` of name → value. The caller
+    is responsible for turning ``_collect_module_constants``'s
+    ``dict[str, tuple[str, int]]`` output into this shape — filtering out
+    constants assigned after the decorated function's own line (use-before-
+    definition) and passing an empty dict for nested functions, whose
+    module-level constants may be shadowed by a local binding of the same
+    name (see ``_extract_subscriptions_from_file``).
+
+    Note: only ``dec.keywords`` is examined here — a positional
+    ``@dag("my_id")`` and ``**kwargs``/``*args`` unpacking are handled by
+    later extensions to this function, not by this contract.
+    """
+    constants = constants or {}
     for dec in decorators:
         if not isinstance(dec, ast.Call):
             continue
@@ -203,17 +273,30 @@ def _extract_dag_id_from_decorators(decorators: list[ast.expr]) -> str | None:
         if not is_dag:
             continue
         for kw in dec.keywords:
-            if kw.arg == "dag_id":
-                try:
-                    value = ast.literal_eval(kw.value)
-                    if isinstance(value, str):
-                        return value
-                except (ValueError, TypeError):
-                    log.warning(
-                        "rmq_trigger: dag_id= is not a string literal — falling back to function name"
-                    )
-                break
-    return None
+            if kw.arg != "dag_id":
+                continue
+            value_node = kw.value
+            if isinstance(value_node, ast.Name):
+                if value_node.id in constants:
+                    return constants[value_node.id]
+                return _UNRESOLVED_DAG_ID
+            try:
+                value = ast.literal_eval(value_node)
+            except (ValueError, TypeError):
+                return _UNRESOLVED_DAG_ID
+            # Falsy check comes FIRST — an empty string is falsy too, and per
+            # the falsy asymmetry documented above, ANY falsy literal
+            # (including "") must fall back to the function name, not be
+            # returned verbatim.
+            if not value:
+                return None
+            if isinstance(value, str):
+                return value
+            return _UNRESOLVED_DAG_ID
+        # Recognized @dag(...) call, but no dag_id= keyword at all.
+        return None
+    # No recognized @dag(...) call among decorators.
+    return _UNRESOLVED_DAG_ID
 
 
 _RMQ_TRIGGER_KWARGS = (
@@ -493,8 +576,24 @@ class RMQWatcherListener:
         Scheduler's own import activity, causing heartbeat failures and tasks being
         marked as killed externally.
 
-        dag_id is taken from the explicit dag_id= argument of @dag(...) when it is
-        a string literal; otherwise falls back to the decorated function name.
+        dag_id is resolved from the explicit dag_id= argument of @dag(...) via
+        ``_extract_dag_id_from_decorators``'s three-way contract: a string
+        literal or a simple module-level string constant assigned earlier in
+        the file (``DAG_NAME = 'x'`` then ``dag_id=DAG_NAME``) resolves
+        directly; a recognized ``@dag(...)`` call with no dag_id= at all (or
+        a falsy resolved value) falls back to the decorated function's name,
+        matching Airflow's own default; anything else that cannot be
+        statically proven (a non-literal expression not found among the
+        file's module constants, a truthy non-string literal, or no
+        recognized ``@dag(...)`` call among the decorators at all — e.g. an
+        aliased import) is treated as unresolved: the subscription is
+        **not** registered, and a WARNING is logged if — and only if —
+        ``@rmq_trigger`` is actually present on the same function (an
+        unresolvable dag_id= with no @rmq_trigger is not this plugin's
+        concern and stays silent). Module constants are never handed to a
+        nested function's decorators (a DAG declared inside a factory
+        function): a local binding of the same name could shadow the
+        module-level one, so guessing would be unsafe there too.
 
         Multiple ``@rmq_trigger(exchange=...)`` decorators on the same DAG are
         not supported (see ``subscription_builder.has_exchange_conflict`` /
@@ -525,11 +624,51 @@ class RMQWatcherListener:
             return []
 
         try:
+            module_constants = _collect_module_constants(tree)  # {name: (value, lineno)}
+            # Only functions whose decorators are evaluated in module scope may use
+            # the module-level constant map. A nested function (or a method) can be
+            # shadowed by a local/class-scope binding of the same name, in which case
+            # the module value is simply wrong — see this function's docstring above.
+            module_scope_function_ids = {
+                id(node)
+                for node in _module_scope_nodes(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+
             result: list[dict] = []
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                dag_id = _extract_dag_id_from_decorators(node.decorator_list) or node.name
+                if id(node) not in module_scope_function_ids:
+                    usable_constants: dict[str, str] = {}  # nested: refuse to resolve
+                else:
+                    # Position filter: a constant assigned AFTER this function's own
+                    # line must not be used to resolve its dag_id= — real Python
+                    # would NameError at import time in that case (use-before-
+                    # definition), so statically resolving it would be a false
+                    # positive.
+                    usable_constants = {
+                        name: value
+                        for name, (value, lineno) in module_constants.items()
+                        if lineno < node.lineno
+                    }
+                dag_id = _extract_dag_id_from_decorators(node.decorator_list, usable_constants)
+                if dag_id is _UNRESOLVED_DAG_ID:
+                    if any(_is_rmq_trigger_call(d) for d in node.decorator_list):
+                        log.warning(
+                            "rmq_trigger: cannot statically resolve dag_id for function %r "
+                            "in %s — dag_id= is not a string literal or a simple "
+                            "module-level string constant defined earlier in the file. "
+                            "Subscription NOT registered from dag_file; for queue=/queues= "
+                            "subscriptions, create it manually via the RMQ Watcher UI "
+                            "(source='ui') instead — the UI form does not support "
+                            "exchange=/routing-key subscriptions, so for those dag_id= "
+                            "must be made statically resolvable.",
+                            node.name, path,
+                        )
+                    continue
+                if dag_id is None:
+                    dag_id = node.name
                 dag_subs: list[dict] = []
                 for decorator in node.decorator_list:
                     for sub in _parse_rmq_trigger_decorator(decorator, dag_id):

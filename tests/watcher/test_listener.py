@@ -11,6 +11,7 @@ import pytest
 
 from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
+    _UNRESOLVED_DAG_ID,
     _collect_module_constants,
     _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
@@ -250,25 +251,43 @@ class TestExtractDagId:
         decs = _decorators("@dag(schedule_interval=None)\ndef f(): pass")
         assert _extract_dag_id_from_decorators(decs) is None
 
-    def test_no_dag_decorator_returns_none(self):
+    def test_no_dag_decorator_returns_unresolved(self):
         decs = _decorators("@some_other_decorator\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is None
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
 
-    def test_non_literal_dag_id_returns_none(self):
+    def test_non_literal_dag_id_without_constant_returns_unresolved(self):
         decs = _decorators("@dag(dag_id=VARIABLE)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is None
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
 
-    def test_non_string_literal_dag_id_returns_none(self):
+    def test_non_string_literal_dag_id_returns_unresolved(self):
         decs = _decorators("@dag(dag_id=123)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is None
+        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
 
     def test_async_function_with_explicit_dag_id(self):
         src = "@dag(dag_id='async_dag')\nasync def f(): pass"
         decs = ast.parse(src).body[0].decorator_list
         assert _extract_dag_id_from_decorators(decs) == "async_dag"
 
-    def test_empty_decorator_list_returns_none(self):
-        assert _extract_dag_id_from_decorators([]) is None
+    def test_empty_decorator_list_returns_unresolved(self):
+        assert _extract_dag_id_from_decorators([]) is _UNRESOLVED_DAG_ID
+
+
+class TestExtractDagIdConstants:
+    def test_variable_dag_id_resolved_via_constants(self):
+        decs = _decorators("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs, {"DAG_ID": "real_id"}) == "real_id"
+
+    def test_variable_dag_id_not_in_constants_returns_unresolved(self):
+        decs = _decorators("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs, {"OTHER": "x"}) is _UNRESOLVED_DAG_ID
+
+    @pytest.mark.parametrize(
+        "literal_src",
+        ["''", "None", "False", "0", "0.0", "[]", "{}", "()"],
+    )
+    def test_falsy_literal_dag_id_returns_none(self, literal_src):
+        decs = _decorators(f"@dag(dag_id={literal_src})\ndef f(): pass")
+        assert _extract_dag_id_from_decorators(decs) is None
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +577,11 @@ class TestExtractSubscriptionsFromFile:
         assert len(result) == 1
         assert result[0]["dag_id"] == "my_function"
 
-    def test_fallback_to_function_name_when_dag_id_is_variable(self, tmp_path):
+    def test_dag_id_resolved_from_module_level_constant(self, tmp_path):
+        # Direct regression test for the real donstroy_pipeline_spark_all.py bug:
+        # dag_id= referencing a module-level string constant assigned earlier in
+        # the file must resolve to the constant's value, NOT to the decorated
+        # function's name.
         dag_file = tmp_path / "my_dag.py"
         dag_file.write_text(
             "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
@@ -571,7 +594,7 @@ class TestExtractSubscriptionsFromFile:
         listener = RMQWatcherListener()
         result = listener._extract_subscriptions_from_file(str(dag_file))
         assert len(result) == 1
-        assert result[0]["dag_id"] == "variable_dag"
+        assert result[0]["dag_id"] == "runtime_name"
 
     def test_exchange_subscription_gets_correct_queue_name_and_group_key(self, tmp_path):
         dag_file = tmp_path / "exchange_dag.py"
@@ -654,6 +677,158 @@ class TestExtractSubscriptionsFromFile:
             result = listener._extract_subscriptions_from_file(str(dag_file))
         assert result == []
         assert any(str(dag_file) in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _extract_subscriptions_from_file — unresolved dag_id contract (Task 3)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractSubscriptionsUnresolvedDagId:
+    def test_nested_function_does_not_use_module_constants(self, tmp_path, caplog):
+        # A DAG declared inside a factory function: the local reassignment of
+        # DAG_ID shadows the module-level constant of the same name. Passing
+        # the module-level map to a nested function's decorators would
+        # resolve to the WRONG value ("module-id" instead of "local-id") —
+        # the guard must refuse to resolve at all instead.
+        dag_file = tmp_path / "factory_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "DAG_ID = 'module-id'\n"
+            "\n"
+            "def make_dag():\n"
+            "    DAG_ID = 'local-id'\n"
+            "\n"
+            "    @rmq_trigger(queue='q')\n"
+            "    @dag(dag_id=DAG_ID)\n"
+            "    def data_proc(): pass\n"
+            "\n"
+            "    return data_proc\n"
+            "\n"
+            "built_dag = make_dag()\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert result == []
+        assert any("data_proc" in r.message for r in caplog.records)
+
+    def test_unresolvable_dag_id_with_rmq_trigger_skips_and_warns(self, tmp_path, caplog):
+        dag_file = tmp_path / "unresolvable_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag(dag_id=f'prefix_{1+1}')\n"
+            "def unresolvable_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert result == []
+        assert any(
+            r.levelname == "WARNING"
+            and str(dag_file) in r.message
+            and "unresolvable_dag" in r.message
+            and "UI" in r.message
+            for r in caplog.records
+        )
+
+    def test_unresolvable_dag_id_without_rmq_trigger_stays_silent(self, tmp_path, caplog):
+        dag_file = tmp_path / "no_trigger_dag.py"
+        dag_file.write_text(
+            "from airflow.decorators import dag\n"
+            "@dag(dag_id=f'prefix_{1+1}')\n"
+            "def no_trigger_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert result == []
+        assert not any("no_trigger_dag" in r.message for r in caplog.records)
+
+    def test_use_before_definition_not_visible_to_earlier_function(self, tmp_path, caplog):
+        # DAG_ID is assigned AFTER the decorated function in the file — real
+        # Python would NameError at import time here, so the static resolver
+        # must not treat it as resolvable either.
+        dag_file = tmp_path / "use_before_def.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag(dag_id=DAG_ID)\n"
+            "def early_dag(): pass\n"
+            "DAG_ID = 'too_late'\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert result == []
+        assert any("early_dag" in r.message for r in caplog.records)
+
+    def test_unresolvable_function_does_not_drop_other_subscriptions_in_same_file(
+        self, tmp_path, caplog
+    ):
+        dag_file = tmp_path / "mixed_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "CONST = 'resolved_id'\n"
+            "@rmq_trigger(queue='q1')\n"
+            "@dag(dag_id=CONST)\n"
+            "def resolvable_dag(): pass\n"
+            "\n"
+            "@rmq_trigger(queue='q2')\n"
+            "@dag(dag_id=f'prefix_{1+1}')\n"
+            "def unresolvable_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "resolved_id"
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "unresolvable_dag" in warnings[0].message
+
+    def test_exchange_subscription_with_resolved_constant(self, tmp_path):
+        dag_file = tmp_path / "exchange_const_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "DAG_ID = 'real_id'\n"
+            "@rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'])\n"
+            "@dag(dag_id=DAG_ID)\n"
+            "def some_function(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        sub = result[0]
+        assert sub["dag_id"] == "real_id"
+        assert sub["queue_name"] == "rmq_watcher.sub.real_id"
+
+    def test_aliased_dag_decorator_not_recognized_skips_and_warns(self, tmp_path, caplog):
+        # `dag` imported under an alias is not matched by the `is_dag`
+        # predicate (Name(id="dag")/Attribute(attr="dag") only) — no
+        # recognized @dag(...) call exists among the decorators at all, so
+        # this must yield _UNRESOLVED_DAG_ID (skip + warn), NOT silent
+        # registration under the function name.
+        dag_file = tmp_path / "aliased_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag as airflow_dag\n"
+            "DAG_ID = 'real_id'\n"
+            "@rmq_trigger(queue='q')\n"
+            "@airflow_dag(dag_id=DAG_ID)\n"
+            "def aliased_function(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING):
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert result == []
+        assert any("aliased_function" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
