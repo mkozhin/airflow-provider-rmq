@@ -13,6 +13,7 @@ from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
     _collect_module_constants,
     _extract_dag_id_from_decorators,
+    _is_rmq_trigger_call,
     _parse_rmq_trigger_decorator,
 )
 
@@ -725,6 +726,31 @@ class TestSyncToDb:
 
         # Subscription is still in scan → must NOT be deleted
         delete_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _is_rmq_trigger_call
+# ---------------------------------------------------------------------------
+
+
+def _expr(src: str) -> ast.expr:
+    """Parse a single expression string and return its AST node."""
+    return ast.parse(src, mode="eval").body
+
+
+class TestIsRmqTriggerCall:
+    def test_bare_call_returns_true(self):
+        assert _is_rmq_trigger_call(_expr("rmq_trigger(queue='orders')")) is True
+
+    def test_attribute_access_call_returns_true(self):
+        assert _is_rmq_trigger_call(_expr("decorators.rmq_trigger(queue='orders')")) is True
+
+    def test_unrelated_call_returns_false(self):
+        assert _is_rmq_trigger_call(_expr("some_other_call(queue='orders')")) is False
+
+    def test_non_call_node_returns_false(self):
+        # A bare `@some_name` decorator is an ast.Name, not an ast.Call.
+        assert _is_rmq_trigger_call(_expr("some_name")) is False
 
 
 # ---------------------------------------------------------------------------

@@ -756,9 +756,9 @@ Details одной таблицей, и реализовывать его пол
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] вынести инлайновую проверку `ast.Call` + `Name`/`Attribute` «это вызов `rmq_trigger(...)`?» из `_parse_rmq_trigger_decorator` в `_is_rmq_trigger_call(node: ast.expr) -> bool`; переключить `_parse_rmq_trigger_decorator` на неё — поведение не меняется, это подготовка к Task 3, где хелпер нужен для решения, логировать ли warning
-- [ ] добавить контрактный тест `TestIsRmqTriggerCall` — bare `rmq_trigger(...)`, `decorators.rmq_trigger(...)` (Attribute-доступ), посторонний вызов `some_other_call(...)` → `False`, не-`Call` узел (например голый `@some_name`) → `False`
-- [ ] прогнать `pytest tests/watcher/test_listener.py` — должно проходить перед Task 3
+- [x] вынести инлайновую проверку `ast.Call` + `Name`/`Attribute` «это вызов `rmq_trigger(...)`?» из `_parse_rmq_trigger_decorator` в `_is_rmq_trigger_call(node: ast.expr) -> bool`; переключить `_parse_rmq_trigger_decorator` на неё — поведение не меняется, это подготовка к Task 3, где хелпер нужен для решения, логировать ли warning
+- [x] добавить контрактный тест `TestIsRmqTriggerCall` — bare `rmq_trigger(...)`, `decorators.rmq_trigger(...)` (Attribute-доступ), посторонний вызов `some_other_call(...)` → `False`, не-`Call` узел (например голый `@some_name`) → `False`
+- [x] прогнать `pytest tests/watcher/test_listener.py` — должно проходить перед Task 3
 
 ### Task 3: Сентинел + трёхвариантный контракт + приведение вызывающего кода (feature работает end-to-end)
 

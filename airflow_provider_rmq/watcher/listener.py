@@ -229,6 +229,23 @@ _RMQ_TRIGGER_KWARGS = (
 )
 
 
+def _is_rmq_trigger_call(node: ast.expr) -> bool:
+    """Return True if node is a call to rmq_trigger(...).
+
+    Handles both bare name ``rmq_trigger(...)`` and attribute access
+    ``decorators.rmq_trigger(...)``. Extracted from ``_parse_rmq_trigger_decorator``
+    so callers elsewhere (e.g. deciding whether an unresolvable dag_id= deserves a
+    warning) can reuse the same check without re-implementing it.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        (isinstance(func, ast.Name) and func.id == "rmq_trigger")
+        or (isinstance(func, ast.Attribute) and func.attr == "rmq_trigger")
+    )
+
+
 def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
     """Return list of subscription dicts if node is an rmq_trigger(...) call, else [].
 
@@ -254,14 +271,7 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
     ``group_key`` is NOT set here — it is set in _extract_subscriptions_from_file
     where dag_id is known.
     """
-    if not isinstance(node, ast.Call):
-        return []
-    func = node.func
-    is_rmq = (
-        (isinstance(func, ast.Name) and func.id == "rmq_trigger")
-        or (isinstance(func, ast.Attribute) and func.attr == "rmq_trigger")
-    )
-    if not is_rmq:
+    if not isinstance(node, ast.Call) or not _is_rmq_trigger_call(node):
         return []
 
     kwargs: dict = {}
