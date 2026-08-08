@@ -156,6 +156,16 @@ def rmq_trigger(
     ``@rmq_trigger`` decorate a plain function instead of a DAG/factory,
     which raises ``TypeError`` at decoration time with a hint about the
     correct order.
+
+    **``dag_id`` must be statically resolvable.** The Scheduler's AST scan
+    (which finds ``@rmq_trigger`` without executing the file) only resolves
+    ``dag_id`` in ``@dag(...)`` — positional or keyword — when it is a string
+    literal, or a simple module-level string constant assigned earlier in the
+    file than this function. Anything else (an imported constant, an f-string,
+    concatenation, a function call, ``**kwargs`` unpacking) is not resolved:
+    the subscription is skipped entirely (it will not appear on the
+    Subscriptions page), and a WARNING is logged the next time the file is
+    re-scanned.
     """
 
     def _attach(dag_obj):

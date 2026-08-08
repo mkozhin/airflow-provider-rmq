@@ -64,11 +64,20 @@ and ``jetstat.airflow.unrouted``::
 
 Gotcha: literal arguments only
 -------------------------------
-``@rmq_trigger(...)`` is re-parsed from the DAG file's source via ``ast`` on
-every reconcile cycle — only literal values are recognised. Referencing a
-module-level variable (e.g. a ``REPORT_ID`` constant) for ``routing_key_ids``
-is silently ignored and the subscription is skipped. Write the report id
-directly as a string literal in the decorator call, as below.
+``@rmq_trigger(...)`` is re-parsed from the DAG file's source via ``ast``
+whenever the reconcile loop re-scans the file (mtime-gated — unchanged
+files are not re-parsed on every cycle, only when their mtime changes) —
+only literal values are recognised. Referencing a module-level variable
+(e.g. a ``REPORT_ID`` constant) for ``routing_key_ids`` is silently ignored
+and the subscription is skipped. Write the report id directly as a string
+literal in the decorator call, as below.
+
+Note this literal-only restriction applies to the arguments of
+``@rmq_trigger(...)`` itself, not to ``dag_id`` in ``@dag(...)``: ``dag_id``
+now also resolves simple module-level string constants (e.g.
+``DAG_NAME = "x"`` then ``dag_id=DAG_NAME``), not just string literals —
+see "How it works" in the README. ``_parse_rmq_trigger_decorator``'s
+behavior for ``@rmq_trigger(...)``'s own arguments is unchanged.
 """
 from __future__ import annotations
 

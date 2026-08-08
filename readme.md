@@ -536,6 +536,8 @@ The Scheduler process runs a background asyncio loop (via Airflow Listener API) 
 
 Every 60 seconds (configurable via Airflow Variable `rmq_watcher_reconcile_interval`) a reconciliation loop re-scans DAG files for `@rmq_trigger` decorators (mtime-based — only changed files are re-parsed) and syncs subscriptions to the database.
 
+`dag_id` in `@dag(...)` (positional or keyword) must be a string literal, or a simple module-level string constant defined earlier in the file than the decorated function, for the AST scan of `dag_file` subscriptions to find it. If it isn't, the subscription simply does not appear on the Subscriptions page at all — not flagged with a badge, completely absent. The only signal is a WARNING in the Scheduler log, and only after a restart or when the file's mtime changes (not on every reconcile cycle — only when the file is actually re-scanned).
+
 ### Quick Start
 
 **Step 1 — annotate your DAG:**

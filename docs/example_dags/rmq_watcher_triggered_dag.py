@@ -12,7 +12,8 @@ How it works
    background asyncio loop (``RMQConsumerManager``) that opens one
    ``connect_robust`` connection per ``conn_id``.
 3. Every 60 s (configurable via Airflow Variable ``rmq_watcher_reconcile_interval``)
-   the reconciliation loop re-reads DAG files and syncs subscriptions to DB.
+   the reconciliation loop re-scans DAG files (mtime-based — only changed
+   files are re-parsed) and syncs subscriptions to DB.
 4. When a matching message arrives the background loop calls ``trigger_dag()``
    directly (no HTTP roundtrip) and acks the message.
 
