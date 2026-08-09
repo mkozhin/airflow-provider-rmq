@@ -194,8 +194,16 @@ def get_active_dag_ids(session: Session) -> set[str]:
     }
 ```
 
-Ленивый импорт `airflow.models`, по той же конвенции, что уже используют
-`_make_session_factory`/`ensure_table_exists` в этом же файле.
+Ленивый импорт `airflow.models` — см. оговорку в Контексте про то, что́ это
+на самом деле даёт (и чего не даёт).
+
+**Тянуть все активные `dag_id`, а не `IN (...)` по строкам страницы — осознанно.**
+На крупном инстансе это тысячи строк ради таблицы с десятком записей, и
+`.filter(DagModel.dag_id.in_(dag_ids))` был бы не сложнее. Выбран простой
+вариант: страница админская и открывается редко, а множество целиком
+делает хелпер переиспользуемым и не завязанным на то, какие строки сейчас
+показывает вью. Если страница когда-нибудь станет горячей — это первое
+место для сужения запроса.
 
 ### `views.py` + шаблон
 
@@ -287,7 +295,7 @@ dag_session:` с исключением) никак не может истечь
 который решит проверить «а правда ли упадёт?», код покажет отсутствие
 краха, и `is defined` будет выглядеть лишним — а его удаление даст ложные
 бейджи на всех подписках. Регрессионный тест на это — последний чекбокс
-Task 3 («контекст без ключа → без бейджа и без исключения»).
+Task 2 («контекст без ключа → без бейджа и без исключения»).
 
 **Что НЕ должно быть в tooltip.** Соблазнительно посоветовать «проверьте,
 что `dag_id=` в `@dag(...)` статически резолвится» — но это заведомо
@@ -341,36 +349,30 @@ paused DAG всё ещё существует и является другим, 
 - Create: `docs/adr/0006-badge-dag-lookup-not-unified-with-sync-trigger.md`
 
 - [ ] добавить `get_active_dag_ids(session: Session) -> set[str]` по спеке из Technical Details — ленивый импорт `from airflow.models import DagModel` внутри функции, `filter(DagModel.is_active.is_(True))`
-- [ ] **зафиксировать в ADR, почему фильтр намеренно НЕ совпадает с `consumer.py::_sync_trigger`** (`is_active` только, против `is_active=True, is_paused=False` там). Сейчас это обоснование живёт лишь в Technical Details этого плана, а Task 5 унесёт файл в `docs/plans/completed/` — через полгода расхождение будет выглядеть недосмотром, а тест на paused DAG — произвольным. В репозитории уже есть ровно такая конвенция: `docs/adr/0001..0005` — короткие ADR в стиле «…не унифицировать», и расхождение consumer/UI по `is_paused` имеет ровно ту же форму. Завести `docs/adr/0006-*.md` **на русском — как все существующие ADR `0001`-`0005`** (проверено: их содержимое русскоязычное; заголовок файла-slug — латиницей, как у остальных) + двухстрочный комментарий в самой `get_active_dag_ids` со ссылкой на тест `test_..._paused_dag_is_included`
+- [ ] **завести `docs/adr/0006-*.md`: почему фильтр намеренно НЕ совпадает с `consumer.py::_sync_trigger`** (`is_active` только, против `is_active=True, is_paused=False` там). Иначе обоснование живёт лишь в Technical Details этого плана, а Task 5 унесёт файл в `docs/plans/completed/` — через полгода расхождение будет выглядеть недосмотром, а тест на paused DAG — произвольным. В репозитории уже есть ровно такая конвенция: `docs/adr/0001..0005` — короткие ADR в стиле «…не унифицировать», и расхождение consumer/UI по `is_paused` имеет ровно ту же форму. Писать **на русском — как все существующие ADR** (проверено: их содержимое русскоязычное; slug имени файла — латиницей, как у остальных)
+- [ ] добавить двухстрочный комментарий в самой `get_active_dag_ids` — что `is_paused` не фильтруется намеренно, со ссылкой на ADR 0006 и на тест `test_..._paused_dag_is_included` по имени
 - [ ] существующая фикстура `session` в `test_models.py` создаёт только таблицы `WatcherBase.metadata` — она **не знает** про `DagModel` (отдельный, принадлежащий Airflow declarative base). Добавить в том же файле отдельную фикстуру `session_with_dagmodel`, построенную так же, как `session` (in-memory SQLite, function-scoped, дропается в teardown), но дополнительно выполняющую `DagModel.__table__.create(engine, checkfirst=True)` на том же движке перед тем как отдать session. Teardown зеркалит существующую фикстуру (`WatcherBase.metadata.drop_all`) — отдельно дропать таблицу `dag` не нужно и не следует: движок in-memory и создаётся заново на каждый тест
-- [ ] импортировать `DagModel` **внутри** тела фикстуры/тестов, а не на уровне модуля — но по честной причине, а не по расхожей. **Неверно** было бы обосновывать это тем, что «`test_models.py` сегодня не тянет Airflow»: он импортирует `models.py`, который на уровне модуля вызывает `_make_session_factory()`, так что `airflow`, `airflow.settings` и `airflow.models` уже загружены (проверено, см. Контекст). Реальные причины две: (а) консистентность со стилем самого `models.py`, где импорты Airflow стоят внутри функций; (б) независимость от транзитивной загрузки `airflow.models` — она перестанет быть гарантией, когда Task 5 reliability-плана сделает `WatcherSession` по-настоящему ленивой
+- [ ] импортировать `DagModel` **внутри** тела фикстуры/тестов, а не на уровне модуля — но по честной причине, а не по расхожей. **Неверно** было бы обосновывать это тем, что «`test_models.py` сегодня не тянет Airflow»: он импортирует `models.py`, который на уровне модуля вызывает `_make_session_factory()`, так что `airflow`, `airflow.settings` и `airflow.models` уже загружены (проверено, см. Контекст). Причина ровно одна: независимость от транзитивной загрузки `airflow.models` — она перестанет быть гарантией, когда Task 5 reliability-плана сделает `WatcherSession` по-настоящему ленивой. (Ссылаться на «конвенцию проекта» здесь тоже нельзя: единственное существующее использование `DagModel` в кодовой базе — `consumer.py:14` — импортирует его как раз на уровне модуля.)
 - [ ] добавить тесты в `TestGetActiveDagIds` (реальная БД, без моков — по конвенции всех остальных тестов хелперов в этом файле): возвращаются только строки с `is_active=True`; строки с `is_active=False` исключаются; пустая таблица возвращает `set()`; **`DagModel(is_active=True, is_paused=True)` — включается в результат** (закрепляет тестом осознанное решение из Technical Details не фильтровать по `is_paused`, а не только держать его в комментарии — без этого теста будущая правка может незаметно добавить `is_paused=False` и тихо изменить задокументированную семантику)
 - [ ] прогнать `pytest tests/watcher/test_models.py` — должно проходить перед Task 2
 
-### Task 2: Встраивание `active_dag_ids` в view Subscriptions
-
-**Files:**
-- Modify: `airflow_provider_rmq/watcher/views.py`
-- Modify: `tests/watcher/test_views.py`
-
-- [ ] импортировать `get_active_dag_ids` в `views.py` рядом с существующим импортом `get_conn_statuses`
-- [ ] в `RMQWatcherView.subscriptions()` **после** того, как основной `with WatcherSession() as session: ...` блок (с `subs`/`conn_statuses`) уже закрылся, открыть **отдельный** `with WatcherSession() as dag_session:` и вызвать в нём `get_active_dag_ids(dag_session)`, обернув весь этот блок в `try/except Exception` по спеке из Technical Details (`active_dag_ids = None` + `log.warning(..., exc_info=True)` при сбое — **без** `session.rollback()`, он не нужен и не должен вызываться ни на одной из сессий: при отдельной сессии откатывать нечего, а `rollback()` на основной истёк бы уже загруженные `subs` и дал `DetachedInstanceError` в шаблоне — см. Technical Details, там же зафиксирована отвергнутая альтернатива «lookup первым в общей сессии»), и передать `active_dag_ids` в `self.render_template(...)` (метод самого FAB-вью, а не свободная функция Flask `render_template` — в тестах он мокается как `view.render_template`, импортировать в `views.py` из Flask ничего для этого не нужно)
-- [ ] **обновить три существующих теста `TestSubscriptionsList`** (`test_subscriptions_list_returns_200`, `test_subscriptions_list_shows_conn_status`, `test_subscriptions_list_shows_consumer_status_badge`), добавив им `patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set())` — эмпирически проверено: без патча `active_dag_ids` посчитается по-настоящему, но не упадёт (`session` там `MagicMock`, а `MagicMock` сама авто-конфигурирует `__iter__` и без явной настройки `filter(...).all()` детерминированно отдаёт пустую последовательность). Патч нужен не чтобы избежать падения, а чтобы тесты не опирались на эту случайность: она держится на текущей реализации `_session_ctx()` и молча исчезнет при её изменении
-- [ ] добавить тест `test_subscriptions_list_passes_active_dag_ids` — замокать `get_active_dag_ids` так, чтобы вернуть множество, не содержащее `dag_id` какого-то subscription, проверить что `render_template` получает `active_dag_ids` соответствующим образом (имя теста намеренно не «shows_badge» — фактическое появление бейджа в HTML проверяется отдельно, в Task 3; этот тест — только про то, что view прокидывает `active_dag_ids` в kwargs)
-- [ ] добавить тест `test_subscriptions_list_active_dag_ids_none_on_lookup_failure` — замокать `get_active_dag_ids` так, чтобы бросала исключение, проверить (через `caplog`), что `subscriptions()` всё равно рендерится (исключение не пробрасывается), `render_template` получает `active_dag_ids=None`, и что `log.warning(..., exc_info=True)` реально был вызван — иначе сам сбой диагностики останется незамеченным
-- [ ] **⚠ отдельный тест на саму изоляцию сессий — без него центральная гарантия плана не закреплена ничем.** Тест выше (с замоканным `render_template`) её НЕ доказывает: реализация «одна общая сессия + `rollback()` на сбое» пройдёт его точно так же, а в проде даст `DetachedInstanceError` — ровно тот дефект, ради которого вводится отдельная сессия. Завести `test_subscriptions_list_dag_lookup_uses_separate_session`: сконфигурировать `WatcherSession` через `side_effect` так, чтобы он отдавал **два разных** context manager'а, и проверить, что (а) `get_active_dag_ids` получил не тот же объект session, из которого читались `subs`/`conn_statuses`, и (б) на первой (основной) session `rollback()` не вызывался ни разу
-- [ ] **regression-тест на реальных объектах** (мок-тесты выше по построению не могут его заменить): реальные `RMQSubscription` из in-memory SQLite, реальный рендеринг шаблона (харнесс из Task 3) — убедиться, что после сбоя `get_active_dag_ids` шаблон успешно читает `item.dag_id`, а не падает с `DetachedInstanceError`. Это единственный тест, который отличает корректную изоляцию от её имитации
-- [ ] прогнать `pytest tests/watcher/test_views.py` — должно проходить перед Task 3
-
-### Task 3: Бейдж `⚠ dag not found` в шаблоне + тест реального рендеринга
+### Task 2: Бейдж `⚠ dag not found` в шаблоне + харнесс реального рендеринга
 
 **Files:**
 - Modify: `airflow_provider_rmq/watcher/templates/rmq_watcher/subscriptions.html`
 - Modify: `tests/watcher/test_views.py`
 
+**Почему шаблон раньше проводки во вью.** Порядок намеренный: харнесс
+рендеринга, который строится здесь, нужен regression-тесту из Task 3 (сбой
+lookup'а на реальных ORM-объектах). Обратный порядок делал бы Task 3
+недоводимой до конца без захода в Task 2. Катить шаблон первым безопасно —
+пока `active_dag_ids` не попадает в контекст, guard `is defined` не рендерит
+ничего (проверено: 0 бейджей).
+
 - [ ] в `subscriptions.html` добавить бейдж `⚠ dag not found` сразу после `{{ item.dag_id }}` в **обеих** ветках (grouped-строка и single-строка), с условием `{% if active_dag_ids is defined and active_dag_ids is not none and item.dag_id not in active_dag_ids %}` — именно с `is defined and`, а не только `is not none`. **Не «иначе упадёт»** (проверено на jinja2 3.1.6: не падает, см. Technical Details): без `is defined` отсутствие `active_dag_ids` в контексте даёт `Undefined is not none` → `True` и `item.dag_id not in Undefined` → `True` (членство в пустом итераторе), то есть бейдж тихо появляется на **каждой** строке. Guard защищает от ложного срабатывания, а не от исключения — не удалять его «как ненужный», убедившись что краха нет
 - [ ] настроить `TestSubscriptionsTemplateRendering` — окружение `jinja2.Environment` напрямую (без полного контекста Flask-AppBuilder), `loader = ChoiceLoader([FileSystemLoader(".../watcher/templates"), DictLoader({"rmq_watcher/base.html": "{% block content %}{% endblock %}"})])` (`{% extends base_template %}` резолвит имя через loader, одного `FileSystemLoader` недостаточно), заглушки в `env.globals` под реальные сигнатуры вызовов из шаблона: `get_flashed_messages` → `lambda **kw: []`, `url_for` → `lambda *a, **kw: "#"`, `csrf_token` → `lambda: "test-token"` (фильтр `| tojson` — встроенный в Jinja2, регистрации не требует)
-- [ ] **⚠ в каждом вызове `render(...)` обязательно передавать `base_template="rmq_watcher/base.html"`** (значение должно совпадать с ключом `DictLoader` выше). Первая строка шаблона — `{% extends base_template %}`, где `base_template` не имя файла, а **контекстная переменная** (её в реальном рантайме подставляет Flask-AppBuilder). Без неё `render(...)` падает с `UndefinedError: 'base_template' is undefined` ещё до того, как что-либо отрендерится — то есть без этого пункта весь харнесс Task 3 не работает, а не просто отдаёт неверный HTML
+- [ ] **⚠ в каждом вызове `render(...)` обязательно передавать `base_template="rmq_watcher/base.html"`** (значение должно совпадать с ключом `DictLoader` выше). Первая строка шаблона — `{% extends base_template %}`, где `base_template` не имя файла, а **контекстная переменная** (её в реальном рантайме подставляет Flask-AppBuilder). Без неё `render(...)` падает с `UndefinedError: 'base_template' is undefined` ещё до того, как что-либо отрендерится — то есть без этого пункта весь харнесс не работает, а не просто отдаёт неверный HTML
+- [ ] **вынести харнесс в переиспользуемую фикстуру** (например `rendered_subscriptions_html(rows, **ctx)`), а не прятать внутри тела одного теста — им пользуется и regression-тест из Task 3
 - [ ] в этом же классе завести настоящие (не `MagicMock`) фикстуры строк — существующий `_make_sub()` возвращает `MagicMock()`, у которого `item.is_group` авто-создаётся truthy, из-за чего в шаблоне `{% if item.is_group is defined and item.is_group %}` любая строка попадала бы в grouped-ветку: grouped-строка — реальный `SubscriptionGroup(...)` из `views.py`; single-строка — объект без атрибута `is_group` вовсе (реальный `RMQSubscription(...)` или `types.SimpleNamespace`)
 - [ ] **⚠ проверять разметку бейджа, а не голую подстроку.** Ассерт вида `"dag not found" in html` пройдёт и тогда, когда текст остался только внутри атрибута `title`, и тогда, когда потерян класс `label label-warning` — то есть визуальная регрессия основного результата плана проскочит незамеченной. Проверять и наличие `<span class="label label-warning">`, и видимый текст `⚠ dag not found` внутри него (устойчиво к переносам/пробелам — через нормализацию пробелов либо HTML-парсер)
 - [ ] тест: неизвестный `dag_id` в grouped-строке → бейдж присутствует в HTML (по критерию выше)
@@ -378,13 +380,31 @@ paused DAG всё ещё существует и является другим, 
 - [ ] тест: известный `dag_id` → бейдж отсутствует
 - [ ] тест: `active_dag_ids=None` → отсутствует для всех строк
 - [ ] тест: контекст рендера вовсе без ключа `active_dag_ids` → рендерится без исключения и без бейджа (проверяет `is defined`)
+- [ ] прогнать `pytest tests/watcher/test_views.py` — должно проходить перед Task 3
+
+### Task 3: Встраивание `active_dag_ids` в view Subscriptions
+
+**Files:**
+- Modify: `airflow_provider_rmq/watcher/views.py`
+- Modify: `tests/watcher/test_views.py`
+
+- [ ] импортировать `get_active_dag_ids` в `views.py` рядом с существующим импортом `get_conn_statuses`
+- [ ] в `RMQWatcherView.subscriptions()` **после** того, как основной `with WatcherSession() as session: ...` блок (с `subs`/`conn_statuses`) уже закрылся, открыть **отдельный** `with WatcherSession() as dag_session:` и вызвать в нём `get_active_dag_ids(dag_session)`
+- [ ] обернуть этот блок в `try/except Exception`: `active_dag_ids = None` + `log.warning(..., exc_info=True)` при сбое, **без** `session.rollback()` — при отдельной сессии откатывать нечего, а `rollback()` на основной истёк бы уже загруженные `subs` и дал `DetachedInstanceError` в шаблоне
+- [ ] передать `active_dag_ids` в `self.render_template(...)` — это метод самого FAB-вью, а не свободная функция Flask `render_template` (в тестах он мокается как `view.render_template`; импортировать в `views.py` из Flask ничего не нужно)
+- [ ] **⚠ закрепить решение об отдельной сессии комментарием в самом `views.py`** (2-3 строки над вторым `with`): почему сессия отдельная и почему `rollback()` вызывать нельзя, со ссылкой на тест изоляции по имени. Без этого обоснование живёт только в этом плане, который Task 5 унесёт в `docs/plans/completed/` — а слияние двух `with`-блоков выглядит как очевидная уборка и будет однажды сделано. Та же логика, по которой Task 1 требует ADR для `is_paused`
+- [ ] **обновить три существующих теста `TestSubscriptionsList`** (`test_subscriptions_list_returns_200`, `test_subscriptions_list_shows_conn_status`, `test_subscriptions_list_shows_consumer_status_badge`), добавив им `patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set())` — эмпирически проверено: без патча `active_dag_ids` посчитается по-настоящему, но не упадёт (`session` там `MagicMock`, а `MagicMock` сама авто-конфигурирует `__iter__` и без явной настройки `filter(...).all()` детерминированно отдаёт пустую последовательность). Патч нужен не чтобы избежать падения, а чтобы тесты не опирались на эту случайность: она держится на текущей реализации `_session_ctx()` и молча исчезнет при её изменении
+- [ ] добавить тест `test_subscriptions_list_passes_active_dag_ids` — замокать `get_active_dag_ids` так, чтобы вернуть множество, не содержащее `dag_id` какого-то subscription, проверить что `render_template` получает `active_dag_ids` соответствующим образом (имя теста намеренно не «shows_badge» — фактическое появление бейджа в HTML уже проверено в Task 2; этот тест — только про то, что view прокидывает `active_dag_ids` в kwargs)
+- [ ] добавить тест `test_subscriptions_list_active_dag_ids_none_on_lookup_failure` — замокать `get_active_dag_ids` так, чтобы бросала исключение, проверить (через `caplog`), что `subscriptions()` всё равно рендерится (исключение не пробрасывается), `render_template` получает `active_dag_ids=None`, и что `log.warning(..., exc_info=True)` реально был вызван — иначе сам сбой диагностики останется незамеченным
+- [ ] **⚠ отдельный тест на саму изоляцию сессий — без него центральная гарантия плана не закреплена ничем.** Тест выше (с замоканным `render_template`) её НЕ доказывает: реализация «одна общая сессия + `rollback()` на сбое» пройдёт его точно так же, а в проде даст `DetachedInstanceError`. Завести `test_subscriptions_list_dag_lookup_uses_separate_session`: замокать `WatcherSession` с `side_effect`-**вызываемым** (не списком `[ctx1, ctx2]` — тот бросит `StopIteration`, если вью когда-нибудь откроет сессию третий раз), который отдаёт свежий context manager на каждый вызов; проверить, что (а) `__enter__`-результаты двух вызовов — разные объекты и `get_active_dag_ids` получил не ту сессию, из которой читались `subs`, и (б) на основной session `rollback()` не вызывался ни разу
+- [ ] **regression-тест на реальных объектах** (мок-тесты выше по построению не могут его заменить): реальные `RMQSubscription` из in-memory SQLite + харнесс рендеринга из Task 2 — убедиться, что после сбоя `get_active_dag_ids` шаблон успешно читает `item.dag_id`, а не падает с `DetachedInstanceError`. Это единственный тест, который отличает корректную изоляцию от её имитации
 - [ ] прогнать `pytest tests/watcher/test_views.py` — должно проходить перед Task 4
 
 ### Task 4: Проверка критериев приёмки
 
 - [ ] **проверить на уровне исходной задачи, а не пересказом тестов**: подписка, созданная через UI с опечаткой в `dag_id`, и `dag_file`-подписка на переименованный/удалённый DAG обе получают бейдж; при этом grouped-строка бейджится по `dag_id` группы, а single-строка — по своему собственному. Это единственный критерий здесь, сформулированный в терминах проблемы из Обзора — остальные три пересказывают уже написанные тесты
-- [ ] проверить: сбой `get_active_dag_ids` отключает бейдж, а не бросает исключение (тест из Task 2)
-- [ ] проверить: бейдж появляется в HTML в обеих ветках шаблона для неизвестного `dag_id`, и отсутствует для известного (тесты из Task 3)
+- [ ] проверить: сбой `get_active_dag_ids` отключает бейдж, а не бросает исключение (тесты из Task 3)
+- [ ] проверить: бейдж появляется в HTML в обеих ветках шаблона для неизвестного `dag_id`, и отсутствует для известного (тесты из Task 2)
 - [ ] прогнать полный набор: `pytest tests/` (совпадает с вызовом в CI, `.github/workflows/publish.yml`)
 
 ### Task 5: [Final] Обновление документации
