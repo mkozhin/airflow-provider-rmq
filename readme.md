@@ -536,7 +536,7 @@ The Scheduler process runs a background asyncio loop (via Airflow Listener API) 
 
 Every 60 seconds (configurable via Airflow Variable `rmq_watcher_reconcile_interval`) a reconciliation loop re-scans DAG files for `@rmq_trigger` decorators (mtime-based — only changed files are re-parsed) and syncs subscriptions to the database.
 
-`dag_id` in `@dag(...)` (positional or keyword) must be a string literal, or a simple module-level string constant defined earlier in the file than the decorated function, for the AST scan of `dag_file` subscriptions to find it. If it isn't, the subscription simply does not appear on the Subscriptions page at all — not flagged with a badge, completely absent. The only signal is a WARNING in the Scheduler log, and only after a restart or when the file's mtime changes (not on every reconcile cycle — only when the file is actually re-scanned).
+`dag_id` in `@dag(...)` (positional or keyword) must be a string literal, or a simple module-level string constant defined earlier in the file than the decorated function, for the AST scan of `dag_file` subscriptions to find it. If it isn't, the subscription simply does not appear on the Subscriptions page at all. This is the one case the `⚠ dag not found` badge (see [Subscription Management](#subscription-management)) cannot catch: there's no row to highlight, since the subscription never registers in the first place. The only signal is a WARNING in the Scheduler log, and only after a restart or when the file's mtime changes (not on every reconcile cycle — only when the file is actually re-scanned).
 
 ### Quick Start
 
@@ -727,6 +727,8 @@ conf = context["dag_run"].conf
 `dag_file` subscriptions are **read-only** in the UI — reconciliation overwrites DB from code every 60 s. Only the `enabled` toggle can be changed via UI for code-managed subscriptions.
 
 Exchange-mode subscriptions show up in the UI like any other `dag_file` subscription — by their queue name (`rmq_watcher.sub.{dag_id}`) only. The `exchange`/`routing_keys` metadata is not displayed there; the DAG source file is the single source of truth for that.
+
+Any subscription whose `dag_id` doesn't correspond to an active Airflow DAG is marked on the page with a `⚠ dag not found` badge. This is a **one-sided** signal: its presence means a real problem — a matching message will be ACKed without triggering anything — but its **absence guarantees nothing**. Three reasons the badge can miss a broken subscription: `is_paused` is not checked, so a paused DAG never gets the badge even though a matching message is still ACKed without triggering a run, exactly like a missing DAG (see [ADR 0006](docs/adr/0006-badge-dag-lookup-not-unified-with-sync-trigger.md)); a just-added DAG may be badged for a short while until the Scheduler parses it; and a just-deleted or renamed DAG conversely stays un-badged for a while until `DagModel.is_active` catches up. The last two are expected lag, not bugs.
 
 ### Best Practices
 
