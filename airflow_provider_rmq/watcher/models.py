@@ -161,3 +161,16 @@ def upsert_conn_status(
 def get_conn_statuses(session: Session) -> list[RMQConnStatus]:
     """Return all connection status rows."""
     return session.query(RMQConnStatus).all()
+
+
+def get_active_dag_ids(session: Session) -> set[str]:
+    """Return dag_ids of all Airflow DAGs currently known to be active."""
+    from airflow.models import DagModel
+    # is_paused is intentionally NOT filtered here — see ADR 0006. A paused
+    # DAG intentionally appears in the result.
+    return {
+        row[0]
+        for row in session.query(DagModel.dag_id)
+        .filter(DagModel.is_active.is_(True))
+        .all()
+    }
