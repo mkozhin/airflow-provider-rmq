@@ -7,6 +7,7 @@ a logged-in user or a full Airflow web-app context.
 from __future__ import annotations
 
 import importlib
+import logging
 import re
 import sys
 from pathlib import Path
@@ -16,6 +17,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from flask import Flask
 from jinja2 import ChoiceLoader, DictLoader, Environment, FileSystemLoader
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from airflow_provider_rmq.watcher.models import RMQSubscription, WatcherBase
 
 # ---------------------------------------------------------------------------
 # Patch has_access → identity before loading views, so the class is built
@@ -117,7 +122,8 @@ class TestSubscriptionsList:
         ctx, _ = _session_ctx()
         with app.test_request_context("/subscriptions"), \
              patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
-             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[]):
+             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[]), \
+             patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
             result = view.subscriptions()
 
         assert result == "<html>mocked</html>"
@@ -131,7 +137,8 @@ class TestSubscriptionsList:
         ctx, _ = _session_ctx()
         with app.test_request_context("/subscriptions"), \
              patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
-             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[cs]):
+             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[cs]), \
+             patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
             view.subscriptions()
 
         kwargs = view.render_template.call_args.kwargs
@@ -143,11 +150,85 @@ class TestSubscriptionsList:
         ctx, _ = _session_ctx(subs=[sub])
         with app.test_request_context("/subscriptions"), \
              patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
-             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[]):
+             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[]), \
+             patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
             view.subscriptions()
 
         kwargs = view.render_template.call_args.kwargs
         assert sub in kwargs["subscriptions"]
+
+    def test_subscriptions_list_passes_active_dag_ids(self, app, view):
+        """render_template receives active_dag_ids as returned by the
+        lookup — this is only about the view passing the value through, not
+        about the badge appearing in HTML (that's covered in Task 2)."""
+        sub = _make_sub(dag_id="ghost_dag")
+        ctx, _ = _session_ctx(subs=[sub])
+        with app.test_request_context("/subscriptions"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[]), \
+             patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value={"other_dag"}):
+            view.subscriptions()
+
+        kwargs = view.render_template.call_args.kwargs
+        assert kwargs["active_dag_ids"] == {"other_dag"}
+
+    def test_subscriptions_list_active_dag_ids_none_on_lookup_failure(self, app, view, caplog):
+        """A failing dag-lookup must not propagate: subscriptions() still
+        renders, active_dag_ids is None, and the failure is logged."""
+        ctx, _ = _session_ctx()
+        with app.test_request_context("/subscriptions"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[]), \
+             patch(
+                 "airflow_provider_rmq.watcher.views.get_active_dag_ids",
+                 side_effect=RuntimeError("boom"),
+             ), \
+             caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.views"):
+            result = view.subscriptions()
+
+        assert result == "<html>mocked</html>"
+        kwargs = view.render_template.call_args.kwargs
+        assert kwargs["active_dag_ids"] is None
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1
+        assert warning_records[0].exc_info is not None
+
+    def test_subscriptions_list_dag_lookup_uses_separate_session(self, app, view):
+        """The mock-based tests above cannot distinguish correct session
+        isolation from an implementation that shares the `subs` session and
+        calls rollback() on failure — both would pass those tests
+        identically. This asserts the isolation itself: WatcherSession is
+        opened twice, with two distinct session objects, and the main
+        session's rollback() is never invoked.
+
+        ``side_effect`` is a callable (not a list of two context managers) —
+        a list would raise StopIteration if the view ever opened a session a
+        third time.
+        """
+        contexts = []
+
+        def _new_ctx(*args, **kwargs):
+            session = MagicMock()
+            query = session.query.return_value
+            query.order_by.return_value.all.return_value = []
+            ctx = MagicMock()
+            ctx.__enter__.return_value = session
+            ctx.__exit__.return_value = False
+            contexts.append(ctx)
+            return ctx
+
+        with app.test_request_context("/subscriptions"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", side_effect=_new_ctx), \
+             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[]), \
+             patch("airflow_provider_rmq.watcher.views.get_active_dag_ids") as mock_get_active:
+            view.subscriptions()
+
+        assert len(contexts) == 2
+        main_session = contexts[0].__enter__.return_value
+        dag_session = contexts[1].__enter__.return_value
+        assert main_session is not dag_session
+        mock_get_active.assert_called_once_with(dag_session)
+        main_session.rollback.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -878,3 +959,62 @@ class TestSubscriptionsTemplateRendering:
         single = _make_single_row(dag_id="ghost_dag_2")
         html = _render_subscriptions_html([grouped, single])  # no active_dag_ids kwarg
         assert not _badge_present(html)
+
+
+# ---------------------------------------------------------------------------
+# Session-isolation regression test — REAL ORM objects, real in-memory
+# SQLite session, combined with the render harness above. The mock-based
+# isolation tests in TestSubscriptionsList (dag_lookup_uses_separate_session,
+# active_dag_ids_none_on_lookup_failure) prove the view *calls* things in the
+# right shape, but a MagicMock session can't reproduce SQLAlchemy's real
+# detach/expire semantics — an implementation that shares one session and
+# calls rollback() on failure would pass those mock tests unchanged, yet
+# raise DetachedInstanceError against a real database. Only a real Session
+# can distinguish the two.
+# ---------------------------------------------------------------------------
+
+class TestSubscriptionsDagLookupSessionIsolationReal:
+    def test_real_subs_survive_dag_lookup_failure_for_template_render(self, app, view):
+        engine = create_engine("sqlite:///:memory:")
+        WatcherBase.metadata.create_all(engine)
+        RealSession = sessionmaker(bind=engine)
+
+        # Seed data in a throwaway session, fully separate from the one the
+        # view will use to read it.
+        seed = RealSession()
+        seed.add(
+            RMQSubscription(
+                dag_id="ghost_dag",
+                queue_name="q1",
+                conn_id="rmq_default",
+                source="ui",
+                enabled=True,
+            )
+        )
+        seed.commit()
+        seed.close()
+
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", RealSession), \
+                 patch(
+                     "airflow_provider_rmq.watcher.views.get_active_dag_ids",
+                     side_effect=RuntimeError("boom"),
+                 ):
+                view.subscriptions()
+
+            kwargs = view.render_template.call_args.kwargs
+            assert kwargs["active_dag_ids"] is None
+
+            # `subs` are real, detached RMQSubscription instances read from a
+            # session that has since been closed (not rolled back). Feeding
+            # them through the real Jinja harness must not raise
+            # DetachedInstanceError when the template reads item.dag_id.
+            html = _render_subscriptions_html(
+                kwargs["subscriptions"],
+                active_dag_ids=kwargs["active_dag_ids"],
+                conn_statuses=kwargs["conn_statuses"],
+            )
+            assert "ghost_dag" in html
+        finally:
+            WatcherBase.metadata.drop_all(engine)

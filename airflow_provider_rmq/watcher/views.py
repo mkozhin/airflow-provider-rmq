@@ -11,6 +11,7 @@ from flask_appbuilder.security.decorators import has_access
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
     WatcherSession,
+    get_active_dag_ids,
     get_conn_statuses,
     upsert_subscription,
 )
@@ -114,10 +115,27 @@ class RMQWatcherView(BaseView):
             subs = session.query(RMQSubscription).order_by(RMQSubscription.dag_id).all()
             conn_statuses = get_conn_statuses(session)
             rows = _group_subscriptions(subs)
+
+        # Separate session, opened only after the one above has closed:
+        # render_template() below reads `rows`/`subs` as detached objects, and
+        # rollback() on any session at this point would expire them and raise
+        # DetachedInstanceError in Jinja — so it must never be called here.
+        try:
+            with WatcherSession() as dag_session:
+                active_dag_ids = get_active_dag_ids(dag_session)
+        except Exception:
+            log.warning(
+                "Failed to look up known Airflow dag_ids for the "
+                "'dag not found' badge — badge disabled for this request",
+                exc_info=True,
+            )
+            active_dag_ids = None
+
         return self.render_template(
             "rmq_watcher/subscriptions.html",
             subscriptions=rows,
             conn_statuses=conn_statuses,
+            active_dag_ids=active_dag_ids,
         )
 
     @expose("/subscriptions/create", methods=["GET", "POST"])
