@@ -626,6 +626,31 @@ class TestExtractSubscriptionsFromFile:
         assert result[0]["dag_id"] == "explicit_name"
         assert result[0]["queue_name"] == "q1"
 
+    def test_extraction_succeeds_for_dag_that_would_fail_at_runtime_import(self, tmp_path):
+        """AST parsing never executes the file (see this method's own docstring:
+        "AST parsing never executes the file and never acquires the Python import
+        lock"). A DAG file that would raise if Airflow's DagBag actually imported
+        it — so the DAG never registers in DagModel — is still scanned
+        successfully here and its @rmq_trigger subscription still gets recorded.
+        This is the mechanism behind the dag-not-found badge's "dag_file
+        subscription whose DAG fails at runtime import" acceptance scenario
+        (see the dag-not-found-badge plan, Task 4)."""
+        dag_file = tmp_path / "broken_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q1')\n"
+            "@dag(dag_id='broken_dag')\n"
+            "def get_broken_dag(): pass\n"
+            "\n"
+            "raise RuntimeError('boom — this module blows up on a real import')\n"
+        )
+        listener = RMQWatcherListener()
+        result = listener._extract_subscriptions_from_file(str(dag_file))
+        assert len(result) == 1
+        assert result[0]["dag_id"] == "broken_dag"
+        assert result[0]["queue_name"] == "q1"
+
     def test_fallback_to_function_name_when_no_dag_id(self, tmp_path):
         dag_file = tmp_path / "my_dag.py"
         dag_file.write_text(

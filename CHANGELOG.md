@@ -2,6 +2,7 @@
 
 ## v2.3.0
 
+- **Added:** the Subscriptions page now marks with a `⚠ dag not found` badge any subscription whose `dag_id` doesn't correspond to any active Airflow DAG
 - **Added:** `dag_id` in `@dag(...)` now resolves simple module-level string constants (`DAG_NAME = 'x'` → `dag_id=DAG_NAME`), including the positional form `@dag(DAG_NAME)` — not just string literals
 - **Changed:** an unresolvable `dag_id` (not a literal and not a simple module-level constant — imported constants, f-strings, concatenation, function calls, `**kwargs` unpacking) no longer falls back to the function name. The subscription is now skipped entirely, with a WARNING logged instead. This removes not only previously-broken subscriptions: if a DAG's `dag_id` happened to statically fall back to a python function name that *coincided* with the real `dag_id` (e.g. `DAG_NAME = "my_dag"` imported from another module, and the decorated function literally named `def my_dag():`), that subscription worked correctly before this change and will disappear after it. Fix by making `dag_id=` a string literal or a local module-level constant defined earlier in the file, or create the subscription manually via the UI
 

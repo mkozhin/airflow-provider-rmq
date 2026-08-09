@@ -10,6 +10,7 @@ from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
     WatcherBase,
     delete_subscriptions_for_dag,
+    get_active_dag_ids,
     get_conn_statuses,
     get_enabled_subscriptions,
     set_consumer_status,
@@ -23,6 +24,21 @@ def session():
     """SQLite in-memory session with fresh schema per test."""
     engine = create_engine("sqlite:///:memory:")
     WatcherBase.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    s = Session()
+    yield s
+    s.close()
+    WatcherBase.metadata.drop_all(engine)
+
+
+@pytest.fixture(scope="function")
+def session_with_dagmodel():
+    """SQLite in-memory session with watcher schema plus Airflow's DagModel table."""
+    from airflow.models import DagModel
+
+    engine = create_engine("sqlite:///:memory:")
+    WatcherBase.metadata.create_all(engine)
+    DagModel.__table__.create(engine, checkfirst=True)
     Session = sessionmaker(bind=engine)
     s = Session()
     yield s
@@ -205,3 +221,42 @@ class TestIsolation:
         assert "rmq_watcher_subscriptions" in table_names
         assert "rmq_watcher_conn_status" in table_names
         assert len(table_names) == 2
+
+
+class TestGetActiveDagIds:
+    def test_returns_only_active_dag_ids(self, session_with_dagmodel):
+        from airflow.models import DagModel
+
+        session = session_with_dagmodel
+        session.add(DagModel(dag_id="active_dag", is_active=True, is_paused=False))
+        session.commit()
+
+        result = get_active_dag_ids(session)
+        assert result == {"active_dag"}
+
+    def test_excludes_inactive_dag_ids(self, session_with_dagmodel):
+        from airflow.models import DagModel
+
+        session = session_with_dagmodel
+        session.add(DagModel(dag_id="active_dag", is_active=True, is_paused=False))
+        session.add(DagModel(dag_id="inactive_dag", is_active=False, is_paused=False))
+        session.commit()
+
+        result = get_active_dag_ids(session)
+        assert result == {"active_dag"}
+
+    def test_empty_table_returns_empty_set(self, session_with_dagmodel):
+        session = session_with_dagmodel
+        result = get_active_dag_ids(session)
+        assert result == set()
+
+    def test_paused_dag_still_included(self, session_with_dagmodel):
+        """Locks in the intentional non-filtering of is_paused — see ADR 0006."""
+        from airflow.models import DagModel
+
+        session = session_with_dagmodel
+        session.add(DagModel(dag_id="paused_dag", is_active=True, is_paused=True))
+        session.commit()
+
+        result = get_active_dag_ids(session)
+        assert result == {"paused_dag"}
