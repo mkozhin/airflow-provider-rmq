@@ -189,7 +189,12 @@ class TestSubscriptionsList:
         assert result == "<html>mocked</html>"
         kwargs = view.render_template.call_args.kwargs
         assert kwargs["active_dag_ids"] is None
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == "airflow_provider_rmq.watcher.views"
+        ]
         assert len(warning_records) == 1
         assert warning_records[0].exc_info is not None
 
@@ -959,6 +964,27 @@ class TestSubscriptionsTemplateRendering:
         single = _make_single_row(dag_id="ghost_dag_2")
         html = _render_subscriptions_html([grouped, single])  # no active_dag_ids kwarg
         assert not _badge_present(html)
+
+    def test_disabled_subscription_unknown_dag_id_still_shows_badge(self):
+        """Per the plan's Technical Details ('Disabled-подписка с неизвестным
+        dag_id бейдж получает'): enabled=False means 'not currently
+        listening', not 'row is correct' — a disabled subscription with an
+        unknown dag_id must still get the badge, so the problem is visible
+        before the subscription is ever re-enabled."""
+        grouped = _make_group(dag_id="ghost_dag_1", group_key="ghost_dag_1", enabled=False)
+        single = _make_single_row(dag_id="ghost_dag_2", enabled=False)
+        html = _render_subscriptions_html([grouped, single], active_dag_ids={"other_dag"})
+        assert _badge_present(html)
+
+    def test_active_dag_ids_empty_set_shows_badge_on_all_rows(self):
+        """set() (lookup succeeded, genuinely zero active DAGs) is a
+        different sentinel than None (lookup failed) per the plan's
+        Technical Details — an empty-but-successful result means every
+        subscription is dangling, so the badge must appear on every row."""
+        grouped = _make_group(dag_id="ghost_dag_1", group_key="ghost_dag_1")
+        single = _make_single_row(dag_id="ghost_dag_2")
+        html = _render_subscriptions_html([grouped, single], active_dag_ids=set())
+        assert _badge_present(html)
 
 
 # ---------------------------------------------------------------------------
