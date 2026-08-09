@@ -41,6 +41,13 @@ skipping trigger", dag_id)` и сообщение ACK-ается без запу
 - Функционально независим от AST-плана — может реализовываться в любом
   порядке, не требует его изменений в коде.
 
+**Известный временный false positive.** Только что добавленный DAG-файл, ещё
+не распарсенный Scheduler'ом, отсутствует в `DagModel` — его subscription
+получит бейдж, пока парсер не догонит. Это осознанно не лечится (см.
+Technical Details — та же гонка объясняет, почему бейдж read-only и не
+делает авто-disable), но должно быть проговорено в README, чтобы не читалось
+как баг.
+
 Этот план:
 1. Добавляет `get_known_dag_ids()` — хелпер, запрашивающий множество
    `dag_id` активных Airflow DAG (`models.py`).
@@ -98,9 +105,21 @@ skipping trigger", dag_id)` и сообщение ACK-ается без запу
   совместимы с описанным там переходом на ленивую фабрику — но
   исполнителям стоит проверить, какой план приземлится первым, и перед
   стартом второго сверить актуальные diff'ы конфликтующих файлов.
-- `docs/plans/completed/20260807-ast-dag-id-constant-resolution.md` — смежный, но не
-  зависимый план (см. Обзор). Может реализовываться до, после или
-  параллельно этому плану.
+- `docs/plans/completed/20260807-ast-dag-id-constant-resolution.md` — смежный,
+  но функционально не зависимый план (см. Обзор). **Реализован и замёржен в
+  `main` (`c684b54`)** — то есть это не будущая координация, а уже
+  свершившийся факт, который меняет состояние двух файлов из списка Task 5:
+  - `readme.md:539` / `readme_ru.md:538` — он **уже добавил** абзац про
+    нерезолвимый `dag_id`, причём с формулировкой «не появляется на странице
+    вовсе — **не «с бейджем»**, а полностью отсутствует». Эта фраза написана
+    когда бейджа ещё не существовало и сейчас висит без референта: Task 5
+    должен **отредактировать** её (противопоставив новому бейджу), а не
+    дописывать рядом второй абзац на ту же тему;
+  - `CHANGELOG.md` — он завёл секцию `## v2.3.0`, которая **не имеет тега**
+    (последний тег — `v2.2.0`, версия считается `setuptools_scm` по тегам),
+    то есть фактически является unreleased-секцией. Отдельной секции
+    `## Unreleased` в этом файле нет и не было — конвенции такой у репозитория
+    нет, все секции именованы версиями.
 
 ## Подход к разработке
 
@@ -123,8 +142,10 @@ skipping trigger", dag_id)` и сообщение ACK-ается без запу
   полного контекста Flask-AppBuilder) — единственный способ доказать, что
   бейдж реально появляется в HTML, а не только доходит до kwargs
   `render_template`. Полный Flask-AppBuilder e2e не нужен.
-- Команда тестов: `pytest tests/watcher/` (сверить точный вызов по
-  `pyproject.toml`/конфигу CI, если он отличается).
+- Команды тестов (сверено): `pytest tests/` — ровно так вызывает CI
+  (`.github/workflows/publish.yml`); `pytest tests/watcher/` — для быстрого
+  цикла по ходу задач. `ruff`/`mypy` настроены в `pyproject.toml`, но в CI
+  **не запускаются** — этот план их и не требует.
 
 ## Отслеживание прогресса
 
@@ -229,9 +250,26 @@ dag_session:` с исключением) никак не может истечь
 
 `is defined and` — на случай, если `known_dag_ids` вообще не попадёт в
 контекст рендера (например при будущем рефакторинге вызова
-`render_template` в другом месте): без этой проверки `Undefined is not
-none` в Jinja2 — `True`, и шаблон упал бы на `item.dag_id not in Undefined`
-вместо того чтобы просто не показать бейдж.
+`render_template` в другом месте). **Важно правильно понимать, от чего
+именно защищает этот guard: не от исключения, а от тихого ложного
+срабатывания.** Проверено на реально установленном jinja2 3.1.6 (и по
+исходникам: `jinja2.runtime.Undefined.__iter__`, runtime.py:898, отдаёт
+**пустой** итератор; падает только `StrictUndefined`, runtime.py:1060-1062,
+а вебсервер Airflow его не включает):
+
+```
+{% if known is not none and x not in known %}BADGE{% endif %}   → 'BADGE'
+{% if known is defined and known is not none and x not in known %} → ''
+```
+
+То есть без `is defined` шаблон **не падает** — `Undefined is not none`
+даёт `True`, `x not in Undefined` тоже `True` (членство в пустом
+итераторе), и бейдж `⚠ dag not found` тихо появляется на **каждой** строке
+таблицы. Это ровно тот сценарий, ради которого guard и нужен: исполнителю,
+который решит проверить «а правда ли упадёт?», код покажет отсутствие
+краха, и `is defined` будет выглядеть лишним — а его удаление даст ложные
+бейджи на всех подписках. Регрессионный тест на это — последний чекбокс
+Task 3 («контекст без ключа → без бейджа и без исключения»).
 
 Гейтинг на `known_dag_ids is not none` означает, что сбой запроса скрывает
 бейдж целиком, а не ложно помечает каждую строку. **Пустое, но успешно
@@ -264,17 +302,22 @@ paused DAG всё ещё существует и является другим, 
 
 ## Implementation Steps
 
-**Перед началом Task 1:**
-- решить и зафиксировать, какой план приземляется первым — этот или `docs/plans/20260703-reliability-hardening.md` (пересекаются по `models.py`, `views.py`, `test_models.py`, `test_views.py`, `CHANGELOG.md`, `readme.md`/`readme_ru.md` — см. Контекст); если этот план стартует вторым — заново сверить актуальные diff'ы конфликтующих файлов перед началом
+### Task 0: Preflight (координация)
+
+- [ ] **Дефолт на момент написания: этот план приземляется первым.** `docs/plans/20260703-reliability-hardening.md` не начат (нет коммитов против него), и его пересекающиеся задачи не трогают `subscriptions()`: Task 5 (ленивая фабрика `WatcherSession`) совместим с `with WatcherSession() as session:`, Task 6 правит `create`/`edit`/`edit_group`, Task 4 — `CHANGELOG.md`, Task 16 — оба readme. Подтвердить, что это всё ещё так (`git log --oneline` по конфликтующим файлам), и зафиксировать решение здесь. Если порядок изменится и reliability-план приземлится раньше — заново сверить актуальные diff'ы `models.py`/`views.py`/`test_models.py`/`test_views.py`/`CHANGELOG.md`/`readme.md`/`readme_ru.md`, не полагаясь на описания «как было» в обоих планах
+- [ ] сверить состояние файлов, уже изменённых замёрженным AST-планом (см. Контекст): `readme.md:539`, `readme_ru.md:538` (абзац про нерезолвимый `dag_id` с фразой «не «с бейджем»») и нетегированная секция `## v2.3.0` в `CHANGELOG.md` — Task 5 рассчитывает именно на это состояние
 
 ### Task 1: Хелпер `get_known_dag_ids` в models.py
 
 **Files:**
 - Modify: `airflow_provider_rmq/watcher/models.py`
 - Modify: `tests/watcher/test_models.py`
+- Create: `docs/adr/0006-badge-dag-lookup-not-unified-with-sync-trigger.md`
 
 - [ ] добавить `get_known_dag_ids(session: Session) -> set[str]` по спеке из Technical Details — ленивый импорт `from airflow.models import DagModel` внутри функции, `filter(DagModel.is_active.is_(True))`
-- [ ] существующая фикстура `session` в `test_models.py` создаёт только таблицы `WatcherBase.metadata` — она **не знает** про `DagModel` (отдельный, принадлежащий Airflow declarative base). Добавить в том же файле отдельную фикстуру `session_with_dagmodel`, построенную так же, как `session` (in-memory SQLite, function-scoped, дропается в teardown), но дополнительно выполняющую `DagModel.__table__.create(engine, checkfirst=True)` на том же движке перед тем как отдать session
+- [ ] **зафиксировать в ADR, почему фильтр намеренно НЕ совпадает с `consumer.py::_sync_trigger`** (`is_active` только, против `is_active=True, is_paused=False` там). Сейчас это обоснование живёт лишь в Technical Details этого плана, а Task 5 унесёт файл в `docs/plans/completed/` — через полгода расхождение будет выглядеть недосмотром, а тест на paused DAG — произвольным. В репозитории уже есть ровно такая конвенция: `docs/adr/0001..0005` — короткие ADR в стиле «…не унифицировать». Завести `docs/adr/0006-*.md` (на английском, как остальные ADR) + двухстрочный комментарий в самой `get_known_dag_ids` со ссылкой на тест `test_..._paused_dag_is_included`
+- [ ] существующая фикстура `session` в `test_models.py` создаёт только таблицы `WatcherBase.metadata` — она **не знает** про `DagModel` (отдельный, принадлежащий Airflow declarative base). Добавить в том же файле отдельную фикстуру `session_with_dagmodel`, построенную так же, как `session` (in-memory SQLite, function-scoped, дропается в teardown), но дополнительно выполняющую `DagModel.__table__.create(engine, checkfirst=True)` на том же движке перед тем как отдать session. Teardown зеркалит существующую фикстуру (`WatcherBase.metadata.drop_all`) — отдельно дропать таблицу `dag` не нужно и не следует: движок in-memory и создаётся заново на каждый тест
+- [ ] импортировать `DagModel` **внутри** тела фикстуры/тестов, а не на уровне модуля: `test_models.py` сегодня не импортирует Airflow вообще, а модульный `from airflow.models import DagModel` втянет в быстрый unit-модуль весь ORM Airflow (плюс `RemovedInAirflow3Warning`). Это та же ленивая конвенция, которой следует сам `models.py`
 - [ ] добавить тесты в `TestGetKnownDagIds` (реальная БД, без моков — по конвенции всех остальных тестов хелперов в этом файле): возвращаются только строки с `is_active=True`; строки с `is_active=False` исключаются; пустая таблица возвращает `set()`; **`DagModel(is_active=True, is_paused=True)` — включается в результат** (закрепляет тестом осознанное решение из Technical Details не фильтровать по `is_paused`, а не только держать его в комментарии — без этого теста будущая правка может незаметно добавить `is_paused=False` и тихо изменить задокументированную семантику)
 - [ ] прогнать `pytest tests/watcher/test_models.py` — должно проходить перед Task 2
 
@@ -298,8 +341,9 @@ paused DAG всё ещё существует и является другим, 
 - Modify: `airflow_provider_rmq/watcher/templates/rmq_watcher/subscriptions.html`
 - Modify: `tests/watcher/test_views.py`
 
-- [ ] в `subscriptions.html` добавить бейдж `⚠ dag not found` сразу после `{{ item.dag_id }}` в **обеих** ветках (grouped-строка и single-строка), с условием `{% if known_dag_ids is defined and known_dag_ids is not none and item.dag_id not in known_dag_ids %}` — именно с `is defined and`, а не только `is not none`: если `known_dag_ids` вообще не попадёт в контекст рендера (например при будущем рефакторинге вызова `render_template` в другом месте), `Undefined is not none` в Jinja2 — `True`, и без `is defined` шаблон упадёт на `item.dag_id not in Undefined` вместо того чтобы просто не показать бейдж
+- [ ] в `subscriptions.html` добавить бейдж `⚠ dag not found` сразу после `{{ item.dag_id }}` в **обеих** ветках (grouped-строка и single-строка), с условием `{% if known_dag_ids is defined and known_dag_ids is not none and item.dag_id not in known_dag_ids %}` — именно с `is defined and`, а не только `is not none`. **Не «иначе упадёт»** (проверено на jinja2 3.1.6: не падает, см. Technical Details): без `is defined` отсутствие `known_dag_ids` в контексте даёт `Undefined is not none` → `True` и `item.dag_id not in Undefined` → `True` (членство в пустом итераторе), то есть бейдж тихо появляется на **каждой** строке. Guard защищает от ложного срабатывания, а не от исключения — не удалять его «как ненужный», убедившись что краха нет
 - [ ] настроить `TestSubscriptionsTemplateRendering` — окружение `jinja2.Environment` напрямую (без полного контекста Flask-AppBuilder), `loader = ChoiceLoader([FileSystemLoader(".../watcher/templates"), DictLoader({"rmq_watcher/base.html": "{% block content %}{% endblock %}"})])` (`{% extends base_template %}` резолвит имя через loader, одного `FileSystemLoader` недостаточно), заглушки в `env.globals` под реальные сигнатуры вызовов из шаблона: `get_flashed_messages` → `lambda **kw: []`, `url_for` → `lambda *a, **kw: "#"`, `csrf_token` → `lambda: "test-token"` (фильтр `| tojson` — встроенный в Jinja2, регистрации не требует)
+- [ ] **⚠ в каждом вызове `render(...)` обязательно передавать `base_template="rmq_watcher/base.html"`** (значение должно совпадать с ключом `DictLoader` выше). Первая строка шаблона — `{% extends base_template %}`, где `base_template` не имя файла, а **контекстная переменная** (её в реальном рантайме подставляет Flask-AppBuilder). Без неё `render(...)` падает с `UndefinedError: 'base_template' is undefined` ещё до того, как что-либо отрендерится — то есть без этого пункта весь харнесс Task 3 не работает, а не просто отдаёт неверный HTML
 - [ ] в этом же классе завести настоящие (не `MagicMock`) фикстуры строк — существующий `_make_sub()` возвращает `MagicMock()`, у которого `item.is_group` авто-создаётся truthy, из-за чего в шаблоне `{% if item.is_group is defined and item.is_group %}` любая строка попадала бы в grouped-ветку: grouped-строка — реальный `SubscriptionGroup(...)` из `views.py`; single-строка — объект без атрибута `is_group` вовсе (реальный `RMQSubscription(...)` или `types.SimpleNamespace`)
 - [ ] тест: неизвестный `dag_id` в grouped-строке → `"dag not found"` присутствует в HTML
 - [ ] тест: неизвестный `dag_id` в single-строке → `"dag not found"` присутствует в HTML (отдельно от grouped — это и есть то, что ловит потенциальный copy-paste промах между двумя ветками шаблона)
@@ -310,6 +354,7 @@ paused DAG всё ещё существует и является другим, 
 
 ### Task 4: Проверка критериев приёмки
 
+- [ ] **проверить на уровне исходной задачи, а не пересказом тестов**: подписка, созданная через UI с опечаткой в `dag_id`, и `dag_file`-подписка на переименованный/удалённый DAG обе получают бейдж; при этом grouped-строка бейджится по `dag_id` группы, а single-строка — по своему собственному. Это единственный критерий здесь, сформулированный в терминах проблемы из Обзора — остальные три пересказывают уже написанные тесты
 - [ ] проверить: сбой `get_known_dag_ids` отключает бейдж, а не бросает исключение (тест из Task 2)
 - [ ] проверить: бейдж появляется в HTML в обеих ветках шаблона для неизвестного `dag_id`, и отсутствует для известного (тесты из Task 3)
 - [ ] прогнать полный набор: `pytest tests/` (совпадает с вызовом в CI, `.github/workflows/publish.yml`)
@@ -321,9 +366,10 @@ paused DAG всё ещё существует и является другим, 
 - Modify: `readme_ru.md`
 - Modify: `CHANGELOG.md`
 
-- [ ] в `readme.md`, раздел "How it works" (RMQ Watcher Plugin) или отдельный подраздел про UI, добавить короткий абзац: любой subscription, чей `dag_id` не соответствует активному Airflow DAG, теперь помечается бейджем `⚠ dag not found` на странице Subscriptions; уточнить, что для случая, когда `dag_id=` в DAG-файле вообще не резолвится статически (см. `docs/plans/completed/20260807-ast-dag-id-constant-resolution.md`, уже реализован — или общее ограничение AST-скана), subscription не появляется на странице вовсе, и бейдж этот случай не покрывает
-- [ ] отзеркалить тот же абзац в `readme_ru.md`
-- [ ] добавить запись в `CHANGELOG.md` (в `## Unreleased`, если секция уже создана другим планом — см. Контекст; иначе создать новую секцию над последней выпущенной версией): **Added** — страница Subscriptions теперь помечает бейджем `⚠ dag not found` любой subscription, чей `dag_id` не соответствует ни одному активному Airflow DAG
+- [ ] **описание бейджа — в раздел про UI, а не в "How it works"**: `readme.md`, `### Subscription Management` (~строка 719) — короткий абзац: любой subscription, чей `dag_id` не соответствует активному Airflow DAG, помечается бейджем `⚠ dag not found`. Проговорить два ограничения: (а) `is_paused` не проверяется — paused DAG бейджа не получит, хотя сообщение его тоже не запустит (см. Technical Details/ADR 0006); (б) только что добавленный DAG может временно бейджиться, пока Scheduler его не распарсил — это ожидаемо, не баг
+- [ ] **⚠ отредактировать уже существующий абзац**, а не дописывать второй на ту же тему: `readme.md:539` (и `readme_ru.md:538`) уже содержит текст, добавленный замёрженным AST-планом, с фразой «не появляется на странице Subscriptions вовсе — **не «с бейджем»**, а полностью отсутствует». Она писалась когда бейджа не существовало и сейчас ссылается в пустоту. Переформулировать так, чтобы она явно противопоставлялась **новому, реально существующему** бейджу: нерезолвимый `dag_id` — единственный случай, который бейдж не ловит, потому что подсвечивать нечего (строки нет)
+- [ ] отзеркалить обе правки в `readme_ru.md`: новый абзац — в `### Управление подписками` (~строка 717), правку существующего — на строке 538
+- [ ] добавить запись в `CHANGELOG.md`: **Added** — страница Subscriptions теперь помечает бейджем `⚠ dag not found` любой subscription, чей `dag_id` не соответствует ни одному активному Airflow DAG. **Дописывать в существующую секцию `## v2.3.0`** — она заведена AST-планом и не имеет тега (`git tag` → последний `v2.2.0`), то есть является unreleased-секцией. Секции `## Unreleased` в этом файле нет и заводить её не надо — конвенции такой у репозитория нет. Перед правкой сверить `git tag`: если к этому моменту `v2.3.0` уже выпущен — завести `## v2.4.0` над ней
 - [ ] прогнать `pytest tests/` ещё раз — должно проходить
 - [ ] перенести этот план в `docs/plans/completed/`
 
