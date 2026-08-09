@@ -78,7 +78,15 @@
           {% if item.is_group is defined and item.is_group %}
           {# ---- Grouped row (multiple queues, shared cooldown) ---- #}
           <tr class="{{ 'text-muted' if not item.enabled else '' }}">
-            <td>{{ item.dag_id }}</td>
+            <td>
+              {{ item.dag_id }}
+              {% if active_dag_ids is defined and active_dag_ids is not none and item.dag_id not in active_dag_ids %}
+                <span class="label label-warning"
+                      title="No active Airflow DAG found for this dag_id — a matching message will not trigger a real pipeline run. Check for a typo in dag_id, a renamed or deleted DAG, a DAG that is inactive (is_active=false), or a newly added DAG the Scheduler has not parsed yet.">
+                  ⚠ dag not found
+                </span>
+              {% endif %}
+            </td>
             <td>
               {% for q in item.queue_names %}
                 <span class="label label-default">{{ q }}</span>
@@ -129,7 +137,15 @@
           {% else %}
           {# ---- Single-queue row (no group_key) ---- #}
           <tr class="{{ 'text-muted' if not item.enabled else '' }}">
-            <td>{{ item.dag_id }}</td>
+            <td>
+              {{ item.dag_id }}
+              {% if active_dag_ids is defined and active_dag_ids is not none and item.dag_id not in active_dag_ids %}
+                <span class="label label-warning"
+                      title="No active Airflow DAG found for this dag_id — a matching message will not trigger a real pipeline run. Check for a typo in dag_id, a renamed or deleted DAG, a DAG that is inactive (is_active=false), or a newly added DAG the Scheduler has not parsed yet.">
+                  ⚠ dag not found
+                </span>
+              {% endif %}
+            </td>
             <td>{{ item.queue_name }}</td>
             <td>{{ item.conn_id }}</td>
             <td>

@@ -7,11 +7,15 @@ a logged-in user or a full Airflow web-app context.
 from __future__ import annotations
 
 import importlib
+import re
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from flask import Flask
+from jinja2 import ChoiceLoader, DictLoader, Environment, FileSystemLoader
 
 # ---------------------------------------------------------------------------
 # Patch has_access → identity before loading views, so the class is built
@@ -712,3 +716,165 @@ class TestEditGroup:
         assert mock_upsert.call_count == 2
         upserted_conn_ids = {call.kwargs["conn_id"] for call in mock_upsert.call_args_list}
         assert upserted_conn_ids == {"rmq_new"}
+
+
+# ---------------------------------------------------------------------------
+# Real-template-rendering harness — jinja2.Environment built directly (NOT
+# the full Flask-AppBuilder context). This is the only way to prove the
+# dag-not-found badge actually appears in rendered HTML, not just that it
+# reaches render_template()'s kwargs. Reused by the Task 3 regression test
+# for the separate-DAG-session isolation guarantee.
+# ---------------------------------------------------------------------------
+
+_TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "airflow_provider_rmq" / "watcher" / "templates"
+
+_subscriptions_jinja_env = Environment(
+    loader=ChoiceLoader(
+        [
+            FileSystemLoader(str(_TEMPLATES_DIR)),
+            DictLoader({"rmq_watcher/base.html": "{% block content %}{% endblock %}"}),
+        ]
+    ),
+)
+_subscriptions_jinja_env.globals["get_flashed_messages"] = lambda **kw: []
+_subscriptions_jinja_env.globals["url_for"] = lambda *a, **kw: "#"
+_subscriptions_jinja_env.globals["csrf_token"] = lambda: "test-token"
+# `| tojson` is a jinja2 builtin filter (verified on 3.1.6) — no registration needed.
+
+
+def _render_subscriptions_html(rows, **ctx):
+    """Render subscriptions.html for real through a standalone jinja2
+    Environment.
+
+    ``base_template`` must resolve via the DictLoader above — the template's
+    first line is ``{% extends base_template %}``, and ``base_template`` is a
+    context variable Flask-AppBuilder normally injects at render time, not a
+    literal filename. Every call passes it by default; callers may override
+    or omit it via ``ctx`` (e.g. to test a context missing other keys).
+    """
+    template = _subscriptions_jinja_env.get_template("rmq_watcher/subscriptions.html")
+    render_ctx = {
+        "base_template": "rmq_watcher/base.html",
+        "subscriptions": rows,
+        "conn_statuses": [],
+    }
+    render_ctx.update(ctx)
+    return template.render(**render_ctx)
+
+
+def _badge_present(html: str) -> bool:
+    """True iff the dag-not-found badge markup is present: the
+    ``label label-warning`` span AND its visible text nested inside it (not
+    just "dag not found" hiding in e.g. the ``title`` attribute).
+    Whitespace-normalized so it's robust to line wrapping in the template.
+    """
+    normalized = re.sub(r"\s+", " ", html)
+    return (
+        re.search(
+            r'<span class="label label-warning"[^>]*>\s*⚠ dag not found\s*</span>',
+            normalized,
+        )
+        is not None
+    )
+
+
+def _make_group(
+    *,
+    dag_id: str = "my_dag",
+    conn_id: str = "rmq_default",
+    source: str = "ui",
+    cooldown: int = 300,
+    group_key: str = "my_dag",
+    queue_names: list[str] | None = None,
+    sub_ids: list[int] | None = None,
+    enabled: bool = True,
+    statuses: list[str] | None = None,
+    last_error: str | None = None,
+) -> SubscriptionGroup:
+    """Real (non-MagicMock) SubscriptionGroup fixture for the grouped
+    template branch."""
+    return SubscriptionGroup(
+        dag_id=dag_id,
+        conn_id=conn_id,
+        source=source,
+        cooldown=cooldown,
+        group_key=group_key,
+        queue_names=queue_names if queue_names is not None else ["q1", "q2"],
+        sub_ids=sub_ids if sub_ids is not None else [1, 2],
+        enabled=enabled,
+        statuses=statuses if statuses is not None else ["listening", "listening"],
+        last_error=last_error,
+    )
+
+
+def _make_single_row(
+    *,
+    id: int = 1,
+    dag_id: str = "my_dag",
+    queue_name: str = "my_queue",
+    conn_id: str = "rmq_default",
+    source: str = "ui",
+    enabled: bool = True,
+    consumer_status: str = "listening",
+    last_error: str | None = None,
+    cooldown: int | None = None,
+) -> SimpleNamespace:
+    """Real (non-MagicMock) single-row fixture matching the attributes the
+    template's single-queue branch reads.
+
+    Deliberately not an unflushed ``RMQSubscription(...)``: SQLAlchemy
+    ``Column(default=...)`` only applies on INSERT, so an unflushed instance
+    has ``enabled``/``source``/``consumer_status`` all ``None``, which would
+    route it into the wrong template branches. Also deliberately has no
+    ``is_group`` attribute, matching the real model — the template's
+    ``item.is_group is defined`` check relies on that to route it here.
+    """
+    return SimpleNamespace(
+        id=id,
+        dag_id=dag_id,
+        queue_name=queue_name,
+        conn_id=conn_id,
+        source=source,
+        enabled=enabled,
+        consumer_status=consumer_status,
+        last_error=last_error,
+        cooldown=cooldown,
+    )
+
+
+class TestSubscriptionsTemplateRendering:
+    def test_grouped_row_unknown_dag_id_shows_badge(self):
+        row = _make_group(dag_id="ghost_dag", group_key="ghost_dag")
+        html = _render_subscriptions_html([row], active_dag_ids={"other_dag"})
+        assert _badge_present(html)
+
+    def test_single_row_unknown_dag_id_shows_badge(self):
+        """Kept separate from the grouped-row test above — this is what
+        would catch a copy-paste mistake between the two template branches."""
+        row = _make_single_row(dag_id="ghost_dag")
+        html = _render_subscriptions_html([row], active_dag_ids={"other_dag"})
+        assert _badge_present(html)
+
+    def test_known_dag_id_no_badge(self):
+        grouped = _make_group(dag_id="known_dag", group_key="known_dag")
+        single = _make_single_row(dag_id="known_dag_2")
+        html = _render_subscriptions_html(
+            [grouped, single], active_dag_ids={"known_dag", "known_dag_2"}
+        )
+        assert not _badge_present(html)
+
+    def test_active_dag_ids_none_no_badge_for_any_row(self):
+        grouped = _make_group(dag_id="ghost_dag_1", group_key="ghost_dag_1")
+        single = _make_single_row(dag_id="ghost_dag_2")
+        html = _render_subscriptions_html([grouped, single], active_dag_ids=None)
+        assert not _badge_present(html)
+
+    def test_active_dag_ids_missing_from_context_renders_without_badge(self):
+        """Regression guard for the `is defined` check in the template:
+        without it, Undefined's __iter__ makes
+        `item.dag_id not in active_dag_ids` evaluate True on every row, and
+        the badge would silently appear everywhere instead of nowhere."""
+        grouped = _make_group(dag_id="ghost_dag_1", group_key="ghost_dag_1")
+        single = _make_single_row(dag_id="ghost_dag_2")
+        html = _render_subscriptions_html([grouped, single])  # no active_dag_ids kwarg
+        assert not _badge_present(html)
