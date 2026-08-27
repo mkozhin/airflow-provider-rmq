@@ -1358,6 +1358,11 @@ class RMQConsumerManager:
                 # prefetch window fills up with them and consumption stops for good once
                 # the misses reach the window size. The unacked window stays unbounded.
                 await state.write("listening", last_error=None)
+                log.info(
+                    "Subscription %d (DAG %s) is consuming queue %r on conn_id=%r",
+                    sub_id, dag_id, queue_name, conn_id,
+                )
+                _incr("rmq_watcher.consumer_reconnect")
 
                 async with queue.iterator(consumer_tag=consumer_tag) as q_iter:
                     async for message in q_iter:
@@ -1516,6 +1521,11 @@ class RMQConsumerManager:
                     channel.declare_queue(_FIRE_QUEUE, passive=True), timeout=rpc_timeout
                 )
                 await state.write("listening")
+                log.info(
+                    "Cooldown fire consumer is consuming queue %r on conn_id=%r",
+                    _FIRE_QUEUE, conn_id,
+                )
+                _incr("rmq_watcher.consumer_reconnect")
 
                 async with queue.iterator(consumer_tag=_consumer_tag("fire")) as q_iter:
                     async for message in q_iter:

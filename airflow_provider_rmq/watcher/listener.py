@@ -65,6 +65,11 @@ _MIGRATION_BACKOFF_CAP = 60
 #: Seconds allowed for the manager to stop before the loop is torn down anyway.
 _STOP_TIMEOUT = 30.0
 
+#: Seconds ``before_stopping`` waits for the watcher thread to leave. The woken loop
+#: only has to finish the current cycle step, and the scheduler's own shutdown must
+#: not stall behind a watcher that refuses to.
+_JOIN_TIMEOUT = 5.0
+
 #: Workers of the cycle pool: the reconcile loop's own blocking calls (schema
 #: migration, Variable reads, DAG-file scan, subscription queries).
 _CYCLE_POOL_WORKERS = 4
@@ -611,7 +616,8 @@ class RMQWatcherListener:
       with its own asyncio event loop.
     - The loop reconciles subscriptions from DAG files (mtime-based scan) and the DB
       every ``reconcile_interval`` seconds, then delegates to ``RMQConsumerManager``.
-    - ``before_stopping`` sets a stop event; the loop exits after the current iteration.
+    - ``before_stopping`` sets the stop event, wakes the loop out of its wait and
+      joins the thread briefly, so shutdown does not wait out a reconcile interval.
     """
 
     def __init__(self) -> None:
@@ -637,6 +643,10 @@ class RMQWatcherListener:
         self._migration_skip_cycles = 0
         #: Step the current cycle is on, reported when the cycle runs out of budget.
         self._phase = "idle"
+        # Loop and wake-up event of the currently running cycle, refreshed by every
+        # ``_main`` so that ``before_stopping`` always signals the live loop.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._wakeup: asyncio.Event | None = None
 
     # ------------------------------------------------------------------
     # Listener API
@@ -654,8 +664,10 @@ class RMQWatcherListener:
         is_scheduler_stack = any('scheduler_command' in f for f in stack_files)
         is_scheduler = "Scheduler" in name or "Scheduler" in job_type or is_scheduler_stack
         log.info(
-            "RMQWatcherListener.on_starting: component=%s (job_type=%s, is_scheduler=%s)",
+            "RMQWatcherListener.on_starting: component=%s (job_type=%s, is_scheduler=%s)%s",
             name, job_type, is_scheduler,
+            "" if is_scheduler
+            else " — watcher not started: only the scheduler process runs it",
         )
         if is_scheduler:
             self._start()
@@ -664,6 +676,31 @@ class RMQWatcherListener:
     def before_stopping(self, component: Any) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        self._wake_loop()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_JOIN_TIMEOUT)
+            if thread.is_alive():
+                log.warning(
+                    "RMQ Watcher thread still running %.0fs after the stop signal — "
+                    "leaving it to the process exit", _JOIN_TIMEOUT,
+                )
+
+    def _wake_loop(self) -> None:
+        """Nudge the running cycle so it sees the stop event without waiting out the
+        reconcile interval.
+
+        The threading event is the authoritative signal; this only shortens the wait.
+        An :class:`asyncio.Event` may be touched from its own loop alone, and that loop
+        may already be closing — hence the guard and the swallowed ``RuntimeError``.
+        """
+        loop, wakeup = self._loop, self._wakeup
+        if loop is None or wakeup is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(wakeup.set)
+        except RuntimeError:
+            pass
 
     # ------------------------------------------------------------------
     # Thread / event-loop bootstrap
@@ -684,6 +721,10 @@ class RMQWatcherListener:
             daemon=True,
         )
         self._thread.start()
+        log.info(
+            "RMQ Watcher thread started: reconcile interval %ss, cycle budget %.0fs",
+            self._reconcile_interval, self._cycle_timeout(),
+        )
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -705,6 +746,8 @@ class RMQWatcherListener:
         log.info("RMQ Watcher loop stopped")
 
     async def _main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._wakeup = asyncio.Event()
         self._manager = RMQConsumerManager(
             executor=self._consumer_pool, cycle_executor=self._cycle_pool
         )
@@ -724,9 +767,18 @@ class RMQWatcherListener:
                     )
                     _incr("rmq_watcher.cycle_timeout")
                     raise
-                await asyncio.sleep(self._reconcile_interval)
+                await self._wait_for_next_cycle()
         finally:
             await self._stop_manager()
+
+    async def _wait_for_next_cycle(self) -> None:
+        """Wait one reconcile interval, returning at once once the watcher is stopping."""
+        if self._stop_event.is_set():
+            return
+        try:
+            await call_with_timeout(self._wakeup.wait(), self._reconcile_interval)
+        except asyncio.TimeoutError:
+            pass
 
     async def _run_cycle(self) -> None:
         """Run one reconciliation pass: migrate, scan, sync, read subscriptions, reconcile.

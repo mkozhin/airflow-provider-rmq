@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import threading
@@ -4405,3 +4406,111 @@ class TestImmediateDeliveryAcknowledgement:
         await _consume_until(manager, _sub(queue_name="orders"), [msg], done)
 
         assert captured["run_id"] == "rmq__orders__msg-42"
+
+
+class TestReconnectDiagnostics:
+    """A subscription attaching to the broker is the one routine event worth a log line.
+
+    During the 2026-08-26 incident the watcher wrote nothing for over a day, so there
+    was no way to tell a healthy consumer from one that had stopped reconnecting.
+    """
+
+    @staticmethod
+    def _connection(queue):
+        channel = AsyncMock()
+        channel.declare_queue = AsyncMock(return_value=queue)
+        connection = AsyncMock()
+        connection.channel = AsyncMock(return_value=channel)
+        return connection
+
+    @staticmethod
+    def _cancelled_queue():
+        """Queue whose iterator ends at once, as it does when the broker cancels us."""
+
+        class _Ctx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        queue = MagicMock()
+        queue.iterator.return_value = _Ctx()
+        return queue
+
+    @pytest.mark.asyncio
+    async def test_subscription_attach_is_logged_and_counted(self, manager, caplog):
+        connection = self._connection(_make_push_queue([]))
+
+        with patch.object(
+            manager, "_get_or_create_connection", return_value=connection
+        ), patch(
+            "airflow_provider_rmq.watcher.consumer._ConsumerState.write"
+        ), patch(
+            "airflow_provider_rmq.watcher.consumer._incr"
+        ) as incr, caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.consumer"
+        ):
+            await _run_then_cancel(
+                manager._consume_subscription(
+                    _sub(queue_name="orders", conn_id="rmq_prod")
+                ),
+                timeout=0.1,
+            )
+
+        incr.assert_any_call("rmq_watcher.consumer_reconnect")
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "orders" in message and "rmq_prod" in message for message in messages
+        ), messages
+
+    @pytest.mark.asyncio
+    async def test_every_reconnect_is_counted_again(self, manager):
+        """The metric measures reconnects, so a second attach must show up as a second
+        increment — a once-only log would hide a subscription flapping."""
+        connection = self._connection(self._cancelled_queue())
+
+        with patch.object(
+            manager, "_get_or_create_connection", return_value=connection
+        ), patch(
+            "airflow_provider_rmq.watcher.consumer._ConsumerState.write"
+        ), patch(
+            "airflow_provider_rmq.watcher.consumer._RECONNECT_DELAY", 0.01
+        ), patch(
+            "airflow_provider_rmq.watcher.consumer._incr"
+        ) as incr:
+            await _run_then_cancel(
+                manager._consume_subscription(_sub()), timeout=0.1
+            )
+
+        attaches = [
+            c for c in incr.call_args_list if c == call("rmq_watcher.consumer_reconnect")
+        ]
+        assert len(attaches) > 1
+
+    @pytest.mark.asyncio
+    async def test_fire_consumer_attach_is_logged_and_counted(self, manager, caplog):
+        connection = self._connection(_make_push_queue([]))
+
+        with patch(
+            "airflow_provider_rmq.watcher.consumer._ConsumerState.write"
+        ), patch(
+            "airflow_provider_rmq.watcher.consumer._incr"
+        ) as incr, caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.consumer"
+        ):
+            await _run_then_cancel(
+                manager._consume_fire_queue(connection, "rmq_prod"), timeout=0.1
+            )
+
+        incr.assert_any_call("rmq_watcher.consumer_reconnect")
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            _FIRE_QUEUE in message and "rmq_prod" in message for message in messages
+        ), messages

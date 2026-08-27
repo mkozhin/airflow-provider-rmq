@@ -953,20 +953,28 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 
 **Files:**
 - Modify: `airflow_provider_rmq/watcher/listener.py`
+- Modify: `airflow_provider_rmq/watcher/consumer.py`
 - Modify: `tests/watcher/test_listener.py`
+- Modify: `tests/watcher/test_consumer.py`
 
-- [ ] `_main`: `asyncio.Event` для пробуждения; ссылки на loop и event хранятся в listener'е и обновляются при каждом пересоздании петли
-- [ ] `before_stopping`: `threading.Event.set()` как авторитетный сигнал + `loop.call_soon_threadsafe(async_event.set)` под guard'ом (`loop.is_closed()` / `except RuntimeError`) + `thread.join(timeout=5)`
-- [ ] `_main`: `asyncio.wait_for(event.wait(), timeout=interval)` вместо `asyncio.sleep(interval)`
-- [ ] дополнить существующий лог `on_starting` (`listener.py:544-547`) явной причиной «watcher not started» при нераспознанном компоненте — не добавляя вторую запись рядом
-- [ ] INFO-лог при успешном старте треда (с интервалом цикла и бюджетом таймаута)
-- [ ] INFO-лог при каждом успешном (пере)подключении к брокеру с `conn_id` и именем очереди; инкремент `rmq_watcher.consumer_reconnect`
-- [ ] тест: `before_stopping` будит петлю немедленно, `manager.stop()` вызван
-- [ ] тест: `before_stopping` при закрытом loop не бросает, `threading.Event` выставлен
-- [ ] тест: нераспознанный компонент → лог с причиной, тред не стартует
-- [ ] тест: успешный старт треда логируется
-- [ ] тест: успешное переподключение логируется и инкрементирует метрику
-- [ ] run tests - must pass before task 10
+- [x] `_main`: `asyncio.Event` для пробуждения; ссылки на loop и event хранятся в listener'е и обновляются при каждом пересоздании петли
+- [x] `before_stopping`: `threading.Event.set()` как авторитетный сигнал + `loop.call_soon_threadsafe(async_event.set)` под guard'ом (`loop.is_closed()` / `except RuntimeError`) + `thread.join(timeout=5)` (`_JOIN_TIMEOUT`, guard вынесен в `_wake_loop`)
+- [x] `_main`: `asyncio.wait_for(event.wait(), timeout=interval)` вместо `asyncio.sleep(interval)` — через `call_with_timeout` в `_wait_for_next_cycle`
+- [x] дополнить существующий лог `on_starting` явной причиной «watcher not started» при нераспознанном компоненте — не добавляя вторую запись рядом (причина дописана суффиксом в ту же запись)
+- [x] INFO-лог при успешном старте треда (с интервалом цикла и бюджетом таймаута)
+- [x] INFO-лог при каждом успешном (пере)подключении к брокеру с `conn_id` и именем очереди; инкремент `rmq_watcher.consumer_reconnect`
+- [x] тест: `before_stopping` будит петлю немедленно, `manager.stop()` вызван
+- [x] тест: `before_stopping` при закрытом loop не бросает, `threading.Event` выставлен
+- [x] тест: нераспознанный компонент → лог с причиной, тред не стартует
+- [x] тест: успешный старт треда логируется
+- [x] тест: успешное переподключение логируется и инкрементирует метрику
+- [x] run tests - must pass before task 10
+- ➕ [x] лог и метрика переподключения живут в `consumer.py` (`_consume_subscription`,
+  `_consume_fire_queue`): только там известны `conn_id` и имя очереди, поэтому список
+  файлов задачи расширен консьюмером и его тестами
+- ➕ [x] `_wait_for_next_cycle` возвращается сразу, если stop-event уже выставлен: цикл,
+  остановивший watcher сам (в том числе в тестах, где `reconcile` выставляет событие),
+  иначе досиживал бы полный интервал до проверки условия `while`
 
 ### Task 10: Отображение живости на странице Subscriptions
 

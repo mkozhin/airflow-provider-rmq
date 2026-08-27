@@ -2227,3 +2227,126 @@ class TestSchemaMigrationRetry:
 
         assert elapsed < 1.0
         manager.reconcile.assert_awaited(), "the cycle must go on without the migration"
+
+
+class TestGracefulStop:
+    """Shutdown must not wait out a reconcile interval that has just started."""
+
+    @pytest.mark.asyncio
+    async def test_before_stopping_wakes_the_loop_instead_of_waiting_out_the_interval(self):
+        listener = _cycle_listener()
+        listener._reconcile_interval = 30
+        manager = _fake_manager()
+        parked = asyncio.Event()
+
+        async def reconcile(subs):
+            parked.set()
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+
+        with _cycle_patches(manager):
+            task = asyncio.ensure_future(listener._main())
+            await call_with_timeout(parked.wait(), 5)
+            started = time.monotonic()
+            listener.before_stopping(MagicMock())
+            await call_with_timeout(task, 5)
+
+        assert time.monotonic() - started < 1.0
+        assert listener._stop_event.is_set()
+        manager.stop.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_that_stopped_the_watcher_does_not_wait_at_all(self):
+        """The stop event may be set while the cycle runs — the wait must see it."""
+        listener = _cycle_listener()
+        listener._reconcile_interval = 30
+        listener._wakeup = asyncio.Event()
+        listener._stop_event.set()
+
+        started = time.monotonic()
+        await listener._wait_for_next_cycle()
+
+        assert time.monotonic() - started < 1.0
+
+    def test_before_stopping_survives_a_loop_that_is_already_closed(self):
+        listener = RMQWatcherListener()
+        listener._stop_event = threading.Event()
+        listener._wakeup = MagicMock()
+        loop = asyncio.new_event_loop()
+        loop.close()
+        listener._loop = loop
+
+        listener.before_stopping(MagicMock())
+
+        assert listener._stop_event.is_set()
+        listener._wakeup.set.assert_not_called()
+
+    def test_before_stopping_survives_a_loop_closing_under_it(self):
+        """``is_closed`` can still say False when the loop closes a moment later."""
+        listener = RMQWatcherListener()
+        listener._stop_event = threading.Event()
+        listener._wakeup = MagicMock()
+        loop = MagicMock()
+        loop.is_closed.return_value = False
+        loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        listener._loop = loop
+
+        listener.before_stopping(MagicMock())
+
+        assert listener._stop_event.is_set()
+
+    def test_before_stopping_joins_the_watcher_thread(self):
+        listener = RMQWatcherListener()
+        listener._stop_event = threading.Event()
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        listener._thread = thread
+
+        listener.before_stopping(MagicMock())
+
+        thread.join.assert_called_once()
+        assert thread.join.call_args.kwargs["timeout"] > 0
+
+
+class TestLifecycleDiagnostics:
+    def test_unrecognised_component_logs_why_the_watcher_is_not_started(self, caplog):
+        class GunicornWebServer:
+            pass
+
+        listener = RMQWatcherListener()
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+        ), patch.object(listener, "_start") as start:
+            listener.on_starting(GunicornWebServer())
+
+        start.assert_not_called()
+        messages = [record.getMessage() for record in caplog.records]
+        assert len(messages) == 1, "the reason belongs in the existing record"
+        assert "watcher not started" in messages[0]
+
+    def test_scheduler_component_is_logged_without_a_reason(self, caplog):
+        class SchedulerJobRunner:
+            pass
+
+        listener = RMQWatcherListener()
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+        ), patch.object(listener, "_start"):
+            listener.on_starting(SchedulerJobRunner())
+
+        assert "watcher not started" not in caplog.records[0].getMessage()
+
+    def test_thread_start_is_logged_with_the_interval_and_the_budget(self, caplog):
+        listener = RMQWatcherListener()
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+        ), patch("threading.Thread", return_value=MagicMock()):
+            listener._start()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "RMQ Watcher thread started" in message
+            and "60" in message
+            and "300" in message
+            for message in messages
+        ), messages
