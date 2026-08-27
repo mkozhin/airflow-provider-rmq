@@ -53,6 +53,14 @@ _VARIABLE_TIMEOUT = 15.0
 #: Seconds allowed for one schema-migration attempt.
 _MIGRATION_TIMEOUT = 30.0
 
+#: Seconds allowed for one blocking step of the cycle — the DAG-file scan and the two
+#: subscription queries. All three go to the cycle pool, and a call that never returns
+#: holds its worker until the operating system gives up on the socket, so without a
+#: bound of their own they would spend the whole cycle budget and cost the loop, every
+#: consumer task and every connection with it. Three steps at this bound still fit
+#: inside the smallest cycle budget with room for the reconcile that follows them.
+_STEP_TIMEOUT = 60.0
+
 #: Cycles to skip after a failed migration attempt: one, then doubling up to the
 #: cap (an hour of cycles at the default interval).
 _MIGRATION_BACKOFF_START = 1
@@ -604,6 +612,16 @@ def _read_active_subs(exchange_meta: dict) -> list[dict]:
     return active_subs
 
 
+class _StepInFlight(Exception):
+    """The previous attempt at a cycle step is still occupying a worker of the pool.
+
+    Raised instead of handing the pool a second copy of a call that has not come back:
+    the cycle pool has four workers, and one stuck attempt per cycle saturates it in a
+    handful of cycles — after which even the pure-filesystem scan cannot start and the
+    liveness check stops running altogether.
+    """
+
+
 class RMQWatcherListener:
     """Airflow Listener that runs a background RabbitMQ consumer loop inside the Scheduler process.
 
@@ -632,6 +650,9 @@ class RMQWatcherListener:
         self._reconcile_interval = DEFAULT_RECONCILE_INTERVAL
         self._cycle_timeout_override: float | None = None
         self._settings_attempt: Future | None = None
+        # Blocking cycle steps that are still in a worker, keyed by step name, so the
+        # next cycle asks whether the previous attempt returned instead of adding one.
+        self._step_attempts: dict[str, Future] = {}
         # Schema migration retry state
         self._migration_attempt: Future | None = None
         self._migration_backoff = 0          # cycles to skip after the last failure
@@ -810,10 +831,10 @@ class RMQWatcherListener:
             await self._ensure_schema()
 
             self._phase = "scan"
-            scanned = await self._cycle_pool.run(self._scan_subscriptions)
+            scanned = await self._cycle_step("scan", self._scan_subscriptions)
 
             self._phase = "sync"
-            await self._cycle_pool.run(self._sync_to_db, scanned)
+            await self._cycle_step("sync", self._sync_to_db, scanned)
 
             # Exchange/routing_keys metadata is never persisted to the DB (see
             # plan Technical Details → "Почему миграция БД не нужна") — it only
@@ -830,12 +851,54 @@ class RMQWatcherListener:
             }
 
             self._phase = "read subs"
-            active_subs = await self._cycle_pool.run(_read_active_subs, exchange_meta)
+            active_subs = await self._cycle_step("read subs", _read_active_subs, exchange_meta)
 
             self._phase = "reconcile"
             await self._manager.reconcile(active_subs)
+        except _StepInFlight as exc:
+            log.warning("RMQ Watcher: skipping this reconciliation cycle — %s", exc)
         except Exception:
             log.exception("Error in RMQ Watcher reconciliation cycle")
+
+    async def _cycle_step(self, name: str, fn: Any, *args: Any) -> Any:
+        """Run one blocking step of the cycle in the cycle pool, bounded and unrepeated.
+
+        :param name: Step name, used for the in-flight bookkeeping and the log line.
+        :param fn: Blocking callable to run in the cycle pool.
+        :returns: Whatever ``fn`` returned.
+        :raises _StepInFlight: The previous attempt at this step has not returned.
+        :raises asyncio.TimeoutError: The attempt outlived :data:`_STEP_TIMEOUT`.
+
+        Either failure ends the cycle: the steps feed each other, and a reconcile run on
+        a subscription list that could not be read would cancel every consumer of a
+        subscription the query simply did not return.
+
+        The bound buys back the coroutine, not the worker — a running thread cannot be
+        interrupted — hence the second half: one attempt of a step in flight at a time.
+        Resubmitting every cycle would fill the four-worker pool with stuck copies of the
+        same call, and the steps that need no database would stop running with it.
+        """
+        attempt = self._step_attempts.get(name)
+        if attempt is not None and not attempt.done():
+            _incr("rmq_watcher.cycle_step_in_flight")
+            raise _StepInFlight(
+                f"the {name!r} step of an earlier cycle is still running in the "
+                f"{self._cycle_pool.name!r} pool "
+                f"({self._cycle_pool.in_flight}/{self._cycle_pool.max_workers} "
+                f"workers busy)"
+            )
+        attempt = self._cycle_pool.submit(fn, *args)
+        self._step_attempts[name] = attempt
+        try:
+            return await call_with_timeout(asyncio.wrap_future(attempt), _STEP_TIMEOUT)
+        except asyncio.TimeoutError:
+            _incr("rmq_watcher.cycle_step_timeout")
+            log.warning(
+                "RMQ Watcher: the %r step did not finish within %ss — ending this cycle; "
+                "its worker stays busy until the call itself returns",
+                name, _STEP_TIMEOUT,
+            )
+            raise
 
     async def _stop_manager(self) -> None:
         """Stop the manager, giving up after ``_STOP_TIMEOUT`` seconds.

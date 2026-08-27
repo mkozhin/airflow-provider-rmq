@@ -95,6 +95,15 @@ _RUN_ID_HASH_LEN = 8
 _TRIGGER_BACKOFF_START = 1.0
 _TRIGGER_BACKOFF_MAX = 60.0
 
+#: Backoff for a delivery whose cooldown placeholder could not be published, doubling
+#: from the first second up to a minute and reset by the next successful publish. A
+#: broker under a resource alarm holds publishes for as long as the alarm lasts, and
+#: without a growing pause the same delivery comes back every reconnect delay and burns
+#: the quorum-queue delivery limit — after which the broker dead-letters or drops the
+#: very message the requeue was meant to keep.
+_PUBLISH_BACKOFF_START = 1.0
+_PUBLISH_BACKOFF_MAX = 60.0
+
 #: Seconds a cancelled task is given to finish before the cycle moves on without it.
 #: A task that ignores its cancellation must not hold up the cycle that cancelled it.
 _CANCEL_TIMEOUT = 30.0
@@ -365,6 +374,16 @@ class _FireSub:
     negative_checks: int = 0
 
 
+def _unseen_reason(unseen_subs: int, fire_unseen: bool) -> str:
+    """Name what the broker failed to confirm on one ``conn_id``."""
+    parts = []
+    if unseen_subs:
+        parts.append(f"{unseen_subs} subscription(s) unseen by the broker")
+    if fire_unseen:
+        parts.append("the fire consumer is unseen by the broker")
+    return " and ".join(parts)
+
+
 @dataclass
 class _ConnLiveness:
     """Verdict one liveness check reached for a single ``conn_id``.
@@ -421,6 +440,8 @@ class RMQConsumerManager:
         self._cooldown_tracker = OrphanTracker()  # dag_ids for which pending queues were created
         self._exchange_tracker = OrphanTracker()  # dag_ids for which sub queues/bindings were created
         self._http_client: httpx.AsyncClient | None = None  # Management API client
+        # conn_ids the split-cooldown warning last named, so it is logged on change
+        self._split_cooldown_warned: set[str] = set()
 
     async def start(self) -> None:
         """Create the shared Management API HTTP client. Connections/tasks are created on demand."""
@@ -533,12 +554,19 @@ class RMQConsumerManager:
 
         # manage cooldown infrastructure
         cooldown_dag_ids: set[str] = set()
-        fire_conn_id: str | None = None
+        cooldown_conn_ids: set[str] = set()
         for sub in subscriptions:
             if sub.get("cooldown", 0) > 0:
                 cooldown_dag_ids.add(sub["dag_id"])
-                if fire_conn_id is None:
-                    fire_conn_id = sub["conn_id"]
+                cooldown_conn_ids.add(sub["conn_id"])
+        # One fire consumer serves every cooldown subscription, and which conn_id carries
+        # it is decided by sorting rather than by the order the rows came back in: the
+        # query behind that list has no ORDER BY, PostgreSQL reorders rows an UPDATE
+        # touched, and every status transition updates exactly these rows. Reading the
+        # choice off that order would move the fire consumer during the reconnect
+        # turbulence this feature exists to survive, and each move costs a cancel.
+        fire_conn_id = min(cooldown_conn_ids) if cooldown_conn_ids else None
+        self._warn_on_split_cooldown(cooldown_conn_ids, fire_conn_id)
 
         if cooldown_dag_ids and fire_conn_id is not None:
             await self._provision_cooldown(cooldown_dag_ids, fire_conn_id)
@@ -587,6 +615,32 @@ class RMQConsumerManager:
         await self._recover_dead_consumers(subscriptions)
 
         await self._update_all_conn_counts(subscriptions)
+
+    def _warn_on_split_cooldown(
+        self, cooldown_conn_ids: set[str], fire_conn_id: str | None
+    ) -> None:
+        """Warn while cooldown subscriptions are spread over more than one broker.
+
+        The pending queues and the fire exchange are declared on ``fire_conn_id`` alone,
+        while a matched delivery is published to ``rmq_watcher.pending.{dag_id}`` on the
+        conn_id of the subscription that received it. On any other conn_id that queue
+        does not exist, the mandatory publish comes back unrouted, the delivery is
+        requeued and the DAG never fires — so the configuration is named out loud, once
+        per change, rather than failing silently per message.
+        """
+        split = cooldown_conn_ids if len(cooldown_conn_ids) > 1 else set()
+        if split == self._split_cooldown_warned:
+            return
+        self._split_cooldown_warned = set(split)
+        if not split:
+            return
+        log.error(
+            "Cooldown subscriptions span %d connections (%s), and cooldown "
+            "infrastructure is provisioned on %r only. Deliveries matched on the other "
+            "connection(s) cannot be routed to their pending queue and their DAGs will "
+            "not fire — put every cooldown subscription on one conn_id.",
+            len(split), ", ".join(sorted(split)), fire_conn_id,
+        )
 
     def _forget_conn_state(self, active_conn_ids: set[str]) -> None:
         """Drop per-conn_id bookkeeping for conn_ids no subscription mentions."""
@@ -1244,11 +1298,15 @@ class RMQConsumerManager:
         signature of the zombie connection this watchdog exists for.
 
         A conn_id that offers no candidate at all is judged on its own terms. With no
-        running task it is reported as an error outright; with running tasks that never
+        running task it is reported as an error outright. With running tasks that never
         reach ``listening`` for :data:`_STUCK_CYCLES_BEFORE_DROP` cycles the connection
-        itself is condemned — that is the shape of a pooled connection whose
-        ``channel()`` never returns, where every task retries onto the same silence and
-        the check would otherwise see nothing to judge.
+        is asked directly, through :meth:`_probe_connection`, whether it answers an RPC:
+        silence is the shape of a pooled connection whose ``channel()`` never returns,
+        where every task retries onto the same silence and the check would otherwise see
+        nothing to judge, and the connection is condemned. An answer means the tasks are
+        attached to a working connection and are failing after it — a trigger that keeps
+        raising leaves a subscription in ``error`` just as surely — so the connection
+        stays and the row says so.
 
         The verdict of each conn_id is kept in ``self._liveness`` for the status writer.
         """
@@ -1258,6 +1316,7 @@ class RMQConsumerManager:
         self._fire_needs_restart = False
 
         candidates: dict[str, list[tuple[dict, _ActiveSub]]] = {}
+        stalled: dict[str, list[dict]] = {}
         live_tasks: dict[str, int] = {}
         for sub in subscriptions:
             conn_id = sub["conn_id"]
@@ -1267,6 +1326,7 @@ class RMQConsumerManager:
                 continue
             live_tasks[conn_id] += 1
             if entry.state.status != "listening" or entry.state.consumer_tag is None:
+                stalled.setdefault(conn_id, []).append(sub)
                 continue
             candidates.setdefault(conn_id, []).append((sub, entry))
 
@@ -1303,11 +1363,13 @@ class RMQConsumerManager:
                 )
                 continue
 
+            unseen: set[int] = set()
             dead_subs: set[int] = set()
             for sub, entry in subs:
                 if entry.state.consumer_tag in live_tags:
                     entry.negative_checks = 0
                     continue
+                unseen.add(sub["id"])
                 entry.negative_checks += 1
                 log.warning(
                     "Broker does not know consumer %s of subscription %d (queue %r, "
@@ -1318,10 +1380,12 @@ class RMQConsumerManager:
                 if entry.negative_checks >= _NEGATIVE_CHECKS_BEFORE_RESTART:
                     dead_subs.add(sub["id"])
 
+            fire_unseen = False
             if fire_here and fire is not None:
                 if fire_tag in live_tags:
                     fire.negative_checks = 0
                 else:
+                    fire_unseen = True
                     fire.negative_checks += 1
                     log.warning(
                         "Broker does not know the fire consumer on conn_id=%r "
@@ -1333,17 +1397,37 @@ class RMQConsumerManager:
                         fire.negative_checks = 0
                         self._fire_needs_restart = True
 
-            if not dead_subs:
+            if not unseen and not fire_unseen:
                 self._liveness[conn_id] = _ConnLiveness(
                     status="connected", broker_consumers=broker_count
                 )
                 continue
 
+            unseen_reason = _unseen_reason(len(unseen), fire_unseen)
+            if not dead_subs:
+                # The restart waits for a second negative check in a row, the reported
+                # status does not: the broker is holding none of these consumers right
+                # now, and a green row would claim the opposite for a whole reconcile
+                # interval.
+                checks = max(
+                    [entry.negative_checks for sub, entry in subs
+                     if sub["id"] in unseen]
+                    + ([fire.negative_checks] if fire_unseen and fire is not None else [])
+                )
+                self._liveness[conn_id] = _ConnLiveness(
+                    status="error",
+                    broker_consumers=broker_count,
+                    reason=(
+                        f"{unseen_reason} — negative check {checks} of "
+                        f"{_NEGATIVE_CHECKS_BEFORE_RESTART}, recovery starts once that "
+                        f"many checks agree"
+                    ),
+                )
+                continue
+
             if not self._may_drop_connection(conn_id):
                 self._liveness[conn_id] = self._held_back_verdict(
-                    conn_id,
-                    broker_count,
-                    f"{len(dead_subs)} subscription(s) unseen by the broker",
+                    conn_id, broker_count, unseen_reason,
                 )
                 continue
 
@@ -1383,15 +1467,43 @@ class RMQConsumerManager:
                     status=None, broker_consumers=None, reason=None
                 )
                 continue
+
+            # Nothing said so far about *why* these tasks are not consuming, so ask the
+            # connection itself. A task sitting in ``error`` because its trigger keeps
+            # failing is attached to a perfectly healthy connection, and condemning that
+            # would blame the broker for a database outage.
+            answers, probe_reason = await self._probe_connection(
+                conn_id, {sub["queue_name"] for sub in stalled.get(conn_id, [])}
+            )
+            if answers:
+                # The counter keeps running: nothing here is fixed, and dropping it
+                # would leave the next cycle with no verdict to report at all.
+                self._liveness[conn_id] = _ConnLiveness(
+                    status="error",
+                    broker_consumers=None,
+                    reason=(
+                        f"{live} task(s) of this connection have not reached 'listening' "
+                        f"for {stuck} cycles, and the connection answers an RPC — the "
+                        f"fault is downstream of it; see the subscriptions' own errors"
+                    ),
+                )
+                log.warning(
+                    "Connection %r has %d running task(s) and not one of them is "
+                    "consuming after %d cycles, yet the connection answers an RPC — "
+                    "leaving it in place: what stops these tasks is not the connection",
+                    conn_id, live, stuck,
+                )
+                continue
+
             reason = (
                 f"{live} task(s) of this connection have not reached 'listening' for "
-                f"{stuck} cycles — the connection answers no RPC"
+                f"{stuck} cycles, and {probe_reason}"
             )
             log.warning(
                 "Connection %r has %d running task(s) and not one of them is consuming "
-                "after %d cycles — recreating it: a pooled connection that answers no "
-                "RPC hands the same silence to every task that retries on it",
-                conn_id, live, stuck,
+                "after %d cycles, and %s — recreating it: a pooled connection that "
+                "answers no RPC hands the same silence to every task that retries on it",
+                conn_id, live, stuck, probe_reason,
             )
             if not self._may_drop_connection(conn_id):
                 self._liveness[conn_id] = self._held_back_verdict(
@@ -1518,6 +1630,28 @@ class RMQConsumerManager:
         self, conn_id: str, queues: set[str], expected_tags: set[str]
     ) -> tuple[set[str], int | None, str | None]:
         """Verify ``conn_id`` by passive-declaring one of its queues on a fresh channel."""
+        answers, reason = await self._probe_connection(conn_id, queues)
+        if not answers:
+            return set(), None, reason
+        return set(expected_tags), None, None
+
+    async def _probe_connection(
+        self, conn_id: str, queues: set[str]
+    ) -> tuple[bool, str | None]:
+        """Ask the pooled connection of ``conn_id`` itself whether it answers an RPC.
+
+        :param conn_id: Airflow connection to probe.
+        :param queues: Queue names to pick the passive declare's subject from.
+        :returns: ``(answers, reason)``; ``reason`` is filled in when it does not.
+
+        A passive ``queue_declare`` on a fresh channel is the one question that reaches
+        the connection object rather than the broker's bookkeeping about it: a zombie —
+        a connection the broker has long forgotten while the client socket stays open —
+        answers it with silence, which the per-call timeout turns into a failure. With
+        no queue to name the probe cannot be asked and the connection is left alone.
+        """
+        if not queues:
+            return True, None
         queue_name = min(queues)
         rpc_timeout = self._rpc_timeout(conn_id)
         channel = None
@@ -1538,14 +1672,14 @@ class RMQConsumerManager:
                 "dead: silence on an AMQP call is what a zombie connection answers with",
                 conn_id, reason,
             )
-            return set(), None, reason
+            return False, reason
         finally:
             if channel is not None:
                 try:
                     await _call_with_timeout(channel.close(), timeout=_CLOSE_TIMEOUT)
                 except Exception:
                     pass
-        return set(expected_tags), None, None
+        return True, None
 
     async def _consume_subscription(self, sub: dict) -> None:
         sub_id: int = sub["id"]
@@ -1556,8 +1690,10 @@ class RMQConsumerManager:
         msg_filter = MessageFilter.deserialize(sub.get("filter_data") or {})
         state = self._state_of(sub_id)
         # Kept across reconnects: a broken trigger path stays broken through the
-        # reconnect that a NACKed delivery may well cause.
+        # reconnect that a NACKed delivery may well cause, and so does a broker that
+        # will not accept a publish.
         trigger_backoff = _TRIGGER_BACKOFF_START
+        publish_backoff = _PUBLISH_BACKOFF_START
 
         while True:
             await state.write("connecting")
@@ -1588,7 +1724,29 @@ class RMQConsumerManager:
                             if not _match(message, msg_filter):
                                 await _nack_and_sleep(message)
                                 continue
-                            await self._publish_pending(conn_id, dag_id, cooldown, message)
+                            try:
+                                await self._publish_pending(
+                                    conn_id, dag_id, cooldown, message
+                                )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                # The delivery is already back on the queue; pausing
+                                # before leaving the iterator keeps the broker from
+                                # handing it straight back while the publish still
+                                # cannot go through.
+                                log.warning(
+                                    "Publishing the cooldown placeholder for DAG %s "
+                                    "failed: %s — the delivery is back on the queue, "
+                                    "pausing %.1fs before consuming again",
+                                    dag_id, exc, publish_backoff,
+                                )
+                                await asyncio.sleep(publish_backoff)
+                                publish_backoff = min(
+                                    publish_backoff * 2, _PUBLISH_BACKOFF_MAX
+                                )
+                                raise
+                            publish_backoff = _PUBLISH_BACKOFF_START
                         else:
                             # Immediate mode: ACK only once the DAG run exists, so a
                             # failed trigger returns the delivery instead of losing it.

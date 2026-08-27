@@ -1903,6 +1903,115 @@ class TestCycleWorkOffTheLoop:
         manager.reconcile.assert_not_awaited()
 
 
+class TestCycleStepsAreBounded:
+    """The cycle's blocking steps run under a bound of their own, and only one attempt
+    of each is ever in flight.
+
+    Without both, a metadata database that stopped answering costs the whole cycle
+    budget every time round: the loop is recreated, every consumer task is cancelled and
+    every connection closed — and each such cycle leaves one more worker of the
+    four-worker cycle pool stuck for good, until even the filesystem scan cannot start
+    and the liveness check stops running at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_stuck_step_ends_the_cycle_without_spending_its_budget(self, caplog):
+        listener = _cycle_listener()
+        listener._cycle_timeout_override = 30
+        manager = _fake_manager()
+        listener._manager = manager
+        release = threading.Event()
+
+        def blocked():
+            release.wait(timeout=5)
+            return []
+
+        listener._scan_subscriptions = blocked
+        try:
+            with _cycle_patches(manager), patch(
+                "airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.05
+            ), patch("airflow_provider_rmq.watcher.listener._incr") as incr, \
+                    caplog.at_level(
+                        logging.WARNING,
+                        logger="airflow_provider_rmq.watcher.listener",
+                    ):
+                await listener._run_cycle()
+        finally:
+            release.set()
+
+        manager.reconcile.assert_not_awaited()
+        incr.assert_any_call("rmq_watcher.cycle_step_timeout")
+        assert any("did not finish" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_step_still_in_a_worker_is_not_submitted_again(self, caplog):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        release = threading.Event()
+        starts = []
+
+        def blocked():
+            starts.append(1)
+            release.wait(timeout=5)
+            return []
+
+        listener._scan_subscriptions = blocked
+        try:
+            with _cycle_patches(manager), patch(
+                "airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.05
+            ), patch("airflow_provider_rmq.watcher.listener._incr") as incr, \
+                    caplog.at_level(
+                        logging.WARNING,
+                        logger="airflow_provider_rmq.watcher.listener",
+                    ):
+                await listener._run_cycle()
+                await listener._run_cycle()
+                await listener._run_cycle()
+        finally:
+            release.set()
+
+        assert starts == [1], "one attempt of a step at a time, whatever the cycle count"
+        incr.assert_any_call("rmq_watcher.cycle_step_in_flight")
+        assert any("still running" in r.getMessage() for r in caplog.records)
+        manager.reconcile.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_step_that_returns_lets_the_next_cycle_try_again(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+
+        with _cycle_patches(manager):
+            await listener._run_cycle()
+            await listener._run_cycle()
+
+        assert listener._scan_subscriptions.call_count == 2
+        assert manager.reconcile.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_subscription_read_that_times_out_never_reaches_reconcile(self):
+        """Reconciling against a list the query could not deliver would cancel every
+        consumer whose subscription simply did not come back."""
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        release = threading.Event()
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.05
+        ), patch(
+            "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
+            side_effect=lambda session: release.wait(timeout=5) or [],
+        ):
+            try:
+                await listener._run_cycle()
+            finally:
+                release.set()
+
+        manager.reconcile.assert_not_awaited()
+
+
 class TestCycleWatchdog:
     @pytest.mark.asyncio
     async def test_cycle_timeout_reaches_the_caller_of_main(self):
