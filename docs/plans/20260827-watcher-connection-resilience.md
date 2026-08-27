@@ -1032,11 +1032,11 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 
 ### Task 13: [Final] Update documentation
 
-- [ ] CHANGELOG: heartbeat по умолчанию, таймауты AMQP-операций, watchdog подписок и цикла, at-least-once в immediate-режиме, колонки `broker_consumer_count` и `last_reconcile_at`, новый статус `degraded`
-- [ ] readme.md: раздел про устойчивость соединения — доступные ключи `extra` (`heartbeat` — общий с синхронным хуком; `connect_timeout`, `rpc_timeout` — только для асинхронного пути), новая Airflow-переменная `rmq_watcher_cycle_timeout` рядом с существующей `rmq_watcher_reconcile_interval`, что показывает страница Subscriptions, граница гарантии at-least-once (paused/inactive DAG = терминальный ACK, дедуп доверяет `message_id` продюсера)
-- [ ] readme_ru.md: те же разделы
-- [ ] CONTEXT.md: термины **Liveness watchdog** и **Cycle timeout** в глоссарий
-- [ ] move this plan to `docs/plans/completed/`
+- [x] CHANGELOG: heartbeat по умолчанию, таймауты AMQP-операций, watchdog подписок и цикла, at-least-once в immediate-режиме, колонки `broker_consumer_count` и `last_reconcile_at`, новый статус `degraded` — записано как `## v2.4.0` в стиле файла, плюс отдельное соединение для публикации, два пула потоков, метрики, диагностические логи, фиксы `DagRunAlreadyExists` / `replace_microseconds=False` / decode после ACK и **Limitation** про отсутствие `prefetch`
+- [x] readme.md: раздел про устойчивость соединения — доступные ключи `extra` (`heartbeat` — общий с синхронным хуком; `connect_timeout`, `rpc_timeout` — только для асинхронного пути), новая Airflow-переменная `rmq_watcher_cycle_timeout` рядом с существующей `rmq_watcher_reconcile_interval`, что показывает страница Subscriptions, граница гарантии at-least-once (paused/inactive DAG = терминальный ACK, дедуп доверяет `message_id` продюсера) — «Connection Timing» в Connection Setup, «Connection Resilience» и «Delivery Guarantee (immediate mode)» в разделе плагина, плюс отсутствие `prefetch` и его цена
+- [x] readme_ru.md: те же разделы — «Тайминги подключения», «Устойчивость соединения», «Гарантия доставки (immediate-режим)»
+- [x] CONTEXT.md: термины **Liveness watchdog** и **Cycle timeout** в глоссарий, плюс строка в Relationships о разнице их радиуса действия
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
