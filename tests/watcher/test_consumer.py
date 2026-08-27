@@ -84,6 +84,21 @@ def _make_push_queue(messages: list = ()):
     return queue
 
 
+class _FakeExecutor:
+    """Stand-in for the manager's thread pool.
+
+    ``run`` awaits the handler the test supplies instead of handing the call to a
+    worker thread, so the test sees the function and arguments the manager offloaded.
+    """
+
+    def __init__(self, handler):
+        self._handler = handler
+
+    async def run(self, fn, *args):
+        return await self._handler(fn, *args)
+
+
+
 def _mock_session():
     """Return a MagicMock usable as `with WatcherSession() as session:`."""
     ctx = MagicMock()
@@ -598,29 +613,16 @@ class TestTriggerDagBinaryBody:
         manager = RMQConsumerManager()
         msg = _make_fake_message(body=b"\xff\xfe invalid utf-8")
 
-        captured_conf = {}
+        conf_result = {}
 
-        async def mock_executor(loop_or_none, func, *args):
-            captured_conf.update(args[1])  # conf is 2nd positional arg to _sync_trigger
+        async def capture_executor(func, *args):
+            conf_result.update(args[1])  # conf is the 2nd argument of _sync_trigger
+            return None
 
+        manager._executor = _FakeExecutor(capture_executor)
         with patch("airflow_provider_rmq.watcher.consumer.WatcherSession",
-                   return_value=_mock_session()[0]), \
-             patch("asyncio.AbstractEventLoop.run_in_executor",
-                   side_effect=mock_executor):
-            # Патчим loop.run_in_executor через patch объекта
-            loop = asyncio.get_running_loop()
-            original = loop.run_in_executor
-            conf_result = {}
-
-            async def capture_executor(executor, func, *args):
-                conf_result.update(args[1])  # conf dict
-                return None
-
-            loop.run_in_executor = capture_executor
-            try:
-                await manager._trigger_dag("dag", "q", 1, msg)
-            finally:
-                loop.run_in_executor = original
+                   return_value=_mock_session()[0]):
+            await manager._trigger_dag("dag", "q", 1, msg)
 
         assert isinstance(conf_result.get("body"), str)
 
@@ -630,18 +632,14 @@ class TestTriggerDagBinaryBody:
         manager = RMQConsumerManager()
         msg = _make_fake_message(body=b"\xff\xfe")
 
-        loop = asyncio.get_running_loop()
         conf_result = {}
 
-        async def capture_executor(executor, func, *args):
+        async def capture_executor(func, *args):
             conf_result.update(args[1])
             return None
 
-        loop.run_in_executor = capture_executor
-        try:
-            await manager._trigger_dag("dag", "q", 1, msg)
-        finally:
-            del loop.run_in_executor
+        manager._executor = _FakeExecutor(capture_executor)
+        await manager._trigger_dag("dag", "q", 1, msg)
 
         assert isinstance(conf_result["body"], str)
         assert "�" in conf_result["body"]
@@ -1303,20 +1301,15 @@ class TestImmediateSourceConf:
         msg = _make_fake_message(b"hello")
 
         captured_conf = {}
-        loop = asyncio.get_running_loop()
-        original_run = loop.run_in_executor
 
-        async def capture_executor(executor, func, *args):
+        async def capture_executor(func, *args):
             # args = (dag_id, conf, run_id)
             if len(args) >= 2 and isinstance(args[1], dict):
                 captured_conf.update(args[1])
             return None
 
-        loop.run_in_executor = capture_executor
-        try:
-            await manager._trigger_dag("my_dag", "my_queue", 1, msg)
-        finally:
-            loop.run_in_executor = original_run
+        manager._executor = _FakeExecutor(capture_executor)
+        await manager._trigger_dag("my_dag", "my_queue", 1, msg)
 
         assert captured_conf.get("source") == "immediate"
 
@@ -1357,15 +1350,14 @@ class TestConsumeFireQueue:
         triggered_calls = []
         triggered = asyncio.Event()
 
-        async def mock_executor(executor, func, *args):
+        async def mock_executor(func, *args):
             # args = (dag_id, conf, run_id) for _sync_trigger
             triggered_calls.append(args)
             triggered.set()
             return None
 
-        loop = asyncio.get_running_loop()
-        original_run = loop.run_in_executor
-        loop.run_in_executor = mock_executor
+        original_run = manager._executor
+        manager._executor = _FakeExecutor(mock_executor)
         try:
             task = asyncio.create_task(manager._consume_fire_queue(connection))
             await asyncio.wait_for(triggered.wait(), timeout=2.0)
@@ -1375,7 +1367,7 @@ class TestConsumeFireQueue:
             except asyncio.CancelledError:
                 pass
         finally:
-            loop.run_in_executor = original_run
+            manager._executor = original_run
 
         assert len(triggered_calls) == 1
         dag_id_arg, conf_arg, run_id_arg = triggered_calls[0]
@@ -1395,14 +1387,13 @@ class TestConsumeFireQueue:
         captured_run_id = {}
         triggered = asyncio.Event()
 
-        async def mock_executor(executor, func, *args):
+        async def mock_executor(func, *args):
             captured_run_id["run_id"] = args[2]
             triggered.set()
             return None
 
-        loop = asyncio.get_running_loop()
-        original_run = loop.run_in_executor
-        loop.run_in_executor = mock_executor
+        original_run = manager._executor
+        manager._executor = _FakeExecutor(mock_executor)
         try:
             task = asyncio.create_task(manager._consume_fire_queue(connection))
             await asyncio.wait_for(triggered.wait(), timeout=2.0)
@@ -1412,7 +1403,7 @@ class TestConsumeFireQueue:
             except asyncio.CancelledError:
                 pass
         finally:
-            loop.run_in_executor = original_run
+            manager._executor = original_run
 
         assert captured_run_id["run_id"] == "rmq_cooldown__my_dag__fixed-uuid-42"
 
@@ -1431,12 +1422,11 @@ class TestConsumeFireQueue:
 
         msg.ack = capture_ack
 
-        async def mock_executor(executor, func, *args):
+        async def mock_executor(func, *args):
             return None
 
-        loop = asyncio.get_running_loop()
-        original_run = loop.run_in_executor
-        loop.run_in_executor = mock_executor
+        original_run = manager._executor
+        manager._executor = _FakeExecutor(mock_executor)
         try:
             task = asyncio.create_task(manager._consume_fire_queue(connection))
             await asyncio.wait_for(acked.wait(), timeout=2.0)
@@ -1446,7 +1436,7 @@ class TestConsumeFireQueue:
             except asyncio.CancelledError:
                 pass
         finally:
-            loop.run_in_executor = original_run
+            manager._executor = original_run
 
         assert acked.is_set()
 
@@ -1473,20 +1463,19 @@ class TestConsumeFireQueue:
 
         msg.ack = capture_ack
 
-        # _sync_trigger is called inside run_in_executor; simulate it raising IntegrityError
+        # _sync_trigger runs in the thread pool; simulate it raising IntegrityError
         def sync_trigger_raises_integrity(dag_id, conf, run_id):
             raise SaIntegrityError("dup run_id", {}, None)
 
-        async def mock_executor(executor, func, *args):
+        async def mock_executor(func, *args):
             # func is _sync_trigger; call it synchronously to trigger the IntegrityError path
             try:
                 func(*args)
             except SaIntegrityError:
                 pass  # _sync_trigger already handles IntegrityError internally
 
-        loop = asyncio.get_running_loop()
-        original_run = loop.run_in_executor
-        loop.run_in_executor = mock_executor
+        original_run = manager._executor
+        manager._executor = _FakeExecutor(mock_executor)
         try:
             with patch("airflow_provider_rmq.watcher.consumer._sync_trigger",
                        side_effect=sync_trigger_raises_integrity):
@@ -1498,7 +1487,7 @@ class TestConsumeFireQueue:
                 except asyncio.CancelledError:
                     pass
         finally:
-            loop.run_in_executor = original_run
+            manager._executor = original_run
 
         assert acked.is_set()
 
@@ -1555,13 +1544,12 @@ class TestConsumeFireQueue:
 
         msg.ack = capture_ack
 
-        async def fail_if_called(executor, func, *args):
+        async def fail_if_called(func, *args):
             trigger_called.set()
             return None
 
-        loop = asyncio.get_running_loop()
-        original_run = loop.run_in_executor
-        loop.run_in_executor = fail_if_called
+        original_run = manager._executor
+        manager._executor = _FakeExecutor(fail_if_called)
         try:
             task = asyncio.create_task(manager._consume_fire_queue(connection))
             await asyncio.wait_for(acked.wait(), timeout=2.0)
@@ -1571,7 +1559,7 @@ class TestConsumeFireQueue:
             except asyncio.CancelledError:
                 pass
         finally:
-            loop.run_in_executor = original_run
+            manager._executor = original_run
 
         assert acked.is_set()
         assert not trigger_called.is_set()
@@ -1591,13 +1579,12 @@ class TestConsumeFireQueue:
 
         msg.ack = capture_ack
 
-        async def fail_if_called(executor, func, *args):
+        async def fail_if_called(func, *args):
             trigger_called.set()
             return None
 
-        loop = asyncio.get_running_loop()
-        original_run = loop.run_in_executor
-        loop.run_in_executor = fail_if_called
+        original_run = manager._executor
+        manager._executor = _FakeExecutor(fail_if_called)
         try:
             task = asyncio.create_task(manager._consume_fire_queue(connection))
             await asyncio.wait_for(acked.wait(), timeout=2.0)
@@ -1607,7 +1594,7 @@ class TestConsumeFireQueue:
             except asyncio.CancelledError:
                 pass
         finally:
-            loop.run_in_executor = original_run
+            manager._executor = original_run
 
         assert acked.is_set()
         assert not trigger_called.is_set()
@@ -2206,9 +2193,9 @@ class TestProvisionExchangeSubs:
         queue_b.bind.assert_not_called()  # desired == current == empty set
 
     @pytest.mark.asyncio
-    async def test_get_connection_called_via_run_in_executor(self):
-        """BaseHook.get_connection must be called through run_in_executor, not directly
-        in the coroutine — verified the same way as _get_or_create_connection tests."""
+    async def test_get_connection_called_via_executor(self):
+        """BaseHook.get_connection must go to the thread pool instead of running in the
+        coroutine — verified the same way as the _get_or_create_connection tests."""
         manager = RMQConsumerManager()
         manager._http_client = AsyncMock()
         connection, setup_channel, queue_mock = self._make_setup()
@@ -2216,13 +2203,12 @@ class TestProvisionExchangeSubs:
 
         executor_calls = []
 
-        async def capture_executor(executor, func, *args):
+        async def capture_executor(func, *args):
             executor_calls.append((func, args))
             return func(*args)
 
-        loop = asyncio.get_running_loop()
-        original_run = loop.run_in_executor
-        loop.run_in_executor = capture_executor
+        original_run = manager._executor
+        manager._executor = _FakeExecutor(capture_executor)
         try:
             with patch.object(manager, "_get_or_create_connection", return_value=connection), \
                  patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
@@ -2233,10 +2219,10 @@ class TestProvisionExchangeSubs:
                     _exchange_sub(id=1, dag_id="test_dag", exchange="jetstat.airflow"),
                 ])
         finally:
-            loop.run_in_executor = original_run
+            manager._executor = original_run
 
         assert any(func is mock_get_connection for func, _ in executor_calls), (
-            "BaseHook.get_connection must be invoked via loop.run_in_executor"
+            "BaseHook.get_connection must be invoked through the manager's thread pool"
         )
 
     @pytest.mark.asyncio

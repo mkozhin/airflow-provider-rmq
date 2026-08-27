@@ -27,6 +27,7 @@ from airflow_provider_rmq.utils.amqp import (
     match as _match,
     nack_and_sleep as _nack_and_sleep,
 )
+from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.utils.filters import MessageFilter
 from airflow_provider_rmq.utils.management import get_current_bindings, get_management_url
 from airflow_provider_rmq.watcher.models import (
@@ -52,6 +53,27 @@ _ROLE_PUBLISH = "publish"
 
 #: Consecutive publish timeouts on one ``conn_id`` that condemn its publish connection.
 _PUBLISH_TIMEOUTS_BEFORE_DROP = 2
+
+#: Workers of the fallback consumer pool. Sized well above the expected number of
+#: subscriptions: every matched delivery occupies one worker for the duration of its
+#: ``trigger_dag``.
+_CONSUMER_POOL_WORKERS = 32
+
+_default_executor: BoundedExecutor | None = None
+
+
+def _consumer_executor() -> BoundedExecutor:
+    """Process-wide pool for managers created without one of their own.
+
+    The listener passes its own pool so that consumer work and cycle work never
+    compete for the same workers; a manager built directly (a test, an embedding
+    caller) still gets a bounded pool rather than the loop's default executor, which
+    dies with the loop and cannot be shut down without risking a deadlock.
+    """
+    global _default_executor
+    if _default_executor is None:
+        _default_executor = BoundedExecutor("rmq-consumer", _CONSUMER_POOL_WORKERS)
+    return _default_executor
 
 _FIRE_EXCHANGE = "rmq_watcher.fire"
 _FIRE_QUEUE = "rmq_watcher.fire"
@@ -142,7 +164,8 @@ class RMQConsumerManager:
     a lazily opened publish connection of that conn_id.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, executor: BoundedExecutor | None = None) -> None:
+        self._executor = executor if executor is not None else _consumer_executor()
         self._active: dict[int, _ActiveSub] = {}  # sub_id → _ActiveSub
         self._connections: dict[tuple[str, str], Any] = {}  # (conn_id, role) → RobustConnection
         self._publish_channels: dict[str, Any] = {}  # conn_id → channel of the publish connection
@@ -476,8 +499,7 @@ class RMQConsumerManager:
                 if role == _ROLE_PUBLISH:
                     self._publish_channels.pop(conn_id, None)
 
-            loop = asyncio.get_running_loop()
-            conn_info = await loop.run_in_executor(None, BaseHook.get_connection, conn_id)
+            conn_info = await self._executor.run(BaseHook.get_connection, conn_id)
             url, ssl_context = build_amqp_connection(conn_info)
             timeouts = get_amqp_timeouts(conn_info)
             self._timeouts[conn_id] = timeouts
@@ -508,7 +530,6 @@ class RMQConsumerManager:
         exchange: str,
         sub: dict,
         http_client: httpx.AsyncClient,
-        loop: asyncio.AbstractEventLoop,
         rpc_timeout: float = DEFAULT_RPC_TIMEOUT,
     ) -> bool:
         """Provision the sub queue + bind-diff for a single exchange-mode subscription.
@@ -526,7 +547,7 @@ class RMQConsumerManager:
         try:
             queue = await _ensure_sub_queue(setup_channel, dag_id, timeout=rpc_timeout)
 
-            conn_info = await loop.run_in_executor(None, BaseHook.get_connection, conn_id)
+            conn_info = await self._executor.run(BaseHook.get_connection, conn_id)
             vhost = conn_info.schema or "/"
             management_url = get_management_url(conn_info)
             if management_url is None:
@@ -608,8 +629,6 @@ class RMQConsumerManager:
             key = (sub["conn_id"], sub["exchange"])
             groups.setdefault(key, []).append(sub)
 
-        loop = asyncio.get_running_loop()
-
         for (conn_id, exchange), group in groups.items():
             try:
                 connection = await self._get_or_create_connection(conn_id)
@@ -626,7 +645,7 @@ class RMQConsumerManager:
                         dag_id = sub["dag_id"]
                         try:
                             provisioned = await self._provision_one_exchange_sub(
-                                setup_channel, exchange, sub, http_client, loop, rpc_timeout,
+                                setup_channel, exchange, sub, http_client, rpc_timeout,
                             )
                         except asyncio.CancelledError:
                             raise
@@ -888,10 +907,7 @@ class RMQConsumerManager:
                             "queue": _FIRE_QUEUE,
                             "subscription_id": None,
                         }
-                        loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(
-                            None, _sync_trigger, dag_id, conf, run_id
-                        )
+                        await self._executor.run(_sync_trigger, dag_id, conf, run_id)
                         # Known limitation: if _sync_trigger returned early because the
                         # DAG is paused/inactive, the message is still ACKed here and the
                         # fire event is permanently lost. This is intentional — the DLX
@@ -941,8 +957,7 @@ class RMQConsumerManager:
             "subscription_id": sub_id,
         }
         run_id = _build_run_id(queue_name)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _sync_trigger, dag_id, conf, run_id)
+        await self._executor.run(_sync_trigger, dag_id, conf, run_id)
 
 
 async def _ensure_fire_infrastructure(

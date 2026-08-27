@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import logging
 import sys
 import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from airflow_provider_rmq.utils.amqp import call_with_timeout
+from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
     _UNRESOLVED_DAG_ID,
@@ -1657,6 +1661,11 @@ class TestMainExchangeMetaMerge:
             "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
             return_value=db_subs,
         ), patch(
+            "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=True
+        ), patch(
+            "airflow_provider_rmq.watcher.listener._read_settings",
+            return_value=(None, None),
+        ), patch(
             "asyncio.sleep", new=AsyncMock()
         ):
             asyncio.run(listener._main())
@@ -1752,3 +1761,394 @@ class TestMainExchangeMetaMerge:
 
         assert len(active_subs) == 1
         assert "exchange" not in active_subs[0]
+
+
+# ---------------------------------------------------------------------------
+# Cycle watchdog, tunables cache, schema-migration retry and the thread pools
+# (Task 4)
+# ---------------------------------------------------------------------------
+
+async def _never_returns(*args, **kwargs):
+    """Stand-in for a call that hangs: it outlives any timeout under test."""
+    await asyncio.sleep(30)
+
+
+def _fake_manager():
+    """Consumer manager stand-in whose async methods return immediately."""
+    manager = MagicMock()
+    manager.start = AsyncMock()
+    manager.stop = AsyncMock()
+    manager.reconcile = AsyncMock()
+    return manager
+
+
+def _instant_stop_event():
+    """Real stop event whose inter-loop wait returns at once.
+
+    ``_run_loop`` waits 30 seconds between loops; a restart test would otherwise
+    spend that long doing nothing.
+    """
+    event = threading.Event()
+    event.wait = lambda timeout=None: event.is_set()
+    return event
+
+
+def _cycle_listener():
+    """Listener with the scan and the DB sync stubbed and no sleep between cycles."""
+    listener = RMQWatcherListener()
+    listener._stop_event = threading.Event()
+    listener._scan_subscriptions = MagicMock(return_value=[])
+    listener._sync_to_db = MagicMock()
+    listener._reconcile_interval = 0
+    listener._settings_cycles = 1000   # no Variable read during the test
+    return listener
+
+
+@contextlib.contextmanager
+def _cycle_patches(manager, db_subs=()):
+    """Patch everything a cycle reaches outside the listener itself."""
+    ctx, _ = _make_session_ctx()
+    with patch(
+        "airflow_provider_rmq.watcher.listener.RMQConsumerManager", return_value=manager
+    ) as manager_cls, patch(
+        "airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx
+    ), patch(
+        "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
+        return_value=list(db_subs),
+    ), patch(
+        "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=True
+    ), patch(
+        "airflow_provider_rmq.watcher.listener._read_settings", return_value=(None, None)
+    ):
+        yield manager_cls
+
+
+class TestCycleWatchdog:
+    @pytest.mark.asyncio
+    async def test_cycle_timeout_reaches_the_caller_of_main(self):
+        """The cycle's own `except Exception` must not see the watchdog's timeout.
+
+        ``asyncio.TimeoutError`` is an ``Exception``, so a handler wrapped around the
+        timeout instead of placed inside the cycle would swallow it and leave the
+        whole layer a no-op — the loop would never be recreated.
+        """
+        listener = _cycle_listener()
+        listener._cycle_timeout_override = 0.05
+        manager = _fake_manager()
+        manager.reconcile = _never_returns
+
+        with _cycle_patches(manager), pytest.raises(asyncio.TimeoutError):
+            await listener._main()
+
+        assert listener._phase == "reconcile"
+        manager.stop.assert_awaited()   # the manager is torn down on the way out
+
+    @pytest.mark.asyncio
+    async def test_cycle_timeout_reports_the_phase_and_counts_a_metric(self, caplog):
+        listener = _cycle_listener()
+        listener._cycle_timeout_override = 0.05
+        manager = _fake_manager()
+        manager.reconcile = _never_returns
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener._incr"
+        ) as incr, caplog.at_level(
+            logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
+        ), pytest.raises(asyncio.TimeoutError):
+            await listener._main()
+
+        incr.assert_called_once_with("rmq_watcher.cycle_timeout")
+        assert any("reconcile" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_ordinary_cycle_error_is_logged_and_swallowed(self):
+        """Moving the handler inside the cycle must not change what it handles."""
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        manager.reconcile = AsyncMock(side_effect=RuntimeError("broker is gone"))
+        listener._manager = manager
+
+        with _cycle_patches(manager):
+            await listener._run_cycle()   # no exception escapes
+
+        manager.reconcile.assert_awaited()
+
+    def test_hung_cycle_recreates_the_event_loop(self):
+        listener = RMQWatcherListener()
+        listener._stop_event = _instant_stop_event()
+        loops = []
+
+        async def fake_main():
+            loops.append(asyncio.get_running_loop())
+            if len(loops) == 1:
+                raise asyncio.TimeoutError()
+            listener._stop_event.set()
+
+        with patch.object(listener, "_main", side_effect=fake_main):
+            listener._run_loop()
+
+        assert len(loops) == 2
+        assert loops[0] is not loops[1]
+
+    def test_loop_restart_reuses_the_pools_and_spares_the_default_executor(self):
+        listener = RMQWatcherListener()
+        listener._stop_event = _instant_stop_event()
+        seen = []
+
+        async def fake_main():
+            seen.append((listener._cycle_pool, listener._consumer_pool))
+            if len(seen) == 1:
+                raise asyncio.TimeoutError()
+            listener._stop_event.set()
+
+        with patch.object(listener, "_main", side_effect=fake_main), patch.object(
+            asyncio.base_events.BaseEventLoop, "shutdown_default_executor"
+        ) as shutdown:
+            listener._run_loop()
+
+        assert seen[0] == seen[1]
+        shutdown.assert_not_called()
+
+    def test_a_call_stuck_in_the_pool_does_not_block_the_next_loop(self):
+        """A worker still occupied by a call the loop gave up on must not hold the
+        watcher thread — the pool outlives the loop by design."""
+        listener = RMQWatcherListener()
+        listener._stop_event = _instant_stop_event()
+        release = threading.Event()
+        rounds = []
+
+        async def fake_main():
+            rounds.append(1)
+            if len(rounds) == 1:
+                await call_with_timeout(
+                    asyncio.wrap_future(listener._cycle_pool.submit(release.wait, 5)),
+                    0.05,
+                )
+            listener._stop_event.set()
+
+        try:
+            with patch.object(listener, "_main", side_effect=fake_main):
+                listener._run_loop()
+        finally:
+            release.set()
+
+        assert len(rounds) == 2
+
+    @pytest.mark.asyncio
+    async def test_hung_manager_stop_does_not_block_teardown(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        manager.stop = _never_returns
+        listener._manager = manager
+
+        with patch("airflow_provider_rmq.watcher.listener._STOP_TIMEOUT", 0.05):
+            await listener._stop_manager()   # returns instead of hanging
+
+    @pytest.mark.asyncio
+    async def test_manager_gets_the_consumer_pool(self):
+        """Cycle work and consumer work must never share workers."""
+        listener = _cycle_listener()
+        manager = _fake_manager()
+
+        async def stop_after_first(subs):
+            listener._stop_event.set()
+
+        manager.reconcile = AsyncMock(side_effect=stop_after_first)
+
+        with _cycle_patches(manager) as manager_cls:
+            await listener._main()
+
+        assert manager_cls.call_args.kwargs["executor"] is listener._consumer_pool
+        assert listener._consumer_pool is not listener._cycle_pool
+
+    @pytest.mark.asyncio
+    async def test_busy_consumer_pool_leaves_the_cycle_pool_free(self):
+        listener = RMQWatcherListener()
+        listener._consumer_pool = BoundedExecutor("test-consumer", 2)
+        release = threading.Event()
+        for _ in range(2):
+            listener._consumer_pool.submit(release.wait, 5)
+        try:
+            assert await listener._cycle_pool.run(lambda: "cycle work") == "cycle work"
+        finally:
+            release.set()
+
+
+class TestCycleTunables:
+    def test_cycle_timeout_never_drops_below_the_floor(self):
+        listener = RMQWatcherListener()
+        listener._reconcile_interval = 60
+        assert listener._cycle_timeout() == 300
+
+    def test_cycle_timeout_scales_with_the_interval(self):
+        listener = RMQWatcherListener()
+        listener._reconcile_interval = 600
+        assert listener._cycle_timeout() == 1800
+
+    def test_variable_overrides_the_computed_budget(self):
+        listener = RMQWatcherListener()
+        listener._reconcile_interval = 600
+        listener._cycle_timeout_override = 42.0
+        assert listener._cycle_timeout() == 42.0
+
+    @pytest.mark.asyncio
+    async def test_refresh_reads_both_variables(self):
+        listener = RMQWatcherListener()
+        with patch(
+            "airflow_provider_rmq.watcher.listener._read_settings",
+            return_value=(120, 45.0),
+        ):
+            await listener._refresh_settings()
+
+        assert listener._reconcile_interval == 120
+        assert listener._cycle_timeout() == 45.0
+
+    @pytest.mark.asyncio
+    async def test_refresh_is_skipped_between_reads(self):
+        listener = RMQWatcherListener()
+        with patch(
+            "airflow_provider_rmq.watcher.listener._read_settings",
+            return_value=(120, None),
+        ) as read:
+            await listener._refresh_settings()
+            await listener._refresh_settings()
+            await listener._refresh_settings()
+
+        assert read.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_hung_variable_read_keeps_the_last_known_interval(self):
+        listener = RMQWatcherListener()
+        listener._reconcile_interval = 17
+        release = threading.Event()
+
+        def blocked():
+            release.wait(timeout=5)
+            return (999, None)
+
+        try:
+            with patch(
+                "airflow_provider_rmq.watcher.listener._read_settings", side_effect=blocked
+            ), patch("airflow_provider_rmq.watcher.listener._VARIABLE_TIMEOUT", 0.05):
+                await listener._refresh_settings()
+                assert listener._reconcile_interval == 17
+                assert listener._cycle_timeout() == 300
+
+                # the previous read still holds a worker — no second one is started
+                listener._settings_cycles = 0
+                await listener._refresh_settings()
+        finally:
+            release.set()
+
+        assert listener._reconcile_interval == 17
+
+    @pytest.mark.asyncio
+    async def test_unset_variable_falls_back_to_the_default_interval(self):
+        listener = RMQWatcherListener()
+        listener._reconcile_interval = 17
+        with patch(
+            "airflow_provider_rmq.watcher.listener._read_settings", return_value=(None, None)
+        ):
+            await listener._refresh_settings()
+
+        assert listener._reconcile_interval == 60
+        assert listener._cycle_timeout_override is None
+
+
+class TestSchemaMigrationRetry:
+    @pytest.mark.asyncio
+    async def test_migration_is_retried_until_the_schema_is_ready(self):
+        listener = _cycle_listener()
+        ready = {"value": False}
+        calls = []
+
+        def migrate():
+            calls.append(1)
+            ready["value"] = len(calls) >= 2
+
+        with patch(
+            "airflow_provider_rmq.watcher.listener.ensure_table_exists", side_effect=migrate
+        ), patch(
+            "airflow_provider_rmq.watcher.listener.is_schema_ready",
+            side_effect=lambda: ready["value"],
+        ):
+            await listener._ensure_schema()
+            assert len(calls) == 1
+            assert listener._migration_skip_cycles == 1   # backoff armed
+
+            listener._migration_skip_cycles = 0
+            await listener._ensure_schema()
+            assert len(calls) == 2
+            assert listener._migration_skip_cycles == 0   # backoff cleared on success
+
+            await listener._ensure_schema()
+            assert len(calls) == 2, "a ready schema must not be migrated again"
+
+    @pytest.mark.asyncio
+    async def test_failed_migration_backs_off_instead_of_retrying_every_cycle(self):
+        listener = _cycle_listener()
+        calls = []
+
+        with patch(
+            "airflow_provider_rmq.watcher.listener.ensure_table_exists",
+            side_effect=lambda: calls.append(1),
+        ), patch(
+            "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=False
+        ):
+            await listener._ensure_schema()      # attempt 1 → wait 1 cycle
+            await listener._ensure_schema()      # skipped
+            assert len(calls) == 1
+            await listener._ensure_schema()      # attempt 2 → wait 2 cycles
+            assert len(calls) == 2
+            assert listener._migration_skip_cycles == 2
+
+    @pytest.mark.asyncio
+    async def test_only_one_migration_attempt_is_ever_in_flight(self):
+        """A timeout does not free the worker, so retrying every cycle would fill the
+        cycle pool with stuck attempts."""
+        listener = _cycle_listener()
+        release = threading.Event()
+        calls = []
+
+        def blocked():
+            calls.append(1)
+            release.wait(timeout=5)
+
+        try:
+            with patch(
+                "airflow_provider_rmq.watcher.listener.ensure_table_exists",
+                side_effect=blocked,
+            ), patch(
+                "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=False
+            ), patch("airflow_provider_rmq.watcher.listener._MIGRATION_TIMEOUT", 0.05):
+                await listener._ensure_schema()
+                for _ in range(5):
+                    listener._migration_skip_cycles = 0   # even with backoff cleared
+                    await listener._ensure_schema()
+        finally:
+            release.set()
+
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_hung_migration_gives_up_without_spending_the_cycle_budget(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        release = threading.Event()
+
+        try:
+            with _cycle_patches(manager), patch(
+                "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=False
+            ), patch(
+                "airflow_provider_rmq.watcher.listener.ensure_table_exists",
+                side_effect=lambda: release.wait(timeout=5),
+            ), patch("airflow_provider_rmq.watcher.listener._MIGRATION_TIMEOUT", 0.05):
+                started = time.monotonic()
+                await listener._run_cycle()
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert elapsed < 1.0
+        manager.reconcile.assert_awaited(), "the cycle must go on without the migration"

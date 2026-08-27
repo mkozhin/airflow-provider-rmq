@@ -7,17 +7,23 @@ import glob
 import logging
 import os
 import threading
+import time
 import traceback
 from collections.abc import Iterator
+from concurrent.futures import Future
 from typing import Any
 
 from airflow.listeners import hookimpl
 
+from airflow_provider_rmq.utils.amqp import call_with_timeout
+from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.watcher.consumer import RMQConsumerManager
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
     WatcherSession,
+    ensure_table_exists,
     get_enabled_subscriptions,
+    is_schema_ready,
     upsert_subscription,
 )
 from airflow_provider_rmq.watcher.subscription_builder import (
@@ -28,6 +34,44 @@ from airflow_provider_rmq.watcher.subscription_builder import (
 log = logging.getLogger(__name__)
 
 _DEFAULT_RECONCILE_INTERVAL = 60
+
+#: Airflow Variables holding the watcher tunables.
+_RECONCILE_INTERVAL_VAR = "rmq_watcher_reconcile_interval"
+_CYCLE_TIMEOUT_VAR = "rmq_watcher_cycle_timeout"
+
+#: A cycle may take this many reconcile intervals, but never less than
+#: ``_MIN_CYCLE_TIMEOUT`` seconds. The budget is generous on purpose: hitting it
+#: cancels every consumer task and pauses consumption on every conn_id for the
+#: 30s loop-restart delay, while the per-call AMQP timeouts catch a stuck network
+#: operation far earlier and only for the subscription that owns it.
+_CYCLE_TIMEOUT_FACTOR = 3
+_MIN_CYCLE_TIMEOUT = 300
+
+#: Seconds allowed for reading the tunables out of the Airflow Variables table.
+_VARIABLE_TIMEOUT = 15.0
+
+#: Cycles between re-reads of the tunables; every read is a database round trip.
+_SETTINGS_REFRESH_CYCLES = 5
+
+#: Seconds allowed for one schema-migration attempt.
+_MIGRATION_TIMEOUT = 30.0
+
+#: Cycles to skip after a failed migration attempt: one, then doubling up to the
+#: cap (an hour of cycles at the default interval).
+_MIGRATION_BACKOFF_START = 1
+_MIGRATION_BACKOFF_CAP = 60
+
+#: Seconds allowed for the manager to stop before the loop is torn down anyway.
+_STOP_TIMEOUT = 30.0
+
+#: Workers of the cycle pool: the reconcile loop's own blocking calls (schema
+#: migration, Variable reads, DAG-file scan, subscription queries).
+_CYCLE_POOL_WORKERS = 4
+
+#: Workers of the consumer pool, handed to the manager. Kept apart from the cycle
+#: pool so that a database that stopped answering degrades consumption without
+#: also starving the cycle that writes statuses and rebuilds connections.
+_CONSUMER_POOL_WORKERS = 32
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +551,41 @@ def _resolve_function_dag_id(
     return dag_id
 
 
+def _read_settings() -> tuple[int | None, float | None]:
+    """Read the watcher tunables from Airflow Variables. Blocking: hits the database.
+
+    Returns ``(reconcile_interval, cycle_timeout)``; either is ``None`` when the
+    Variable is unset or holds something that is not a positive number, which the
+    caller reads as "keep the built-in default".
+    """
+    from airflow.models import Variable
+
+    def _positive(name: str, cast: Any) -> Any:
+        raw = Variable.get(name, default_var=None)
+        if raw is None:
+            return None
+        try:
+            value = cast(raw)
+        except (TypeError, ValueError):
+            log.warning("RMQ Watcher: Variable %s=%r is not a number — ignoring", name, raw)
+            return None
+        if value <= 0:
+            log.warning("RMQ Watcher: Variable %s=%r must be positive — ignoring", name, raw)
+            return None
+        return value
+
+    return _positive(_RECONCILE_INTERVAL_VAR, int), _positive(_CYCLE_TIMEOUT_VAR, float)
+
+
+def _incr(metric: str) -> None:
+    """Bump a statsd counter. Metrics never affect control flow, so failures are silent."""
+    try:
+        from airflow.stats import Stats
+        Stats.incr(metric)
+    except Exception:
+        log.debug("RMQ Watcher: cannot report metric %s", metric, exc_info=True)
+
+
 class RMQWatcherListener:
     """Airflow Listener that runs a background RabbitMQ consumer loop inside the Scheduler process.
 
@@ -525,6 +604,22 @@ class RMQWatcherListener:
         # mtime-based incremental scan state (lives in the daemon thread only)
         self._last_mtimes: dict[str, float] = {}   # filepath → mtime
         self._cached_subs: dict[str, list[dict]] = {}  # filepath → list[sub dict]
+        # Both pools are built here, in whatever thread constructs the listener, and
+        # outlive every event loop the watcher thread creates.
+        self._cycle_pool = BoundedExecutor("rmq-watcher-cycle", _CYCLE_POOL_WORKERS)
+        self._consumer_pool = BoundedExecutor("rmq-watcher-consumer", _CONSUMER_POOL_WORKERS)
+        # Tunables, cached between refreshes so that a database outage cannot stall
+        # the loop at a point the cycle watchdog does not cover.
+        self._reconcile_interval = _DEFAULT_RECONCILE_INTERVAL
+        self._cycle_timeout_override: float | None = None
+        self._settings_cycles = 0            # cycles left before the next read
+        self._settings_attempt: Future | None = None
+        # Schema migration retry state
+        self._migration_attempt: Future | None = None
+        self._migration_backoff = 0          # cycles to skip after the last failure
+        self._migration_skip_cycles = 0
+        #: Step the current cycle is on, reported when the cycle runs out of budget.
+        self._phase = "idle"
 
     # ------------------------------------------------------------------
     # Listener API
@@ -582,69 +677,213 @@ class RMQWatcherListener:
             except Exception:
                 log.exception("RMQ Watcher loop crashed — restarting in 30s")
             finally:
+                # Both thread pools belong to the listener, not to the loop, so the
+                # next loop reuses them. loop.shutdown_default_executor() is
+                # deliberately not called: on Python 3.10/3.11 it ends in a
+                # thread.join() with no timeout that wait_for cannot interrupt, so a
+                # single call stuck on the database would freeze this thread for good.
                 loop.close()
             if not self._stop_event.is_set():
                 self._stop_event.wait(timeout=30)
         log.info("RMQ Watcher loop stopped")
 
     async def _main(self) -> None:
-        self._manager = RMQConsumerManager()
+        self._manager = RMQConsumerManager(executor=self._consumer_pool)
         await self._manager.start()
         try:
             while not self._stop_event.is_set():
+                await self._refresh_settings()
+                budget = self._cycle_timeout()
+                started = time.monotonic()
                 try:
-                    scanned = self._scan_subscriptions()
-                    self._sync_to_db(scanned)
-
-                    # Exchange/routing_keys metadata is never persisted to the DB (see
-                    # plan Technical Details → "Почему миграция БД не нужна") — it only
-                    # lives in-memory in the AST scan cache, re-derived every cycle. Build
-                    # a lookup keyed the same way as the unique constraint on
-                    # RMQSubscription so it can be merged back onto DB rows below.
-                    exchange_meta = {
-                        (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default")): {
-                            "exchange": s["exchange"],
-                            "routing_keys": s["routing_keys"],
-                        }
-                        for s in scanned
-                        if "exchange" in s
-                    }
-
-                    with WatcherSession() as session:
-                        active_subs = []
-                        for sub in get_enabled_subscriptions(session):
-                            entry = {
-                                "id": sub.id,
-                                "dag_id": sub.dag_id,
-                                "queue_name": sub.queue_name,
-                                "conn_id": sub.conn_id,
-                                "filter_data": sub.filter_data or {},
-                                "cooldown": sub.cooldown or 0,
-                            }
-                            meta = exchange_meta.get(
-                                (sub.dag_id, sub.queue_name, sub.conn_id)
-                            )
-                            if meta is not None:
-                                entry.update(meta)
-                            active_subs.append(entry)
-
-                    await self._manager.reconcile(active_subs)
-                except Exception:
-                    log.exception("Error in RMQ Watcher reconciliation cycle")
-
-                await asyncio.sleep(self._get_reconcile_interval())
+                    await call_with_timeout(self._run_cycle(), budget)
+                except asyncio.TimeoutError:
+                    log.error(
+                        "RMQ Watcher cycle exceeded its %.0fs budget in phase %r after "
+                        "%.0fs — recreating the event loop",
+                        budget, self._phase, time.monotonic() - started,
+                    )
+                    _incr("rmq_watcher.cycle_timeout")
+                    raise
+                await asyncio.sleep(self._reconcile_interval)
         finally:
-            await self._manager.stop()
+            await self._stop_manager()
 
-    def _get_reconcile_interval(self) -> int:
+    async def _run_cycle(self) -> None:
+        """Run one reconciliation pass: migrate, scan, sync, read subscriptions, reconcile.
+
+        Errors are logged here rather than around the call site, so that the only
+        thing the caller's timeout can observe is the timeout itself.
+        ``asyncio.TimeoutError`` is a subclass of ``Exception`` (an alias of the
+        builtin ``TimeoutError`` from Python 3.11 on), so an ``except Exception``
+        wrapped around this call instead of placed inside it would swallow the cycle
+        watchdog whole and leave the layer a no-op.
+        """
         try:
-            from airflow.models import Variable
-            val = Variable.get("rmq_watcher_reconcile_interval", default_var=None)
-            if val is not None:
-                return int(val)
+            self._phase = "migrate"
+            await self._ensure_schema()
+
+            self._phase = "scan"
+            scanned = self._scan_subscriptions()
+
+            self._phase = "sync"
+            self._sync_to_db(scanned)
+
+            # Exchange/routing_keys metadata is never persisted to the DB (see
+            # plan Technical Details → "Почему миграция БД не нужна") — it only
+            # lives in-memory in the AST scan cache, re-derived every cycle. Build
+            # a lookup keyed the same way as the unique constraint on
+            # RMQSubscription so it can be merged back onto DB rows below.
+            exchange_meta = {
+                (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default")): {
+                    "exchange": s["exchange"],
+                    "routing_keys": s["routing_keys"],
+                }
+                for s in scanned
+                if "exchange" in s
+            }
+
+            self._phase = "read subs"
+            with WatcherSession() as session:
+                active_subs = []
+                for sub in get_enabled_subscriptions(session):
+                    entry = {
+                        "id": sub.id,
+                        "dag_id": sub.dag_id,
+                        "queue_name": sub.queue_name,
+                        "conn_id": sub.conn_id,
+                        "filter_data": sub.filter_data or {},
+                        "cooldown": sub.cooldown or 0,
+                    }
+                    meta = exchange_meta.get(
+                        (sub.dag_id, sub.queue_name, sub.conn_id)
+                    )
+                    if meta is not None:
+                        entry.update(meta)
+                    active_subs.append(entry)
+
+            self._phase = "reconcile"
+            await self._manager.reconcile(active_subs)
         except Exception:
-            pass
-        return _DEFAULT_RECONCILE_INTERVAL
+            log.exception("Error in RMQ Watcher reconciliation cycle")
+
+    async def _stop_manager(self) -> None:
+        """Stop the manager, giving up after ``_STOP_TIMEOUT`` seconds.
+
+        Reached while the loop is already being torn down, so a manager that cannot
+        finish must not keep the thread from starting a fresh loop.
+        """
+        try:
+            await call_with_timeout(self._manager.stop(), _STOP_TIMEOUT)
+        except Exception:
+            log.warning(
+                "RMQ Watcher: manager.stop() did not finish within %ss — continuing "
+                "with loop teardown", _STOP_TIMEOUT, exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Tunables and schema migration — blocking calls kept off the loop thread
+    # ------------------------------------------------------------------
+
+    def _cycle_timeout(self) -> float:
+        """Seconds one cycle may take before the event loop is recreated."""
+        if self._cycle_timeout_override is not None:
+            return self._cycle_timeout_override
+        return float(
+            max(self._reconcile_interval * _CYCLE_TIMEOUT_FACTOR, _MIN_CYCLE_TIMEOUT)
+        )
+
+    async def _refresh_settings(self) -> None:
+        """Re-read the tunables, keeping the last known values on any failure.
+
+        ``Variable.get`` talks to the database and the result decides the cycle
+        budget, so it has to be read *before* the budget starts counting — outside
+        everything the cycle watchdog covers. It therefore runs in the cycle pool
+        under a short timeout of its own, and only every ``_SETTINGS_REFRESH_CYCLES``
+        cycles. A read still stuck in a worker blocks the next one from starting, so
+        an unresponsive database costs one worker rather than one per cycle.
+        """
+        if self._settings_cycles > 0:
+            self._settings_cycles -= 1
+            return
+        if self._settings_attempt is not None and not self._settings_attempt.done():
+            return
+        self._settings_cycles = _SETTINGS_REFRESH_CYCLES
+        attempt = self._cycle_pool.submit(_read_settings)
+        self._settings_attempt = attempt
+        try:
+            interval, cycle_timeout = await call_with_timeout(
+                asyncio.wrap_future(attempt), _VARIABLE_TIMEOUT
+            )
+        except Exception:
+            log.warning(
+                "RMQ Watcher: cannot read tunables from Airflow Variables — keeping "
+                "interval=%ss, cycle timeout=%ss",
+                self._reconcile_interval, self._cycle_timeout(), exc_info=True,
+            )
+            return
+        self._reconcile_interval = (
+            interval if interval is not None else _DEFAULT_RECONCILE_INTERVAL
+        )
+        self._cycle_timeout_override = cycle_timeout
+
+    async def _ensure_schema(self) -> None:
+        """Retry table creation and column migration until the schema is ready.
+
+        The plugin runs the migration once at load; a database unreachable at that
+        moment would leave the ORM model describing columns the live table lacks,
+        which breaks every status upsert and the Subscriptions page with it. So each
+        cycle tries again until the schema reports itself ready.
+
+        The call blocks (``create_all``, ``inspect``, ``ALTER TABLE``) and goes to the
+        cycle pool: run inline it would block the loop thread, and a blocked loop
+        services no timers — the very watchdog wrapped around this cycle would never
+        fire, and AMQP heartbeats would stop leaving the process with it.
+
+        ``ALTER TABLE ... ADD COLUMN`` needs an ACCESS EXCLUSIVE lock and can queue
+        behind whoever holds one, hence both the private timeout and the single
+        attempt in flight: a timeout does not free the worker, so a retry every cycle
+        would fill the pool with stuck attempts and hold that many connections of
+        Airflow's shared engine.
+        """
+        if is_schema_ready():
+            return
+        if self._migration_attempt is not None and not self._migration_attempt.done():
+            return
+        if self._migration_skip_cycles > 0:
+            self._migration_skip_cycles -= 1
+            return
+
+        attempt = self._cycle_pool.submit(ensure_table_exists)
+        self._migration_attempt = attempt
+        try:
+            await call_with_timeout(asyncio.wrap_future(attempt), _MIGRATION_TIMEOUT)
+        except Exception:
+            log.warning(
+                "RMQ Watcher: schema migration attempt failed or exceeded %ss",
+                _MIGRATION_TIMEOUT, exc_info=True,
+            )
+            self._defer_migration()
+            return
+
+        if is_schema_ready():
+            self._migration_backoff = 0
+            self._migration_skip_cycles = 0
+            log.info("RMQ Watcher: watcher schema is ready")
+        else:
+            self._defer_migration()
+
+    def _defer_migration(self) -> None:
+        """Hold off the next migration attempt, doubling the wait up to the cap."""
+        self._migration_backoff = min(
+            max(self._migration_backoff * 2, _MIGRATION_BACKOFF_START),
+            _MIGRATION_BACKOFF_CAP,
+        )
+        self._migration_skip_cycles = self._migration_backoff
+        log.warning(
+            "RMQ Watcher: schema is not ready — retrying the migration in %s cycle(s)",
+            self._migration_backoff,
+        )
 
     # ------------------------------------------------------------------
     # DAG-file scanning (mtime-based incremental)
