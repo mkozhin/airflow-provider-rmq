@@ -483,6 +483,30 @@ class TestPushModeNoFilter:
         assert events[0]["message"]["exchange"] == "ex"
         fake_message.ack.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_binary_body_is_decoded_with_replacement(self):
+        """The ACK is already behind the decode, so a binary payload must not raise:
+        the event would be gone with nothing left to redeliver."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode="push")
+
+        fake_message = _make_fake_message(
+            body=b"\xff\xfe not utf-8", headers={}, routing_key="rk", exchange="ex",
+        )
+        fake_queue = _make_push_queue([fake_message])
+        fake_connection = _make_fake_connection(fake_queue)
+
+        with patch("airflow_provider_rmq.triggers.rmq.aio_pika") as mock_aio_pika:
+            mock_aio_pika.connect_robust = AsyncMock(return_value=fake_connection)
+            with patch("airflow_provider_rmq.triggers.rmq.BaseHook") as mock_base:
+                mock_base.get_connection = MagicMock(return_value=FakeAirflowConnection())
+
+                events = await _collect_events(trigger)
+
+        assert len(events) == 1
+        assert events[0]["status"] == "success"
+        assert "\ufffd" in events[0]["message"]["body"]
+        fake_message.ack.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # Push mode — with filter

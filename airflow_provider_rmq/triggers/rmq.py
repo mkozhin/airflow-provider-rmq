@@ -93,7 +93,9 @@ class RMQTrigger(BaseTrigger):
         return {
             "status": "success",
             "message": {
-                "body": message.body.decode("utf-8"),
+                # errors="replace": the ACK is already behind us, so a binary payload
+                # must not raise here — the event would be gone with nothing to redeliver.
+                "body": message.body.decode("utf-8", errors="replace"),
                 "headers": dict(message.headers or {}),
                 "routing_key": message.routing_key or "",
                 "exchange": message.exchange or "",

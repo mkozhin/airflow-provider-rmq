@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import socket
 import time
 import uuid
@@ -13,6 +15,7 @@ from typing import Any
 import aio_pika
 import aio_pika.exceptions
 import httpx
+from airflow.exceptions import DagRunAlreadyExists
 from airflow.hooks.base import BaseHook
 from airflow.models import DagModel
 from sqlalchemy.exc import IntegrityError
@@ -23,7 +26,6 @@ from airflow_provider_rmq.utils.amqp import (
     build_amqp_connection,
     call_with_timeout as _call_with_timeout,
     get_amqp_timeouts,
-    match_and_ack,
     match as _match,
     nack_and_sleep as _nack_and_sleep,
 )
@@ -70,6 +72,27 @@ _NEGATIVE_CHECKS_BEFORE_RESTART = 2
 #: misclassification turns from a continuous loop into a rare, logged event.
 _DROP_COOLDOWN_CYCLES = 5
 
+#: What a trigger attempt ended as. ``triggered`` and ``duplicate`` both mean the DAG
+#: run for this delivery exists, so the delivery is acknowledged; ``skipped`` means the
+#: DAG cannot run at all and acknowledging it is terminal by design — a NACK would turn
+#: a paused DAG into a redelivery accumulator.
+_OUTCOME_TRIGGERED = "triggered"
+_OUTCOME_SKIPPED = "skipped"
+_OUTCOME_DUPLICATE = "duplicate"
+
+#: ``DagRun.run_id`` is a ``String(250)`` validated against this alphabet.
+_RUN_ID_MAX_LEN = 250
+_RUN_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.~:+-]")
+_RUN_ID_HASH_LEN = 8
+
+#: Backoff for a delivery whose trigger failed: doubling from the first second up to a
+#: minute, reset by the next success. The 0.1 s of ``nack_and_sleep`` guards against a
+#: hot loop of filter misses and is far too short here — ~10 redeliveries per second
+#: burn the default delivery-limit of 20 on a quorum queue in about two seconds, and the
+#: message is dead-lettered by the very mechanism meant to keep it.
+_TRIGGER_BACKOFF_START = 1.0
+_TRIGGER_BACKOFF_MAX = 60.0
+
 #: Workers of the fallback consumer pool. Sized well above the expected number of
 #: subscriptions: every matched delivery occupies one worker for the duration of its
 #: ``trigger_dag``.
@@ -108,15 +131,45 @@ def _consumer_tag(suffix: Any) -> str:
     return f"rmq_watcher.{socket.gethostname()}.{os.getpid()}.{suffix}"
 
 
-def _build_run_id(queue_name: str) -> str:
-    return f"rmq__{queue_name}__{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+def _safe_run_id(raw: str) -> str:
+    """Turn an arbitrary string into a run id Airflow accepts and can store.
+
+    Both halves of a run id come from outside: the producer picks ``message_id`` (a
+    shortstr of up to 255 bytes, any characters at all), and a queue or DAG name may
+    carry spaces or slashes, while ``DagRun.run_id`` is a validated ``String(250)``.
+    A value that needed substitution or truncation carries a short digest of the
+    original, so two different messages keep two different run ids instead of
+    collapsing into a single DAG run.
+    """
+    sanitized = _RUN_ID_UNSAFE_RE.sub("_", raw)
+    if sanitized == raw and len(sanitized) <= _RUN_ID_MAX_LEN:
+        return sanitized
+    digest = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:_RUN_ID_HASH_LEN]
+    return f"{sanitized[: _RUN_ID_MAX_LEN - _RUN_ID_HASH_LEN - 1]}_{digest}"
 
 
-def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> None:
-    """Synchronous DAG trigger — called via run_in_executor from the consumer loop.
+def _build_run_id(queue_name: str, message_id: str | None = None) -> str:
+    """Run id for one immediate-mode delivery.
+
+    An AMQP ``message_id`` makes the run id deterministic, so a redelivery of the same
+    message lands on the DAG run it already produced instead of starting a second one.
+    Without one, the timestamp keeps every delivery distinct — deduplication then rests
+    entirely on the producer choosing to set ``message_id``.
+    """
+    suffix = message_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    return _safe_run_id(f"rmq__{queue_name}__{suffix}")
+
+
+def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> str:
+    """Synchronous DAG trigger — called via the thread pool from the consumer loop.
+
+    :returns: :data:`_OUTCOME_TRIGGERED` when a DAG run was created,
+        :data:`_OUTCOME_DUPLICATE` when this delivery already has one, and
+        :data:`_OUTCOME_SKIPPED` when the DAG cannot run.
 
     Uses a short-lived WatcherSession to avoid polluting Airflow's thread-local
-    scoped session. Skips trigger if the DAG is inactive or paused.
+    scoped session. Every other exception propagates, so the caller requeues the
+    delivery instead of acknowledging an event that never reached a DAG.
     """
     from airflow.api.common.trigger_dag import trigger_dag  # lazy: not always installed
 
@@ -131,12 +184,20 @@ def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> None:
                 "DAG %s not found, inactive or paused — message acked, skipping trigger",
                 dag_id,
             )
-            return
+            return _OUTCOME_SKIPPED
 
     try:
-        trigger_dag(dag_id=dag_id, run_id=run_id, conf=conf)
+        # replace_microseconds=False keeps the full timestamp: find_duplicate() matches
+        # on execution_date as well as run_id, so a truncated one makes two distinct
+        # messages of the same second look like a redelivery of each other.
+        trigger_dag(dag_id=dag_id, run_id=run_id, conf=conf, replace_microseconds=False)
+    except DagRunAlreadyExists:
+        log.info("DAG run %s already exists — redelivery of a handled message", run_id)
+        return _OUTCOME_DUPLICATE
     except IntegrityError:
-        log.warning("DAG run %s already exists (duplicate run_id), skipping", run_id)
+        log.info("DAG run %s already exists (concurrent insert), acking the delivery", run_id)
+        return _OUTCOME_DUPLICATE
+    return _OUTCOME_TRIGGERED
 
 
 class _ConsumerState:
@@ -1177,6 +1238,9 @@ class RMQConsumerManager:
         msg_filter = MessageFilter.deserialize(sub.get("filter_data") or {})
         state = self._state_of(sub_id)
         consumer_tag = _consumer_tag(sub_id)
+        # Kept across reconnects: a broken trigger path stays broken through the
+        # reconnect that a NACKed delivery may well cause.
+        trigger_backoff = _TRIGGER_BACKOFF_START
 
         while True:
             state.write("connecting")
@@ -1202,10 +1266,33 @@ class RMQConsumerManager:
                                 continue
                             await self._publish_pending(conn_id, dag_id, cooldown, message)
                         else:
-                            # Immediate mode: existing match_and_ack + trigger_dag
-                            matched = await match_and_ack(message, msg_filter)
-                            if matched:
-                                await self._trigger_dag(dag_id, queue_name, sub_id, message)
+                            # Immediate mode: ACK only once the DAG run exists, so a
+                            # failed trigger returns the delivery instead of losing it.
+                            if not _match(message, msg_filter):
+                                await _nack_and_sleep(message)
+                                continue
+                            try:
+                                outcome = await self._trigger_dag(
+                                    dag_id, queue_name, sub_id, message
+                                )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                log.warning(
+                                    "Triggering DAG %s for subscription %d failed: %s "
+                                    "— requeueing the delivery, pausing %.1fs",
+                                    dag_id, sub_id, exc, trigger_backoff,
+                                )
+                                await message.nack(requeue=True)
+                                await asyncio.sleep(trigger_backoff)
+                                trigger_backoff = min(
+                                    trigger_backoff * 2, _TRIGGER_BACKOFF_MAX
+                                )
+                                continue
+                            trigger_backoff = _TRIGGER_BACKOFF_START
+                            await message.ack()
+                            if outcome == _OUTCOME_TRIGGERED:
+                                _incr("rmq_watcher.dag_triggered")
 
                 # The iterator finished without an exception — the broker cancelled the
                 # consumer. Pause before subscribing again so a broker that keeps ending
@@ -1338,7 +1425,9 @@ class RMQConsumerManager:
                             )
                             await message.ack()
                             continue
-                        run_id = f"rmq_cooldown__{dag_id}__{message.message_id}"
+                        run_id = _safe_run_id(
+                            f"rmq_cooldown__{dag_id}__{message.message_id}"
+                        )
                         conf = {
                             "source": "cooldown",
                             "dag_id": dag_id,
@@ -1348,7 +1437,11 @@ class RMQConsumerManager:
                             "queue": _FIRE_QUEUE,
                             "subscription_id": None,
                         }
-                        await self._executor.run(_sync_trigger, dag_id, conf, run_id)
+                        outcome = await self._executor.run(
+                            _sync_trigger, dag_id, conf, run_id
+                        )
+                        if outcome == _OUTCOME_TRIGGERED:
+                            _incr("rmq_watcher.dag_triggered")
                         # Known limitation: if _sync_trigger returned early because the
                         # DAG is paused/inactive, the message is still ACKed here and the
                         # fire event is permanently lost. This is intentional — the DLX
@@ -1391,7 +1484,8 @@ class RMQConsumerManager:
         queue_name: str,
         sub_id: int,
         message: Any,
-    ) -> None:
+    ) -> str:
+        """Start the DAG run for one delivery and report how it ended."""
         conf = {
             "source": "immediate",
             "body": message.body.decode("utf-8", errors="replace"),
@@ -1400,8 +1494,8 @@ class RMQConsumerManager:
             "queue": queue_name,
             "subscription_id": sub_id,
         }
-        run_id = _build_run_id(queue_name)
-        await self._executor.run(_sync_trigger, dag_id, conf, run_id)
+        run_id = _build_run_id(queue_name, getattr(message, "message_id", None))
+        return await self._executor.run(_sync_trigger, dag_id, conf, run_id)
 
 
 async def _ensure_fire_infrastructure(

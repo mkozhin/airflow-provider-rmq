@@ -893,29 +893,29 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 - Modify: `tests/watcher/test_consumer.py`
 - Modify: `tests/test_trigger.py`
 
-- [ ] `_sync_trigger`: возвращает `"triggered" | "skipped" | "duplicate"`; `DagRunAlreadyExists` и `IntegrityError` → INFO + `"duplicate"`; прочие исключения (включая `MultipleResultsFound`) пробрасываются
-- [ ] вызывать `trigger_dag` с `replace_microseconds=False`: иначе `find_duplicate` ищет и по обнулённому до секунды `execution_date`, и два разных сообщения одной секунды дают `DagRunAlreadyExists` → терминальный ACK → тихая потеря события
-- [ ] `_build_run_id(queue_name, message_id)`: детерминированный `rmq__{queue}__{message_id}` при наличии `message_id`, иначе timestamp-формат
-- [ ] санитайзить обе части `run_id` (алфавит, допустимый для `DagRun.run_id`) и усекать до лимита `String(250)` с добавлением короткого хеша исходной строки — иначе длинное имя очереди или произвольный `message_id` дают `DataError`, который не попадает ни в одну ветку классификации
-- [ ] применить ту же санитизацию к `run_id` в fire-консьюмере (`consumer.py:680`, формат `rmq_cooldown__{dag_id}__{message_id}`): длинный `dag_id` с UUID даёт ~272 символа при лимите 250, и cooldown-событие не запускает DAG никогда
-- [ ] immediate-ветка `_consume_subscription`: `_match` без ACK → **не совпало → NACK с requeue и `_nack_and_sleep`, continue** → совпало → `_trigger_dag` → `message.ack()`; при исключении из триггера → WARNING + NACK с requeue
-- [ ] добавить растущий backoff для ветки отказа триггера (1 с → удвоение → потолок 60 с, сброс при успехе) вместо фиксированных 0.1 с из `_nack_and_sleep`
-- [ ] `_trigger_dag` принимает `message_id` и возвращает исход; удалить ставший неиспользуемым импорт `match_and_ack` в `consumer.py`
-- [ ] инкрементировать `rmq_watcher.dag_triggered` при исходе `"triggered"`
-- [ ] `triggers/rmq.py:96`: `decode("utf-8", errors="replace")` — бинарный payload после ACK не должен ронять обработку
-- [ ] тест: успешный триггер → `ack` вызван после `trigger_dag` (проверка порядка)
-- [ ] тест: `trigger_dag` бросает → `nack`+requeue, `ack` не вызван
-- [ ] тест: повторный отказ триггера наращивает паузу и не даёт горячего цикла редоставок
-- [ ] тест: `DagRunAlreadyExists` → исход `"duplicate"`, `ack`, `nack` не вызван
-- [ ] тест: `IntegrityError` → исход `"duplicate"`, `ack`
-- [ ] тест: `run_id` детерминирован при `message_id`, timestamp-fallback без него
-- [ ] тест: длинное имя очереди и `message_id` с недопустимыми символами → `run_id` валиден, укладывается в лимит и остаётся различимым для разных сообщений
-- [ ] тест: то же для cooldown-ветки — длинный `dag_id` не даёт `run_id` сверх лимита
-- [ ] тест: два сообщения в пределах одной секунды дают два разных DAG-рана, а не `"duplicate"` (регрессия на `execution_date`)
-- [ ] тест: несовпавшее по фильтру сообщение → NACK с requeue, потребление продолжается (регрессия на потерянную ветку)
-- [ ] тест: paused/inactive DAG → исход `"skipped"`, терминальный `ack`
-- [ ] тест: бинарный payload в триггере не бросает `UnicodeDecodeError`
-- [ ] run tests - must pass before task 8
+- [x] `_sync_trigger`: возвращает `"triggered" | "skipped" | "duplicate"`; `DagRunAlreadyExists` и `IntegrityError` → INFO + `"duplicate"`; прочие исключения (включая `MultipleResultsFound`) пробрасываются
+- [x] вызывать `trigger_dag` с `replace_microseconds=False`: иначе `find_duplicate` ищет и по обнулённому до секунды `execution_date`, и два разных сообщения одной секунды дают `DagRunAlreadyExists` → терминальный ACK → тихая потеря события
+- [x] `_build_run_id(queue_name, message_id)`: детерминированный `rmq__{queue}__{message_id}` при наличии `message_id`, иначе timestamp-формат
+- [x] санитайзить обе части `run_id` (алфавит, допустимый для `DagRun.run_id`) и усекать до лимита `String(250)` с добавлением короткого хеша исходной строки — иначе длинное имя очереди или произвольный `message_id` дают `DataError`, который не попадает ни в одну ветку классификации
+- [x] применить ту же санитизацию к `run_id` в fire-консьюмере (`consumer.py:680`, формат `rmq_cooldown__{dag_id}__{message_id}`): длинный `dag_id` с UUID даёт ~272 символа при лимите 250, и cooldown-событие не запускает DAG никогда
+- [x] immediate-ветка `_consume_subscription`: `_match` без ACK → **не совпало → NACK с requeue и `_nack_and_sleep`, continue** → совпало → `_trigger_dag` → `message.ack()`; при исключении из триггера → WARNING + NACK с requeue
+- [x] добавить растущий backoff для ветки отказа триггера (1 с → удвоение → потолок 60 с, сброс при успехе) вместо фиксированных 0.1 с из `_nack_and_sleep`
+- [x] `_trigger_dag` принимает `message_id` и возвращает исход; удалить ставший неиспользуемым импорт `match_and_ack` в `consumer.py`
+- [x] инкрементировать `rmq_watcher.dag_triggered` при исходе `"triggered"`
+- [x] `triggers/rmq.py:96`: `decode("utf-8", errors="replace")` — бинарный payload после ACK не должен ронять обработку
+- [x] тест: успешный триггер → `ack` вызван после `trigger_dag` (проверка порядка)
+- [x] тест: `trigger_dag` бросает → `nack`+requeue, `ack` не вызван
+- [x] тест: повторный отказ триггера наращивает паузу и не даёт горячего цикла редоставок
+- [x] тест: `DagRunAlreadyExists` → исход `"duplicate"`, `ack`, `nack` не вызван
+- [x] тест: `IntegrityError` → исход `"duplicate"`, `ack`
+- [x] тест: `run_id` детерминирован при `message_id`, timestamp-fallback без него
+- [x] тест: длинное имя очереди и `message_id` с недопустимыми символами → `run_id` валиден, укладывается в лимит и остаётся различимым для разных сообщений
+- [x] тест: то же для cooldown-ветки — длинный `dag_id` не даёт `run_id` сверх лимита
+- [x] тест: два сообщения в пределах одной секунды дают два разных DAG-рана, а не `"duplicate"` (регрессия на `execution_date`)
+- [x] тест: несовпавшее по фильтру сообщение → NACK с requeue, потребление продолжается (регрессия на потерянную ветку)
+- [x] тест: paused/inactive DAG → исход `"skipped"`, терминальный `ack`
+- [x] тест: бинарный payload в триггере не бросает `UnicodeDecodeError`
+- [x] run tests - must pass before task 8
 
 ### Task 8: Вынос синхронных вызовов из event loop
 

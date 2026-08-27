@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-from contextlib import ExitStack
+import re
+from contextlib import ExitStack, suppress
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
+from uuid import uuid4
 
 import aio_pika
 import aio_pika.exceptions
@@ -26,7 +29,14 @@ from airflow_provider_rmq.watcher.consumer import (
     _ROLE_PUBLISH,
     _consumer_tag,
     _build_run_id,
+    _safe_run_id,
     _sync_trigger,
+    _OUTCOME_DUPLICATE,
+    _OUTCOME_SKIPPED,
+    _OUTCOME_TRIGGERED,
+    _RUN_ID_MAX_LEN,
+    _TRIGGER_BACKOFF_MAX,
+    _TRIGGER_BACKOFF_START,
     _ensure_fire_infrastructure,
     _ensure_pending_queue,
     _ensure_exchange_infrastructure,
@@ -44,12 +54,18 @@ from airflow_provider_rmq.watcher.consumer import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_fake_message(body: bytes = b"hello", headers: dict | None = None):
+#: Alphabet Airflow accepts for DagRun.run_id (scheduler.allowed_run_id_pattern).
+_RUN_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_.~:+-]")
+
+def _make_fake_message(
+    body: bytes = b"hello", headers: dict | None = None, message_id: str | None = None
+):
     msg = MagicMock()
     msg.body = body
     msg.headers = headers or {}
     msg.routing_key = "rk"
     msg.exchange = ""
+    msg.message_id = message_id
     msg.ack = AsyncMock()
     msg.nack = AsyncMock()
     return msg
@@ -174,26 +190,37 @@ def _patch_sync_trigger_deps(dag_model=None):
     return ws_patch, td_patch
 
 
+def _dag_run_already_exists(run_id: str = "run_id"):
+    from airflow.exceptions import DagRunAlreadyExists
+
+    return DagRunAlreadyExists(
+        MagicMock(), datetime(2026, 8, 27, 12, 0, 0, tzinfo=timezone.utc), run_id
+    )
+
+
 class TestSyncTrigger:
     def test_trigger_dag_uses_watcher_session(self):
         fake_dag = MagicMock()
         ws_patch, td_patch = _patch_sync_trigger_deps(dag_model=fake_dag)
         with ws_patch as mock_ws, td_patch:
-            _sync_trigger("my_dag", {}, "run_id_1")
+            outcome = _sync_trigger("my_dag", {}, "run_id_1")
         mock_ws.assert_called()
+        assert outcome == _OUTCOME_TRIGGERED
 
     def test_trigger_dag_skips_inactive_dag(self):
         ws_patch, td_patch = _patch_sync_trigger_deps(dag_model=None)
         with ws_patch, td_patch as mock_td:
-            _sync_trigger("missing_dag", {}, "run_id")
+            outcome = _sync_trigger("missing_dag", {}, "run_id")
         mock_td.assert_not_called()
+        assert outcome == _OUTCOME_SKIPPED
 
     def test_trigger_dag_skips_paused_dag(self):
         # filter_by includes is_paused=False; paused DAGs return None from .first()
         ws_patch, td_patch = _patch_sync_trigger_deps(dag_model=None)
         with ws_patch, td_patch as mock_td:
-            _sync_trigger("paused_dag", {}, "run_id")
+            outcome = _sync_trigger("paused_dag", {}, "run_id")
         mock_td.assert_not_called()
+        assert outcome == _OUTCOME_SKIPPED
 
     def test_trigger_dag_handles_integrity_error(self):
         from sqlalchemy.exc import IntegrityError
@@ -202,8 +229,79 @@ class TestSyncTrigger:
         ws_patch, td_patch = _patch_sync_trigger_deps(dag_model=fake_dag)
         with ws_patch, td_patch as mock_td:
             mock_td.side_effect = IntegrityError("dup", {}, None)
-            # Must not raise
+            outcome = _sync_trigger("dag", {}, "run_id")
+        assert outcome == _OUTCOME_DUPLICATE
+
+    def test_redelivery_is_reported_as_duplicate(self):
+        """Airflow raises DagRunAlreadyExists before the INSERT, not an IntegrityError."""
+        fake_dag = MagicMock()
+        ws_patch, td_patch = _patch_sync_trigger_deps(dag_model=fake_dag)
+        with ws_patch, td_patch as mock_td:
+            mock_td.side_effect = _dag_run_already_exists("rmq__q__mid")
+            outcome = _sync_trigger("dag", {}, "rmq__q__mid")
+        assert outcome == _OUTCOME_DUPLICATE
+
+    def test_other_exceptions_propagate(self):
+        """MultipleResultsFound and friends are trigger failures, not duplicates."""
+        from sqlalchemy.orm.exc import MultipleResultsFound
+
+        fake_dag = MagicMock()
+        ws_patch, td_patch = _patch_sync_trigger_deps(dag_model=fake_dag)
+        with ws_patch, td_patch as mock_td:
+            mock_td.side_effect = MultipleResultsFound("two rows")
+            with pytest.raises(MultipleResultsFound):
+                _sync_trigger("dag", {}, "run_id")
+
+    def test_microseconds_are_kept(self):
+        """find_duplicate() also matches on execution_date: truncating it to whole
+        seconds makes two distinct messages of the same second look like a redelivery."""
+        fake_dag = MagicMock()
+        ws_patch, td_patch = _patch_sync_trigger_deps(dag_model=fake_dag)
+        with ws_patch, td_patch as mock_td:
             _sync_trigger("dag", {}, "run_id")
+        assert mock_td.call_args.kwargs["replace_microseconds"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_id construction
+# ---------------------------------------------------------------------------
+
+class TestBuildRunId:
+    def test_message_id_makes_the_run_id_deterministic(self):
+        first = _build_run_id("orders", "msg-42")
+        second = _build_run_id("orders", "msg-42")
+        assert first == second == "rmq__orders__msg-42"
+
+    def test_without_message_id_every_delivery_gets_its_own_run_id(self):
+        first = _build_run_id("orders")
+        second = _build_run_id("orders")
+        assert first.startswith("rmq__orders__")
+        assert first != second
+
+    def test_unsafe_characters_are_replaced_and_stay_distinguishable(self):
+        first = _build_run_id("my queue", "a b")
+        second = _build_run_id("my queue", "a/b")
+        assert _RUN_ID_UNSAFE.search(first) is None
+        assert _RUN_ID_UNSAFE.search(second) is None
+        assert first != second
+
+    def test_long_parts_fit_the_column_and_stay_distinguishable(self):
+        queue = "q" * 300
+        first = _build_run_id(queue, "x" * 200 + "-1")
+        second = _build_run_id(queue, "x" * 200 + "-2")
+        assert len(first) <= _RUN_ID_MAX_LEN
+        assert len(second) <= _RUN_ID_MAX_LEN
+        assert _RUN_ID_UNSAFE.search(first) is None
+        assert first != second
+
+    def test_cooldown_run_id_of_a_long_dag_id_fits_the_column(self):
+        dag_id = "very_long_dag_" + "n" * 240
+        run_id = _safe_run_id(f"rmq_cooldown__{dag_id}__{uuid4()}")
+        assert len(run_id) <= _RUN_ID_MAX_LEN
+        assert _RUN_ID_UNSAFE.search(run_id) is None
+
+    def test_short_clean_value_is_left_alone(self):
+        assert _safe_run_id("rmq_cooldown__dag__uuid-1") == "rmq_cooldown__dag__uuid-1"
 
 
 # ---------------------------------------------------------------------------
@@ -1411,6 +1509,36 @@ class TestConsumeFireQueue:
             manager._executor = original_run
 
         assert captured_run_id["run_id"] == "rmq_cooldown__my_dag__fixed-uuid-42"
+
+    @pytest.mark.asyncio
+    async def test_fire_consumer_run_id_of_a_long_dag_id_fits_the_column(self):
+        """A long dag_id plus a UUID overruns DagRun.run_id, and the DataError it
+        raises matches no classification branch — the cooldown event would never fire."""
+        manager = RMQConsumerManager()
+        dag_id = "orders_" + "x" * 240
+        msg = _make_fire_message(routing_key=dag_id, message_id=str(uuid4()))
+        connection = self._make_connection_with_queue([msg])
+
+        captured_run_id = {}
+        triggered = asyncio.Event()
+
+        async def mock_executor(func, *args):
+            captured_run_id["run_id"] = args[2]
+            triggered.set()
+            return _OUTCOME_TRIGGERED
+
+        manager._executor = _FakeExecutor(mock_executor)
+        task = asyncio.create_task(manager._consume_fire_queue(connection))
+        try:
+            await asyncio.wait_for(triggered.wait(), timeout=2.0)
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        run_id = captured_run_id["run_id"]
+        assert len(run_id) <= _RUN_ID_MAX_LEN
+        assert _RUN_ID_UNSAFE.search(run_id) is None
 
     @pytest.mark.asyncio
     async def test_fire_consumer_acks_after_trigger(self):
@@ -3871,3 +3999,208 @@ class TestConnStatusRows:
                 manager._update_all_conn_counts([sub])
 
         assert mock_log.warning.called
+
+
+# ---------------------------------------------------------------------------
+# Tests for at-least-once handling of immediate-mode deliveries
+# ---------------------------------------------------------------------------
+
+def _immediate_connection(queue):
+    channel = AsyncMock()
+    channel.declare_queue = AsyncMock(return_value=queue)
+    connection = AsyncMock()
+    connection.channel = AsyncMock(return_value=channel)
+    return connection
+
+
+async def _consume_until(manager, sub, messages, done, timeout: float = 2.0):
+    """Run ``_consume_subscription`` over ``messages`` until ``done`` is set."""
+    connection = _immediate_connection(_make_push_queue(messages))
+    with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+         patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"):
+        task = asyncio.create_task(manager._consume_subscription(sub))
+        try:
+            await asyncio.wait_for(done.wait(), timeout=timeout)
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+class TestImmediateDeliveryAcknowledgement:
+    @pytest.mark.asyncio
+    async def test_ack_comes_after_the_trigger(self, manager):
+        """The delivery is acknowledged only once the DAG run exists."""
+        order = []
+        done = asyncio.Event()
+        msg = _make_fake_message(b"order", message_id="m1")
+
+        async def ack():
+            order.append("ack")
+            done.set()
+
+        msg.ack = ack
+
+        async def handler(fn, *args):
+            order.append("trigger")
+            return _OUTCOME_TRIGGERED
+
+        manager._executor = _FakeExecutor(handler)
+        await _consume_until(manager, _sub(), [msg], done)
+
+        assert order == ["trigger", "ack"]
+        msg.nack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_successful_trigger_reports_the_metric(self, manager):
+        done = asyncio.Event()
+        msg = _make_fake_message(b"order", message_id="m1")
+        msg.ack = AsyncMock(side_effect=lambda: done.set())
+
+        async def handler(fn, *args):
+            return _OUTCOME_TRIGGERED
+
+        manager._executor = _FakeExecutor(handler)
+        with patch("airflow_provider_rmq.watcher.consumer._incr") as incr:
+            await _consume_until(manager, _sub(), [msg], done)
+
+        assert call("rmq_watcher.dag_triggered") in incr.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_failed_trigger_requeues_without_acking(self, manager):
+        done = asyncio.Event()
+        msg = _make_fake_message(b"order", message_id="m1")
+
+        async def nack(requeue=False):
+            done.set()
+            assert requeue is True
+
+        msg.nack = AsyncMock(side_effect=nack)
+
+        async def handler(fn, *args):
+            raise RuntimeError("airflow metadata db is down")
+
+        manager._executor = _FakeExecutor(handler)
+        with patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep",
+                   new_callable=AsyncMock):
+            await _consume_until(manager, _sub(), [msg], done)
+
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repeated_failures_grow_the_pause_up_to_the_cap(self, manager):
+        """A steady trigger failure must not turn into a hot redelivery loop: the
+        default delivery-limit of a quorum queue is 20, which 0.1 s pauses burn in
+        seconds."""
+        delays = []
+        done = asyncio.Event()
+        messages = [_make_fake_message(b"x", message_id=f"m{i}") for i in range(8)]
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+            if len(delays) >= 8:
+                done.set()
+
+        async def handler(fn, *args):
+            raise RuntimeError("boom")
+
+        manager._executor = _FakeExecutor(handler)
+        with patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep",
+                   side_effect=fake_sleep):
+            await _consume_until(manager, _sub(), messages, done)
+
+        assert delays[:8] == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+        assert delays[0] == _TRIGGER_BACKOFF_START
+        assert delays[-1] == _TRIGGER_BACKOFF_MAX
+
+    @pytest.mark.asyncio
+    async def test_backoff_resets_after_a_success(self, manager):
+        delays = []
+        done = asyncio.Event()
+        messages = [_make_fake_message(b"x", message_id=f"m{i}") for i in range(4)]
+        outcomes = iter([RuntimeError("boom"), RuntimeError("boom"), None, RuntimeError("boom")])
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+            if len(delays) >= 3:
+                done.set()
+
+        async def handler(fn, *args):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _OUTCOME_TRIGGERED
+
+        manager._executor = _FakeExecutor(handler)
+        with patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep",
+                   side_effect=fake_sleep):
+            await _consume_until(manager, _sub(), messages, done)
+
+        assert delays[:3] == [1.0, 2.0, 1.0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", [_OUTCOME_DUPLICATE, _OUTCOME_SKIPPED])
+    async def test_duplicate_and_skipped_deliveries_are_acked(self, manager, outcome):
+        """A redelivery of a handled message and a paused DAG both end the delivery:
+        requeueing either one would build an accumulator of redeliveries."""
+        done = asyncio.Event()
+        msg = _make_fake_message(b"order", message_id="m1")
+        msg.ack = AsyncMock(side_effect=lambda: done.set())
+
+        async def handler(fn, *args):
+            return outcome
+
+        manager._executor = _FakeExecutor(handler)
+        with patch("airflow_provider_rmq.watcher.consumer._incr") as incr:
+            await _consume_until(manager, _sub(), [msg], done)
+
+        msg.ack.assert_awaited_once()
+        msg.nack.assert_not_awaited()
+        assert call("rmq_watcher.dag_triggered") not in incr.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_a_series_of_filter_misses_keeps_consumption_going(self, manager):
+        """Every miss is requeued, and the delivery behind them is still processed —
+        a single missing NACK branch would stall the subscription for good."""
+        misses = [
+            _make_fake_message(b"noise", headers={"type": "other"}, message_id=f"n{i}")
+            for i in range(25)
+        ]
+        hit = _make_fake_message(b"order", headers={"type": "order"}, message_id="m1")
+        done = asyncio.Event()
+        hit.ack = AsyncMock(side_effect=lambda: done.set())
+
+        async def handler(fn, *args):
+            return _OUTCOME_TRIGGERED
+
+        manager._executor = _FakeExecutor(handler)
+        with patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep",
+                   new_callable=AsyncMock):
+            await _consume_until(
+                manager,
+                _sub(filter_data={"filter_headers": {"type": "order"}}),
+                [*misses, hit],
+                done,
+            )
+
+        for miss in misses:
+            miss.nack.assert_awaited_once_with(requeue=True)
+            miss.ack.assert_not_awaited()
+        hit.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_run_id_carries_the_message_id(self, manager):
+        captured = {}
+        done = asyncio.Event()
+        msg = _make_fake_message(b"order", message_id="msg-42")
+        msg.ack = AsyncMock(side_effect=lambda: done.set())
+
+        async def handler(fn, *args):
+            captured["run_id"] = args[2]
+            return _OUTCOME_TRIGGERED
+
+        manager._executor = _FakeExecutor(handler)
+        await _consume_until(manager, _sub(queue_name="orders"), [msg], done)
+
+        assert captured["run_id"] == "rmq__orders__msg-42"
