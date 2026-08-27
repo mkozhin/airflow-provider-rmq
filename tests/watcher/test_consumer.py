@@ -16,6 +16,8 @@ from airflow_provider_rmq.watcher.consumer import (
     _ActiveSub,
     _CLOSE_TIMEOUT,
     _ConsumerState,
+    _DROP_COOLDOWN_CYCLES,
+    _FireSub,
     _RECONNECT_DELAY,
     _ROLE_CONSUME,
     _ROLE_PUBLISH,
@@ -3151,3 +3153,422 @@ class TestConsumptionKeepsGoing:
 
         assert delays[0] == _RECONNECT_DELAY
         assert queue.iterator.call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for the broker-side liveness check
+# ---------------------------------------------------------------------------
+
+def _state_with(status: str | None, sub_id: int | None = 1) -> _ConsumerState:
+    """Build a state record that already reports ``status``."""
+    state = _ConsumerState(sub_id)
+    if status is not None:
+        with _patch_watcher_session():
+            state.write(status)
+    return state
+
+
+def _register_active(manager, sub: dict, status: str | None = "listening") -> _ActiveSub:
+    """Put a running subscription into the manager the way reconcile does."""
+    task = MagicMock()
+    task.done.return_value = False
+    entry = _ActiveSub(task=task, sub=sub.copy(), state=_state_with(status, sub["id"]))
+    manager._active[sub["id"]] = entry
+    return entry
+
+
+def _register_fire(manager, conn_id: str = "rmq_default", status: str | None = "listening"):
+    task = MagicMock()
+    task.done.return_value = False
+    manager._fire_task = task
+    manager._fire_state = _FireSub(conn_id=conn_id, state=_state_with(status, None))
+    return manager._fire_state
+
+
+def _consumer_entry(tag: str, queue: str) -> dict:
+    return {"consumer_tag": tag, "queue": {"name": queue, "vhost": "/"}}
+
+
+def _mgmt_client(payload, requested: list | None = None, status_code: int = 200):
+    """httpx client answering the Management API consumer listing from ``payload``."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if requested is not None:
+            requested.append(str(request.url))
+        return httpx.Response(status_code, json=payload)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def _mgmt_conn_info(url: str = "https://mb.example"):
+    conn_info = _make_conn_info()
+    conn_info.extra_dejson = {"management_url": url}
+    return conn_info
+
+
+def _patch_mgmt_connection(url: str = "https://mb.example"):
+    return patch(
+        "airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+        return_value=_mgmt_conn_info(url),
+    )
+
+
+class TestSubscriptionLiveness:
+    @pytest.mark.asyncio
+    async def test_missing_tag_twice_condemns_the_subscription(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection():
+            first = await manager._check_subscription_liveness([sub])
+            second = await manager._check_subscription_liveness([sub])
+
+        assert first == (set(), set())
+        assert second == ({7}, {"rmq_default"})
+        assert manager._liveness["rmq_default"].status == "error"
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_one_negative_check_restarts_nothing(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection():
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert entry.negative_checks == 1
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_foreign_consumer_does_not_vouch_for_ours(self, manager):
+        """Regression: an HA replica or a foreign client keeps the consumer count
+        non-zero while our own consumer is a zombie."""
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = _mgmt_client([
+            _consumer_entry("some.other.client", "orders"),
+            _consumer_entry("rmq_watcher.otherhost.999.7", "orders"),
+        ])
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == ({7}, {"rmq_default"})
+        assert manager._liveness["rmq_default"].broker_consumers == 2
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_our_tag_among_foreign_ones_counts_as_alive(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        entry.negative_checks = 1
+        manager._http_client = _mgmt_client([
+            _consumer_entry("some.other.client", "orders"),
+            _consumer_entry(_consumer_tag(7), "orders"),
+        ])
+
+        with _patch_mgmt_connection():
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert entry.negative_checks == 0
+        assert manager._liveness["rmq_default"].status == "connected"
+        assert manager._liveness["rmq_default"].broker_consumers == 2
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_cluster_alarm_does_not_mute_the_verdict(self, manager):
+        """Regression: reading node alarms would silence the watchdog for every conn_id
+        for as long as the cluster alarm lasts — including connections that died then."""
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        requested: list[str] = []
+        manager._http_client = _mgmt_client(
+            [_consumer_entry("publisher.blocked.by.alarm", "orders")], requested=requested,
+        )
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == ({7}, {"rmq_default"})
+        assert requested and all("/api/nodes" not in url for url in requested)
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_management_api_failure_is_no_data(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        manager._http_client = _mgmt_client({"error": "unavailable"}, status_code=503)
+
+        with _patch_mgmt_connection(), \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            first = await manager._check_subscription_liveness([sub])
+            second = await manager._check_subscription_liveness([sub])
+
+        assert first == (set(), set())
+        assert second == (set(), set())
+        assert entry.negative_checks == 0
+        assert manager._liveness["rmq_default"].status is None
+        assert manager._liveness["rmq_default"].broker_consumers is None
+        assert mock_log.warning.call_count >= 2
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_status_gate_reads_the_manager_record_not_the_sub_dict(self, manager):
+        """Regression: the subscription dicts reconcile receives carry no status, so a
+        gate built on them would be silently always empty (or always true)."""
+        sub = _sub(id=7, queue_name="orders")
+        sub["consumer_status"] = "listening"
+        _register_active(manager, sub, status="connecting")
+        requested: list[str] = []
+        manager._http_client = _mgmt_client([], requested=requested)
+
+        with _patch_mgmt_connection():
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert requested == [], "a subscription that is not listening is not probed"
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["connecting", "error", None])
+    async def test_subscription_outside_listening_is_not_a_candidate(self, manager, status):
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub, status=status)
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert entry.negative_checks == 0
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_finished_task_is_not_a_candidate(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        entry.task.done.return_value = True
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert entry.negative_checks == 0
+        await manager._http_client.aclose()
+
+
+class TestLivenessDropRateLimit:
+    @pytest.mark.asyncio
+    async def test_connection_is_not_recreated_faster_than_the_limit(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection(), \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            await manager._check_subscription_liveness([sub])
+            condemned = await manager._check_subscription_liveness([sub])
+            await manager._drop_connection("rmq_default")  # what reconcile does next
+            held_back = await manager._check_subscription_liveness([sub])
+
+        assert condemned == ({7}, {"rmq_default"})
+        assert held_back == (set(), set())
+        assert manager._liveness["rmq_default"].status == "degraded"
+        assert manager._liveness["rmq_default"].reason
+        assert any(
+            "sooner than" in str(c.args[0]) for c in mock_log.warning.call_args_list
+        ), "holding a condemned connection in place must be logged"
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_connection_may_be_recreated_again_after_the_cooldown(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            await manager._check_subscription_liveness([sub])
+            await manager._drop_connection("rmq_default")
+            for _ in range(_DROP_COOLDOWN_CYCLES - 1):
+                assert await manager._check_subscription_liveness([sub]) == (set(), set())
+            again = await manager._check_subscription_liveness([sub])
+
+        assert again == ({7}, {"rmq_default"})
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_publish_role_drop_does_not_delay_consumer_recovery(self, manager):
+        """The publish role has its own gate of consecutive timeouts; letting it move the
+        limit would postpone recovery of a consuming connection that died at the same time."""
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._connections[("rmq_default", _ROLE_PUBLISH)] = _make_live_connection()
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            await manager._drop_connection("rmq_default", role=_ROLE_PUBLISH)
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == ({7}, {"rmq_default"})
+        await manager._http_client.aclose()
+
+
+class TestFireTaskLiveness:
+    @pytest.mark.asyncio
+    async def test_fire_task_pausing_after_an_error_is_not_a_candidate(self, manager):
+        sub = _sub(id=7, queue_name="orders", cooldown=300)
+        _register_active(manager, sub)
+        fire = _register_fire(manager, status="error")
+        manager._http_client = _mgmt_client([_consumer_entry(_consumer_tag(7), "orders")])
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert fire.negative_checks == 0
+        assert manager._fire_needs_restart is False
+        assert manager._active[7].negative_checks == 0
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_dead_fire_task_condemns_only_itself(self, manager):
+        sub = _sub(id=7, queue_name="orders", cooldown=300)
+        _register_active(manager, sub)
+        _register_fire(manager)
+        manager._http_client = _mgmt_client([_consumer_entry(_consumer_tag(7), "orders")])
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert manager._fire_needs_restart is True
+        assert manager._liveness["rmq_default"].status == "connected"
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_live_fire_tag_clears_its_counter(self, manager):
+        sub = _sub(id=7, queue_name="orders", cooldown=300)
+        _register_active(manager, sub)
+        fire = _register_fire(manager)
+        fire.negative_checks = 1
+        manager._http_client = _mgmt_client([
+            _consumer_entry(_consumer_tag(7), "orders"),
+            _consumer_entry(_consumer_tag("fire"), _FIRE_QUEUE),
+        ])
+
+        with _patch_mgmt_connection():
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert fire.negative_checks == 0
+        assert manager._fire_needs_restart is False
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_fire_task_state_is_reported_by_the_running_task(self, manager):
+        queue = _make_push_queue()
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+        manager._fire_state = _FireSub(conn_id="rmq_default", state=_ConsumerState(None))
+
+        task = asyncio.create_task(manager._consume_fire_queue(connection, "rmq_default"))
+        await asyncio.sleep(0.05)
+        assert manager._fire_state.state.status == "listening"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+class TestLivenessAmqpProbe:
+    def _hanging_declare_connection(self):
+        channel = _make_live_channel()
+        channel.declare_queue = _hanging_call
+        return _make_live_connection(channel=channel)
+
+    @pytest.mark.asyncio
+    async def test_hanging_passive_declare_condemns_the_subscription(self, manager):
+        """The incident scenario: the connection answers nothing at all, and silence
+        must count as death rather than as missing data."""
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = None
+        _fast_timeouts(manager)
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = self._hanging_declare_connection()
+
+        with patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05):
+            first = await manager._check_subscription_liveness([sub])
+            second = await manager._check_subscription_liveness([sub])
+
+        assert first == (set(), set())
+        assert second == ({7}, {"rmq_default"})
+        assert manager._liveness["rmq_default"].status == "error"
+
+    @pytest.mark.asyncio
+    async def test_failing_passive_declare_condemns_the_subscription(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = None
+        _fast_timeouts(manager)
+        channel = _make_live_channel()
+        channel.declare_queue = AsyncMock(side_effect=ConnectionError("gone"))
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = _make_live_connection(channel=channel)
+
+        await manager._check_subscription_liveness([sub])
+        result = await manager._check_subscription_liveness([sub])
+
+        assert result == ({7}, {"rmq_default"})
+
+    @pytest.mark.asyncio
+    async def test_successful_passive_declare_keeps_the_subscription(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        entry.negative_checks = 1
+        manager._http_client = None
+        _fast_timeouts(manager)
+        channel = _make_live_channel(queue=MagicMock())
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = _make_live_connection(channel=channel)
+
+        result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert entry.negative_checks == 0
+        assert manager._liveness["rmq_default"].status == "connected"
+        assert channel.declare_queue.await_args.kwargs["passive"] is True
+        channel.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_amqp_probe_is_used_without_an_http_client_and_reconcile_still_runs(self, manager):
+        """``_http_client is None`` (start() not called) must fall back to the AMQP probe
+        instead of raising through reconcile."""
+        sub = _sub(id=7, queue_name="orders")
+        channel = _make_live_channel(queue=MagicMock())
+        connection = _make_live_connection(channel=channel)
+        manager._http_client = None
+        _fast_timeouts(manager)
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = connection
+
+        async def blocking_consume(sub_arg):
+            await asyncio.Future()
+
+        with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch.object(manager, "_provision_cooldown"):
+            await manager.reconcile([sub])
+            manager._active[7].state = _state_with("listening", 7)
+            result = await manager._check_subscription_liveness([sub])
+
+            manager._active[7].task.cancel()
+            await asyncio.gather(manager._active[7].task, return_exceptions=True)
+
+        assert result == (set(), set())
+        assert channel.declare_queue.await_count == 1

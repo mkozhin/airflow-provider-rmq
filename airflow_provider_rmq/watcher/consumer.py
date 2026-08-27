@@ -29,7 +29,11 @@ from airflow_provider_rmq.utils.amqp import (
 )
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.utils.filters import MessageFilter
-from airflow_provider_rmq.utils.management import get_current_bindings, get_management_url
+from airflow_provider_rmq.utils.management import (
+    get_current_bindings,
+    get_management_url,
+    get_queue_consumers,
+)
 from airflow_provider_rmq.watcher.models import (
     WatcherSession,
     set_consumer_status,
@@ -53,6 +57,16 @@ _ROLE_PUBLISH = "publish"
 
 #: Consecutive publish timeouts on one ``conn_id`` that condemn its publish connection.
 _PUBLISH_TIMEOUTS_BEFORE_DROP = 2
+
+#: Consecutive negative liveness checks that condemn a consumer. Two of them put the
+#: verdict at least two reconcile intervals away from the first suspicion, so a single
+#: slow cycle or a consumer registering late never costs a restart.
+_NEGATIVE_CHECKS_BEFORE_RESTART = 2
+
+#: Reconcile cycles that must pass before the same conn_id may be recreated again.
+#: A real disconnect needs one recreation, so the limit costs nothing there, while a
+#: misclassification turns from a continuous loop into a rare, logged event.
+_DROP_COOLDOWN_CYCLES = 5
 
 #: Workers of the fallback consumer pool. Sized well above the expected number of
 #: subscriptions: every matched delivery occupies one worker for the duration of its
@@ -127,9 +141,12 @@ class _ConsumerState:
     """In-memory guard: writes consumer_status to DB only when the status actually changes.
 
     Prevents hot DB writes during reconnect storms (e.g. 20+/min → 2-4/min).
+
+    A ``sub_id`` of ``None`` tracks the status in memory only — the fire consumer runs
+    on the shared ``rmq_watcher.fire`` queue and has no row in ``rmq_subscriptions``.
     """
 
-    def __init__(self, sub_id: int) -> None:
+    def __init__(self, sub_id: int | None) -> None:
         self._sub_id = sub_id
         self._last_status: str | None = None
 
@@ -141,9 +158,10 @@ class _ConsumerState:
     def write(self, status: str, last_error: str | None = None) -> None:
         if status == self._last_status:
             return
-        with WatcherSession() as session:
-            set_consumer_status(session, self._sub_id, status, last_error=last_error)
-            session.commit()
+        if self._sub_id is not None:
+            with WatcherSession() as session:
+                set_consumer_status(session, self._sub_id, status, last_error=last_error)
+                session.commit()
         self._last_status = status
 
 
@@ -153,6 +171,37 @@ class _ActiveSub:
     task: asyncio.Task
     sub: dict  # full snapshot of sub at task start time
     state: _ConsumerState  # status the task reports, readable by the manager
+    negative_checks: int = 0  # consecutive liveness checks the broker answered negatively
+
+
+@dataclass
+class _FireSub:
+    """What the manager knows about the fire consumer task, mirroring :class:`_ActiveSub`.
+
+    Its own state gates the liveness check the same way a subscription's does — a fire
+    task pausing in its retry loop is not a candidate — and its own counter keeps its
+    verdict to itself instead of expressing it through the ``conn_id`` it shares with
+    ordinary subscriptions.
+    """
+    conn_id: str
+    state: _ConsumerState
+    negative_checks: int = 0
+
+
+@dataclass
+class _ConnLiveness:
+    """Verdict one liveness check reached for a single ``conn_id``.
+
+    :param status: ``connected`` when the broker confirmed our consumers, ``error``
+        when it did not, ``degraded`` when a negative verdict was held back by the
+        recreation rate limit, and ``None`` when the check produced no data at all.
+    :param broker_consumers: Consumers the broker reports on our queues, ``None``
+        when the check cannot tell (Management API unavailable or not configured).
+    :param reason: Human-readable explanation for a non-``connected`` status.
+    """
+    status: str | None
+    broker_consumers: int | None
+    reason: str | None = None
 
 
 class RMQConsumerManager:
@@ -172,8 +221,13 @@ class RMQConsumerManager:
         self._timeouts: dict[str, AmqpTimeouts] = {}  # conn_id → call timeouts from its extra
         self._publish_timeouts: dict[str, int] = {}  # conn_id → consecutive publish timeouts
         self._last_drop_at: dict[str, float] = {}  # conn_id → monotonic time of last drop
+        self._last_drop_cycle: dict[str, int] = {}  # conn_id → cycle of its last full drop
+        self._cycle_no = 0  # liveness checks performed, i.e. reconcile cycles
+        self._liveness: dict[str, _ConnLiveness] = {}  # conn_id → verdict of the last check
         self._conn_lock = asyncio.Lock()  # prevents duplicate connections on concurrent starts
         self._fire_task: asyncio.Task | None = None
+        self._fire_state: _FireSub | None = None  # state record of the running fire task
+        self._fire_needs_restart = False  # last check found the fire consumer gone
         self._cooldown_tracker = OrphanTracker()  # dag_ids for which pending queues were created
         self._exchange_tracker = OrphanTracker()  # dag_ids for which sub queues/bindings were created
         self._http_client: httpx.AsyncClient | None = None  # Management API client
@@ -195,6 +249,7 @@ class RMQConsumerManager:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
         self._fire_task = None
+        self._fire_state = None
 
         for conn in list(self._connections.values()):
             try:
@@ -288,6 +343,9 @@ class RMQConsumerManager:
             if self._fire_task is None or self._fire_task.done():
                 connection = self._connections.get((fire_conn_id, _ROLE_CONSUME))
                 if connection is not None:
+                    self._fire_state = _FireSub(
+                        conn_id=fire_conn_id, state=_ConsumerState(None)
+                    )
                     self._fire_task = asyncio.create_task(
                         self._consume_fire_queue(connection, fire_conn_id)
                     )
@@ -301,6 +359,7 @@ class RMQConsumerManager:
                 self._fire_task.cancel()
                 await asyncio.gather(self._fire_task, return_exceptions=True)
             self._fire_task = None
+            self._fire_state = None
 
         # Orphan check runs unconditionally so that removing a dag_id from an otherwise
         # active set of cooldown subscriptions is still detected even when RMQ provisioning
@@ -468,6 +527,23 @@ class RMQConsumerManager:
                     pooled_role, conn_id, exc,
                 )
         self._last_drop_at[conn_id] = time.monotonic()
+        if role is None:
+            # Only a full drop feeds the liveness rate limit: the publish role has its
+            # own gate of consecutive publish timeouts, and letting it move this mark
+            # would postpone recovery of a consuming connection that went silent at the
+            # same time.
+            self._last_drop_cycle[conn_id] = self._cycle_no
+
+    def _may_drop_connection(self, conn_id: str) -> bool:
+        """Whether ``conn_id`` may be recreated in this cycle.
+
+        The same connection is torn down at most once every
+        :data:`_DROP_COOLDOWN_CYCLES` cycles, so a verdict that keeps coming back
+        negative — a misclassification, or a fault that lives outside the connection —
+        surfaces as a rare logged event instead of a silent recreation loop.
+        """
+        last_cycle = self._last_drop_cycle.get(conn_id)
+        return last_cycle is None or self._cycle_no - last_cycle >= _DROP_COOLDOWN_CYCLES
 
     async def _get_publish_channel(self, conn_id: str) -> Any:
         """Return a channel on the publish connection of ``conn_id``, opening it on demand."""
@@ -730,6 +806,232 @@ class RMQConsumerManager:
         entry = self._active.get(sub_id)
         return entry.state if entry is not None else _ConsumerState(sub_id)
 
+    def _fire_state_of(self) -> _ConsumerState:
+        """State record the manager keeps for the fire consumer."""
+        return self._fire_state.state if self._fire_state is not None else _ConsumerState(None)
+
+    async def _check_subscription_liveness(
+        self, subscriptions: list[dict]
+    ) -> tuple[set[int], set[str]]:
+        """Ask the broker whether our consumers are still registered.
+
+        :param subscriptions: The subscription list of the current reconcile cycle.
+        :returns: ``(sub_ids to restart, conn_ids to recreate)``.
+
+        Only a subscription whose own state says ``listening`` is examined: one still
+        connecting or backing off after an error is being handled by its own retry loop.
+        A consumer is alive when its own ``consumer_tag`` is registered on the broker —
+        a plain consumer count would be satisfied by a foreign client or by the second
+        scheduler replica, which is exactly what masks a zombie of ours.
+
+        A verdict needs :data:`_NEGATIVE_CHECKS_BEFORE_RESTART` negative checks in a row;
+        a single positive one clears the counter. A check that produced no data — the
+        Management API being unreachable — leaves the counters untouched, whereas an AMQP
+        probe that fails *or hangs* counts as negative: silence on an AMQP call is the
+        signature of the zombie connection this watchdog exists for.
+
+        The verdict of each conn_id is kept in ``self._liveness`` for the status writer.
+        """
+        self._cycle_no += 1
+        self._liveness = {}
+        self._fire_needs_restart = False
+
+        candidates: dict[str, list[dict]] = {}
+        for sub in subscriptions:
+            entry = self._active.get(sub["id"])
+            if entry is None or entry.task.done() or entry.state.status != "listening":
+                continue
+            candidates.setdefault(sub["conn_id"], []).append(sub)
+
+        fire = self._fire_state
+        fire_candidate = (
+            fire is not None
+            and self._fire_task is not None
+            and not self._fire_task.done()
+            and fire.state.status == "listening"
+        )
+        if fire_candidate and fire is not None:
+            candidates.setdefault(fire.conn_id, [])
+
+        to_restart: set[int] = set()
+        to_recreate: set[str] = set()
+
+        for conn_id, subs in candidates.items():
+            fire_here = fire_candidate and fire is not None and fire.conn_id == conn_id
+            queues = {sub["queue_name"] for sub in subs}
+            expected_tags = {_consumer_tag(sub["id"]) for sub in subs}
+            if fire_here:
+                queues.add(_FIRE_QUEUE)
+                expected_tags.add(_consumer_tag("fire"))
+
+            live_tags, broker_count, reason = await self._probe_consumers(
+                conn_id, queues, expected_tags
+            )
+            if live_tags is None:
+                self._liveness[conn_id] = _ConnLiveness(
+                    status=None, broker_consumers=None, reason=reason
+                )
+                continue
+
+            dead_subs: set[int] = set()
+            for sub in subs:
+                entry = self._active.get(sub["id"])
+                if entry is None:
+                    continue
+                if _consumer_tag(sub["id"]) in live_tags:
+                    entry.negative_checks = 0
+                    continue
+                entry.negative_checks += 1
+                log.warning(
+                    "Broker does not know consumer %s of subscription %d (queue %r, "
+                    "conn_id=%r) — negative check %d of %d",
+                    _consumer_tag(sub["id"]), sub["id"], sub["queue_name"], conn_id,
+                    entry.negative_checks, _NEGATIVE_CHECKS_BEFORE_RESTART,
+                )
+                if entry.negative_checks >= _NEGATIVE_CHECKS_BEFORE_RESTART:
+                    dead_subs.add(sub["id"])
+
+            if fire_here and fire is not None:
+                if _consumer_tag("fire") in live_tags:
+                    fire.negative_checks = 0
+                else:
+                    fire.negative_checks += 1
+                    log.warning(
+                        "Broker does not know the fire consumer on conn_id=%r "
+                        "(queue %r) — negative check %d of %d",
+                        conn_id, _FIRE_QUEUE, fire.negative_checks,
+                        _NEGATIVE_CHECKS_BEFORE_RESTART,
+                    )
+                    if fire.negative_checks >= _NEGATIVE_CHECKS_BEFORE_RESTART:
+                        fire.negative_checks = 0
+                        self._fire_needs_restart = True
+
+            if not dead_subs:
+                self._liveness[conn_id] = _ConnLiveness(
+                    status="connected", broker_consumers=broker_count
+                )
+                continue
+
+            if not self._may_drop_connection(conn_id):
+                held_back = (
+                    f"{len(dead_subs)} subscription(s) unseen by the broker, but the "
+                    f"connection was already recreated less than "
+                    f"{_DROP_COOLDOWN_CYCLES} cycles ago"
+                )
+                log.warning(
+                    "Connection %r is condemned again after %d cycle(s), sooner than the "
+                    "%d-cycle limit allows — leaving it in place. Repeated verdicts mean "
+                    "either the check misjudges it or the fault is not in the connection.",
+                    conn_id, self._cycle_no - self._last_drop_cycle[conn_id],
+                    _DROP_COOLDOWN_CYCLES,
+                )
+                self._liveness[conn_id] = _ConnLiveness(
+                    status="degraded", broker_consumers=broker_count, reason=held_back
+                )
+                continue
+
+            to_restart |= dead_subs
+            to_recreate.add(conn_id)
+            self._liveness[conn_id] = _ConnLiveness(
+                status="error",
+                broker_consumers=broker_count,
+                reason=reason or "consumer not registered on the broker",
+            )
+
+        return to_restart, to_recreate
+
+    async def _probe_consumers(
+        self, conn_id: str, queues: set[str], expected_tags: set[str]
+    ) -> tuple[set[str] | None, int | None, str | None]:
+        """Ask ``conn_id`` which of our consumers the broker currently holds.
+
+        :param conn_id: Airflow connection whose consumers are being verified.
+        :param queues: Queue names our consumers of this conn_id are subscribed to.
+        :param expected_tags: Consumer tags those subscriptions registered.
+        :returns: ``(live tags, consumers the broker reports, reason)``, where live tags
+            of ``None`` means the check produced no data and the counters stay untouched.
+
+        With a ``management_url`` the answer comes from ``GET /api/consumers/{vhost}``.
+        Without one the probe is a passive declare on a fresh channel: it says nothing
+        about individual consumers, so its success vouches for every tag of this conn_id
+        and its failure — a raised error or a call that never returns — condemns them all.
+        """
+        conn_info = None
+        management_url = None
+        if self._http_client is not None:
+            try:
+                conn_info = await self._executor.run(BaseHook.get_connection, conn_id)
+                management_url = get_management_url(conn_info)
+            except Exception as exc:
+                log.warning(
+                    "Cannot read connection %r for the liveness check: %s — liveness "
+                    "unknown this cycle, counters unchanged",
+                    conn_id, exc,
+                )
+                return None, None, str(exc)
+
+        if (
+            self._http_client is not None
+            and management_url is not None
+            and conn_info is not None
+            and conn_info.login is not None
+            and conn_info.password is not None
+        ):
+            try:
+                by_queue = await get_queue_consumers(
+                    self._http_client,
+                    management_url,
+                    conn_info.schema or "/",
+                    (conn_info.login, conn_info.password),
+                )
+            except Exception as exc:
+                log.warning(
+                    "Management API did not answer the consumer list for conn_id=%r: %s "
+                    "— liveness unknown this cycle, counters unchanged",
+                    conn_id, exc,
+                )
+                return None, None, str(exc)
+            live_tags: set[str] = set()
+            broker_count = 0
+            for queue_name in queues:
+                queue_tags = by_queue.get(queue_name, set())
+                live_tags |= queue_tags
+                broker_count += len(queue_tags)
+            return live_tags, broker_count, None
+
+        return await self._probe_by_passive_declare(conn_id, queues, expected_tags)
+
+    async def _probe_by_passive_declare(
+        self, conn_id: str, queues: set[str], expected_tags: set[str]
+    ) -> tuple[set[str], int | None, str | None]:
+        """Verify ``conn_id`` by passive-declaring one of its queues on a fresh channel."""
+        queue_name = min(queues)
+        rpc_timeout = self._rpc_timeout(conn_id)
+        channel = None
+        try:
+            connection = await self._get_or_create_connection(conn_id)
+            channel = await _call_with_timeout(connection.channel(), timeout=rpc_timeout)
+            await _call_with_timeout(
+                channel.declare_queue(queue_name, passive=True), timeout=rpc_timeout
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason = f"passive declare of {queue_name!r} failed: {exc}"
+            log.warning(
+                "Liveness probe on conn_id=%r failed (%s) — treating the connection as "
+                "dead: silence on an AMQP call is what a zombie connection answers with",
+                conn_id, reason,
+            )
+            return set(), None, reason
+        finally:
+            if channel is not None:
+                try:
+                    await _call_with_timeout(channel.close(), timeout=_CLOSE_TIMEOUT)
+                except Exception:
+                    pass
+        return set(expected_tags), None, None
+
     async def _consume_subscription(self, sub: dict) -> None:
         sub_id: int = sub["id"]
         dag_id: str = sub["dag_id"]
@@ -874,13 +1176,16 @@ class RMQConsumerManager:
 
     async def _consume_fire_queue(self, connection: Any, conn_id: str | None = None) -> None:
         """Consumer for rmq_watcher.fire queue — triggers DAGs after cooldown expires via DLX."""
+        state = self._fire_state_of()
         while True:
+            state.write("connecting")
             try:
                 rpc_timeout = self._rpc_timeout(conn_id)
                 channel = await _call_with_timeout(connection.channel(), timeout=rpc_timeout)
                 queue = await _call_with_timeout(
                     channel.declare_queue(_FIRE_QUEUE, passive=True), timeout=rpc_timeout
                 )
+                state.write("listening")
 
                 async with queue.iterator(consumer_tag=_consumer_tag("fire")) as q_iter:
                     async for message in q_iter:
@@ -920,6 +1225,7 @@ class RMQConsumerManager:
                 return
 
             except aio_pika.exceptions.ChannelNotFoundEntity as exc:
+                state.write("error", last_error=str(exc))
                 log.error(
                     "Fire queue %r not found: %s — exiting fire consumer, "
                     "will restart on next reconcile cycle.",
@@ -928,6 +1234,7 @@ class RMQConsumerManager:
                 return
 
             except aio_pika.exceptions.ChannelClosed as exc:
+                state.write("error", last_error=str(exc))
                 log.warning(
                     "Fire queue channel closed: %s — retrying in %ss",
                     exc, _RECONNECT_DELAY,
@@ -935,6 +1242,7 @@ class RMQConsumerManager:
                 await asyncio.sleep(_RECONNECT_DELAY)
 
             except Exception as exc:
+                state.write("error", last_error=str(exc))
                 log.warning(
                     "Transient error in fire consumer: %s — retrying in %ss",
                     exc, _RECONNECT_DELAY,
