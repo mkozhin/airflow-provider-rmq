@@ -35,6 +35,7 @@ from airflow_provider_rmq.watcher.consumer import (
     _build_run_id,
     _safe_run_id,
     _sync_trigger,
+    _write_consumer_status,
     _OUTCOME_DUPLICATE,
     _OUTCOME_SKIPPED,
     _OUTCOME_TRIGGERED,
@@ -121,6 +122,23 @@ class _FakeExecutor:
 
     async def run(self, fn, *args):
         return await self._handler(fn, *args)
+
+
+def _offloading_executor(outcome: str = _OUTCOME_TRIGGERED) -> _FakeExecutor:
+    """Executor stand-in for whole-scenario tests.
+
+    A trigger reports ``outcome``, a status write goes nowhere, and everything else —
+    reading the Airflow connection, for one — runs as the manager offloaded it.
+    """
+
+    async def handler(fn, *args):
+        if fn is _sync_trigger:
+            return outcome
+        if fn is _write_consumer_status:
+            return None
+        return fn(*args)
+
+    return _FakeExecutor(handler)
 
 
 
@@ -4514,3 +4532,187 @@ class TestReconnectDiagnostics:
         assert any(
             _FIRE_QUEUE in message and "rmq_prod" in message for message in messages
         ), messages
+
+
+# ---------------------------------------------------------------------------
+# End-to-end recovery scenarios of the 2026-08-26 incident
+# ---------------------------------------------------------------------------
+
+class TestIncidentRecovery:
+    """Whole-chain checks: detection, connection rebuild and consumption afterwards.
+
+    The unit tests above pin down each layer on its own; these run the scenario the
+    way it happened — a connection that answers nothing while reporting itself open,
+    a broker blocking publishers under an alarm — through reconcile from end to end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_silent_connection_is_rebuilt_and_consumption_resumes(self, manager):
+        """The incident itself: attached, then silent, with ``is_closed`` still False.
+
+        Two cycles condemn the subscription, the connection is recreated, and the
+        delivery waiting on the queue is finally triggered and acked.
+        """
+        sub = _sub(id=7, queue_name="orders")
+
+        zombie_channel = _make_live_channel(queue=_make_push_queue([]))
+        zombie = _make_live_connection()
+        opened: list[int] = []
+
+        async def silent_channel():
+            opened.append(1)
+            if len(opened) == 1:
+                return zombie_channel
+            await asyncio.Future()  # every later call is swallowed
+
+        zombie.channel = silent_channel
+        zombie.close = _hanging_call
+
+        acked = asyncio.Event()
+        msg = _make_fake_message(b"order", message_id="m1")
+        msg.ack = AsyncMock(side_effect=lambda: acked.set())
+        fresh = _make_live_connection(channel=_make_live_channel(queue=_make_push_queue([msg])))
+
+        manager._executor = _offloading_executor()
+        manager._http_client = _mgmt_client([])  # the broker holds no consumer of ours
+
+        with _patch_mgmt_connection(), _patch_watcher_session(), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05), \
+             patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
+                   new_callable=AsyncMock, side_effect=[zombie, fresh]) as connect:
+            await manager.reconcile([sub])
+            await _wait_for_status(manager._active[7], "listening")
+            silent_task = manager._active[7].task
+
+            await manager.reconcile([sub])  # one negative check changes nothing
+            assert manager._active[7].task is silent_task
+            assert not acked.is_set()
+
+            await manager.reconcile([sub])  # second negative check → rebuild
+            await asyncio.wait_for(acked.wait(), timeout=2.0)
+
+            assert connect.await_count == 2
+            assert manager._connections[("rmq_default", _ROLE_CONSUME)] is fresh
+            assert zombie not in manager._connections.values()
+            assert manager._active[7].task is not silent_task
+            assert silent_task.done()
+            msg.ack.assert_awaited_once()
+
+            await _drain(manager)
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_unreachable_broker_turns_the_stored_status_to_error(self, manager):
+        """A connection the broker no longer answers must stop being written as
+        ``connected`` — the row staying green is what hid the incident for a day."""
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = None
+        _fast_timeouts(manager)
+        channel = _make_live_channel()
+        channel.declare_queue = AsyncMock(side_effect=ConnectionError("broker is gone"))
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = _make_live_connection(
+            channel=channel
+        )
+
+        await manager._check_subscription_liveness([sub])
+        await manager._check_subscription_liveness([sub])
+        upsert = await _write_statuses(manager, [sub], stored={"rmq_default": "connected"})
+
+        assert manager._liveness["rmq_default"].status == "error"
+        assert upsert.call_args.args[2] == "error"
+
+    @pytest.mark.asyncio
+    async def test_zombie_publish_connection_heals_and_cooldown_fires_again(self, manager):
+        """A publish connection carries no consumers, so the broker-side watchdog cannot
+        see it: the publish itself is its probe, and the next delivery must go out on a
+        connection built to replace it — no process restart involved."""
+        _fast_timeouts(manager)
+        zombie_channel = _make_live_channel()
+        zombie_channel.default_exchange.publish = _hanging_call
+        zombie_publish = _make_live_connection(channel=zombie_channel)
+        consume_conn = _make_live_connection()
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = consume_conn
+        manager._connections[("rmq_default", _ROLE_PUBLISH)] = zombie_publish
+        manager._publish_channels["rmq_default"] = zombie_channel
+
+        for _ in range(2):
+            with pytest.raises(asyncio.TimeoutError):
+                await manager._publish_pending(
+                    "rmq_default", "my_dag", 300, _make_fake_message(b"order")
+                )
+
+        assert ("rmq_default", _ROLE_PUBLISH) not in manager._connections
+        assert manager._connections[("rmq_default", _ROLE_CONSUME)] is consume_conn
+        consume_conn.close.assert_not_awaited()
+
+        fresh_channel = _make_live_channel()
+        fresh_publish = _make_live_connection(channel=fresh_channel)
+        msg = _make_fake_message(b"order")
+
+        with patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
+                   new_callable=AsyncMock, return_value=fresh_publish), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=_make_conn_info()):
+            await manager._publish_pending("rmq_default", "my_dag", 300, msg)
+
+        assert manager._connections[("rmq_default", _ROLE_PUBLISH)] is fresh_publish
+        fresh_channel.default_exchange.publish.assert_awaited_once()
+        msg.ack.assert_awaited_once()
+        msg.nack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_memory_alarm_stays_inside_the_publish_connection(self, manager):
+        """Under a resource alarm the broker stops reading from publishing connections.
+
+        With publish split off, deliveries and their acks keep flowing on the consuming
+        connection and our consumer tag stays registered, so the watchdog leaves that
+        connection alone while the alarm lasts.
+        """
+        _fast_timeouts(manager)
+        blocked_channel = _make_live_channel()
+        blocked_channel.default_exchange.publish = _hanging_call
+        manager._connections[("rmq_default", _ROLE_PUBLISH)] = _make_live_connection(
+            channel=blocked_channel
+        )
+        manager._publish_channels["rmq_default"] = blocked_channel
+
+        acked = asyncio.Event()
+        msg = _make_fake_message(b"order", message_id="m1")
+        msg.ack = AsyncMock(side_effect=lambda: acked.set())
+        consume_conn = _make_live_connection(
+            channel=_make_live_channel(queue=_make_push_queue([msg]))
+        )
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = consume_conn
+
+        manager._executor = _offloading_executor()
+        sub = _sub(id=7, queue_name="orders")
+        entry = _ActiveSub(
+            task=asyncio.create_task(manager._consume_subscription(sub)),
+            sub=sub.copy(),
+            state=_ConsumerState(7, manager._executor),
+        )
+        manager._active[7] = entry
+
+        await asyncio.wait_for(acked.wait(), timeout=2.0)
+
+        # A cooldown publish of the same conn_id is still stuck behind the alarm.
+        with pytest.raises(asyncio.TimeoutError):
+            await manager._publish_pending(
+                "rmq_default", "my_dag", 300, _make_fake_message(b"order")
+            )
+
+        manager._http_client = _mgmt_client([_consumer_entry(_consumer_tag(7), "orders")])
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+            result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert manager._liveness["rmq_default"].status == "connected"
+        assert manager._connections[("rmq_default", _ROLE_CONSUME)] is consume_conn
+        consume_conn.close.assert_not_awaited()
+        assert not entry.task.done()
+
+        await _drain(manager)
+        await manager._http_client.aclose()

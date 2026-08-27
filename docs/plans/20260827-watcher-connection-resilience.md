@@ -1017,18 +1017,18 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 
 ### Task 12: Verify acceptance criteria
 
-- [ ] все пункты Overview реализованы, крайние случаи из Technical Details покрыты
-- [ ] полный тестовый сьют: `pytest`
-- [ ] DagBag-регрессия example DAGs проходит
-- [ ] `ruff check .` без новых замечаний
-- [ ] сквозная проверка сценария инцидента на моках: зомби-соединение (`is_closed == False`, операции не резолвятся) → watchdog признаёт подписку мёртвой за два цикла → соединение пересоздано → потребление возобновилось
-- [ ] проверить, что при недоступном брокере статусы в БД становятся `error`, а не остаются `connected`
-- [ ] проверить, что недоступность Management API не приводит ни к перезапускам, ни к смене статуса на `error`
-- [ ] проверить, что **серия** несовпавших по фильтру сообщений (больше, чем любое разумное окно prefetch) не останавливает потребление — одного сообщения для этой проверки недостаточно
-- [ ] проверить, что сброс соединения поднимает заново и fire-таску
-- [ ] проверить, что зомби на publish-соединении лечится: cooldown-подписки возобновляют запуск DAG'ов без перезапуска процесса
-- [ ] проверить, что memory alarm брокера не приводит ни к пересозданиям соединений, ни к заморозке watchdog'а: потребление и подтверждения продолжаются на consume-соединении, а блокировка остаётся внутри publish-соединения
-- [ ] проверить, что зомби-consumer опознаётся при живом чужом consumer'е на той же очереди
+- [x] все пункты Overview реализованы, крайние случаи из Technical Details покрыты — сверено по коду: heartbeat и таймауты в `utils/amqp.py`, роли соединений и watchdog подписок в `watcher/consumer.py`, таймаут итерации и два пула в `watcher/listener.py`, колонки и миграция в `watcher/models.py`, диагностика на странице Subscriptions, decode после ACK в `triggers/rmq.py`, ADR-0007
+- [x] полный тестовый сьют: `pytest` — 862 passed, 1 skipped
+- [x] DagBag-регрессия example DAGs проходит (`tests/watcher/test_example_dags_dagbag.py` в составе сьюта)
+- [x] `ruff check .` без новых замечаний — 148 находок как и на `git stash`-базе, построчный diff пуст
+- [x] сквозная проверка сценария инцидента на моках: зомби-соединение (`is_closed == False`, операции не резолвятся) → watchdog признаёт подписку мёртвой за два цикла → соединение пересоздано → потребление возобновилось — `TestIncidentRecovery::test_silent_connection_is_rebuilt_and_consumption_resumes`
+- [x] проверить, что при недоступном брокере статусы в БД становятся `error`, а не остаются `connected` — `TestIncidentRecovery::test_unreachable_broker_turns_the_stored_status_to_error`, `TestConnStatusRows::test_negative_verdict_is_not_written_as_connected`
+- [x] проверить, что недоступность Management API не приводит ни к перезапускам, ни к смене статуса на `error` — `TestSubscriptionLiveness::test_management_api_failure_is_no_data`, `TestConnStatusRows::test_no_data_keeps_the_stored_status_but_still_stamps_the_cycle`
+- [x] проверить, что **серия** несовпавших по фильтру сообщений (больше, чем любое разумное окно prefetch) не останавливает потребление — одного сообщения для этой проверки недостаточно — `TestImmediateDeliveryAcknowledgement::test_a_series_of_filter_misses_keeps_consumption_going` (25 подряд несовпавших, затем совпавшее)
+- [x] проверить, что сброс соединения поднимает заново и fire-таску — `TestRecoverDeadConsumers::test_fire_task_on_the_dropped_conn_id_is_cancelled_and_started_again`
+- [x] проверить, что зомби на publish-соединении лечится: cooldown-подписки возобновляют запуск DAG'ов без перезапуска процесса — `TestIncidentRecovery::test_zombie_publish_connection_heals_and_cooldown_fires_again`
+- [x] проверить, что memory alarm брокера не приводит ни к пересозданиям соединений, ни к заморозке watchdog'а: потребление и подтверждения продолжаются на consume-соединении, а блокировка остаётся внутри publish-соединения — ⚠️ выполняется с оговоркой (`TestIncidentRecovery::test_memory_alarm_stays_inside_the_publish_connection`): consume-соединение не пересоздаётся, watchdog видит наш `consumer_tag` и даёт `connected`, доставки подтверждаются. Но **publish-соединение** под длительным alarm пересоздаётся: два подряд таймаута `publish` — это его собственная проба живости (Ключевые решения, «Живость publish-соединения определяется самой публикацией»), и ограничитель частоты на роль publish не распространяется. То есть буквальное «ни к пересозданиям соединений» верно только для consume-роли; для publish-роли это осознанная цена выбранного дизайна
+- [x] проверить, что зомби-consumer опознаётся при живом чужом consumer'е на той же очереди — `TestSubscriptionLiveness::test_foreign_consumer_does_not_vouch_for_ours`
 
 ### Task 13: [Final] Update documentation
 
