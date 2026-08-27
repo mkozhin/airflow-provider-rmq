@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from airflow_provider_rmq.triggers.rmq import RMQTrigger
+from airflow_provider_rmq.utils.amqp import DEFAULT_HEARTBEAT
 from tests.conftest import FakeAirflowConnection
 
 
@@ -335,6 +336,40 @@ class TestSSLUrl:
 
         call_kwargs = mock_aio_pika.connect_robust.call_args.kwargs
         assert "ssl_context" not in call_kwargs
+
+
+class TestHeartbeatUrl:
+    @pytest.mark.asyncio
+    async def test_url_carries_default_heartbeat(self):
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+
+        fake_conn_info = FakeAirflowConnection()
+
+        with patch("airflow_provider_rmq.triggers.rmq.aio_pika") as mock_aio_pika:
+            mock_aio_pika.connect_robust = AsyncMock(side_effect=ConnectionError("test"))
+            with patch("airflow_provider_rmq.triggers.rmq.BaseHook") as mock_base:
+                mock_base.get_connection = MagicMock(return_value=fake_conn_info)
+
+                await _collect_events(trigger)
+
+        url = mock_aio_pika.connect_robust.call_args.kwargs["url"]
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+
+    @pytest.mark.asyncio
+    async def test_url_carries_heartbeat_from_extra(self):
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+
+        fake_conn_info = FakeAirflowConnection(extra='{"heartbeat": 12}')
+
+        with patch("airflow_provider_rmq.triggers.rmq.aio_pika") as mock_aio_pika:
+            mock_aio_pika.connect_robust = AsyncMock(side_effect=ConnectionError("test"))
+            with patch("airflow_provider_rmq.triggers.rmq.BaseHook") as mock_base:
+                mock_base.get_connection = MagicMock(return_value=fake_conn_info)
+
+                await _collect_events(trigger)
+
+        url = mock_aio_pika.connect_robust.call_args.kwargs["url"]
+        assert url.endswith("?heartbeat=12")
 
 
 # ---------------------------------------------------------------------------

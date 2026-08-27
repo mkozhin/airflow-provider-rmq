@@ -685,16 +685,16 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 - Modify: `tests/test_amqp_utils.py`
 - Modify: `tests/test_trigger.py`
 
-- [ ] добавить константы `DEFAULT_HEARTBEAT`, `DEFAULT_CONNECT_TIMEOUT`, `DEFAULT_RPC_TIMEOUT`
-- [ ] `build_amqp_connection`: добавить в URL query-параметр `heartbeat` из `extra` (ключ `heartbeat`, как в `hooks/rmq.py:145`) или из константы
-- [ ] `heartbeat=0` в `extra` принимается, но логируется WARNING о том, что детект разрыва отключён
-- [ ] добавить `get_amqp_timeouts(conn_info)` → dataclass `AmqpTimeouts(connect, rpc)` с чтением `extra`, дефолтами и валидацией (нечисловое/неположительное → дефолт + WARNING)
-- [ ] обновить существующие проверки URL: точные сравнения в `tests/test_amqp_utils.py` и проверки построения URL в `tests/test_trigger.py` — найти по факту, не по номерам строк
-- [ ] тест: URL содержит `heartbeat` из дефолта и из `extra`; схема, credentials, порт и vhost не меняются
-- [ ] тест: `heartbeat=0` → параметр в URL, WARNING залогирован
-- [ ] тест: `get_amqp_timeouts` — дефолты, override из `extra`, мусорные значения (строка, отрицательное число, `None`)
-- [ ] тест: экранирование credentials и vhost сохраняется при добавлении query-строки
-- [ ] run tests - must pass before task 2
+- [x] добавить константы `DEFAULT_HEARTBEAT`, `DEFAULT_CONNECT_TIMEOUT`, `DEFAULT_RPC_TIMEOUT`
+- [x] `build_amqp_connection`: добавить в URL query-параметр `heartbeat` из `extra` (ключ `heartbeat`, как в `hooks/rmq.py:145`) или из константы
+- [x] `heartbeat=0` в `extra` принимается, но логируется WARNING о том, что детект разрыва отключён
+- [x] добавить `get_amqp_timeouts(conn_info)` → dataclass `AmqpTimeouts(connect, rpc)` с чтением `extra`, дефолтами и валидацией (нечисловое/неположительное → дефолт + WARNING)
+- [x] обновить существующие проверки URL: точные сравнения в `tests/test_amqp_utils.py` и проверки построения URL в `tests/test_trigger.py` — найти по факту, не по номерам строк
+- [x] тест: URL содержит `heartbeat` из дефолта и из `extra`; схема, credentials, порт и vhost не меняются
+- [x] тест: `heartbeat=0` → параметр в URL, WARNING залогирован
+- [x] тест: `get_amqp_timeouts` — дефолты, override из `extra`, мусорные значения (строка, отрицательное число, `None`)
+- [x] тест: экранирование credentials и vhost сохраняется при добавлении query-строки
+- [x] run tests - must pass before task 2
 
 ### Task 2: Таймауты AMQP-операций, consumer_tag и состояние подписки в менеджере
 

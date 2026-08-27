@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import ssl
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,9 +9,13 @@ import pytest
 from airflow_provider_rmq.utils.amqp import (
     AMQP_PORT,
     AMQPS_PORT,
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_HEARTBEAT,
+    DEFAULT_RPC_TIMEOUT,
     match as _match,
     nack_and_sleep as _nack_and_sleep,
     build_amqp_connection,
+    get_amqp_timeouts,
     match_and_ack,
 )
 from airflow_provider_rmq.utils.filters import MessageFilter
@@ -25,7 +30,7 @@ class TestBuildAmqpConnection:
     def test_plain_url(self):
         conn = FakeAirflowConnection(host="rmq.local", port=None, login="user", password="pass", schema="/")
         url, ssl_ctx = build_amqp_connection(conn)
-        assert url == "amqp://user:pass@rmq.local:5672/%2F"
+        assert url == f"amqp://user:pass@rmq.local:5672/%2F?heartbeat={DEFAULT_HEARTBEAT}"
         assert ssl_ctx is None
 
     def test_default_port_no_ssl(self):
@@ -73,7 +78,7 @@ class TestBuildAmqpConnection:
     def test_default_vhost_when_schema_empty(self):
         conn = FakeAirflowConnection(schema="")
         url, _ = build_amqp_connection(conn)
-        assert url.endswith("/%2F")
+        assert url.endswith(f"/%2F?heartbeat={DEFAULT_HEARTBEAT}")
 
     def test_returns_ssl_context_when_ssl_configured(self):
         conn = FakeAirflowConnection(extra='{"ssl_enabled": true}')
@@ -87,6 +92,143 @@ class TestBuildAmqpConnection:
         conn = FakeAirflowConnection()
         _, ssl_ctx = build_amqp_connection(conn)
         assert ssl_ctx is None
+
+
+# ---------------------------------------------------------------------------
+# heartbeat in the URL
+# ---------------------------------------------------------------------------
+
+class TestHeartbeatInUrl:
+    def test_default_heartbeat_present(self):
+        conn = FakeAirflowConnection()
+        url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+
+    def test_heartbeat_from_extra(self):
+        conn = FakeAirflowConnection(extra='{"heartbeat": 90}')
+        url, _ = build_amqp_connection(conn)
+        assert url.endswith("?heartbeat=90")
+
+    def test_heartbeat_from_extra_as_string(self):
+        conn = FakeAirflowConnection(extra='{"heartbeat": "45"}')
+        url, _ = build_amqp_connection(conn)
+        assert url.endswith("?heartbeat=45")
+
+    def test_scheme_credentials_port_and_vhost_unchanged(self):
+        conn = FakeAirflowConnection(
+            host="rmq.local", port=5700, login="user@domain", password="p@ss", schema="/app/v2",
+            extra='{"heartbeat": 90}',
+        )
+        url, _ = build_amqp_connection(conn)
+        assert url == "amqp://user%40domain:p%40ss@rmq.local:5700/%2Fapp%2Fv2?heartbeat=90"
+
+    def test_credentials_and_vhost_escaping_kept_with_query(self):
+        conn = FakeAirflowConnection(login="a b", password="p/w?x", schema="/v host")
+        url, _ = build_amqp_connection(conn)
+        assert "a%20b:p%2Fw%3Fx@" in url
+        assert "/%2Fv%20host?heartbeat=" in url
+        # the only "?" is the one starting the query string
+        assert url.count("?") == 1
+
+    def test_heartbeat_zero_kept_in_url(self):
+        conn = FakeAirflowConnection(extra='{"heartbeat": 0}')
+        url, _ = build_amqp_connection(conn)
+        assert url.endswith("?heartbeat=0")
+
+    def test_heartbeat_zero_logs_warning(self, caplog):
+        conn = FakeAirflowConnection(extra='{"heartbeat": 0}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            build_amqp_connection(conn)
+        assert any("heartbeat" in r.getMessage() for r in caplog.records)
+
+    def test_garbage_heartbeat_falls_back_to_default(self, caplog):
+        conn = FakeAirflowConnection(extra='{"heartbeat": "soon"}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert caplog.records
+
+    def test_negative_heartbeat_falls_back_to_default(self, caplog):
+        conn = FakeAirflowConnection(extra='{"heartbeat": -5}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert caplog.records
+
+    def test_null_heartbeat_falls_back_to_default(self, caplog):
+        conn = FakeAirflowConnection(extra='{"heartbeat": null}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert caplog.records
+
+    def test_ssl_url_keeps_query(self):
+        conn = FakeAirflowConnection(port=None, extra='{"ssl_enabled": true, "heartbeat": 15}')
+        with patch("airflow_provider_rmq.utils.amqp.build_ssl_context") as mock_ssl:
+            mock_ssl.return_value = MagicMock(spec=ssl.SSLContext)
+            url, _ = build_amqp_connection(conn)
+        assert url.startswith("amqps://")
+        assert f":{AMQPS_PORT}/%2F?heartbeat=15" in url
+
+
+# ---------------------------------------------------------------------------
+# get_amqp_timeouts
+# ---------------------------------------------------------------------------
+
+class TestGetAmqpTimeouts:
+    def test_defaults_without_extra(self):
+        timeouts = get_amqp_timeouts(FakeAirflowConnection())
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert timeouts.rpc == DEFAULT_RPC_TIMEOUT
+
+    def test_override_from_extra(self):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": 5, "rpc_timeout": 7.5}')
+        timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == 5
+        assert timeouts.rpc == 7.5
+
+    def test_numeric_string_override(self):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": "5"}')
+        assert get_amqp_timeouts(conn).connect == 5
+
+    def test_non_numeric_string_falls_back(self, caplog):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": "fast"}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert caplog.records
+
+    def test_negative_value_falls_back(self, caplog):
+        conn = FakeAirflowConnection(extra='{"rpc_timeout": -1}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.rpc == DEFAULT_RPC_TIMEOUT
+        assert caplog.records
+
+    def test_zero_value_falls_back(self, caplog):
+        conn = FakeAirflowConnection(extra='{"rpc_timeout": 0}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.rpc == DEFAULT_RPC_TIMEOUT
+        assert caplog.records
+
+    def test_null_value_falls_back(self, caplog):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": null}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert caplog.records
+
+    def test_missing_key_does_not_warn(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            get_amqp_timeouts(FakeAirflowConnection())
+        assert not caplog.records
+
+    def test_one_bad_value_does_not_affect_the_other(self):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": "nope", "rpc_timeout": 3}')
+        timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert timeouts.rpc == 3
 
 
 # ---------------------------------------------------------------------------

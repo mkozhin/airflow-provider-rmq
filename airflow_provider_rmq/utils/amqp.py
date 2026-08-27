@@ -1,15 +1,116 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
+from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from airflow_provider_rmq.utils.filters import MessageFilter
 from airflow_provider_rmq.utils.ssl import build_ssl_context
 
+log = logging.getLogger(__name__)
+
 AMQP_PORT = 5672
 AMQPS_PORT = 5671
+
+#: Seconds between AMQP heartbeat frames. The client declares the connection dead
+#: after two missed intervals, so a broken link surfaces as an exception in about
+#: ``2 * DEFAULT_HEARTBEAT`` seconds and ``connect_robust`` reconnects.
+DEFAULT_HEARTBEAT = 30
+#: Seconds allowed for establishing an AMQP connection.
+DEFAULT_CONNECT_TIMEOUT = 15
+#: Seconds allowed for a single AMQP RPC: ``channel()``, declare, bind, publish.
+DEFAULT_RPC_TIMEOUT = 30
+
+#: ``extra`` keys that override the defaults above.
+HEARTBEAT_KEY = "heartbeat"
+CONNECT_TIMEOUT_KEY = "connect_timeout"
+RPC_TIMEOUT_KEY = "rpc_timeout"
+
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class AmqpTimeouts:
+    """Timeouts applied to asynchronous AMQP calls.
+
+    :param connect: Seconds allowed for ``connect_robust``.
+    :param rpc: Seconds allowed for a single AMQP RPC.
+    """
+
+    connect: float
+    rpc: float
+
+
+def _read_positive_number(extras: dict[str, Any], key: str, default: float) -> float:
+    """Read a positive number from ``extra``, falling back to ``default``.
+
+    A missing key uses the default silently; a present but unusable value
+    (non-numeric, zero or negative) uses the default and logs a WARNING.
+    """
+    raw = extras.get(key, _MISSING)
+    if raw is _MISSING:
+        return default
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        log.warning("RMQ connection extra %r=%r is not a number, using %s", key, raw, default)
+        return default
+    if value <= 0:
+        log.warning("RMQ connection extra %r=%r must be positive, using %s", key, raw, default)
+        return default
+    return value
+
+
+def _read_heartbeat(extras: dict[str, Any]) -> int:
+    """Read the heartbeat interval in seconds from ``extra``.
+
+    ``0`` is accepted as a deliberate opt-out and logged as a WARNING, because it
+    turns off broken-link detection entirely. Unusable values fall back to
+    :data:`DEFAULT_HEARTBEAT` with a WARNING.
+    """
+    raw = extras.get(HEARTBEAT_KEY, _MISSING)
+    if raw is _MISSING:
+        return DEFAULT_HEARTBEAT
+    try:
+        value = int(float(raw))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        log.warning(
+            "RMQ connection extra %r=%r is not a number, using %s",
+            HEARTBEAT_KEY, raw, DEFAULT_HEARTBEAT,
+        )
+        return DEFAULT_HEARTBEAT
+    if value < 0:
+        log.warning(
+            "RMQ connection extra %r=%r must not be negative, using %s",
+            HEARTBEAT_KEY, raw, DEFAULT_HEARTBEAT,
+        )
+        return DEFAULT_HEARTBEAT
+    if value == 0:
+        log.warning(
+            "RMQ connection extra %r=0 turns off the AMQP heartbeat: a broken link stays "
+            "undetected and the consumer keeps waiting on a zombie connection",
+            HEARTBEAT_KEY,
+        )
+    return value
+
+
+def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
+    """Build call timeouts from an Airflow connection.
+
+    :param conn_info: Airflow Connection object (``airflow.models.Connection``).
+    :returns: :class:`AmqpTimeouts` with ``extra`` overrides applied.
+
+    Timeouts come back separately from the URL because they parameterise the
+    calls, not the connection string.
+    """
+    extras = conn_info.extra_dejson
+    return AmqpTimeouts(
+        connect=_read_positive_number(extras, CONNECT_TIMEOUT_KEY, DEFAULT_CONNECT_TIMEOUT),
+        rpc=_read_positive_number(extras, RPC_TIMEOUT_KEY, DEFAULT_RPC_TIMEOUT),
+    )
 
 
 class _PropsShim:
@@ -30,15 +131,21 @@ def build_amqp_connection(
     :param conn_info: Airflow Connection object (``airflow.models.Connection``).
     :param vhost_override: Optional vhost to use instead of ``conn_info.schema``.
     :returns: ``(url, ssl_context)`` — pass ``ssl_context`` to ``connect_robust()`` if not None.
+
+    The URL carries a ``heartbeat`` query parameter taken from the ``heartbeat``
+    key of ``extra`` (the same key the synchronous hook reads) or from
+    :data:`DEFAULT_HEARTBEAT`. Heartbeats are what turn a broken link into an
+    exception, which is what lets ``connect_robust`` reconnect.
     """
     extras = conn_info.extra_dejson
     ssl_context = build_ssl_context(extras)
     vhost = vhost_override or conn_info.schema or "/"
     port = conn_info.port if conn_info.port else (AMQPS_PORT if ssl_context else AMQP_PORT)
+    query = urlencode({HEARTBEAT_KEY: _read_heartbeat(extras)})
     url = (
         f"{'amqps' if ssl_context else 'amqp'}://"
         f"{quote(conn_info.login or 'guest', safe='')}:{quote(conn_info.password or 'guest', safe='')}"
-        f"@{conn_info.host or 'localhost'}:{port}/{quote(vhost, safe='')}"
+        f"@{conn_info.host or 'localhost'}:{port}/{quote(vhost, safe='')}?{query}"
     )
     return url, ssl_context
 
