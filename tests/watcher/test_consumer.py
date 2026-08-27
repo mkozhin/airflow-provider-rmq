@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import threading
+import time
 from contextlib import ExitStack, suppress
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ import httpx
 import pytest
 
 from airflow_provider_rmq.utils.amqp import AmqpTimeouts
+from airflow_provider_rmq.utils.executor import BoundedExecutor
 
 from airflow_provider_rmq.watcher.consumer import (
     RMQConsumerManager,
@@ -312,26 +315,29 @@ class TestConsumerState:
     def _make_state(self, mock_ws, mock_set):
         return _ConsumerState(sub_id=42)
 
-    def test_state_guard_skips_duplicate_status_write(self):
+    @pytest.mark.asyncio
+    async def test_state_guard_skips_duplicate_status_write(self):
         ctx, _ = _mock_session()
         with patch("airflow_provider_rmq.watcher.consumer.WatcherSession", return_value=ctx), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status") as mock_set:
             state = _ConsumerState(sub_id=1)
-            state.write("listening")
-            state.write("listening")  # duplicate — should be skipped
+            await state.write("listening")
+            await state.write("listening")  # duplicate — should be skipped
             assert mock_set.call_count == 1
 
-    def test_state_guard_writes_on_status_change(self):
+    @pytest.mark.asyncio
+    async def test_state_guard_writes_on_status_change(self):
         ctx, _ = _mock_session()
         with patch("airflow_provider_rmq.watcher.consumer.WatcherSession", return_value=ctx), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status") as mock_set:
             state = _ConsumerState(sub_id=1)
-            state.write("connecting")
-            state.write("listening")
-            state.write("error")
+            await state.write("connecting")
+            await state.write("listening")
+            await state.write("error")
             assert mock_set.call_count == 3
 
-    def test_last_error_cleared_on_successful_connect(self):
+    @pytest.mark.asyncio
+    async def test_last_error_cleared_on_successful_connect(self):
         writes = []
         ctx, _ = _mock_session()
 
@@ -342,10 +348,57 @@ class TestConsumerState:
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status", side_effect=capture):
             state = _ConsumerState(sub_id=1)
             state._last_status = "error"  # simulate being in error state
-            state.write("connecting")
-            state.write("listening", last_error=None)
+            await state.write("connecting")
+            await state.write("listening", last_error=None)
 
         assert ("listening", None) in writes
+
+    @pytest.mark.asyncio
+    async def test_status_write_runs_in_the_consumer_pool(self):
+        """The write blocks on the database, so it must not run on the loop thread."""
+        pool = BoundedExecutor("test-status", 2)
+        threads = []
+        ctx, _ = _mock_session()
+
+        def capture(session, sub_id, status, last_error=None):
+            threads.append(threading.current_thread())
+
+        try:
+            with patch("airflow_provider_rmq.watcher.consumer.WatcherSession", return_value=ctx), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=capture):
+                state = _ConsumerState(sub_id=1, executor=pool)
+                await state.write("listening")
+        finally:
+            pool.shutdown()
+
+        assert threads and threads[0] is not threading.current_thread()
+
+    @pytest.mark.asyncio
+    async def test_hanging_status_write_does_not_stall_the_consumer(self):
+        """A database that never answers must cost the write, not the subscription."""
+        release = threading.Event()
+        pool = BoundedExecutor("test-status-hang", 1)
+        ctx, _ = _mock_session()
+
+        def hang(session, sub_id, status, last_error=None):
+            release.wait(5)
+
+        try:
+            with patch("airflow_provider_rmq.watcher.consumer.WatcherSession", return_value=ctx), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=hang), \
+                 patch("airflow_provider_rmq.watcher.consumer._DB_TIMEOUT", 0.05), \
+                 patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+                state = _ConsumerState(sub_id=1, executor=pool)
+                await state.write("listening")
+        finally:
+            release.set()
+            pool.shutdown()
+
+        assert mock_log.warning.called
+        # The status is not remembered, so the next transition tries the write again.
+        assert state.status is None
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +618,7 @@ class TestConsumeSubscription:
 
         status_writes = []
 
-        def capture_write(self_arg, status, last_error=None):
+        async def capture_write(self_arg, status, last_error=None):
             status_writes.append(status)
 
         with patch.object(manager, "_get_or_create_connection", return_value=connection), \
@@ -3293,10 +3346,22 @@ class TestConsumptionKeepsGoing:
 def _state_with(status: str | None, sub_id: int | None = 1) -> _ConsumerState:
     """Build a state record that already reports ``status``."""
     state = _ConsumerState(sub_id)
-    if status is not None:
-        with _patch_watcher_session():
-            state.write(status)
+    state._last_status = status
     return state
+
+
+async def _wait_for_status(entry, status: str, timeout: float = 5.0) -> None:
+    """Wait until a subscription task reports ``status``.
+
+    The status write goes through a thread pool, so the task reaches it a few event
+    loop turns after reconcile returns rather than after a fixed delay.
+    """
+    deadline = time.monotonic() + timeout
+    while entry.state.status != status:
+        assert time.monotonic() < deadline, (
+            f"status stayed {entry.state.status!r}, never became {status!r}"
+        )
+        await asyncio.sleep(0.01)
 
 
 def _register_active(manager, sub: dict, status: str | None = "listening") -> _ActiveSub:
@@ -3753,13 +3818,13 @@ def _patch_status_writer(upsert, stored: dict[str, str] | None = None):
     )
 
 
-def _write_statuses(manager, subscriptions: list[dict], stored: dict[str, str] | None = None):
+async def _write_statuses(manager, subscriptions: list[dict], stored: dict[str, str] | None = None):
     """Run the status writer against patched storage and return the calls it made."""
     upsert = MagicMock()
     with ExitStack() as stack:
         for patcher in _patch_status_writer(upsert, stored):
             stack.enter_context(patcher)
-        manager._update_all_conn_counts(subscriptions)
+        await manager._update_all_conn_counts(subscriptions)
     return upsert
 
 
@@ -3779,9 +3844,8 @@ class TestRecoverDeadConsumers:
              patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
                    new_callable=AsyncMock, side_effect=[zombie, fresh]) as connect:
             await manager.reconcile([sub])
-            await asyncio.sleep(0.05)
+            await _wait_for_status(manager._active[7], "listening")
             first_task = manager._active[7].task
-            assert manager._active[7].state.status == "listening"
 
             await manager.reconcile([sub])  # first negative check
             assert manager._active[7].task is first_task
@@ -3811,9 +3875,8 @@ class TestRecoverDeadConsumers:
              patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
                    new_callable=AsyncMock, return_value=connection) as connect:
             await manager.reconcile([sub])
-            await asyncio.sleep(0.05)
+            await _wait_for_status(manager._active[7], "listening")
             first_task = manager._active[7].task
-            assert manager._active[7].state.status == "listening"
 
             await manager.reconcile([sub])
             await manager.reconcile([sub])
@@ -3932,63 +3995,68 @@ class TestRecoverDeadConsumers:
         second_conn.close.assert_not_awaited()
         assert manager._active[7].task is rebuilt_task
 
-        upsert = _write_statuses(manager, [sub])
+        upsert = await _write_statuses(manager, [sub])
         assert upsert.call_args.args[2] == "degraded"
         await _drain(manager)
         await manager._http_client.aclose()
 
 
 class TestConnStatusRows:
-    def test_negative_verdict_is_not_written_as_connected(self, manager):
+    @pytest.mark.asyncio
+    async def test_negative_verdict_is_not_written_as_connected(self, manager):
         sub = _sub(id=7)
         _register_active(manager, sub)
         manager._liveness["rmq_default"] = _ConnLiveness(
             status="error", broker_consumers=0, reason="consumer not registered",
         )
 
-        upsert = _write_statuses(manager, [sub], stored={"rmq_default": "connected"})
+        upsert = await _write_statuses(manager, [sub], stored={"rmq_default": "connected"})
 
         assert upsert.call_args.args[2] == "error"
         assert upsert.call_args.kwargs["broker_consumer_count"] == 0
         assert upsert.call_args.kwargs["last_error"] == "consumer not registered"
 
-    def test_no_data_keeps_the_stored_status_but_still_stamps_the_cycle(self, manager):
+    @pytest.mark.asyncio
+    async def test_no_data_keeps_the_stored_status_but_still_stamps_the_cycle(self, manager):
         sub = _sub(id=7)
         _register_active(manager, sub)
         manager._liveness["rmq_default"] = _ConnLiveness(
             status=None, broker_consumers=None, reason="management API unreachable",
         )
 
-        upsert = _write_statuses(manager, [sub], stored={"rmq_default": "connected"})
+        upsert = await _write_statuses(manager, [sub], stored={"rmq_default": "connected"})
 
         assert upsert.call_args.args[2] == "connected"
         assert upsert.call_args.kwargs["broker_consumer_count"] is None
         assert upsert.call_args.kwargs["last_reconcile_at"] is not None
 
-    def test_conn_id_without_a_single_live_task_is_still_written(self, manager):
+    @pytest.mark.asyncio
+    async def test_conn_id_without_a_single_live_task_is_still_written(self, manager):
         """Regression: a row that stops being updated is what made a dead watcher
         look healthy for a day."""
         sub = _sub(id=7)
 
-        upsert = _write_statuses(manager, [sub], stored={"rmq_default": "connected"})
+        upsert = await _write_statuses(manager, [sub], stored={"rmq_default": "connected"})
 
         assert upsert.call_count == 1
         assert upsert.call_args.args[1] == "rmq_default"
         assert upsert.call_args.kwargs["consumer_count"] == 0
         assert upsert.call_args.kwargs["last_reconcile_at"] is not None
 
-    def test_confirmed_liveness_is_written_with_the_broker_count(self, manager):
+    @pytest.mark.asyncio
+    async def test_confirmed_liveness_is_written_with_the_broker_count(self, manager):
         sub = _sub(id=7)
         _register_active(manager, sub)
         manager._liveness["rmq_default"] = _ConnLiveness(status="connected", broker_consumers=2)
 
-        upsert = _write_statuses(manager, [sub])
+        upsert = await _write_statuses(manager, [sub])
 
         assert upsert.call_args.args[2] == "connected"
         assert upsert.call_args.kwargs["consumer_count"] == 1
         assert upsert.call_args.kwargs["broker_consumer_count"] == 2
 
-    def test_status_write_failure_is_logged_and_swallowed(self, manager):
+    @pytest.mark.asyncio
+    async def test_status_write_failure_is_logged_and_swallowed(self, manager):
         sub = _sub(id=7)
         upsert = MagicMock(side_effect=RuntimeError("db is gone"))
 
@@ -3996,7 +4064,82 @@ class TestConnStatusRows:
             for patcher in _patch_status_writer(upsert):
                 stack.enter_context(patcher)
             with patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
-                manager._update_all_conn_counts([sub])
+                await manager._update_all_conn_counts([sub])
+
+        assert mock_log.warning.called
+
+
+class TestCycleWritesOffTheLoop:
+    """Reconcile's own database writes belong in the cycle pool.
+
+    They are awaited by the reconcile cycle, not by a consumer task, so sharing the
+    consumer pool would let deliveries stuck on the database starve the very cycle
+    that is meant to notice and recover from that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_conn_status_rows_leave_the_loop_thread(self, manager):
+        sub = _sub(id=7)
+        _register_active(manager, sub)
+        threads = []
+        upsert = MagicMock(
+            side_effect=lambda *a, **k: threads.append(threading.current_thread())
+        )
+        pool = BoundedExecutor("test-cycle", 2)
+        manager._cycle_executor = pool
+
+        try:
+            with ExitStack() as stack:
+                for patcher in _patch_status_writer(upsert):
+                    stack.enter_context(patcher)
+                await manager._update_all_conn_counts([sub])
+        finally:
+            pool.shutdown()
+
+        assert threads and threads[0] is not threading.current_thread()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_writes_go_to_the_cycle_pool_not_the_consumer_one(self, manager):
+        sub = _sub(id=7)
+        _register_running(manager, sub)
+        cycle_calls = []
+        consumer_calls = []
+
+        async def cycle_handler(fn, *args):
+            cycle_calls.append((fn.__name__, args))
+
+        async def consumer_handler(fn, *args):
+            consumer_calls.append((fn.__name__, args))
+
+        manager._cycle_executor = _FakeExecutor(cycle_handler)
+        manager._executor = _FakeExecutor(consumer_handler)
+
+        await manager.reconcile([])   # the subscription is gone — mark it disconnected
+
+        assert ("_write_consumer_status", (7, "disconnected", None)) in cycle_calls
+        assert any(name == "_write_conn_status_rows" for name, _ in cycle_calls) is False
+        assert consumer_calls == []
+        await _drain(manager)
+
+    @pytest.mark.asyncio
+    async def test_a_hung_status_write_does_not_stall_reconcile(self, manager):
+        release = threading.Event()
+        pool = BoundedExecutor("test-cycle-hang", 1)
+        manager._cycle_executor = pool
+
+        def hang(*args, **kwargs):
+            release.wait(5)
+
+        try:
+            with ExitStack() as stack:
+                for patcher in _patch_status_writer(MagicMock(side_effect=hang)):
+                    stack.enter_context(patcher)
+                with patch("airflow_provider_rmq.watcher.consumer._DB_TIMEOUT", 0.05), \
+                     patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+                    await manager._update_all_conn_counts([_sub(id=7)])
+        finally:
+            release.set()
+            pool.shutdown()
 
         assert mock_log.warning.called
 
@@ -4025,6 +4168,64 @@ async def _consume_until(manager, sub, messages, done, timeout: float = 2.0):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+
+
+class TestHungTrigger:
+    @pytest.mark.asyncio
+    async def test_a_trigger_stuck_in_the_pool_becomes_an_ordinary_failure(self, manager):
+        """A consumer task awaits its own trigger, so the cycle watchdog never sees it.
+
+        Without a timeout of its own the subscription would sit in ``listening`` while
+        consuming nothing at all. The timeout buys the coroutine back, not the worker:
+        the thread stays busy until the blocked call returns, which the test asserts
+        rather than pretends otherwise.
+        """
+        release = threading.Event()
+        done = asyncio.Event()
+        delays = []
+        statuses = []
+        msg = _make_fake_message(b"order", message_id="m1")
+        msg.nack = AsyncMock()
+        # Two workers: one is swallowed by the stuck trigger, the other still carries
+        # the status writes the subscription makes while reacting to it.
+        pool = BoundedExecutor("test-trigger-hang", 2)
+        manager._executor = pool
+
+        def hang(dag_id, conf, run_id):
+            release.wait(5)
+            return _OUTCOME_TRIGGERED
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+            done.set()
+
+        connection = _immediate_connection(_make_push_queue([msg]))
+        try:
+            with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+                 patch("airflow_provider_rmq.watcher.consumer._sync_trigger", hang), \
+                 patch("airflow_provider_rmq.watcher.consumer._TRIGGER_TIMEOUT", 0.05), \
+                 patch(
+                     "airflow_provider_rmq.watcher.consumer._write_consumer_status",
+                     lambda sub_id, status, last_error: statuses.append(status),
+                 ), \
+                 patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep",
+                       side_effect=fake_sleep):
+                task = asyncio.create_task(manager._consume_subscription(_sub()))
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=3.0)
+                    assert pool.in_flight >= 1   # the worker is still held by the call
+                finally:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+        finally:
+            release.set()
+            pool.shutdown()
+
+        msg.nack.assert_awaited_with(requeue=True)
+        msg.ack.assert_not_awaited()
+        assert delays[0] == _TRIGGER_BACKOFF_START
+        assert statuses[-1] == "error"
 
 
 class TestImmediateDeliveryAcknowledgement:

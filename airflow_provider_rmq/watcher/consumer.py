@@ -93,12 +93,27 @@ _RUN_ID_HASH_LEN = 8
 _TRIGGER_BACKOFF_START = 1.0
 _TRIGGER_BACKOFF_MAX = 60.0
 
+#: Seconds a blocking database write is given before the caller stops waiting for it.
+#: The worker stays busy until the call itself returns — a running thread cannot be
+#: interrupted — so the timeout buys back the coroutine, not the worker.
+_DB_TIMEOUT = 30.0
+
+#: Seconds a single ``trigger_dag`` is given. A consumer task awaits it, not the
+#: reconcile cycle, so the cycle watchdog never sees it hang: without a timeout of its
+#: own the task would sit in ``listening`` while consuming nothing at all.
+_TRIGGER_TIMEOUT = 60.0
+
 #: Workers of the fallback consumer pool. Sized well above the expected number of
 #: subscriptions: every matched delivery occupies one worker for the duration of its
 #: ``trigger_dag``.
 _CONSUMER_POOL_WORKERS = 32
 
+#: Workers of the fallback cycle pool. One cycle runs its blocking calls in sequence,
+#: and a call that hangs holds its worker, so a couple of spares cover the overlap.
+_CYCLE_POOL_WORKERS = 4
+
 _default_executor: BoundedExecutor | None = None
+_default_cycle_executor: BoundedExecutor | None = None
 
 
 def _consumer_executor() -> BoundedExecutor:
@@ -113,6 +128,20 @@ def _consumer_executor() -> BoundedExecutor:
     if _default_executor is None:
         _default_executor = BoundedExecutor("rmq-consumer", _CONSUMER_POOL_WORKERS)
     return _default_executor
+
+
+def _cycle_executor() -> BoundedExecutor:
+    """Process-wide cycle pool for managers created without one of their own.
+
+    Reconcile work keeps its own pool so that consumer tasks stuck on the database
+    cannot starve it: with a single pool every matched delivery spawns another
+    blocking trigger, the reconcile writes queue behind them, the cycle runs out of
+    budget and the loop is recreated — straight into the same exhausted pool.
+    """
+    global _default_cycle_executor
+    if _default_cycle_executor is None:
+        _default_cycle_executor = BoundedExecutor("rmq-cycle", _CYCLE_POOL_WORKERS)
+    return _default_cycle_executor
 
 _FIRE_EXCHANGE = "rmq_watcher.fire"
 _FIRE_QUEUE = "rmq_watcher.fire"
@@ -200,6 +229,44 @@ def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> str:
     return _OUTCOME_TRIGGERED
 
 
+def _write_consumer_status(sub_id: int, status: str, last_error: str | None) -> None:
+    """Store the status of one subscription. Blocking — belongs in a pool."""
+    with WatcherSession() as session:
+        set_consumer_status(session, sub_id, status, last_error=last_error)
+        session.commit()
+
+
+def _write_conn_error(conn_id: str, error: str) -> None:
+    """Store a failed connection attempt against ``conn_id``. Blocking."""
+    with WatcherSession() as session:
+        upsert_conn_status(session, conn_id, "error", consumer_count=0, last_error=error)
+        session.commit()
+
+
+def _write_conn_status_rows(rows: list[tuple], now: datetime) -> None:
+    """Store one status row per conn_id. Blocking.
+
+    A row whose ``status`` is ``None`` carries no verdict — the check produced no data —
+    and keeps whatever is already stored, so an unreachable Management API does not
+    paint every connection red.
+    """
+    with WatcherSession() as session:
+        stored = {row.conn_id: row.status for row in get_conn_statuses(session)}
+        for conn_id, count, status, reason, broker_count in rows:
+            if status is None:
+                status = stored.get(conn_id, "connected" if count else "disconnected")
+            upsert_conn_status(
+                session,
+                conn_id,
+                status,
+                consumer_count=count,
+                last_error=reason,
+                broker_consumer_count=broker_count,
+                last_reconcile_at=now,
+            )
+        session.commit()
+
+
 class _ConsumerState:
     """In-memory guard: writes consumer_status to DB only when the status actually changes.
 
@@ -209,8 +276,9 @@ class _ConsumerState:
     on the shared ``rmq_watcher.fire`` queue and has no row in ``rmq_subscriptions``.
     """
 
-    def __init__(self, sub_id: int | None) -> None:
+    def __init__(self, sub_id: int | None, executor: BoundedExecutor | None = None) -> None:
         self._sub_id = sub_id
+        self._executor = executor if executor is not None else _consumer_executor()
         self._last_status: str | None = None
 
     @property
@@ -218,13 +286,33 @@ class _ConsumerState:
         """Status last written for this subscription, ``None`` before the first write."""
         return self._last_status
 
-    def write(self, status: str, last_error: str | None = None) -> None:
+    async def write(self, status: str, last_error: str | None = None) -> None:
+        """Record ``status``, storing it if it differs from the one already stored.
+
+        The store is a blocking database write, so it runs in the consumer pool under a
+        timeout: the consumer task awaits it, and a database that never answers would
+        otherwise hold the task open forever. A write that does not land leaves the
+        remembered status untouched, so the next transition tries again, and it never
+        propagates — diagnostics must not stop consumption.
+        """
         if status == self._last_status:
             return
         if self._sub_id is not None:
-            with WatcherSession() as session:
-                set_consumer_status(session, self._sub_id, status, last_error=last_error)
-                session.commit()
+            try:
+                await _call_with_timeout(
+                    self._executor.run(
+                        _write_consumer_status, self._sub_id, status, last_error
+                    ),
+                    timeout=_DB_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Cannot store status %r of subscription %s: %s",
+                    status, self._sub_id, exc,
+                )
+                return
         self._last_status = status
 
 
@@ -276,8 +364,19 @@ class RMQConsumerManager:
     a lazily opened publish connection of that conn_id.
     """
 
-    def __init__(self, executor: BoundedExecutor | None = None) -> None:
+    def __init__(
+        self,
+        executor: BoundedExecutor | None = None,
+        cycle_executor: BoundedExecutor | None = None,
+    ) -> None:
+        # Two pools, never one: ``executor`` carries what a consumer task waits on,
+        # ``cycle_executor`` what the reconcile cycle waits on. Sharing them would let
+        # deliveries stuck on the database starve the cycle that is supposed to notice
+        # and recover from exactly that.
         self._executor = executor if executor is not None else _consumer_executor()
+        self._cycle_executor = (
+            cycle_executor if cycle_executor is not None else _cycle_executor()
+        )
         self._active: dict[int, _ActiveSub] = {}  # sub_id → _ActiveSub
         self._connections: dict[tuple[str, str], Any] = {}  # (conn_id, role) → RobustConnection
         self._publish_channels: dict[str, Any] = {}  # conn_id → channel of the publish connection
@@ -366,11 +465,16 @@ class RMQConsumerManager:
             )
             for sub_id in to_remove:
                 try:
-                    with WatcherSession() as session:
-                        set_consumer_status(session, sub_id, "disconnected")
-                        session.commit()
-                except Exception:
-                    pass
+                    await _call_with_timeout(
+                        self._cycle_executor.run(
+                            _write_consumer_status, sub_id, "disconnected", None
+                        ),
+                        timeout=_DB_TIMEOUT,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Cannot mark removed subscription %s disconnected: %s", sub_id, exc
+                    )
                 self._active.pop(sub_id, None)
 
         # start tasks for new subscriptions, dead ones, or changed ones (hot-reload)
@@ -383,7 +487,7 @@ class RMQConsumerManager:
                     await asyncio.gather(entry.task, return_exceptions=True)
                 task = asyncio.create_task(self._consume_subscription(sub))
                 self._active[sub_id] = _ActiveSub(
-                    task=task, sub=sub.copy(), state=_ConsumerState(sub_id)
+                    task=task, sub=sub.copy(), state=_ConsumerState(sub_id, self._executor)
                 )
 
         # close connections no longer referenced by any subscription
@@ -436,7 +540,7 @@ class RMQConsumerManager:
 
         await self._recover_dead_consumers(subscriptions)
 
-        self._update_all_conn_counts(subscriptions)
+        await self._update_all_conn_counts(subscriptions)
 
     def _subs_changed(self, sub_id: int, new_sub: dict) -> bool:
         """Compare snapshot of running sub with new sub on fields that affect consumer behaviour."""
@@ -544,7 +648,7 @@ class RMQConsumerManager:
                     dag_id,
                 )
 
-    def _update_all_conn_counts(self, subscriptions: list[dict]) -> None:
+    async def _update_all_conn_counts(self, subscriptions: list[dict]) -> None:
         """Write the status row of every conn_id the subscription list mentions.
 
         A conn_id whose tasks have all died still gets a row: a row that simply stops
@@ -571,29 +675,22 @@ class RMQConsumerManager:
         # Naive UTC: the view compares this stamp with a naive utcnow() of its own, and
         # mixing naive and aware values would raise straight from the template.
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        rows = []
+        for conn_id, count in counts.items():
+            verdict = self._liveness.get(conn_id)
+            rows.append((
+                conn_id,
+                count,
+                verdict.status if verdict is not None else None,
+                verdict.reason if verdict is not None else None,
+                verdict.broker_consumers if verdict is not None else None,
+            ))
+
         try:
-            with WatcherSession() as session:
-                stored = {row.conn_id: row.status for row in get_conn_statuses(session)}
-                for conn_id, count in counts.items():
-                    verdict = self._liveness.get(conn_id)
-                    if verdict is not None and verdict.status is not None:
-                        status = verdict.status
-                    else:
-                        status = stored.get(
-                            conn_id, "connected" if count else "disconnected"
-                        )
-                    upsert_conn_status(
-                        session,
-                        conn_id,
-                        status,
-                        consumer_count=count,
-                        last_error=verdict.reason if verdict is not None else None,
-                        broker_consumer_count=(
-                            verdict.broker_consumers if verdict is not None else None
-                        ),
-                        last_reconcile_at=now,
-                    )
-                session.commit()
+            await _call_with_timeout(
+                self._cycle_executor.run(_write_conn_status_rows, rows, now),
+                timeout=_DB_TIMEOUT,
+            )
         except Exception as exc:
             log.warning("Cannot write connection status rows: %s", exc)
 
@@ -691,14 +788,15 @@ class RMQConsumerManager:
                 self._connections[key] = connection
             except Exception as exc:
                 try:
-                    with WatcherSession() as session:
-                        upsert_conn_status(
-                            session, conn_id, "error",
-                            consumer_count=0, last_error=str(exc),
-                        )
-                        session.commit()
-                except Exception:
-                    pass
+                    await _call_with_timeout(
+                        self._executor.run(_write_conn_error, conn_id, str(exc)),
+                        timeout=_DB_TIMEOUT,
+                    )
+                except Exception as write_exc:
+                    log.warning(
+                        "Cannot store the failed connection attempt for conn_id=%r: %s",
+                        conn_id, write_exc,
+                    )
                 raise
 
             return connection
@@ -907,11 +1005,13 @@ class RMQConsumerManager:
         connecting or backing off after an error.
         """
         entry = self._active.get(sub_id)
-        return entry.state if entry is not None else _ConsumerState(sub_id)
+        return entry.state if entry is not None else _ConsumerState(sub_id, self._executor)
 
     def _fire_state_of(self) -> _ConsumerState:
         """State record the manager keeps for the fire consumer."""
-        return self._fire_state.state if self._fire_state is not None else _ConsumerState(None)
+        if self._fire_state is not None:
+            return self._fire_state.state
+        return _ConsumerState(None, self._executor)
 
     def _launch_fire_task(self, conn_id: str, connection: Any) -> None:
         """Start the fire consumer on an open connection of ``conn_id``.
@@ -920,7 +1020,9 @@ class RMQConsumerManager:
         connection object it was handed for its whole life, so whoever recreates that
         connection has to know which task is holding the old one.
         """
-        self._fire_state = _FireSub(conn_id=conn_id, state=_ConsumerState(None))
+        self._fire_state = _FireSub(
+            conn_id=conn_id, state=_ConsumerState(None, self._executor)
+        )
         self._fire_task = asyncio.create_task(
             self._consume_fire_queue(connection, conn_id)
         )
@@ -990,7 +1092,7 @@ class RMQConsumerManager:
             self._active[sub_id] = _ActiveSub(
                 task=asyncio.create_task(self._consume_subscription(sub)),
                 sub=sub.copy(),
-                state=_ConsumerState(sub_id),
+                state=_ConsumerState(sub_id, self._executor),
             )
             _incr("rmq_watcher.consumer_restarted")
 
@@ -1243,7 +1345,7 @@ class RMQConsumerManager:
         trigger_backoff = _TRIGGER_BACKOFF_START
 
         while True:
-            state.write("connecting")
+            await state.write("connecting")
             try:
                 connection = await self._get_or_create_connection(conn_id)
                 rpc_timeout = self._rpc_timeout(conn_id)
@@ -1255,7 +1357,7 @@ class RMQConsumerManager:
                 # requeue (ADR-0002) and come back to the head of the queue, so any finite
                 # prefetch window fills up with them and consumption stops for good once
                 # the misses reach the window size. The unacked window stays unbounded.
-                state.write("listening", last_error=None)
+                await state.write("listening", last_error=None)
 
                 async with queue.iterator(consumer_tag=consumer_tag) as q_iter:
                     async for message in q_iter:
@@ -1284,12 +1386,17 @@ class RMQConsumerManager:
                                     dag_id, sub_id, exc, trigger_backoff,
                                 )
                                 await message.nack(requeue=True)
+                                # The connection is fine and the iterator keeps running,
+                                # so nothing else would ever report that this
+                                # subscription stopped starting DAG runs.
+                                await state.write("error", last_error=str(exc))
                                 await asyncio.sleep(trigger_backoff)
                                 trigger_backoff = min(
                                     trigger_backoff * 2, _TRIGGER_BACKOFF_MAX
                                 )
                                 continue
                             trigger_backoff = _TRIGGER_BACKOFF_START
+                            await state.write("listening", last_error=None)
                             await message.ack()
                             if outcome == _OUTCOME_TRIGGERED:
                                 _incr("rmq_watcher.dag_triggered")
@@ -1304,7 +1411,7 @@ class RMQConsumerManager:
 
             except aio_pika.exceptions.ChannelNotFoundEntity as exc:
                 # Fatal: queue doesn't exist — exit and wait for reconciliation to restart
-                state.write("error", last_error=str(exc))
+                await state.write("error", last_error=str(exc))
                 log.error(
                     "Queue %r not found for subscription %d (DAG %s): %s",
                     queue_name, sub_id, dag_id, exc,
@@ -1401,14 +1508,14 @@ class RMQConsumerManager:
         """Consumer for rmq_watcher.fire queue — triggers DAGs after cooldown expires via DLX."""
         state = self._fire_state_of()
         while True:
-            state.write("connecting")
+            await state.write("connecting")
             try:
                 rpc_timeout = self._rpc_timeout(conn_id)
                 channel = await _call_with_timeout(connection.channel(), timeout=rpc_timeout)
                 queue = await _call_with_timeout(
                     channel.declare_queue(_FIRE_QUEUE, passive=True), timeout=rpc_timeout
                 )
-                state.write("listening")
+                await state.write("listening")
 
                 async with queue.iterator(consumer_tag=_consumer_tag("fire")) as q_iter:
                     async for message in q_iter:
@@ -1437,8 +1544,9 @@ class RMQConsumerManager:
                             "queue": _FIRE_QUEUE,
                             "subscription_id": None,
                         }
-                        outcome = await self._executor.run(
-                            _sync_trigger, dag_id, conf, run_id
+                        outcome = await _call_with_timeout(
+                            self._executor.run(_sync_trigger, dag_id, conf, run_id),
+                            timeout=_TRIGGER_TIMEOUT,
                         )
                         if outcome == _OUTCOME_TRIGGERED:
                             _incr("rmq_watcher.dag_triggered")
@@ -1454,7 +1562,7 @@ class RMQConsumerManager:
                 return
 
             except aio_pika.exceptions.ChannelNotFoundEntity as exc:
-                state.write("error", last_error=str(exc))
+                await state.write("error", last_error=str(exc))
                 log.error(
                     "Fire queue %r not found: %s — exiting fire consumer, "
                     "will restart on next reconcile cycle.",
@@ -1463,7 +1571,7 @@ class RMQConsumerManager:
                 return
 
             except aio_pika.exceptions.ChannelClosed as exc:
-                state.write("error", last_error=str(exc))
+                await state.write("error", last_error=str(exc))
                 log.warning(
                     "Fire queue channel closed: %s — retrying in %ss",
                     exc, _RECONNECT_DELAY,
@@ -1471,7 +1579,7 @@ class RMQConsumerManager:
                 await asyncio.sleep(_RECONNECT_DELAY)
 
             except Exception as exc:
-                state.write("error", last_error=str(exc))
+                await state.write("error", last_error=str(exc))
                 log.warning(
                     "Transient error in fire consumer: %s — retrying in %ss",
                     exc, _RECONNECT_DELAY,
@@ -1495,7 +1603,10 @@ class RMQConsumerManager:
             "subscription_id": sub_id,
         }
         run_id = _build_run_id(queue_name, getattr(message, "message_id", None))
-        return await self._executor.run(_sync_trigger, dag_id, conf, run_id)
+        return await _call_with_timeout(
+            self._executor.run(_sync_trigger, dag_id, conf, run_id),
+            timeout=_TRIGGER_TIMEOUT,
+        )
 
 
 async def _ensure_fire_infrastructure(

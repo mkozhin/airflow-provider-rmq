@@ -1823,6 +1823,81 @@ def _cycle_patches(manager, db_subs=()):
         yield manager_cls
 
 
+class TestCycleWorkOffTheLoop:
+    """The cycle's blocking steps belong in the cycle pool, not on the loop thread.
+
+    A blocked loop services no timers, so the very watchdog wrapped around the cycle
+    would never fire — and the AMQP heartbeats sent from that loop would stop with it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_scan_sync_and_subscription_read_leave_the_loop_thread(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        loop_thread = threading.current_thread()
+        threads = {}
+
+        def record(name, result=None):
+            def call(*args):
+                threads[name] = threading.current_thread()
+                return result
+            return call
+
+        listener._scan_subscriptions = record("scan", [])
+        listener._sync_to_db = record("sync")
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
+            side_effect=record("read subs", []),
+        ):
+            await listener._run_cycle()
+
+        assert set(threads) == {"scan", "sync", "read subs"}
+        assert all(thread is not loop_thread for thread in threads.values())
+        manager.reconcile.assert_awaited_once_with([])
+
+    @pytest.mark.asyncio
+    async def test_settings_read_leaves_the_loop_thread(self):
+        listener = RMQWatcherListener()
+        loop_thread = threading.current_thread()
+        seen = []
+
+        def read():
+            seen.append(threading.current_thread())
+            return (120, None)
+
+        with patch(
+            "airflow_provider_rmq.watcher.listener._read_settings", side_effect=read
+        ):
+            await listener._refresh_settings()
+
+        assert seen and seen[0] is not loop_thread
+        assert listener._reconcile_interval == 120
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_scan_trips_the_cycle_watchdog(self):
+        """A step stuck inside a worker still costs the cycle its budget."""
+        listener = _cycle_listener()
+        listener._cycle_timeout_override = 0.1
+        manager = _fake_manager()
+        release = threading.Event()
+
+        def blocked():
+            release.wait(timeout=5)
+            return []
+
+        listener._scan_subscriptions = blocked
+        try:
+            with _cycle_patches(manager), pytest.raises(asyncio.TimeoutError):
+                await listener._main()
+        finally:
+            release.set()
+
+        assert listener._phase == "scan"
+        manager.reconcile.assert_not_awaited()
+
+
 class TestCycleWatchdog:
     @pytest.mark.asyncio
     async def test_cycle_timeout_reaches_the_caller_of_main(self):

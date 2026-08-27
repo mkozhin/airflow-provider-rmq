@@ -578,6 +578,31 @@ def _read_settings() -> tuple[int | None, float | None]:
     return _positive(_RECONCILE_INTERVAL_VAR, int), _positive(_CYCLE_TIMEOUT_VAR, float)
 
 
+def _read_active_subs(exchange_meta: dict) -> list[dict]:
+    """Read the enabled subscriptions, merging the in-memory exchange metadata onto them.
+
+    A blocking SQLAlchemy query, so it runs in the cycle pool rather than on the loop
+    thread; the exchange/routing_keys pairs are keyed the same way as the unique
+    constraint on ``RMQSubscription`` and are looked up here, where the rows are.
+    """
+    with WatcherSession() as session:
+        active_subs = []
+        for sub in get_enabled_subscriptions(session):
+            entry = {
+                "id": sub.id,
+                "dag_id": sub.dag_id,
+                "queue_name": sub.queue_name,
+                "conn_id": sub.conn_id,
+                "filter_data": sub.filter_data or {},
+                "cooldown": sub.cooldown or 0,
+            }
+            meta = exchange_meta.get((sub.dag_id, sub.queue_name, sub.conn_id))
+            if meta is not None:
+                entry.update(meta)
+            active_subs.append(entry)
+    return active_subs
+
+
 class RMQWatcherListener:
     """Airflow Listener that runs a background RabbitMQ consumer loop inside the Scheduler process.
 
@@ -680,7 +705,9 @@ class RMQWatcherListener:
         log.info("RMQ Watcher loop stopped")
 
     async def _main(self) -> None:
-        self._manager = RMQConsumerManager(executor=self._consumer_pool)
+        self._manager = RMQConsumerManager(
+            executor=self._consumer_pool, cycle_executor=self._cycle_pool
+        )
         await self._manager.start()
         try:
             while not self._stop_event.is_set():
@@ -716,10 +743,10 @@ class RMQWatcherListener:
             await self._ensure_schema()
 
             self._phase = "scan"
-            scanned = self._scan_subscriptions()
+            scanned = await self._cycle_pool.run(self._scan_subscriptions)
 
             self._phase = "sync"
-            self._sync_to_db(scanned)
+            await self._cycle_pool.run(self._sync_to_db, scanned)
 
             # Exchange/routing_keys metadata is never persisted to the DB (see
             # plan Technical Details → "Почему миграция БД не нужна") — it only
@@ -736,23 +763,7 @@ class RMQWatcherListener:
             }
 
             self._phase = "read subs"
-            with WatcherSession() as session:
-                active_subs = []
-                for sub in get_enabled_subscriptions(session):
-                    entry = {
-                        "id": sub.id,
-                        "dag_id": sub.dag_id,
-                        "queue_name": sub.queue_name,
-                        "conn_id": sub.conn_id,
-                        "filter_data": sub.filter_data or {},
-                        "cooldown": sub.cooldown or 0,
-                    }
-                    meta = exchange_meta.get(
-                        (sub.dag_id, sub.queue_name, sub.conn_id)
-                    )
-                    if meta is not None:
-                        entry.update(meta)
-                    active_subs.append(entry)
+            active_subs = await self._cycle_pool.run(_read_active_subs, exchange_meta)
 
             self._phase = "reconcile"
             await self._manager.reconcile(active_subs)

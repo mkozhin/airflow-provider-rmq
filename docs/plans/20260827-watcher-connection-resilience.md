@@ -925,19 +925,29 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 - Modify: `tests/watcher/test_listener.py`
 - Modify: `tests/watcher/test_consumer.py`
 
-- [ ] `_run_cycle`: `_scan_subscriptions` и `_sync_to_db` через `run_in_executor` с пулом цикла из Task 4 (не `None`)
-- [ ] `_run_cycle`: чтение `get_enabled_subscriptions` (синхронный SQLAlchemy-запрос в корутине) через `run_in_executor`
-- [ ] `_ConsumerState.write` → `async def` с записью в БД через `run_in_executor`; обновить колл-сайты
-- [ ] обернуть `wait_for` каждый `run_in_executor` в consumer-ветках (`_sync_trigger`, запись статуса) и направить их в consumer-пул: их ждёт consumer-таска, а не `_run_cycle`, поэтому cycle timeout их не покрывает — зависший вызов оставлял бы таску `listening` при неработающем потреблении
-- [ ] записи статусов в `reconcile` (`set_consumer_status` при удалении подписки, `_update_all_conn_counts`) и `upsert_conn_status` в error-ветке `_get_or_create_connection` — через `run_in_executor`
-- [ ] тест: scan/sync/чтение подписок уходят через executor
-- [ ] тест: `Variable.get` уходит через executor
-- [ ] тест: `_ConsumerState.write` сохраняет дедупликацию статусов
-- [ ] тест: записи статусов в `reconcile` идут через executor
-- [ ] тест: зависший executor-вызов в цикле приводит к срабатыванию cycle timeout, а не к вечному ожиданию
-- [ ] тест: зависший `_sync_trigger` отваливается по своему таймауту → NACK с backoff, статус `error` (воркер при этом остаётся занят — отмена не прерывает поток; тест это фиксирует, а не опровергает)
-- [ ] тест: исчерпание пула логируется, а не деградирует молча
-- [ ] run tests - must pass before task 9
+- [x] `_run_cycle`: `_scan_subscriptions` и `_sync_to_db` через `run_in_executor` с пулом цикла из Task 4 (не `None`)
+- [x] `_run_cycle`: чтение `get_enabled_subscriptions` (синхронный SQLAlchemy-запрос в корутине) через `run_in_executor` — вынесено в `listener.py::_read_active_subs`, туда же переехало наложение exchange-метаданных
+- [x] `_ConsumerState.write` → `async def` с записью в БД через `run_in_executor`; обновить колл-сайты
+- [x] обернуть `wait_for` каждый `run_in_executor` в consumer-ветках (`_sync_trigger`, запись статуса) и направить их в consumer-пул: их ждёт consumer-таска, а не `_run_cycle`, поэтому cycle timeout их не покрывает — зависший вызов оставлял бы таску `listening` при неработающем потреблении
+- [x] записи статусов в `reconcile` (`set_consumer_status` при удалении подписки, `_update_all_conn_counts`) и `upsert_conn_status` в error-ветке `_get_or_create_connection` — через `run_in_executor`
+- [x] тест: scan/sync/чтение подписок уходят через executor
+- [x] тест: `Variable.get` уходит через executor (`test_settings_read_leaves_the_loop_thread`; сам вынос сделан в Task 4)
+- [x] тест: `_ConsumerState.write` сохраняет дедупликацию статусов (`TestConsumerState`, переведены на `await`)
+- [x] тест: записи статусов в `reconcile` идут через executor
+- [x] тест: зависший executor-вызов в цикле приводит к срабатыванию cycle timeout, а не к вечному ожиданию
+- [x] тест: зависший `_sync_trigger` отваливается по своему таймауту → NACK с backoff, статус `error` (воркер при этом остаётся занят — отмена не прерывает поток; тест это фиксирует, а не опровергает)
+- [x] тест: исчерпание пула логируется, а не деградирует молча (сделано в Task 4, `tests/test_executor.py::test_saturation_is_logged_instead_of_queueing_silently`)
+- [x] run tests - must pass before task 9
+- ➕ [x] `RMQConsumerManager` принимает второй пул параметром (`cycle_executor=`): reconcile
+  ждёт своих записей статуса сам, и с общим пулом зависшие на БД доставки съедали бы
+  воркеры у того самого цикла, который должен это заметить и восстановить. Listener
+  передаёт свой cycle-пул, менеджер без параметра берёт процессный
+- ➕ [x] отказ триггера теперь виден в статусе подписки: соединение цело и итератор жив,
+  поэтому ни один другой слой не сообщил бы, что подписка перестала запускать DAG'и —
+  ветка отказа пишет `error`, успешный триггер возвращает `listening`
+- ➕ [x] `_ConsumerState.write` не пробрасывает отказ записи: диагностика не должна
+  останавливать потребление, а неудачная запись не запоминается и повторяется на
+  следующем переходе
 
 ### Task 9: Graceful stop и диагностика жизненного цикла
 
