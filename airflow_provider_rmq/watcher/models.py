@@ -53,9 +53,25 @@ class RMQConnStatus(WatcherBase):
 
     conn_id = Column(String(250), primary_key=True)
     status = Column(String(20), nullable=False, default="disconnected")
+    # how many consumer tasks the watcher itself has started
     consumer_count = Column(Integer, nullable=False, default=0)
+    # how many consumers the broker reports for our queues; NULL means "no data"
+    broker_consumer_count = Column(Integer, nullable=True)
     last_error = Column(Text, nullable=True)
+    # wall-clock time of the last reconcile cycle, written explicitly by the
+    # watcher so that an UPDATE is emitted even when nothing else changed
+    last_reconcile_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+
+
+class _Unset:
+    """Marker for an argument the caller left out."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unset>"
+
+
+UNSET = _Unset()
 
 
 def _make_session_factory():
@@ -66,10 +82,70 @@ def _make_session_factory():
 WatcherSession: sessionmaker = _make_session_factory()
 
 
+_schema_ready = False
+
+
+def is_schema_ready() -> bool:
+    """Whether the schema has been fully created and migrated in this process."""
+    return _schema_ready
+
+
+def _add_missing_columns(engine) -> bool:
+    """Add columns the model declares but the live table lacks.
+
+    Columns are added as nullable regardless of the model, because a NOT NULL
+    column cannot be attached to a table that already holds rows. Returns True
+    when every table matches the model; a False result keeps the schema marked
+    as not ready so that the next call tries again.
+    """
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text
+
+    complete = True
+    inspector = sa_inspect(engine)
+    for table in WatcherBase.metadata.sorted_tables:
+        try:
+            present = {col["name"] for col in inspector.get_columns(table.name)}
+        except Exception:
+            log.warning("RMQ Watcher: cannot inspect %s", table.name, exc_info=True)
+            complete = False
+            continue
+        for column in table.columns:
+            if column.name in present:
+                continue
+            col_type = column.type.compile(engine.dialect)
+            # no IF NOT EXISTS: SQLite rejects it outright, and the inspector
+            # above already told us the column is absent
+            ddl = f"ALTER TABLE {table.name} ADD COLUMN {column.name} {col_type}"
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(ddl))
+            except Exception:
+                log.warning(
+                    "RMQ Watcher: failed to add column %s.%s", table.name, column.name,
+                    exc_info=True,
+                )
+                complete = False
+            else:
+                log.info("RMQ Watcher: added column %s.%s", table.name, column.name)
+    return complete
+
+
 def ensure_table_exists() -> None:
-    """Create rmq_watcher_* tables if they don't exist. Safe to call multiple times."""
+    """Create rmq_watcher_* tables and add columns missing from an older schema.
+
+    Safe to call multiple times: once a call completes without errors the
+    schema is marked ready and further calls return immediately. Until then
+    every call retries, so a caller that runs periodically recovers from a
+    database that was unreachable earlier.
+    """
+    global _schema_ready
+    if _schema_ready:
+        return
     from airflow.settings import engine
     WatcherBase.metadata.create_all(engine, checkfirst=True)
+    if _add_missing_columns(engine):
+        _schema_ready = True
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +222,15 @@ def upsert_conn_status(
     status: str,
     consumer_count: int,
     last_error: str | None = None,
+    broker_consumer_count: int | None | _Unset = UNSET,
+    last_reconcile_at: datetime | None | _Unset = UNSET,
 ) -> RMQConnStatus:
-    """Insert or update connection status. Caller must commit."""
+    """Insert or update connection status. Caller must commit.
+
+    ``broker_consumer_count`` and ``last_reconcile_at`` distinguish two cases:
+    an omitted argument keeps whatever the row holds, while an explicit None
+    records "no data" — the broker could not be asked.
+    """
     row = session.query(RMQConnStatus).filter_by(conn_id=conn_id).first()
     if row is None:
         row = RMQConnStatus(conn_id=conn_id)
@@ -155,6 +238,10 @@ def upsert_conn_status(
     row.status = status
     row.consumer_count = consumer_count
     row.last_error = last_error
+    if not isinstance(broker_consumer_count, _Unset):
+        row.broker_consumer_count = broker_consumer_count
+    if not isinstance(last_reconcile_at, _Unset):
+        row.last_reconcile_at = last_reconcile_at
     return row
 
 

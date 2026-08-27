@@ -750,17 +750,17 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 - Modify: `airflow_provider_rmq/watcher/models.py`
 - Modify: `tests/watcher/test_models.py`
 
-- [ ] добавить в `RMQConnStatus` колонки `broker_consumer_count` (Integer, nullable) и `last_reconcile_at` (DateTime, nullable)
-- [ ] расширить `upsert_conn_status` необязательными параметрами для обеих; сентинел «не менять» отличается от явного `None` («данных нет»)
-- [ ] `last_reconcile_at` пишется явным значением, а не полагается на `onupdate` — иначе при неизменных полях UPDATE не выпускается и время замирает
-- [ ] запоминать результат миграции флагом в `models.py` и выставлять его только при успехе; повторный вызов при невыполненном флаге снова пробует мигрировать (колл-сайт для повтора добавляет Task 4 — единственный существующий, `plugin.py:38`, отрабатывает один раз за жизнь процесса)
-- [ ] дополнить `ensure_table_exists` миграцией через `sqlalchemy.inspect(engine).get_columns(...)` + `ALTER TABLE ... ADD COLUMN` для отсутствующих колонок, под `try/except` с WARNING (без `IF NOT EXISTS` — он не поддерживается SQLite)
-- [ ] тест: `upsert_conn_status` пишет и обновляет обе новые колонки
-- [ ] тест: вызов без параметра сохраняет ранее записанное значение; явный `None` записывает «нет данных»
-- [ ] тест: повторный upsert с теми же `status`/`consumer_count` всё равно двигает `last_reconcile_at` (регрессия на отсутствие UPDATE при нулевом net-change)
-- [ ] тест: `ensure_table_exists` на таблице без новых колонок добавляет их; повторный вызов не падает (SQLite)
-- [ ] тест: неудачная миграция не считается выполненной и повторяется при следующем вызове
-- [ ] run tests - must pass before task 4
+- [x] добавить в `RMQConnStatus` колонки `broker_consumer_count` (Integer, nullable) и `last_reconcile_at` (DateTime, nullable)
+- [x] расширить `upsert_conn_status` необязательными параметрами для обеих; сентинел «не менять» отличается от явного `None` («данных нет»)
+- [x] `last_reconcile_at` пишется явным значением, а не полагается на `onupdate` — иначе при неизменных полях UPDATE не выпускается и время замирает
+- [x] запоминать результат миграции флагом в `models.py` и выставлять его только при успехе; повторный вызов при невыполненном флаге снова пробует мигрировать (колл-сайт для повтора добавляет Task 4 — единственный существующий, `plugin.py:38`, отрабатывает один раз за жизнь процесса)
+- [x] дополнить `ensure_table_exists` миграцией через `sqlalchemy.inspect(engine).get_columns(...)` + `ALTER TABLE ... ADD COLUMN` для отсутствующих колонок, под `try/except` с WARNING (без `IF NOT EXISTS` — он не поддерживается SQLite)
+- [x] тест: `upsert_conn_status` пишет и обновляет обе новые колонки
+- [x] тест: вызов без параметра сохраняет ранее записанное значение; явный `None` записывает «нет данных»
+- [x] тест: повторный upsert с теми же `status`/`consumer_count` всё равно двигает `last_reconcile_at` (регрессия на отсутствие UPDATE при нулевом net-change)
+- [x] тест: `ensure_table_exists` на таблице без новых колонок добавляет их; повторный вызов не падает (SQLite)
+- [x] тест: неудачная миграция не считается выполненной и повторяется при следующем вызове
+- [x] run tests - must pass before task 4
 
 ### Task 4: Watchdog итерации reconcile-цикла
 
