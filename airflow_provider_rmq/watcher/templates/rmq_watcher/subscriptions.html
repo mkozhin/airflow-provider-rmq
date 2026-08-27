@@ -17,10 +17,19 @@
   <div class="panel panel-default">
     <div class="panel-heading"><h4>Connections</h4></div>
     <div class="panel-body">
-      {% if conn_statuses %}
+      {% if conn_status_error %}
+      <p class="text-warning">⚠ {{ conn_status_error }}</p>
+      {% elif conn_statuses %}
       <table class="table table-condensed table-bordered">
         <thead>
-          <tr><th>conn_id</th><th>Status</th><th>Consumers</th><th>Last Error</th></tr>
+          <tr>
+            <th>conn_id</th>
+            <th>Status</th>
+            <th>Consumers</th>
+            <th>Broker consumers</th>
+            <th>Last reconcile</th>
+            <th>Last Error</th>
+          </tr>
         </thead>
         <tbody>
         {% for cs in conn_statuses %}
@@ -33,11 +42,37 @@
               <span class="label label-danger">✕ error</span>
             {% elif cs.status == 'connecting' %}
               <span class="label label-warning">○ connecting</span>
+            {% elif cs.status == 'degraded' %}
+              <span class="label label-warning">○ degraded</span>
             {% else %}
               <span class="label label-default">○ {{ cs.status }}</span>
             {% endif %}
           </td>
           <td>{{ cs.consumer_count }}</td>
+          <td>
+            {% if cs.broker_consumer_count is none %}
+              —
+            {% elif cs.counts_mismatch %}
+              <span class="label label-warning"
+                    title="The broker reports a different number of consumers than the watcher has started for this conn_id. A lower number means a subscription the broker does not see — the watchdog restarts it; a higher number means other clients, or another scheduler replica, consume the same queues.">
+                ⚠ {{ cs.broker_consumer_count }}
+              </span>
+            {% else %}
+              {{ cs.broker_consumer_count }}
+            {% endif %}
+          </td>
+          <td>
+            {% if cs.age_seconds is none %}
+              —
+            {% elif cs.is_stale %}
+              <span class="label label-warning"
+                    title="The last reconcile cycle for this conn_id is older than two reconcile intervals — the watcher loop is stuck, restarting, or not running at all.">
+                ⚠ {{ cs.age_display }} ago
+              </span>
+            {% else %}
+              {{ cs.age_display }} ago
+            {% endif %}
+          </td>
           <td>{{ cs.last_error or '—' }}</td>
         </tr>
         {% endfor %}

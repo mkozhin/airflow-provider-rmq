@@ -983,19 +983,19 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 - Modify: `airflow_provider_rmq/watcher/templates/rmq_watcher/subscriptions.html`
 - Modify: `tests/watcher/test_views.py`
 
-- [ ] выводить возраст `last_reconcile_at` для каждого `conn_id`
-- [ ] читать интервал во вью через собственный `Variable.get("rmq_watcher_reconcile_interval")` под `try/except` с фолбэком на `_DEFAULT_RECONCILE_INTERVAL`
-- [ ] помечать предупреждением `conn_id`, у которого `last_reconcile_at` старше двух интервалов; сравнение вести в наивном UTC (значение пишет процесс Airflow через `utcnow()`, а не сервер БД)
-- [ ] показывать `broker_consumer_count` рядом с `consumer_count` и помечать расхождение
-- [ ] отображать `—` вместо числа, когда `broker_consumer_count` равен `NULL`
-- [ ] тест: свежий `last_reconcile_at` → пометки нет; устаревший → пометка есть
-- [ ] тест: `NULL` в `last_reconcile_at` (миграция только что прошла) не ломает рендеринг
-- [ ] тест: наивная дата в колонке не вызывает `TypeError` при рендеринге
-- [ ] тест: расхождение счётчиков отражается в выводе
-- [ ] тест: `NULL` в `broker_consumer_count` не ломает рендеринг
-- [ ] тест: недоступная Airflow-переменная → используется дефолтный интервал
-- [ ] тест: чтение статусов при неполной схеме даёт сообщение, а не ошибку рендеринга
-- [ ] run tests - must pass before task 11
+- [x] выводить возраст `last_reconcile_at` для каждого `conn_id`
+- [x] читать интервал во вью через собственный `Variable.get("rmq_watcher_reconcile_interval")` под `try/except` с фолбэком на `_DEFAULT_RECONCILE_INTERVAL`
+- [x] помечать предупреждением `conn_id`, у которого `last_reconcile_at` старше двух интервалов; сравнение вести в наивном UTC (значение пишет процесс Airflow через `utcnow()`, а не сервер БД)
+- [x] показывать `broker_consumer_count` рядом с `consumer_count` и помечать расхождение
+- [x] отображать `—` вместо числа, когда `broker_consumer_count` равен `NULL`
+- [x] тест: свежий `last_reconcile_at` → пометки нет; устаревший → пометка есть
+- [x] тест: `NULL` в `last_reconcile_at` (миграция только что прошла) не ломает рендеринг
+- [x] тест: наивная дата в колонке не вызывает `TypeError` при рендеринге
+- [x] тест: расхождение счётчиков отражается в выводе
+- [x] тест: `NULL` в `broker_consumer_count` не ломает рендеринг
+- [x] тест: недоступная Airflow-переменная → используется дефолтный интервал
+- [x] тест: чтение статусов при неполной схеме даёт сообщение, а не ошибку рендеринга
+- [x] run tests - must pass before task 11
 
 ### Task 11: ADR по стратегии живучести
 

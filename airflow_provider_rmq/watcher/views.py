@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from flask import flash, redirect, request, url_for
 from flask_appbuilder import BaseView, expose
 from flask_appbuilder.security.decorators import has_access
 
+from airflow_provider_rmq.watcher.listener import (
+    _DEFAULT_RECONCILE_INTERVAL,
+    _RECONCILE_INTERVAL_VAR,
+)
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
     WatcherSession,
@@ -92,6 +97,126 @@ def _group_subscriptions(subs: list[RMQSubscription]) -> list[Any]:
     return result
 
 
+# ------------------------------------------------------------------
+# Connection status helpers
+# ------------------------------------------------------------------
+
+#: A conn_id whose last reconcile cycle is older than this many reconcile
+#: intervals is flagged as stale on the page.
+_STALE_INTERVAL_FACTOR = 2
+
+#: Shown instead of the Connections table when the status rows cannot be read.
+SCHEMA_OUTDATED_MESSAGE = (
+    "Connection status is unavailable: the rmq_watcher_conn_status table does "
+    "not yet match this version of the provider. The watcher loop in the "
+    "scheduler migrates it on one of its next cycles."
+)
+
+
+@dataclass
+class ConnStatusRow:
+    """One row of the Connections table with its liveness already evaluated."""
+
+    conn_id: str
+    status: str
+    consumer_count: int | None
+    broker_consumer_count: int | None
+    last_error: str | None
+    age_seconds: float | None
+    is_stale: bool
+
+    @property
+    def counts_mismatch(self) -> bool:
+        """Broker reports a different number of consumers than the watcher started."""
+        return (
+            self.broker_consumer_count is not None
+            and self.broker_consumer_count != self.consumer_count
+        )
+
+    @property
+    def age_display(self) -> str:
+        """Age of the last reconcile cycle, or an em dash when there is none."""
+        if self.age_seconds is None:
+            return "—"
+        seconds = int(self.age_seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+def _reconcile_interval() -> int:
+    """Reconcile interval the watcher runs on, in seconds.
+
+    The view lives in the webserver process and cannot see the listener's
+    state, so it reads the same Airflow Variable the listener reads. Anything
+    that goes wrong — an unreachable database, an unset or non-numeric
+    Variable — falls back to the built-in default.
+    """
+    try:
+        from airflow.models import Variable
+
+        raw = Variable.get(_RECONCILE_INTERVAL_VAR, default_var=None)
+        if raw is None:
+            return _DEFAULT_RECONCILE_INTERVAL
+        interval = int(raw)
+    except Exception:
+        log.warning(
+            "Failed to read Airflow Variable %s — assuming the default "
+            "reconcile interval of %ss for the staleness check",
+            _RECONCILE_INTERVAL_VAR,
+            _DEFAULT_RECONCILE_INTERVAL,
+            exc_info=True,
+        )
+        return _DEFAULT_RECONCILE_INTERVAL
+    if interval <= 0:
+        log.warning(
+            "Airflow Variable %s=%r must be positive — assuming the default "
+            "reconcile interval of %ss for the staleness check",
+            _RECONCILE_INTERVAL_VAR, raw, _DEFAULT_RECONCILE_INTERVAL,
+        )
+        return _DEFAULT_RECONCILE_INTERVAL
+    return interval
+
+
+def _build_conn_status_rows(conn_statuses: list[Any], interval: int) -> list[ConnStatusRow]:
+    """Wrap the status rows for display, computing the age of each cycle.
+
+    ``last_reconcile_at`` is written by the Airflow process as naive UTC, so
+    the comparison is made in naive UTC as well. A value carrying a timezone
+    is normalized first: mixing naive and aware datetimes raises TypeError,
+    and an error in the middle of rendering is a worse outcome than an
+    approximate age. A value that is not a datetime at all — a freshly
+    migrated row still holding NULL — counts as "no data" and is shown as
+    an em dash.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    rows: list[ConnStatusRow] = []
+    for cs in conn_statuses:
+        last = getattr(cs, "last_reconcile_at", None)
+        age_seconds: float | None = None
+        is_stale = False
+        if isinstance(last, datetime):
+            if last.tzinfo is not None:
+                last = last.astimezone(timezone.utc).replace(tzinfo=None)
+            age_seconds = max((now - last).total_seconds(), 0.0)
+            is_stale = age_seconds > interval * _STALE_INTERVAL_FACTOR
+        broker_count = getattr(cs, "broker_consumer_count", None)
+        rows.append(
+            ConnStatusRow(
+                conn_id=cs.conn_id,
+                status=cs.status,
+                consumer_count=cs.consumer_count,
+                broker_consumer_count=broker_count if isinstance(broker_count, int) else None,
+                last_error=cs.last_error,
+                age_seconds=age_seconds,
+                is_stale=is_stale,
+            )
+        )
+    return rows
+
+
 class RMQWatcherView(BaseView):
     route_base = "/rmq-watcher"
     default_view = "subscriptions"
@@ -113,8 +238,25 @@ class RMQWatcherView(BaseView):
     def subscriptions(self):
         with WatcherSession() as session:
             subs = session.query(RMQSubscription).order_by(RMQSubscription.dag_id).all()
-            conn_statuses = get_conn_statuses(session)
+            try:
+                conn_statuses = get_conn_statuses(session)
+            except Exception:
+                log.warning(
+                    "Failed to read rmq_watcher_conn_status — the Connections "
+                    "block is replaced with a schema notice for this request",
+                    exc_info=True,
+                )
+                conn_statuses = None
             rows = _group_subscriptions(subs)
+
+        conn_status_error = None
+        conn_status_rows: list[ConnStatusRow] = []
+        if conn_statuses is None:
+            conn_status_error = SCHEMA_OUTDATED_MESSAGE
+        elif conn_statuses:
+            # reading the interval is a database round trip, so it happens only
+            # when there is a row whose age it could be measured against
+            conn_status_rows = _build_conn_status_rows(conn_statuses, _reconcile_interval())
 
         # Separate session, opened only after the one above has closed:
         # render_template() below reads `rows`/`subs` as detached objects, and
@@ -134,7 +276,8 @@ class RMQWatcherView(BaseView):
         return self.render_template(
             "rmq_watcher/subscriptions.html",
             subscriptions=rows,
-            conn_statuses=conn_statuses,
+            conn_statuses=conn_status_rows,
+            conn_status_error=conn_status_error,
             active_dag_ids=active_dag_ids,
         )
 

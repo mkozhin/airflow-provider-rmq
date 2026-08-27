@@ -10,6 +10,7 @@ import importlib
 import logging
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -35,7 +36,16 @@ _fab_sec_dec.has_access = lambda f: f  # no-op for tests
 if "airflow_provider_rmq.watcher.views" in sys.modules:
     importlib.reload(sys.modules["airflow_provider_rmq.watcher.views"])
 
-from airflow_provider_rmq.watcher.views import RMQWatcherView, SubscriptionGroup, _group_subscriptions  # noqa: E402
+from airflow_provider_rmq.watcher.views import (  # noqa: E402
+    _DEFAULT_RECONCILE_INTERVAL,
+    SCHEMA_OUTDATED_MESSAGE,
+    ConnStatusRow,
+    RMQWatcherView,
+    SubscriptionGroup,
+    _build_conn_status_rows,
+    _group_subscriptions,
+    _reconcile_interval,
+)
 
 _fab_sec_dec.has_access = _orig_has_access  # restore for the rest of the session
 
@@ -76,8 +86,35 @@ def _make_conn_status(conn_id: str = "rmq_default", status: str = "connected") -
     cs.conn_id = conn_id
     cs.status = status
     cs.consumer_count = 1
+    cs.broker_consumer_count = 1
     cs.last_error = None
+    cs.last_reconcile_at = None
     return cs
+
+
+def _make_conn_status_row(
+    *,
+    conn_id: str = "rmq_default",
+    status: str = "connected",
+    consumer_count: int = 1,
+    broker_consumer_count: int | None = 1,
+    last_error: str | None = None,
+    last_reconcile_at: datetime | None = None,
+) -> SimpleNamespace:
+    """Real (non-MagicMock) stand-in for an RMQConnStatus row."""
+    return SimpleNamespace(
+        conn_id=conn_id,
+        status=status,
+        consumer_count=consumer_count,
+        broker_consumer_count=broker_consumer_count,
+        last_error=last_error,
+        last_reconcile_at=last_reconcile_at,
+    )
+
+
+def _naive_utc_ago(seconds: float) -> datetime:
+    """Naive-UTC timestamp `seconds` in the past — the form the watcher writes."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=seconds)
 
 
 def _session_ctx(first_sub=None, subs=None):
@@ -138,11 +175,15 @@ class TestSubscriptionsList:
         with app.test_request_context("/subscriptions"), \
              patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
              patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[cs]), \
+             patch("airflow_provider_rmq.watcher.views._reconcile_interval", return_value=60), \
              patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
             view.subscriptions()
 
         kwargs = view.render_template.call_args.kwargs
-        assert kwargs["conn_statuses"] == [cs]
+        rows = kwargs["conn_statuses"]
+        assert [r.conn_id for r in rows] == [cs.conn_id]
+        assert rows[0].status == cs.status
+        assert kwargs["conn_status_error"] is None
 
     def test_subscriptions_list_shows_consumer_status_badge(self, app, view):
         """render_template receives the subscriptions list (badges are rendered from it)."""
@@ -1044,3 +1085,309 @@ class TestSubscriptionsDagLookupSessionIsolationReal:
             assert "ghost_dag" in html
         finally:
             WatcherBase.metadata.drop_all(engine)
+
+
+# ---------------------------------------------------------------------------
+# Connection liveness on the Subscriptions page — age of the last reconcile
+# cycle, broker consumer count and the schema notice.
+# ---------------------------------------------------------------------------
+
+def _stale_badge_present(html: str) -> bool:
+    """True iff a 'last reconcile too old' badge is rendered: the warning span
+    around an age reading. Whitespace-normalized against template wrapping."""
+    normalized = re.sub(r"\s+", " ", html)
+    return (
+        re.search(
+            r'<span class="label label-warning"[^>]*>\s*⚠ [^<]*ago\s*</span>',
+            normalized,
+        )
+        is not None
+    )
+
+
+def _broker_mismatch_badge_present(html: str) -> bool:
+    """True iff a consumer-count mismatch badge (warning span around a bare
+    number) is rendered."""
+    normalized = re.sub(r"\s+", " ", html)
+    return (
+        re.search(
+            r'<span class="label label-warning"[^>]*>\s*⚠ \d+\s*</span>',
+            normalized,
+        )
+        is not None
+    )
+
+
+class TestReconcileIntervalFromVariable:
+    def test_variable_value_is_used(self):
+        with patch("airflow.models.Variable") as variable:
+            variable.get.return_value = "120"
+            assert _reconcile_interval() == 120
+        variable.get.assert_called_once()
+        assert variable.get.call_args.args[0] == "rmq_watcher_reconcile_interval"
+
+    def test_unset_variable_falls_back_to_default(self):
+        with patch("airflow.models.Variable") as variable:
+            variable.get.return_value = None
+            assert _reconcile_interval() == _DEFAULT_RECONCILE_INTERVAL
+
+    def test_unavailable_variable_falls_back_to_default(self, caplog):
+        """A database that cannot be reached must not take the page down —
+        the staleness check simply assumes the built-in interval."""
+        with patch("airflow.models.Variable") as variable, \
+             caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.views"):
+            variable.get.side_effect = RuntimeError("no database")
+            assert _reconcile_interval() == _DEFAULT_RECONCILE_INTERVAL
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is not None
+
+    def test_non_numeric_variable_falls_back_to_default(self):
+        with patch("airflow.models.Variable") as variable:
+            variable.get.return_value = "not-a-number"
+            assert _reconcile_interval() == _DEFAULT_RECONCILE_INTERVAL
+
+    def test_non_positive_variable_falls_back_to_default(self):
+        """Zero would make every row stale, a negative one would make none."""
+        with patch("airflow.models.Variable") as variable:
+            variable.get.return_value = "0"
+            assert _reconcile_interval() == _DEFAULT_RECONCILE_INTERVAL
+
+
+class TestConnStatusRowBuilding:
+    def test_fresh_reconcile_is_not_stale(self):
+        row = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(10))], 60
+        )[0]
+        assert row.is_stale is False
+        assert 5 <= row.age_seconds <= 30
+        assert row.age_display.endswith("s")
+
+    def test_reconcile_older_than_two_intervals_is_stale(self):
+        row = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(300))], 60
+        )[0]
+        assert row.is_stale is True
+        assert row.age_display == "5m"
+
+    def test_just_under_two_intervals_is_not_stale(self):
+        """The threshold is 'older than two intervals' — a cycle that has only
+        just come due must not be flagged, or a healthy watcher would blink
+        into warning whenever a cycle ran a little late."""
+        rows = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(110))], 60
+        )
+        assert rows[0].is_stale is False
+
+    def test_null_reconcile_time_reads_as_no_data(self):
+        row = _build_conn_status_rows([_make_conn_status_row(last_reconcile_at=None)], 60)[0]
+        assert row.age_seconds is None
+        assert row.is_stale is False
+        assert row.age_display == "—"
+
+    def test_naive_timestamp_does_not_raise(self):
+        """The watcher writes naive UTC; the comparison must be made in the
+        same form, so a naive value is the normal case, not an error."""
+        row = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(90))], 60
+        )[0]
+        assert row.age_seconds == pytest.approx(90, abs=10)
+
+    def test_aware_timestamp_does_not_raise(self):
+        """A driver that hands back an aware datetime must not produce a
+        TypeError from mixing it with the naive 'now'."""
+        aware = datetime.now(timezone.utc) - timedelta(seconds=120)
+        row = _build_conn_status_rows([_make_conn_status_row(last_reconcile_at=aware)], 60)[0]
+        assert row.age_seconds == pytest.approx(120, abs=10)
+        assert row.is_stale is True
+
+    def test_future_timestamp_clamps_to_zero(self):
+        """Clock skew between the scheduler and the webserver must not show a
+        negative age."""
+        future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=120)
+        row = _build_conn_status_rows([_make_conn_status_row(last_reconcile_at=future)], 60)[0]
+        assert row.age_seconds == 0.0
+        assert row.is_stale is False
+
+    def test_hour_scale_age_display(self):
+        row = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(3 * 3600 + 25 * 60))], 60
+        )[0]
+        assert row.age_display == "3h 25m"
+
+    def test_matching_counts_are_no_mismatch(self):
+        row = _build_conn_status_rows(
+            [_make_conn_status_row(consumer_count=2, broker_consumer_count=2)], 60
+        )[0]
+        assert row.counts_mismatch is False
+
+    def test_differing_counts_are_a_mismatch(self):
+        row = _build_conn_status_rows(
+            [_make_conn_status_row(consumer_count=2, broker_consumer_count=0)], 60
+        )[0]
+        assert row.counts_mismatch is True
+
+    def test_null_broker_count_is_no_mismatch(self):
+        """NULL means 'the broker could not be asked', which is not evidence
+        of a disagreement."""
+        row = _build_conn_status_rows(
+            [_make_conn_status_row(consumer_count=2, broker_consumer_count=None)], 60
+        )[0]
+        assert row.broker_consumer_count is None
+        assert row.counts_mismatch is False
+
+    def test_missing_columns_on_an_old_row_read_as_no_data(self):
+        """A row loaded before the migration ran carries neither attribute;
+        building must degrade to 'no data' rather than raise."""
+        legacy = SimpleNamespace(
+            conn_id="rmq_default", status="connected", consumer_count=1, last_error=None
+        )
+        row = _build_conn_status_rows([legacy], 60)[0]
+        assert row.age_seconds is None
+        assert row.broker_consumer_count is None
+
+
+class TestConnectionsTableRendering:
+    def test_fresh_reconcile_shows_age_without_badge(self):
+        rows = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(15))], 60
+        )
+        html = _render_subscriptions_html([], conn_statuses=rows)
+        assert "ago" in html
+        assert not _stale_badge_present(html)
+
+    def test_stale_reconcile_shows_badge(self):
+        rows = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(3600))], 60
+        )
+        html = _render_subscriptions_html([], conn_statuses=rows)
+        assert _stale_badge_present(html)
+
+    def test_null_reconcile_time_renders_dash(self):
+        """A row written before the migration added the column holds NULL —
+        the page must render, not blow up on the missing value."""
+        rows = _build_conn_status_rows([_make_conn_status_row(last_reconcile_at=None)], 60)
+        html = _render_subscriptions_html([], conn_statuses=rows)
+        assert "rmq_default" in html
+        assert not _stale_badge_present(html)
+        assert "—" in html
+
+    def test_naive_timestamp_renders_without_type_error(self):
+        rows = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(45))], 60
+        )
+        html = _render_subscriptions_html([], conn_statuses=rows)
+        assert "45s ago" in re.sub(r"\s+", " ", html) or "ago" in html
+
+    def test_broker_count_shown_next_to_consumer_count(self):
+        rows = _build_conn_status_rows(
+            [_make_conn_status_row(consumer_count=3, broker_consumer_count=3)], 60
+        )
+        html = re.sub(r"\s+", " ", _render_subscriptions_html([], conn_statuses=rows))
+        assert "Broker consumers" in html
+        assert "<td>3</td> <td> 3 </td>" in html
+        assert not _broker_mismatch_badge_present(html)
+
+    def test_count_mismatch_is_marked(self):
+        rows = _build_conn_status_rows(
+            [_make_conn_status_row(consumer_count=3, broker_consumer_count=1)], 60
+        )
+        html = _render_subscriptions_html([], conn_statuses=rows)
+        assert _broker_mismatch_badge_present(html)
+
+    def test_null_broker_count_renders_dash(self):
+        rows = _build_conn_status_rows(
+            [_make_conn_status_row(consumer_count=3, broker_consumer_count=None)], 60
+        )
+        html = _render_subscriptions_html([], conn_statuses=rows)
+        assert not _broker_mismatch_badge_present(html)
+        assert "—" in html
+
+    def test_schema_notice_replaces_the_table(self):
+        html = _render_subscriptions_html(
+            [], conn_statuses=[], conn_status_error=SCHEMA_OUTDATED_MESSAGE
+        )
+        assert "rmq_watcher_conn_status" in html
+        assert "No connections established yet." not in html
+
+
+class TestConnStatusReadFailure:
+    def test_unreadable_conn_status_yields_notice_not_error(self, app, view, caplog):
+        """An incomplete schema (the migration has not run yet in this
+        database) must degrade to a message on the page instead of a
+        rendering error — the subscriptions themselves still render."""
+        sub = _make_sub(dag_id="my_dag")
+        ctx, _ = _session_ctx(subs=[sub])
+        with app.test_request_context("/subscriptions"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch(
+                 "airflow_provider_rmq.watcher.views.get_conn_statuses",
+                 side_effect=RuntimeError("no such column: broker_consumer_count"),
+             ), \
+             patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value={"my_dag"}), \
+             caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.views"):
+            result = view.subscriptions()
+
+        assert result == "<html>mocked</html>"
+        kwargs = view.render_template.call_args.kwargs
+        assert kwargs["conn_status_error"] == SCHEMA_OUTDATED_MESSAGE
+        assert kwargs["conn_statuses"] == []
+        assert sub in kwargs["subscriptions"]
+        assert any(r.exc_info is not None for r in caplog.records)
+
+    def test_notice_renders_through_the_real_template(self, app, view):
+        """Proves the notice reaches HTML: the view's own kwargs, fed to the
+        real template, must produce the message and no Connections table."""
+        row = _make_single_row(dag_id="my_dag")
+        # _group_subscriptions reads group_key; the template branch fixture
+        # only carries what the template itself reads
+        row.group_key = None
+        ctx, _ = _session_ctx(subs=[row])
+        with app.test_request_context("/subscriptions"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch(
+                 "airflow_provider_rmq.watcher.views.get_conn_statuses",
+                 side_effect=RuntimeError("no such column: last_reconcile_at"),
+             ), \
+             patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value={"my_dag"}):
+            view.subscriptions()
+
+        kwargs = view.render_template.call_args.kwargs
+        html = _render_subscriptions_html(
+            kwargs["subscriptions"],
+            conn_statuses=kwargs["conn_statuses"],
+            conn_status_error=kwargs["conn_status_error"],
+            active_dag_ids=kwargs["active_dag_ids"],
+        )
+        assert "rmq_watcher_conn_status" in html
+        assert "Broker consumers" not in html
+        assert "my_dag" in html
+
+    def test_no_interval_lookup_when_there_are_no_rows(self, app, view):
+        """Reading the interval is a database round trip; with no connection
+        rows to measure, the page must not make it."""
+        ctx, _ = _session_ctx()
+        with app.test_request_context("/subscriptions"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.get_conn_statuses", return_value=[]), \
+             patch("airflow_provider_rmq.watcher.views._reconcile_interval") as interval, \
+             patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
+            view.subscriptions()
+
+        interval.assert_not_called()
+        assert view.render_template.call_args.kwargs["conn_statuses"] == []
+
+
+class TestConnStatusRowDataclass:
+    def test_age_display_seconds(self):
+        assert ConnStatusRow(
+            conn_id="c", status="connected", consumer_count=1,
+            broker_consumer_count=1, last_error=None, age_seconds=42.7, is_stale=False,
+        ).age_display == "42s"
+
+    def test_age_display_minutes(self):
+        assert ConnStatusRow(
+            conn_id="c", status="connected", consumer_count=1,
+            broker_consumer_count=1, last_error=None, age_seconds=605.0, is_stale=True,
+        ).age_display == "10m"
