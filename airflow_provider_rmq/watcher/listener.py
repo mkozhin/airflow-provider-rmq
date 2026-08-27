@@ -17,6 +17,7 @@ from airflow.listeners import hookimpl
 
 from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.executor import BoundedExecutor
+from airflow_provider_rmq.utils.metrics import incr as _incr
 from airflow_provider_rmq.watcher.consumer import RMQConsumerManager
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -575,15 +576,6 @@ def _read_settings() -> tuple[int | None, float | None]:
         return value
 
     return _positive(_RECONCILE_INTERVAL_VAR, int), _positive(_CYCLE_TIMEOUT_VAR, float)
-
-
-def _incr(metric: str) -> None:
-    """Bump a statsd counter. Metrics never affect control flow, so failures are silent."""
-    try:
-        from airflow.stats import Stats
-        Stats.incr(metric)
-    except Exception:
-        log.debug("RMQ Watcher: cannot report metric %s", metric, exc_info=True)
 
 
 class RMQWatcherListener:

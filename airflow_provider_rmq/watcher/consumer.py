@@ -34,8 +34,10 @@ from airflow_provider_rmq.utils.management import (
     get_management_url,
     get_queue_consumers,
 )
+from airflow_provider_rmq.utils.metrics import incr as _incr
 from airflow_provider_rmq.watcher.models import (
     WatcherSession,
+    get_conn_statuses,
     set_consumer_status,
     upsert_conn_status,
 )
@@ -276,6 +278,11 @@ class RMQConsumerManager:
         Also manages cooldown infrastructure (fire exchange/queue, pending queues) and
         exchange-mode infrastructure (exchange/sub queue/bindings).
 
+        A task that is merely still running proves nothing, so the cycle ends by asking
+        the broker which of our consumers it actually holds: one it does not know is
+        rebuilt together with its connection, and the status row of every conn_id is
+        written from that answer.
+
         Exchange provisioning runs (awaited) before the cancel/start consumer block below:
         exchange-mode queues are created by this provider (unlike ``queue=`` mode, where the
         queue is created out-of-band and ``_consume_subscription`` always passive-declares
@@ -343,12 +350,7 @@ class RMQConsumerManager:
             if self._fire_task is None or self._fire_task.done():
                 connection = self._connections.get((fire_conn_id, _ROLE_CONSUME))
                 if connection is not None:
-                    self._fire_state = _FireSub(
-                        conn_id=fire_conn_id, state=_ConsumerState(None)
-                    )
-                    self._fire_task = asyncio.create_task(
-                        self._consume_fire_queue(connection, fire_conn_id)
-                    )
+                    self._launch_fire_task(fire_conn_id, connection)
                 else:
                     log.warning(
                         "Fire task cannot start: connection %s not available after provisioning",
@@ -370,6 +372,8 @@ class RMQConsumerManager:
         # exchange-mode sub queues/bindings.
         active_exchange_dag_ids = {s["dag_id"] for s in exchange_subs}
         self._check_orphaned_exchange_bindings(active_exchange_dag_ids)
+
+        await self._recover_dead_consumers(subscriptions)
 
         self._update_all_conn_counts(subscriptions)
 
@@ -480,19 +484,57 @@ class RMQConsumerManager:
                 )
 
     def _update_all_conn_counts(self, subscriptions: list[dict]) -> None:
+        """Write the status row of every conn_id the subscription list mentions.
+
+        A conn_id whose tasks have all died still gets a row: a row that simply stops
+        being updated is indistinguishable from a healthy one, which is how a dead
+        watcher showed green for a day.
+
+        ``status`` follows the verdict of the liveness check rather than the number of
+        running tasks — a task that is not done proves nothing about the broker. A check
+        that produced no data leaves the stored status alone, so an unreachable
+        Management API does not paint every connection red, while ``last_reconcile_at``
+        is written with an explicit value on every cycle: without it SQLAlchemy emits no
+        UPDATE at all once the other fields stop changing, and the timestamp freezes.
+        """
         counts: dict[str, int] = {}
         for sub in subscriptions:
-            cid = sub["conn_id"]
+            conn_id = sub["conn_id"]
             entry = self._active.get(sub["id"])
-            if entry and not entry.task.done():
-                counts[cid] = counts.get(cid, 0) + 1
-        for conn_id, count in counts.items():
-            try:
-                with WatcherSession() as session:
-                    upsert_conn_status(session, conn_id, "connected", consumer_count=count)
-                    session.commit()
-            except Exception:
-                pass
+            alive = 1 if entry is not None and not entry.task.done() else 0
+            counts[conn_id] = counts.get(conn_id, 0) + alive
+
+        if not counts:
+            return
+
+        # Naive UTC: the view compares this stamp with a naive utcnow() of its own, and
+        # mixing naive and aware values would raise straight from the template.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        try:
+            with WatcherSession() as session:
+                stored = {row.conn_id: row.status for row in get_conn_statuses(session)}
+                for conn_id, count in counts.items():
+                    verdict = self._liveness.get(conn_id)
+                    if verdict is not None and verdict.status is not None:
+                        status = verdict.status
+                    else:
+                        status = stored.get(
+                            conn_id, "connected" if count else "disconnected"
+                        )
+                    upsert_conn_status(
+                        session,
+                        conn_id,
+                        status,
+                        consumer_count=count,
+                        last_error=verdict.reason if verdict is not None else None,
+                        broker_consumer_count=(
+                            verdict.broker_consumers if verdict is not None else None
+                        ),
+                        last_reconcile_at=now,
+                    )
+                session.commit()
+        except Exception as exc:
+            log.warning("Cannot write connection status rows: %s", exc)
 
     def _rpc_timeout(self, conn_id: str | None) -> float:
         """Seconds allowed for a single AMQP RPC on ``conn_id``.
@@ -809,6 +851,100 @@ class RMQConsumerManager:
     def _fire_state_of(self) -> _ConsumerState:
         """State record the manager keeps for the fire consumer."""
         return self._fire_state.state if self._fire_state is not None else _ConsumerState(None)
+
+    def _launch_fire_task(self, conn_id: str, connection: Any) -> None:
+        """Start the fire consumer on an open connection of ``conn_id``.
+
+        The conn_id is recorded next to the task: the fire consumer keeps the
+        connection object it was handed for its whole life, so whoever recreates that
+        connection has to know which task is holding the old one.
+        """
+        self._fire_state = _FireSub(conn_id=conn_id, state=_ConsumerState(None))
+        self._fire_task = asyncio.create_task(
+            self._consume_fire_queue(connection, conn_id)
+        )
+
+    def _restart_reason(self, conn_id: str | None) -> str:
+        """Why the last liveness check condemned ``conn_id``, for the restart log."""
+        verdict = self._liveness.get(conn_id) if conn_id is not None else None
+        if verdict is not None and verdict.reason:
+            return verdict.reason
+        return "the broker does not hold our consumer"
+
+    async def _recover_dead_consumers(self, subscriptions: list[dict]) -> None:
+        """Ask the broker what it still holds and rebuild whatever it does not.
+
+        Recovery recreates the connection, not just the task: a zombie connection
+        answers every call with silence, so a task restarted on the pooled object hangs
+        exactly where its predecessor did. The fire consumer goes down with that
+        connection because it holds the object it was handed at startup for its whole
+        life and never finishes on its own — left running it would spin on a closed
+        connection while ``rmq_watcher.fire`` sits without a consumer.
+        """
+        to_restart, to_recreate = await self._check_subscription_liveness(subscriptions)
+        fire = self._fire_state
+        restart_fire = self._fire_needs_restart or (
+            fire is not None and fire.conn_id in to_recreate
+        )
+        if not to_restart and not to_recreate and not restart_fire:
+            return
+
+        by_id = {sub["id"]: sub for sub in subscriptions}
+        cancelled: list[asyncio.Task] = []
+
+        for sub_id in sorted(to_restart):
+            entry = self._active.pop(sub_id, None)
+            if entry is None:
+                continue
+            log.warning(
+                "Restarting consumer of subscription %d (queue %r, conn_id=%r): %s",
+                sub_id, entry.sub.get("queue_name"), entry.sub.get("conn_id"),
+                self._restart_reason(entry.sub.get("conn_id")),
+            )
+            entry.task.cancel()
+            cancelled.append(entry.task)
+
+        fire_conn_id = fire.conn_id if fire is not None else None
+        if restart_fire:
+            log.warning(
+                "Restarting the fire consumer on conn_id=%r: %s",
+                fire_conn_id, self._restart_reason(fire_conn_id),
+            )
+            if self._fire_task is not None:
+                self._fire_task.cancel()
+                cancelled.append(self._fire_task)
+            self._fire_task = None
+            self._fire_state = None
+
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+
+        for conn_id in sorted(to_recreate):
+            await self._drop_connection(conn_id)
+
+        for sub_id in sorted(to_restart):
+            sub = by_id.get(sub_id)
+            if sub is None:
+                continue
+            self._active[sub_id] = _ActiveSub(
+                task=asyncio.create_task(self._consume_subscription(sub)),
+                sub=sub.copy(),
+                state=_ConsumerState(sub_id),
+            )
+            _incr("rmq_watcher.consumer_restarted")
+
+        if restart_fire and fire_conn_id is not None:
+            try:
+                connection = await self._get_or_create_connection(fire_conn_id)
+            except Exception as exc:
+                log.warning(
+                    "Fire consumer cannot restart: connection %r is unavailable: %s — "
+                    "the next reconcile cycle tries again",
+                    fire_conn_id, exc,
+                )
+            else:
+                self._launch_fire_task(fire_conn_id, connection)
+                _incr("rmq_watcher.consumer_restarted")
 
     async def _check_subscription_liveness(
         self, subscriptions: list[dict]
