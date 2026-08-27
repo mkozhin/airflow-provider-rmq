@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 import pytest
 
 from airflow_provider_rmq.utils.executor import BoundedExecutor
+
+
+def _wait_until(condition, timeout: float = 5.0) -> None:
+    """Poll ``condition`` until it holds, failing the test if it never does."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition never became true"
+        time.sleep(0.005)
 
 
 class TestBoundedExecutor:
@@ -53,10 +62,9 @@ class TestBoundedExecutor:
         try:
             future = pool.submit(lambda: "done")
             assert future.result(timeout=5) == "done"
-            # the release callback runs on the worker thread, so give it a moment
-            deadline = threading.Event()
-            deadline.wait(0.1)
-            assert pool.in_flight == 0
+            # The release callback runs on the worker thread, a moment after the
+            # result is available, so poll for it rather than guessing a delay.
+            _wait_until(lambda: pool.in_flight == 0)
         finally:
             pool.shutdown()
 
@@ -73,4 +81,28 @@ class TestBoundedExecutor:
             assert future.done() is True
         finally:
             release.set()
+            pool.shutdown()
+
+    def test_the_in_flight_counter_survives_concurrent_submits(self):
+        """``submit`` runs on the loop thread and the release on whichever worker
+        finished, so the counter has to be taken under a lock — an unguarded
+        read-modify-write drifts and takes the saturation warning with it."""
+        pool = BoundedExecutor("test", 8)
+        submitters = 8
+        per_thread = 200
+        start = threading.Barrier(submitters)
+
+        def submit_many():
+            start.wait(timeout=5)
+            for _ in range(per_thread):
+                pool.submit(lambda: None)
+
+        try:
+            threads = [threading.Thread(target=submit_many) for _ in range(submitters)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+            _wait_until(lambda: pool.in_flight == 0)
+        finally:
             pool.shutdown()

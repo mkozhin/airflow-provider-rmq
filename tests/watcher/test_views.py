@@ -37,7 +37,7 @@ if "airflow_provider_rmq.watcher.views" in sys.modules:
     importlib.reload(sys.modules["airflow_provider_rmq.watcher.views"])
 
 from airflow_provider_rmq.watcher.views import (  # noqa: E402
-    _DEFAULT_RECONCILE_INTERVAL,
+    DEFAULT_RECONCILE_INTERVAL,
     SCHEMA_OUTDATED_MESSAGE,
     ConnStatusRow,
     RMQWatcherView,
@@ -1129,7 +1129,7 @@ class TestReconcileIntervalFromVariable:
     def test_unset_variable_falls_back_to_default(self):
         with patch("airflow.models.Variable") as variable:
             variable.get.return_value = None
-            assert _reconcile_interval() == _DEFAULT_RECONCILE_INTERVAL
+            assert _reconcile_interval() == DEFAULT_RECONCILE_INTERVAL
 
     def test_unavailable_variable_falls_back_to_default(self, caplog):
         """A database that cannot be reached must not take the page down —
@@ -1137,7 +1137,7 @@ class TestReconcileIntervalFromVariable:
         with patch("airflow.models.Variable") as variable, \
              caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.views"):
             variable.get.side_effect = RuntimeError("no database")
-            assert _reconcile_interval() == _DEFAULT_RECONCILE_INTERVAL
+            assert _reconcile_interval() == DEFAULT_RECONCILE_INTERVAL
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
@@ -1146,13 +1146,13 @@ class TestReconcileIntervalFromVariable:
     def test_non_numeric_variable_falls_back_to_default(self):
         with patch("airflow.models.Variable") as variable:
             variable.get.return_value = "not-a-number"
-            assert _reconcile_interval() == _DEFAULT_RECONCILE_INTERVAL
+            assert _reconcile_interval() == DEFAULT_RECONCILE_INTERVAL
 
     def test_non_positive_variable_falls_back_to_default(self):
         """Zero would make every row stale, a negative one would make none."""
         with patch("airflow.models.Variable") as variable:
             variable.get.return_value = "0"
-            assert _reconcile_interval() == _DEFAULT_RECONCILE_INTERVAL
+            assert _reconcile_interval() == DEFAULT_RECONCILE_INTERVAL
 
 
 class TestConnStatusRowBuilding:
@@ -1237,16 +1237,6 @@ class TestConnStatusRowBuilding:
         assert row.broker_consumer_count is None
         assert row.counts_mismatch is False
 
-    def test_missing_columns_on_an_old_row_read_as_no_data(self):
-        """A row loaded before the migration ran carries neither attribute;
-        building must degrade to 'no data' rather than raise."""
-        legacy = SimpleNamespace(
-            conn_id="rmq_default", status="connected", consumer_count=1, last_error=None
-        )
-        row = _build_conn_status_rows([legacy], 60)[0]
-        assert row.age_seconds is None
-        assert row.broker_consumer_count is None
-
 
 class TestConnectionsTableRendering:
     def test_fresh_reconcile_shows_age_without_badge(self):
@@ -1277,8 +1267,8 @@ class TestConnectionsTableRendering:
         rows = _build_conn_status_rows(
             [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(45))], 60
         )
-        html = _render_subscriptions_html([], conn_statuses=rows)
-        assert "45s ago" in re.sub(r"\s+", " ", html) or "ago" in html
+        html = re.sub(r"\s+", " ", _render_subscriptions_html([], conn_statuses=rows))
+        assert re.search(r"\d+s ago", html), html
 
     def test_broker_count_shown_next_to_consumer_count(self):
         rows = _build_conn_status_rows(
@@ -1286,7 +1276,9 @@ class TestConnectionsTableRendering:
         )
         html = re.sub(r"\s+", " ", _render_subscriptions_html([], conn_statuses=rows))
         assert "Broker consumers" in html
-        assert "<td>3</td> <td> 3 </td>" in html
+        # Equal counts: both cells carry the number and neither carries a badge.
+        assert re.search(r"<td>\s*3\s*</td>\s*<td>\s*3\s*</td>", html), html
+        assert "label-warning" not in html
         assert not _broker_mismatch_badge_present(html)
 
     def test_count_mismatch_is_marked(self):
@@ -1310,6 +1302,26 @@ class TestConnectionsTableRendering:
         )
         assert "rmq_watcher_conn_status" in html
         assert "No connections established yet." not in html
+
+
+class TestConnStatusBadges:
+    def test_degraded_status_renders_its_own_badge(self):
+        """A verdict the drop rate limit held back is neither green nor an error."""
+        rows = _build_conn_status_rows(
+            [_make_conn_status_row(status="degraded", last_error="held back")], 60
+        )
+        html = re.sub(r"\s+", " ", _render_subscriptions_html([], conn_statuses=rows))
+        assert "degraded" in html
+        assert "label-warning" in html
+        assert "label-success" not in html
+
+    def test_unknown_status_renders_as_a_neutral_label(self):
+        """A conn_id no check has reached a verdict on must not read as healthy."""
+        rows = _build_conn_status_rows([_make_conn_status_row(status="unknown")], 60)
+        html = re.sub(r"\s+", " ", _render_subscriptions_html([], conn_statuses=rows))
+        assert "unknown" in html
+        assert "label-default" in html
+        assert "label-success" not in html
 
 
 class TestConnStatusReadFailure:

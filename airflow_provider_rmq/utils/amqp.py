@@ -31,6 +31,10 @@ RPC_TIMEOUT_KEY = "rpc_timeout"
 
 _MISSING = object()
 
+#: Smallest timeout a connection may ask for. Anything at or below zero would make
+#: every call fail before it started.
+_MIN_TIMEOUT = 1e-9
+
 
 @dataclass(frozen=True)
 class AmqpTimeouts:
@@ -44,22 +48,31 @@ class AmqpTimeouts:
     rpc: float
 
 
-def _read_positive_number(extras: dict[str, Any], key: str, default: float) -> float:
-    """Read a positive number from ``extra``, falling back to ``default``.
+def _read_number(
+    extras: dict[str, Any],
+    key: str,
+    default: Any,
+    cast: Any,
+    minimum: Any,
+) -> Any:
+    """Read a number from ``extra``, falling back to ``default``.
 
     A missing key uses the default silently; a present but unusable value
-    (non-numeric, zero or negative) uses the default and logs a WARNING.
+    (non-numeric, or below ``minimum``) uses the default and logs a WARNING.
     """
     raw = extras.get(key, _MISSING)
     if raw is _MISSING:
         return default
     try:
-        value = float(raw)  # type: ignore[arg-type]
+        value = cast(raw)
     except (TypeError, ValueError):
         log.warning("RMQ connection extra %r=%r is not a number, using %s", key, raw, default)
         return default
-    if value <= 0:
-        log.warning("RMQ connection extra %r=%r must be positive, using %s", key, raw, default)
+    if value < minimum:
+        log.warning(
+            "RMQ connection extra %r=%r must be at least %s, using %s",
+            key, raw, minimum, default,
+        )
         return default
     return value
 
@@ -71,23 +84,9 @@ def _read_heartbeat(extras: dict[str, Any]) -> int:
     turns off broken-link detection entirely. Unusable values fall back to
     :data:`DEFAULT_HEARTBEAT` with a WARNING.
     """
-    raw = extras.get(HEARTBEAT_KEY, _MISSING)
-    if raw is _MISSING:
-        return DEFAULT_HEARTBEAT
-    try:
-        value = int(float(raw))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        log.warning(
-            "RMQ connection extra %r=%r is not a number, using %s",
-            HEARTBEAT_KEY, raw, DEFAULT_HEARTBEAT,
-        )
-        return DEFAULT_HEARTBEAT
-    if value < 0:
-        log.warning(
-            "RMQ connection extra %r=%r must not be negative, using %s",
-            HEARTBEAT_KEY, raw, DEFAULT_HEARTBEAT,
-        )
-        return DEFAULT_HEARTBEAT
+    value = _read_number(
+        extras, HEARTBEAT_KEY, DEFAULT_HEARTBEAT, lambda raw: int(float(raw)), 0
+    )
     if value == 0:
         log.warning(
             "RMQ connection extra %r=0 turns off the AMQP heartbeat: a broken link stays "
@@ -108,8 +107,10 @@ def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
     """
     extras = conn_info.extra_dejson
     return AmqpTimeouts(
-        connect=_read_positive_number(extras, CONNECT_TIMEOUT_KEY, DEFAULT_CONNECT_TIMEOUT),
-        rpc=_read_positive_number(extras, RPC_TIMEOUT_KEY, DEFAULT_RPC_TIMEOUT),
+        connect=_read_number(
+            extras, CONNECT_TIMEOUT_KEY, DEFAULT_CONNECT_TIMEOUT, float, _MIN_TIMEOUT
+        ),
+        rpc=_read_number(extras, RPC_TIMEOUT_KEY, DEFAULT_RPC_TIMEOUT, float, _MIN_TIMEOUT),
     )
 
 
@@ -119,14 +120,18 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
     :param awaitable: Coroutine or future to await; it is cancelled when the timeout hits.
     :param timeout: Seconds allowed for the call.
 
-    Cancellation of the *caller* is passed on untouched. ``asyncio.wait_for`` on Python
-    below 3.11 returns the inner result instead when the caller is cancelled in the same
-    moment the inner future completes, so the ``CancelledError`` disappears and the caller
-    keeps running — a consumer task would then ignore ``stop()`` and reconcile would wait
-    for it forever.
+    Cancellation of the *caller* is passed on untouched, including when it lands in the
+    same event-loop tick as the timeout. The caller waits on a private future that only
+    its own cancellation can reach, so a ``CancelledError`` arriving there is always the
+    caller's and is re-raised, while the timeout is read off the inner future instead.
+    ``asyncio.wait_for`` on Python below 3.11 collapses the two cases and returns the
+    inner result, and a plain ``await`` on the inner future collapses them the other way
+    and reports a timeout — either way a consumer task would ignore ``stop()`` and
+    reconcile would wait for it forever.
     """
     loop = asyncio.get_running_loop()
     future = asyncio.ensure_future(awaitable)
+    waiter = loop.create_future()
     expired = False
 
     def _on_timeout() -> None:
@@ -134,15 +139,29 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
         expired = True
         future.cancel()
 
+    def _on_done(_future: Any) -> None:
+        if not waiter.done():
+            waiter.set_result(None)
+
     timer = loop.call_later(timeout, _on_timeout)
+    future.add_done_callback(_on_done)
     try:
-        return await future
+        await waiter
+    except asyncio.CancelledError:
+        future.remove_done_callback(_on_done)
+        if future.done() and not future.cancelled():
+            future.exception()  # retrieved so it is not reported as never awaited
+        future.cancel()
+        raise
+    finally:
+        timer.cancel()
+
+    try:
+        return future.result()
     except asyncio.CancelledError:
         if expired:
             raise asyncio.TimeoutError() from None
         raise
-    finally:
-        timer.cancel()
 
 
 class _PropsShim:

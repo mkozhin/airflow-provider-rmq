@@ -4,6 +4,7 @@ import ast
 import asyncio
 import contextlib
 import logging
+import re
 import sys
 import threading
 import time
@@ -14,12 +15,15 @@ import pytest
 from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.watcher.listener import (
+    CYCLE_TIMEOUT_VAR,
+    RECONCILE_INTERVAL_VAR,
     RMQWatcherListener,
     _UNRESOLVED_DAG_ID,
     _collect_module_constants,
     _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
     _parse_rmq_trigger_decorator,
+    _read_settings,
 )
 
 
@@ -472,7 +476,7 @@ class TestListenerLifecycle:
     def test_run_loop_restarts_after_crash(self):
         """L3: _run_loop должен перезапускать _main() после исключения."""
         listener = RMQWatcherListener()
-        listener._stop_event = threading.Event()
+        listener._stop_event = _instant_stop_event()
         call_count = {"n": 0}
 
         async def mock_main():
@@ -1800,7 +1804,8 @@ def _cycle_listener():
     listener._scan_subscriptions = MagicMock(return_value=[])
     listener._sync_to_db = MagicMock()
     listener._reconcile_interval = 0
-    listener._settings_cycles = 1000   # no Variable read during the test
+    # The tunables are set by each test; the read itself has its own tests.
+    listener._refresh_settings = AsyncMock()
     return listener
 
 
@@ -2079,7 +2084,8 @@ class TestCycleTunables:
         assert listener._cycle_timeout() == 45.0
 
     @pytest.mark.asyncio
-    async def test_refresh_is_skipped_between_reads(self):
+    async def test_every_cycle_re_reads_the_tunables(self):
+        """One read per cycle, so a changed Variable takes effect on the next one."""
         listener = RMQWatcherListener()
         with patch(
             "airflow_provider_rmq.watcher.listener._read_settings",
@@ -2089,7 +2095,8 @@ class TestCycleTunables:
             await listener._refresh_settings()
             await listener._refresh_settings()
 
-        assert read.call_count == 1
+        assert read.call_count == 3
+        assert listener._reconcile_interval == 120
 
     @pytest.mark.asyncio
     async def test_hung_variable_read_keeps_the_last_known_interval(self):
@@ -2110,7 +2117,6 @@ class TestCycleTunables:
                 assert listener._cycle_timeout() == 300
 
                 # the previous read still holds a worker — no second one is started
-                listener._settings_cycles = 0
                 await listener._refresh_settings()
         finally:
             release.set()
@@ -2128,6 +2134,73 @@ class TestCycleTunables:
 
         assert listener._reconcile_interval == 60
         assert listener._cycle_timeout_override is None
+
+
+class TestReadSettings:
+    """The reader itself: both Variable names, both casts and both reject branches.
+
+    Every caller of it is patched out in the tests above, so a typo in a Variable name
+    would leave the whole suite green while the operator's override stopped working.
+    """
+
+    @contextlib.contextmanager
+    def _variables(self, values: dict):
+        variable = MagicMock()
+        variable.get.side_effect = lambda name, default_var=None: values.get(
+            name, default_var
+        )
+        module = MagicMock()
+        module.Variable = variable
+        with patch.dict(sys.modules, {"airflow.models": module}):
+            yield variable
+
+    def test_unset_variables_read_as_no_override(self):
+        with self._variables({}) as variable:
+            assert _read_settings() == (None, None)
+        asked = {c.args[0] for c in variable.get.call_args_list}
+        assert asked == {RECONCILE_INTERVAL_VAR, CYCLE_TIMEOUT_VAR}
+
+    def test_values_are_read_and_cast(self):
+        with self._variables({
+            RECONCILE_INTERVAL_VAR: "120",
+            CYCLE_TIMEOUT_VAR: "45.5",
+        }):
+            interval, budget = _read_settings()
+
+        assert interval == 120 and isinstance(interval, int)
+        assert budget == 45.5 and isinstance(budget, float)
+
+    def test_a_value_that_is_not_a_number_is_ignored_with_a_warning(self, caplog):
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+        ), self._variables({RECONCILE_INTERVAL_VAR: "soon"}):
+            interval, _ = _read_settings()
+
+        assert interval is None
+        assert any(
+            RECONCILE_INTERVAL_VAR in r.getMessage() and "not a number" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.parametrize("raw", ["0", "-30"])
+    def test_a_non_positive_value_is_ignored_with_a_warning(self, caplog, raw):
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+        ), self._variables({CYCLE_TIMEOUT_VAR: raw}):
+            _, budget = _read_settings()
+
+        assert budget is None
+        assert any(
+            CYCLE_TIMEOUT_VAR in r.getMessage() and "must be positive" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_one_bad_variable_does_not_hide_the_other(self):
+        with self._variables({
+            RECONCILE_INTERVAL_VAR: "nope",
+            CYCLE_TIMEOUT_VAR: "900",
+        }):
+            assert _read_settings() == (None, 900.0)
 
 
 class TestSchemaMigrationRetry:
@@ -2336,7 +2409,9 @@ class TestLifecycleDiagnostics:
 
         assert "watcher not started" not in caplog.records[0].getMessage()
 
-    def test_thread_start_is_logged_with_the_interval_and_the_budget(self, caplog):
+    def test_thread_start_is_logged_with_the_default_interval_and_budget(self, caplog):
+        """The thread starts before the first Variable read, so the record has to say
+        that the numbers in it are the built-in defaults."""
         listener = RMQWatcherListener()
         with caplog.at_level(
             logging.INFO, logger="airflow_provider_rmq.watcher.listener"
@@ -2344,9 +2419,46 @@ class TestLifecycleDiagnostics:
             listener._start()
 
         messages = [record.getMessage() for record in caplog.records]
+        started = [m for m in messages if "RMQ Watcher thread started" in m]
+        assert started, messages
+        assert re.search(r"default reconcile interval of 60s", started[0]), started[0]
+        assert re.search(r"cycle budget of 300s", started[0]), started[0]
+        assert RECONCILE_INTERVAL_VAR in started[0]
+        assert CYCLE_TIMEOUT_VAR in started[0]
+
+    @pytest.mark.asyncio
+    async def test_an_override_is_logged_once_the_first_cycle_has_read_it(self, caplog):
+        listener = RMQWatcherListener()
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+        ), patch(
+            "airflow_provider_rmq.watcher.listener._read_settings",
+            return_value=(120, 999.0),
+        ):
+            await listener._refresh_settings()
+            await listener._refresh_settings()
+
+        effective = [
+            r.getMessage() for r in caplog.records if "tunables in effect" in r.getMessage()
+        ]
+        assert len(effective) == 1, effective
+        assert "120" in effective[0] and "999" in effective[0]
+
+    def test_a_thread_that_ignores_the_stop_signal_is_logged(self, caplog):
+        """The scheduler's own shutdown must not stall behind the watcher, so the join
+        gives up — and says so, or a thread left behind would be invisible."""
+        listener = RMQWatcherListener()
+        listener._stop_event = threading.Event()
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        listener._thread = thread
+
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+        ):
+            listener.before_stopping(MagicMock())
+
+        thread.join.assert_called_once()
         assert any(
-            "RMQ Watcher thread started" in message
-            and "60" in message
-            and "300" in message
-            for message in messages
-        ), messages
+            "still running" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]

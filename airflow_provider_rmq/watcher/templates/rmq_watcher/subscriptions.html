@@ -40,10 +40,8 @@
               <span class="label label-success">● connected</span>
             {% elif cs.status == 'error' %}
               <span class="label label-danger">✕ error</span>
-            {% elif cs.status == 'connecting' %}
-              <span class="label label-warning">○ connecting</span>
             {% elif cs.status == 'degraded' %}
-              <span class="label label-warning">○ degraded</span>
+              <span class="label label-warning" title="The broker did not confirm a consumer of this connection, but the connection was recreated too recently to be torn down again — the watcher is holding off rather than looping through recreations.">○ degraded</span>
             {% else %}
               <span class="label label-default">○ {{ cs.status }}</span>
             {% endif %}

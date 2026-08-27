@@ -9,10 +9,6 @@ from flask import flash, redirect, request, url_for
 from flask_appbuilder import BaseView, expose
 from flask_appbuilder.security.decorators import has_access
 
-from airflow_provider_rmq.watcher.listener import (
-    _DEFAULT_RECONCILE_INTERVAL,
-    _RECONCILE_INTERVAL_VAR,
-)
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
     WatcherSession,
@@ -21,6 +17,10 @@ from airflow_provider_rmq.watcher.models import (
     upsert_subscription,
 )
 from airflow_provider_rmq.watcher.subscription_form import parse_cooldown, parse_filter_data
+from airflow_provider_rmq.watcher.tunables import (
+    DEFAULT_RECONCILE_INTERVAL,
+    RECONCILE_INTERVAL_VAR,
+)
 
 log = logging.getLogger(__name__)
 
@@ -157,26 +157,26 @@ def _reconcile_interval() -> int:
     try:
         from airflow.models import Variable
 
-        raw = Variable.get(_RECONCILE_INTERVAL_VAR, default_var=None)
+        raw = Variable.get(RECONCILE_INTERVAL_VAR, default_var=None)
         if raw is None:
-            return _DEFAULT_RECONCILE_INTERVAL
+            return DEFAULT_RECONCILE_INTERVAL
         interval = int(raw)
     except Exception:
         log.warning(
             "Failed to read Airflow Variable %s — assuming the default "
             "reconcile interval of %ss for the staleness check",
-            _RECONCILE_INTERVAL_VAR,
-            _DEFAULT_RECONCILE_INTERVAL,
+            RECONCILE_INTERVAL_VAR,
+            DEFAULT_RECONCILE_INTERVAL,
             exc_info=True,
         )
-        return _DEFAULT_RECONCILE_INTERVAL
+        return DEFAULT_RECONCILE_INTERVAL
     if interval <= 0:
         log.warning(
             "Airflow Variable %s=%r must be positive — assuming the default "
             "reconcile interval of %ss for the staleness check",
-            _RECONCILE_INTERVAL_VAR, raw, _DEFAULT_RECONCILE_INTERVAL,
+            RECONCILE_INTERVAL_VAR, raw, DEFAULT_RECONCILE_INTERVAL,
         )
-        return _DEFAULT_RECONCILE_INTERVAL
+        return DEFAULT_RECONCILE_INTERVAL
     return interval
 
 
@@ -187,28 +187,26 @@ def _build_conn_status_rows(conn_statuses: list[Any], interval: int) -> list[Con
     the comparison is made in naive UTC as well. A value carrying a timezone
     is normalized first: mixing naive and aware datetimes raises TypeError,
     and an error in the middle of rendering is a worse outcome than an
-    approximate age. A value that is not a datetime at all — a freshly
-    migrated row still holding NULL — counts as "no data" and is shown as
-    an em dash.
+    approximate age. NULL — a freshly migrated row the watcher has not stamped
+    yet — counts as "no data" and is shown as an em dash.
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     rows: list[ConnStatusRow] = []
     for cs in conn_statuses:
-        last = getattr(cs, "last_reconcile_at", None)
+        last = cs.last_reconcile_at
         age_seconds: float | None = None
         is_stale = False
-        if isinstance(last, datetime):
+        if last is not None:
             if last.tzinfo is not None:
                 last = last.astimezone(timezone.utc).replace(tzinfo=None)
             age_seconds = max((now - last).total_seconds(), 0.0)
             is_stale = age_seconds > interval * _STALE_INTERVAL_FACTOR
-        broker_count = getattr(cs, "broker_consumer_count", None)
         rows.append(
             ConnStatusRow(
                 conn_id=cs.conn_id,
                 status=cs.status,
                 consumer_count=cs.consumer_count,
-                broker_consumer_count=broker_count if isinstance(broker_count, int) else None,
+                broker_consumer_count=cs.broker_consumer_count,
                 last_error=cs.last_error,
                 age_seconds=age_seconds,
                 is_stale=is_stale,

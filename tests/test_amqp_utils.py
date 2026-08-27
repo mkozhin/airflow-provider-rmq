@@ -423,3 +423,59 @@ class TestCallWithTimeout:
             await task
 
         assert resumed is False
+
+    @pytest.mark.asyncio
+    async def test_an_error_from_the_inner_call_reaches_the_caller_unchanged(self):
+        """The helper bounds the wait; it must not turn a real failure into a timeout."""
+        async def boom():
+            raise ValueError("passive declare refused")
+
+        with pytest.raises(ValueError, match="passive declare refused"):
+            await call_with_timeout(boom(), 10.0)
+
+    @pytest.mark.asyncio
+    async def test_the_timer_is_dropped_once_the_call_returns(self):
+        """The fast path leaves no timer behind: one per AMQP call, and every call of
+        a busy watcher would otherwise keep a callback scheduled for its full timeout."""
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        before = list(loop._scheduled)
+
+        async def quick():
+            return "value"
+
+        assert await call_with_timeout(quick(), 3600.0) == "value"
+
+        added = [handle for handle in loop._scheduled if handle not in before]
+        assert all(handle.cancelled() for handle in added), added
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_in_the_same_tick_as_the_timeout_is_still_a_cancel(self):
+        """The race the incident hinged on: the timer fires, the caller is cancelled in
+        the same tick, and the handler must not read the caller's cancel as its own
+        timeout — a consumer task would then ignore stop() and keep consuming."""
+        import asyncio
+
+        survived = False
+
+        async def slow():
+            await asyncio.sleep(100)
+
+        async def caller():
+            nonlocal survived
+            try:
+                await call_with_timeout(slow(), 0.05)
+            except asyncio.TimeoutError:
+                pass
+            survived = True
+            await asyncio.sleep(0.2)
+
+        task = asyncio.create_task(caller())
+        await asyncio.sleep(0.05)   # the timer fires in this tick
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert survived is False

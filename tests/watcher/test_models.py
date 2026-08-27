@@ -393,6 +393,25 @@ class TestSchemaMigration:
         finally:
             session.close()
 
+    @pytest.mark.parametrize("dialect_name", ["postgresql", "mysql", "sqlite"])
+    def test_the_ddl_is_built_from_the_target_dialect(self, dialect_name):
+        """The migration claims to be dialect-independent because it compiles each
+        column with the engine's own dialect rather than hard-coding a type name; a
+        literal ``DATETIME`` would be wrong on PostgreSQL."""
+        from sqlalchemy.dialects import registry
+
+        dialect = registry.load(dialect_name)()
+        table = models.RMQConnStatus.__table__
+        rendered = {
+            column.name: column.type.compile(dialect) for column in table.columns
+        }
+
+        assert rendered["broker_consumer_count"].upper().startswith("INTEGER")
+        assert "CHAR" not in rendered["last_reconcile_at"].upper()
+        if dialect_name == "postgresql":
+            assert rendered["last_reconcile_at"].upper() == "TIMESTAMP WITHOUT TIME ZONE"
+        assert all(value for value in rendered.values())
+
     def test_repeated_call_on_current_schema_is_safe(self, schema_engine):
         ensure_table_exists()
         assert models.is_schema_ready() is True

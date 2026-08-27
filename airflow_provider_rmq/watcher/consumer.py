@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import socket
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -76,6 +75,9 @@ _DROP_COOLDOWN_CYCLES = 5
 #: run for this delivery exists, so the delivery is acknowledged; ``skipped`` means the
 #: DAG cannot run at all and acknowledging it is terminal by design — a NACK would turn
 #: a paused DAG into a redelivery accumulator.
+#: Status of a ``conn_id`` no liveness check has ever reached a verdict on.
+_STATUS_UNKNOWN = "unknown"
+
 _OUTCOME_TRIGGERED = "triggered"
 _OUTCOME_SKIPPED = "skipped"
 _OUTCOME_DUPLICATE = "duplicate"
@@ -93,6 +95,20 @@ _RUN_ID_HASH_LEN = 8
 _TRIGGER_BACKOFF_START = 1.0
 _TRIGGER_BACKOFF_MAX = 60.0
 
+#: Seconds a cancelled task is given to finish before the cycle moves on without it.
+#: A task that ignores its cancellation must not hold up the cycle that cancelled it.
+_CANCEL_TIMEOUT = 30.0
+
+#: Consecutive Management API failures on one ``conn_id`` after which the liveness check
+#: switches to the passive-declare probe. A single blip stays "no data"; a misconfigured
+#: or permanently unreachable API must not disable the watchdog altogether.
+_MGMT_FAILURES_BEFORE_FALLBACK = 2
+
+#: Consecutive cycles in which a ``conn_id`` has live tasks but not one of them reaches
+#: ``listening``. A healthy attach costs a connect and two RPCs, so a connection that
+#: never gets there is not answering, and the check has no candidate to prove it with.
+_STUCK_CYCLES_BEFORE_DROP = 2
+
 #: Seconds a blocking database write is given before the caller stops waiting for it.
 #: The worker stays busy until the call itself returns — a running thread cannot be
 #: interrupted — so the timeout buys back the coroutine, not the worker.
@@ -103,61 +119,31 @@ _DB_TIMEOUT = 30.0
 #: own the task would sit in ``listening`` while consuming nothing at all.
 _TRIGGER_TIMEOUT = 60.0
 
-#: Workers of the fallback consumer pool. Sized well above the expected number of
-#: subscriptions: every matched delivery occupies one worker for the duration of its
-#: ``trigger_dag``.
-_CONSUMER_POOL_WORKERS = 32
-
-#: Workers of the fallback cycle pool. One cycle runs its blocking calls in sequence,
-#: and a call that hangs holds its worker, so a couple of spares cover the overlap.
-_CYCLE_POOL_WORKERS = 4
-
-_default_executor: BoundedExecutor | None = None
-_default_cycle_executor: BoundedExecutor | None = None
-
-
-def _consumer_executor() -> BoundedExecutor:
-    """Process-wide pool for managers created without one of their own.
-
-    The listener passes its own pool so that consumer work and cycle work never
-    compete for the same workers; a manager built directly (a test, an embedding
-    caller) still gets a bounded pool rather than the loop's default executor, which
-    dies with the loop and cannot be shut down without risking a deadlock.
-    """
-    global _default_executor
-    if _default_executor is None:
-        _default_executor = BoundedExecutor("rmq-consumer", _CONSUMER_POOL_WORKERS)
-    return _default_executor
-
-
-def _cycle_executor() -> BoundedExecutor:
-    """Process-wide cycle pool for managers created without one of their own.
-
-    Reconcile work keeps its own pool so that consumer tasks stuck on the database
-    cannot starve it: with a single pool every matched delivery spawns another
-    blocking trigger, the reconcile writes queue behind them, the cycle runs out of
-    budget and the loop is recreated — straight into the same exhausted pool.
-    """
-    global _default_cycle_executor
-    if _default_cycle_executor is None:
-        _default_cycle_executor = BoundedExecutor("rmq-cycle", _CYCLE_POOL_WORKERS)
-    return _default_cycle_executor
-
 _FIRE_EXCHANGE = "rmq_watcher.fire"
 _FIRE_QUEUE = "rmq_watcher.fire"
 _PENDING_QUEUE_PREFIX = "rmq_watcher.pending."
 _EXCHANGE_TTL_MS = 28800000  # 8h — safety net against unbounded orphan queue growth
 
 
-def _consumer_tag(suffix: Any) -> str:
+def _consumer_tag(suffix: Any, nonce: str | None = None) -> str:
     """Build the consumer tag this process registers on a queue.
 
     The tag carries host, pid and subscription id, so a liveness check can pick our
     own consumer out of the queue's consumer list: the same queue legitimately
     carries foreign consumers and the second scheduler replica in HA mode, and a
     plain consumer count cannot tell them apart from ours.
+
+    ``nonce`` distinguishes one attach from the next. A connection whose ``close()``
+    never returned may still be registered on the broker, and without the nonce that
+    ghost carries the same tag as the task that replaced it and vouches for it.
     """
-    return f"rmq_watcher.{socket.gethostname()}.{os.getpid()}.{suffix}"
+    tag = f"rmq_watcher.{socket.gethostname()}.{os.getpid()}.{suffix}"
+    return f"{tag}.{nonce}" if nonce else tag
+
+
+def _attach_nonce() -> str:
+    """Short random marker identifying a single attach of a consumer to a queue."""
+    return uuid.uuid4().hex[:8]
 
 
 def _safe_run_id(raw: str) -> str:
@@ -248,13 +234,21 @@ def _write_conn_status_rows(rows: list[tuple], now: datetime) -> None:
 
     A row whose ``status`` is ``None`` carries no verdict — the check produced no data —
     and keeps whatever is already stored, so an unreachable Management API does not
-    paint every connection red.
+    paint every connection red. A conn_id with nothing stored yet starts at
+    :data:`_STATUS_UNKNOWN`: the number of tasks the watcher started says nothing about
+    the broker, so a connection nobody has verified is reported as unverified rather
+    than as healthy.
+
+    The stored statuses are read only when some row actually needs the fallback, so an
+    all-verdict cycle costs one write and no extra full-table scan.
     """
     with WatcherSession() as session:
-        stored = {row.conn_id: row.status for row in get_conn_statuses(session)}
+        stored: dict[str, str] | None = None
         for conn_id, count, status, reason, broker_count in rows:
             if status is None:
-                status = stored.get(conn_id, "connected" if count else "disconnected")
+                if stored is None:
+                    stored = {row.conn_id: row.status for row in get_conn_statuses(session)}
+                status = stored.get(conn_id, _STATUS_UNKNOWN)
             upsert_conn_status(
                 session,
                 conn_id,
@@ -267,6 +261,27 @@ def _write_conn_status_rows(rows: list[tuple], now: datetime) -> None:
         session.commit()
 
 
+async def _wait_cancelled(tasks: list[asyncio.Task]) -> None:
+    """Wait for already-cancelled ``tasks``, giving up after :data:`_CANCEL_TIMEOUT`.
+
+    A task is free to catch its own ``CancelledError`` and keep going, and the cycle
+    that cancelled it has a budget of its own to keep. Waiting without a bound is what
+    turns one uncooperative task into a cycle that never ends.
+    """
+    if not tasks:
+        return
+    done, pending = await asyncio.wait(tasks, timeout=_CANCEL_TIMEOUT)
+    for task in done:
+        if not task.cancelled():
+            task.exception()  # retrieved so it is not reported as never awaited
+    if pending:
+        log.warning(
+            "%d consumer task(s) are still running %.0fs after being cancelled — the "
+            "cycle continues without waiting for them",
+            len(pending), _CANCEL_TIMEOUT,
+        )
+
+
 class _ConsumerState:
     """In-memory guard: writes consumer_status to DB only when the status actually changes.
 
@@ -276,26 +291,37 @@ class _ConsumerState:
     on the shared ``rmq_watcher.fire`` queue and has no row in ``rmq_subscriptions``.
     """
 
-    def __init__(self, sub_id: int | None, executor: BoundedExecutor | None = None) -> None:
+    def __init__(self, sub_id: int | None, executor: BoundedExecutor) -> None:
         self._sub_id = sub_id
-        self._executor = executor if executor is not None else _consumer_executor()
-        self._last_status: str | None = None
+        self._executor = executor
+        self._status: str | None = None
+        self._stored_status: str | None = None
+        #: Tag the task registered on its queue during its current attach, ``None``
+        #: while it is not attached. The liveness check asks the broker for this exact
+        #: tag rather than recomputing one.
+        self.consumer_tag: str | None = None
 
     @property
     def status(self) -> str | None:
-        """Status last written for this subscription, ``None`` before the first write."""
-        return self._last_status
+        """Status the task last reported, ``None`` before it reported anything."""
+        return self._status
 
     async def write(self, status: str, last_error: str | None = None) -> None:
         """Record ``status``, storing it if it differs from the one already stored.
 
+        The reported status is the manager's own view of the task and is updated
+        whatever the database does: it gates the liveness check, and a subscription
+        left out of that check because one write timed out would never be verified
+        again for the life of the task.
+
         The store is a blocking database write, so it runs in the consumer pool under a
         timeout: the consumer task awaits it, and a database that never answers would
         otherwise hold the task open forever. A write that does not land leaves the
-        remembered status untouched, so the next transition tries again, and it never
+        *stored* marker untouched, so the next call tries again, and it never
         propagates — diagnostics must not stop consumption.
         """
-        if status == self._last_status:
+        self._status = status
+        if status == self._stored_status:
             return
         if self._sub_id is not None:
             try:
@@ -313,7 +339,7 @@ class _ConsumerState:
                     status, self._sub_id, exc,
                 )
                 return
-        self._last_status = status
+        self._stored_status = status
 
 
 @dataclass
@@ -366,26 +392,28 @@ class RMQConsumerManager:
 
     def __init__(
         self,
-        executor: BoundedExecutor | None = None,
-        cycle_executor: BoundedExecutor | None = None,
+        executor: BoundedExecutor,
+        cycle_executor: BoundedExecutor,
     ) -> None:
         # Two pools, never one: ``executor`` carries what a consumer task waits on,
         # ``cycle_executor`` what the reconcile cycle waits on. Sharing them would let
         # deliveries stuck on the database starve the cycle that is supposed to notice
-        # and recover from exactly that.
-        self._executor = executor if executor is not None else _consumer_executor()
-        self._cycle_executor = (
-            cycle_executor if cycle_executor is not None else _cycle_executor()
-        )
+        # and recover from exactly that. Both are owned by whoever builds the manager
+        # and outlive the event loop, so neither is created here.
+        self._executor = executor
+        self._cycle_executor = cycle_executor
         self._active: dict[int, _ActiveSub] = {}  # sub_id → _ActiveSub
         self._connections: dict[tuple[str, str], Any] = {}  # (conn_id, role) → RobustConnection
         self._publish_channels: dict[str, Any] = {}  # conn_id → channel of the publish connection
         self._timeouts: dict[str, AmqpTimeouts] = {}  # conn_id → call timeouts from its extra
         self._publish_timeouts: dict[str, int] = {}  # conn_id → consecutive publish timeouts
-        self._last_drop_at: dict[str, float] = {}  # conn_id → monotonic time of last drop
         self._last_drop_cycle: dict[str, int] = {}  # conn_id → cycle of its last full drop
         self._cycle_no = 0  # liveness checks performed, i.e. reconcile cycles
         self._liveness: dict[str, _ConnLiveness] = {}  # conn_id → verdict of the last check
+        self._mgmt_failures: dict[str, int] = {}  # conn_id → consecutive Management API errors
+        self._stuck_cycles: dict[str, int] = {}  # conn_id → cycles with no listening task
+        # (management_url, vhost) → queue → consumer tags, for the current cycle only
+        self._consumer_cache: dict[tuple[str, str], dict[str, set[str]]] = {}
         self._conn_lock = asyncio.Lock()  # prevents duplicate connections on concurrent starts
         self._fire_task: asyncio.Task | None = None
         self._fire_state: _FireSub | None = None  # state record of the running fire task
@@ -407,8 +435,7 @@ class RMQConsumerManager:
 
         for task in tasks_to_cancel:
             task.cancel()
-        if tasks_to_cancel:
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        await _wait_cancelled(tasks_to_cancel)
 
         self._fire_task = None
         self._fire_state = None
@@ -459,10 +486,7 @@ class RMQConsumerManager:
         for sub_id in to_remove:
             self._active[sub_id].task.cancel()
         if to_remove:
-            await asyncio.gather(
-                *(self._active[sub_id].task for sub_id in to_remove),
-                return_exceptions=True,
-            )
+            await _wait_cancelled([self._active[sub_id].task for sub_id in to_remove])
             for sub_id in to_remove:
                 try:
                     await _call_with_timeout(
@@ -484,7 +508,7 @@ class RMQConsumerManager:
             if entry is None or entry.task.done() or self._subs_changed(sub_id, sub):
                 if entry is not None and not entry.task.done():
                     entry.task.cancel()
-                    await asyncio.gather(entry.task, return_exceptions=True)
+                    await _wait_cancelled([entry.task])
                 task = asyncio.create_task(self._consume_subscription(sub))
                 self._active[sub_id] = _ActiveSub(
                     task=task, sub=sub.copy(), state=_ConsumerState(sub_id, self._executor)
@@ -501,6 +525,12 @@ class RMQConsumerManager:
             if role == _ROLE_PUBLISH:
                 self._publish_channels.pop(conn_id, None)
 
+        # Forget everything else remembered per conn_id. A conn_id that comes back later
+        # is a new connection and starts from a clean slate: a leftover drop cycle would
+        # hold off its first legitimate recreation, and a leftover verdict would be
+        # written into its status row.
+        self._forget_conn_state(active_conn_ids)
+
         # manage cooldown infrastructure
         cooldown_dag_ids: set[str] = set()
         fire_conn_id: str | None = None
@@ -512,6 +542,22 @@ class RMQConsumerManager:
 
         if cooldown_dag_ids and fire_conn_id is not None:
             await self._provision_cooldown(cooldown_dag_ids, fire_conn_id)
+            running = self._fire_state
+            moved = running is not None and running.conn_id != fire_conn_id
+            if moved and self._fire_task is not None:
+                # The fire consumer holds the connection object it was handed for its
+                # whole life. Left running against the old conn_id it would keep
+                # rmq_watcher.fire without a consumer on the new one and cooldown DAGs
+                # would silently stop firing.
+                log.info(
+                    "Cooldown subscriptions moved from conn_id=%r to %r — restarting the "
+                    "fire consumer on the new connection",
+                    running.conn_id if running else None, fire_conn_id,
+                )
+                self._fire_task.cancel()
+                await _wait_cancelled([self._fire_task])
+                self._fire_task = None
+                self._fire_state = None
             if self._fire_task is None or self._fire_task.done():
                 connection = self._connections.get((fire_conn_id, _ROLE_CONSUME))
                 if connection is not None:
@@ -524,7 +570,7 @@ class RMQConsumerManager:
         elif not cooldown_dag_ids:
             if self._fire_task is not None and not self._fire_task.done():
                 self._fire_task.cancel()
-                await asyncio.gather(self._fire_task, return_exceptions=True)
+                await _wait_cancelled([self._fire_task])
             self._fire_task = None
             self._fire_state = None
 
@@ -541,6 +587,19 @@ class RMQConsumerManager:
         await self._recover_dead_consumers(subscriptions)
 
         await self._update_all_conn_counts(subscriptions)
+
+    def _forget_conn_state(self, active_conn_ids: set[str]) -> None:
+        """Drop per-conn_id bookkeeping for conn_ids no subscription mentions."""
+        for tracked in (
+            self._timeouts,
+            self._publish_timeouts,
+            self._last_drop_cycle,
+            self._liveness,
+            self._mgmt_failures,
+            self._stuck_cycles,
+        ):
+            for conn_id in [c for c in tracked if c not in active_conn_ids]:
+                del tracked[conn_id]
 
     def _subs_changed(self, sub_id: int, new_sub: dict) -> bool:
         """Compare snapshot of running sub with new sub on fields that affect consumer behaviour."""
@@ -566,7 +625,9 @@ class RMQConsumerManager:
         and returns without raising so ordinary consumers continue to work.
         """
         try:
-            connection = await self._get_or_create_connection(conn_id)
+            connection = await self._get_or_create_connection(
+                conn_id, executor=self._cycle_executor
+            )
             rpc_timeout = self._rpc_timeout(conn_id)
             # Use a short-lived channel for setup operations
             setup_channel = await _call_with_timeout(connection.channel(), timeout=rpc_timeout)
@@ -652,13 +713,14 @@ class RMQConsumerManager:
         """Write the status row of every conn_id the subscription list mentions.
 
         A conn_id whose tasks have all died still gets a row: a row that simply stops
-        being updated is indistinguishable from a healthy one, which is how a dead
-        watcher showed green for a day.
+        being updated is indistinguishable from a healthy one, so every conn_id is
+        stamped on every cycle whether or not anything is consuming on it.
 
         ``status`` follows the verdict of the liveness check rather than the number of
         running tasks — a task that is not done proves nothing about the broker. A check
         that produced no data leaves the stored status alone, so an unreachable
-        Management API does not paint every connection red, while ``last_reconcile_at``
+        Management API does not paint every connection red; a conn_id no check has ever
+        reached a verdict on starts at ``unknown``, while ``last_reconcile_at``
         is written with an explicit value on every cycle: without it SQLAlchemy emits no
         UPDATE at all once the other fields stop changing, and the timestamp freezes.
         """
@@ -669,11 +731,23 @@ class RMQConsumerManager:
             alive = 1 if entry is not None and not entry.task.done() else 0
             counts[conn_id] = counts.get(conn_id, 0) + alive
 
+        # The fire consumer is one of our consumers on the broker too, so it counts on
+        # this side as well. Both numbers then cover the same set and a conn_id with
+        # cooldown subscriptions compares equal on a healthy system.
+        fire = self._fire_state
+        if (
+            fire is not None
+            and self._fire_task is not None
+            and not self._fire_task.done()
+            and fire.conn_id in counts
+        ):
+            counts[fire.conn_id] += 1
+
         if not counts:
             return
 
         # Naive UTC: the view compares this stamp with a naive utcnow() of its own, and
-        # mixing naive and aware values would raise straight from the template.
+        # mixing naive and aware values raises straight from the template.
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         rows = []
         for conn_id, count in counts.items():
@@ -694,14 +768,13 @@ class RMQConsumerManager:
         except Exception as exc:
             log.warning("Cannot write connection status rows: %s", exc)
 
-    def _rpc_timeout(self, conn_id: str | None) -> float:
+    def _rpc_timeout(self, conn_id: str) -> float:
         """Seconds allowed for a single AMQP RPC on ``conn_id``.
 
         The value comes from the connection's ``extra`` and is cached when the
-        connection is built; before that — and for callers that have no conn_id — the
-        provider default applies.
+        connection is built; before that the provider default applies.
         """
-        timeouts = self._timeouts.get(conn_id) if conn_id else None
+        timeouts = self._timeouts.get(conn_id)
         return timeouts.rpc if timeouts else DEFAULT_RPC_TIMEOUT
 
     async def _drop_connection(self, conn_id: str, role: str | None = None) -> None:
@@ -726,7 +799,6 @@ class RMQConsumerManager:
                     "pool anyway",
                     pooled_role, conn_id, exc,
                 )
-        self._last_drop_at[conn_id] = time.monotonic()
         if role is None:
             # Only a full drop feeds the liveness rate limit: the publish role has its
             # own gate of consecutive publish timeouts, and letting it move this mark
@@ -757,7 +829,32 @@ class RMQConsumerManager:
         self._publish_channels[conn_id] = channel
         return channel
 
-    async def _get_or_create_connection(self, conn_id: str, role: str = _ROLE_CONSUME) -> Any:
+    async def _get_connection_info(
+        self, conn_id: str, executor: BoundedExecutor | None = None
+    ) -> Any:
+        """Read the Airflow connection of ``conn_id`` off the loop thread, under a timeout.
+
+        ``BaseHook.get_connection`` is a metadata-database query, and a database that
+        stopped answering must not decide how long a reconcile cycle lasts.
+        """
+        pool = executor if executor is not None else self._executor
+        return await _call_with_timeout(
+            pool.run(BaseHook.get_connection, conn_id), timeout=_DB_TIMEOUT
+        )
+
+    async def _get_or_create_connection(
+        self,
+        conn_id: str,
+        role: str = _ROLE_CONSUME,
+        executor: BoundedExecutor | None = None,
+    ) -> Any:
+        """Return the pooled connection of ``(conn_id, role)``, building it on demand.
+
+        ``executor`` names the pool the blocking metadata read runs in: a consumer task
+        uses the consumer pool, everything the reconcile cycle awaits uses the cycle
+        pool, so a stalled delivery and a stalled cycle never share a worker.
+        """
+        pool = executor if executor is not None else self._executor
         key = (conn_id, role)
         # Fast path: a live connection is already pooled
         connection = self._connections.get(key)
@@ -775,7 +872,7 @@ class RMQConsumerManager:
                 if role == _ROLE_PUBLISH:
                     self._publish_channels.pop(conn_id, None)
 
-            conn_info = await self._executor.run(BaseHook.get_connection, conn_id)
+            conn_info = await self._get_connection_info(conn_id, pool)
             url, ssl_context = build_amqp_connection(conn_info)
             timeouts = get_amqp_timeouts(conn_info)
             self._timeouts[conn_id] = timeouts
@@ -789,7 +886,7 @@ class RMQConsumerManager:
             except Exception as exc:
                 try:
                     await _call_with_timeout(
-                        self._executor.run(_write_conn_error, conn_id, str(exc)),
+                        pool.run(_write_conn_error, conn_id, str(exc)),
                         timeout=_DB_TIMEOUT,
                     )
                 except Exception as write_exc:
@@ -807,7 +904,7 @@ class RMQConsumerManager:
         exchange: str,
         sub: dict,
         http_client: httpx.AsyncClient,
-        rpc_timeout: float = DEFAULT_RPC_TIMEOUT,
+        rpc_timeout: float,
     ) -> bool:
         """Provision the sub queue + bind-diff for a single exchange-mode subscription.
 
@@ -824,7 +921,7 @@ class RMQConsumerManager:
         try:
             queue = await _ensure_sub_queue(setup_channel, dag_id, timeout=rpc_timeout)
 
-            conn_info = await self._executor.run(BaseHook.get_connection, conn_id)
+            conn_info = await self._get_connection_info(conn_id, self._cycle_executor)
             vhost = conn_info.schema or "/"
             management_url = get_management_url(conn_info)
             if management_url is None:
@@ -908,7 +1005,9 @@ class RMQConsumerManager:
 
         for (conn_id, exchange), group in groups.items():
             try:
-                connection = await self._get_or_create_connection(conn_id)
+                connection = await self._get_or_create_connection(
+                    conn_id, executor=self._cycle_executor
+                )
                 rpc_timeout = self._rpc_timeout(conn_id)
                 setup_channel = await _call_with_timeout(
                     connection.channel(), timeout=rpc_timeout
@@ -1005,13 +1104,27 @@ class RMQConsumerManager:
         connecting or backing off after an error.
         """
         entry = self._active.get(sub_id)
-        return entry.state if entry is not None else _ConsumerState(sub_id, self._executor)
+        if entry is None:
+            # The task is started from the same statement that registers the entry, so
+            # this cannot happen; a status written into an object the manager does not
+            # hold would leave the subscription out of the liveness check for good.
+            log.error(
+                "Subscription %s has no state record in the manager — its status is "
+                "reported nowhere and the liveness check will skip it",
+                sub_id,
+            )
+            return _ConsumerState(sub_id, self._executor)
+        return entry.state
 
     def _fire_state_of(self) -> _ConsumerState:
         """State record the manager keeps for the fire consumer."""
-        if self._fire_state is not None:
-            return self._fire_state.state
-        return _ConsumerState(None, self._executor)
+        if self._fire_state is None:
+            log.error(
+                "The fire consumer has no state record in the manager — its status is "
+                "reported nowhere and the liveness check will skip it"
+            )
+            return _ConsumerState(None, self._executor)
+        return self._fire_state.state
 
     def _launch_fire_task(self, conn_id: str, connection: Any) -> None:
         """Start the fire consumer on an open connection of ``conn_id``.
@@ -1079,8 +1192,7 @@ class RMQConsumerManager:
             self._fire_task = None
             self._fire_state = None
 
-        if cancelled:
-            await asyncio.gather(*cancelled, return_exceptions=True)
+        await _wait_cancelled(cancelled)
 
         for conn_id in sorted(to_recreate):
             await self._drop_connection(conn_id)
@@ -1098,7 +1210,9 @@ class RMQConsumerManager:
 
         if restart_fire and fire_conn_id is not None:
             try:
-                connection = await self._get_or_create_connection(fire_conn_id)
+                connection = await self._get_or_create_connection(
+                    fire_conn_id, executor=self._cycle_executor
+                )
             except Exception as exc:
                 log.warning(
                     "Fire consumer cannot restart: connection %r is unavailable: %s — "
@@ -1129,22 +1243,38 @@ class RMQConsumerManager:
         probe that fails *or hangs* counts as negative: silence on an AMQP call is the
         signature of the zombie connection this watchdog exists for.
 
+        A conn_id that offers no candidate at all is judged on its own terms. With no
+        running task it is reported as an error outright; with running tasks that never
+        reach ``listening`` for :data:`_STUCK_CYCLES_BEFORE_DROP` cycles the connection
+        itself is condemned — that is the shape of a pooled connection whose
+        ``channel()`` never returns, where every task retries onto the same silence and
+        the check would otherwise see nothing to judge.
+
         The verdict of each conn_id is kept in ``self._liveness`` for the status writer.
         """
         self._cycle_no += 1
         self._liveness = {}
+        self._consumer_cache = {}
         self._fire_needs_restart = False
 
-        candidates: dict[str, list[dict]] = {}
+        candidates: dict[str, list[tuple[dict, _ActiveSub]]] = {}
+        live_tasks: dict[str, int] = {}
         for sub in subscriptions:
+            conn_id = sub["conn_id"]
+            live_tasks.setdefault(conn_id, 0)
             entry = self._active.get(sub["id"])
-            if entry is None or entry.task.done() or entry.state.status != "listening":
+            if entry is None or entry.task.done():
                 continue
-            candidates.setdefault(sub["conn_id"], []).append(sub)
+            live_tasks[conn_id] += 1
+            if entry.state.status != "listening" or entry.state.consumer_tag is None:
+                continue
+            candidates.setdefault(conn_id, []).append((sub, entry))
 
         fire = self._fire_state
+        fire_tag = fire.state.consumer_tag if fire is not None else None
         fire_candidate = (
             fire is not None
+            and fire_tag is not None
             and self._fire_task is not None
             and not self._fire_task.done()
             and fire.state.status == "listening"
@@ -1156,12 +1286,13 @@ class RMQConsumerManager:
         to_recreate: set[str] = set()
 
         for conn_id, subs in candidates.items():
+            self._stuck_cycles.pop(conn_id, None)
             fire_here = fire_candidate and fire is not None and fire.conn_id == conn_id
-            queues = {sub["queue_name"] for sub in subs}
-            expected_tags = {_consumer_tag(sub["id"]) for sub in subs}
+            queues = {sub["queue_name"] for sub, _ in subs}
+            expected_tags = {entry.state.consumer_tag for _, entry in subs}
             if fire_here:
                 queues.add(_FIRE_QUEUE)
-                expected_tags.add(_consumer_tag("fire"))
+                expected_tags.add(fire_tag)
 
             live_tags, broker_count, reason = await self._probe_consumers(
                 conn_id, queues, expected_tags
@@ -1173,25 +1304,22 @@ class RMQConsumerManager:
                 continue
 
             dead_subs: set[int] = set()
-            for sub in subs:
-                entry = self._active.get(sub["id"])
-                if entry is None:
-                    continue
-                if _consumer_tag(sub["id"]) in live_tags:
+            for sub, entry in subs:
+                if entry.state.consumer_tag in live_tags:
                     entry.negative_checks = 0
                     continue
                 entry.negative_checks += 1
                 log.warning(
                     "Broker does not know consumer %s of subscription %d (queue %r, "
                     "conn_id=%r) — negative check %d of %d",
-                    _consumer_tag(sub["id"]), sub["id"], sub["queue_name"], conn_id,
+                    entry.state.consumer_tag, sub["id"], sub["queue_name"], conn_id,
                     entry.negative_checks, _NEGATIVE_CHECKS_BEFORE_RESTART,
                 )
                 if entry.negative_checks >= _NEGATIVE_CHECKS_BEFORE_RESTART:
                     dead_subs.add(sub["id"])
 
             if fire_here and fire is not None:
-                if _consumer_tag("fire") in live_tags:
+                if fire_tag in live_tags:
                     fire.negative_checks = 0
                 else:
                     fire.negative_checks += 1
@@ -1212,23 +1340,23 @@ class RMQConsumerManager:
                 continue
 
             if not self._may_drop_connection(conn_id):
-                held_back = (
-                    f"{len(dead_subs)} subscription(s) unseen by the broker, but the "
-                    f"connection was already recreated less than "
-                    f"{_DROP_COOLDOWN_CYCLES} cycles ago"
-                )
-                log.warning(
-                    "Connection %r is condemned again after %d cycle(s), sooner than the "
-                    "%d-cycle limit allows — leaving it in place. Repeated verdicts mean "
-                    "either the check misjudges it or the fault is not in the connection.",
-                    conn_id, self._cycle_no - self._last_drop_cycle[conn_id],
-                    _DROP_COOLDOWN_CYCLES,
-                )
-                self._liveness[conn_id] = _ConnLiveness(
-                    status="degraded", broker_consumers=broker_count, reason=held_back
+                self._liveness[conn_id] = self._held_back_verdict(
+                    conn_id,
+                    broker_count,
+                    f"{len(dead_subs)} subscription(s) unseen by the broker",
                 )
                 continue
 
+            confirmed = sorted(
+                sub["id"] for sub, _ in subs if sub["id"] not in dead_subs
+            )
+            if confirmed:
+                log.warning(
+                    "Connection %r is being recreated for %d unseen subscription(s); "
+                    "subscription(s) %s share it and keep their own retry loop — they "
+                    "surface the drop as a transient consumer error",
+                    conn_id, len(dead_subs), confirmed,
+                )
             to_restart |= dead_subs
             to_recreate.add(conn_id)
             self._liveness[conn_id] = _ConnLiveness(
@@ -1237,7 +1365,71 @@ class RMQConsumerManager:
                 reason=reason or "consumer not registered on the broker",
             )
 
+        for conn_id, live in live_tasks.items():
+            if conn_id in candidates:
+                continue
+            if not live:
+                self._stuck_cycles.pop(conn_id, None)
+                self._liveness[conn_id] = _ConnLiveness(
+                    status="error",
+                    broker_consumers=None,
+                    reason="no consumer task of this connection is running",
+                )
+                continue
+            stuck = self._stuck_cycles.get(conn_id, 0) + 1
+            self._stuck_cycles[conn_id] = stuck
+            if stuck < _STUCK_CYCLES_BEFORE_DROP:
+                self._liveness[conn_id] = _ConnLiveness(
+                    status=None, broker_consumers=None, reason=None
+                )
+                continue
+            reason = (
+                f"{live} task(s) of this connection have not reached 'listening' for "
+                f"{stuck} cycles — the connection answers no RPC"
+            )
+            log.warning(
+                "Connection %r has %d running task(s) and not one of them is consuming "
+                "after %d cycles — recreating it: a pooled connection that answers no "
+                "RPC hands the same silence to every task that retries on it",
+                conn_id, live, stuck,
+            )
+            if not self._may_drop_connection(conn_id):
+                self._liveness[conn_id] = self._held_back_verdict(
+                    conn_id, None, reason
+                )
+                continue
+            self._stuck_cycles.pop(conn_id, None)
+            to_recreate.add(conn_id)
+            self._liveness[conn_id] = _ConnLiveness(
+                status="error", broker_consumers=None, reason=reason
+            )
+
         return to_restart, to_recreate
+
+    def _held_back_verdict(
+        self, conn_id: str, broker_count: int | None, reason: str
+    ) -> _ConnLiveness:
+        """Verdict for a ``conn_id`` the rate limit keeps from being recreated again.
+
+        Repeated verdicts mean either the check misjudges the connection or the fault
+        is not in the connection, so the drop is refused and the row says ``degraded``
+        rather than silently looping through recreations.
+        """
+        log.warning(
+            "Connection %r is condemned again after %d cycle(s), sooner than the "
+            "%d-cycle limit allows — leaving it in place. Repeated verdicts mean "
+            "either the check misjudges it or the fault is not in the connection.",
+            conn_id, self._cycle_no - self._last_drop_cycle[conn_id],
+            _DROP_COOLDOWN_CYCLES,
+        )
+        return _ConnLiveness(
+            status="degraded",
+            broker_consumers=broker_count,
+            reason=(
+                f"{reason}, but the connection was already recreated less than "
+                f"{_DROP_COOLDOWN_CYCLES} cycles ago"
+            ),
+        )
 
     async def _probe_consumers(
         self, conn_id: str, queues: set[str], expected_tags: set[str]
@@ -1250,46 +1442,68 @@ class RMQConsumerManager:
         :returns: ``(live tags, consumers the broker reports, reason)``, where live tags
             of ``None`` means the check produced no data and the counters stay untouched.
 
-        With a ``management_url`` the answer comes from ``GET /api/consumers/{vhost}``.
-        Without one the probe is a passive declare on a fresh channel: it says nothing
-        about individual consumers, so its success vouches for every tag of this conn_id
-        and its failure — a raised error or a call that never returns — condemns them all.
+        With a ``management_url`` the answer comes from ``GET /api/consumers/{vhost}``,
+        whose reply covers the whole vhost and is therefore cached for the cycle: several
+        conn_ids often point at one broker, and asking it once per conn_id multiplies the
+        same request. Without a ``management_url`` — and after
+        :data:`_MGMT_FAILURES_BEFORE_FALLBACK` failed Management API calls in a row, which
+        is what a wrong URL or credentials without the ``management`` tag look like — the
+        probe is a passive declare on a fresh channel: it says nothing about individual
+        consumers, so its success vouches for every tag of this conn_id and its failure —
+        a raised error or a call that never returns — condemns them all.
         """
-        conn_info = None
-        management_url = None
-        if self._http_client is not None:
-            try:
-                conn_info = await self._executor.run(BaseHook.get_connection, conn_id)
-                management_url = get_management_url(conn_info)
-            except Exception as exc:
-                log.warning(
-                    "Cannot read connection %r for the liveness check: %s — liveness "
-                    "unknown this cycle, counters unchanged",
-                    conn_id, exc,
-                )
-                return None, None, str(exc)
+        if self._http_client is None:
+            return await self._probe_by_passive_declare(conn_id, queues, expected_tags)
+
+        try:
+            conn_info = await self._get_connection_info(conn_id, self._cycle_executor)
+            management_url = get_management_url(conn_info)
+        except Exception as exc:
+            log.warning(
+                "Cannot read connection %r for the liveness check: %s — liveness "
+                "unknown this cycle, counters unchanged",
+                conn_id, exc,
+            )
+            return None, None, str(exc)
 
         if (
-            self._http_client is not None
-            and management_url is not None
-            and conn_info is not None
+            management_url is not None
             and conn_info.login is not None
             and conn_info.password is not None
         ):
-            try:
-                by_queue = await get_queue_consumers(
-                    self._http_client,
-                    management_url,
-                    conn_info.schema or "/",
-                    (conn_info.login, conn_info.password),
-                )
-            except Exception as exc:
-                log.warning(
-                    "Management API did not answer the consumer list for conn_id=%r: %s "
-                    "— liveness unknown this cycle, counters unchanged",
-                    conn_id, exc,
-                )
-                return None, None, str(exc)
+            vhost = conn_info.schema or "/"
+            cache_key = (management_url, vhost)
+            by_queue = self._consumer_cache.get(cache_key)
+            if by_queue is None:
+                try:
+                    by_queue = await get_queue_consumers(
+                        self._http_client,
+                        management_url,
+                        vhost,
+                        (conn_info.login, conn_info.password),
+                    )
+                except Exception as exc:
+                    failures = self._mgmt_failures.get(conn_id, 0) + 1
+                    self._mgmt_failures[conn_id] = failures
+                    if failures < _MGMT_FAILURES_BEFORE_FALLBACK:
+                        log.warning(
+                            "Management API did not answer the consumer list for "
+                            "conn_id=%r: %s — liveness unknown this cycle, counters "
+                            "unchanged",
+                            conn_id, exc,
+                        )
+                        return None, None, str(exc)
+                    log.warning(
+                        "Management API has failed %d times in a row for conn_id=%r "
+                        "(%s) — falling back to the AMQP probe so the watchdog keeps "
+                        "running while the API stays unusable",
+                        failures, conn_id, exc,
+                    )
+                    return await self._probe_by_passive_declare(
+                        conn_id, queues, expected_tags
+                    )
+                self._consumer_cache[cache_key] = by_queue
+            self._mgmt_failures.pop(conn_id, None)
             live_tags: set[str] = set()
             broker_count = 0
             for queue_name in queues:
@@ -1308,7 +1522,9 @@ class RMQConsumerManager:
         rpc_timeout = self._rpc_timeout(conn_id)
         channel = None
         try:
-            connection = await self._get_or_create_connection(conn_id)
+            connection = await self._get_or_create_connection(
+                conn_id, executor=self._cycle_executor
+            )
             channel = await _call_with_timeout(connection.channel(), timeout=rpc_timeout)
             await _call_with_timeout(
                 channel.declare_queue(queue_name, passive=True), timeout=rpc_timeout
@@ -1339,7 +1555,6 @@ class RMQConsumerManager:
         cooldown: int = sub.get("cooldown", 0) or 0
         msg_filter = MessageFilter.deserialize(sub.get("filter_data") or {})
         state = self._state_of(sub_id)
-        consumer_tag = _consumer_tag(sub_id)
         # Kept across reconnects: a broken trigger path stays broken through the
         # reconnect that a NACKed delivery may well cause.
         trigger_backoff = _TRIGGER_BACKOFF_START
@@ -1357,6 +1572,8 @@ class RMQConsumerManager:
                 # requeue (ADR-0002) and come back to the head of the queue, so any finite
                 # prefetch window fills up with them and consumption stops for good once
                 # the misses reach the window size. The unacked window stays unbounded.
+                consumer_tag = _consumer_tag(sub_id, _attach_nonce())
+                state.consumer_tag = consumer_tag
                 await state.write("listening", last_error=None)
                 log.info(
                     "Subscription %d (DAG %s) is consuming queue %r on conn_id=%r",
@@ -1409,6 +1626,7 @@ class RMQConsumerManager:
                 # The iterator finished without an exception — the broker cancelled the
                 # consumer. Pause before subscribing again so a broker that keeps ending
                 # it right away cannot spin this loop.
+                state.consumer_tag = None
                 await asyncio.sleep(_RECONNECT_DELAY)
 
             except asyncio.CancelledError:
@@ -1447,10 +1665,17 @@ class RMQConsumerManager:
         publishers under a resource alarm leaves the consuming connection — and with it
         every ``basic.ack`` — untouched.
 
-        A failed publish returns the delivery to the queue right away: leaving the loop
-        hands back only what is still buffered in the iterator, and this message, already
-        taken out of it, would otherwise sit unacknowledged on the abandoned channel until
-        the broker's ``consumer_timeout``.
+        A broker that rejects the publish has done its job: the pending queue is declared
+        ``x-max-length=1`` with ``x-overflow=reject-publish``, so a rejection means the
+        cooldown for this dag_id is already counting down and a second placeholder would
+        add nothing. That is the ordinary case while a cooldown window is open, and the
+        delivery is acknowledged — requeueing it would redeliver the same message for the
+        whole window and burn the quorum-queue delivery limit on it.
+
+        A publish that fails for any other reason returns the delivery to the queue right
+        away: leaving the loop hands back only what is still buffered in the iterator, and
+        this message, already taken out of it, would otherwise sit unacknowledged on the
+        abandoned channel until the broker's ``consumer_timeout``.
         """
         pending_queue = f"{_PENDING_QUEUE_PREFIX}{dag_id}"
         try:
@@ -1468,6 +1693,19 @@ class RMQConsumerManager:
             )
         except asyncio.CancelledError:
             raise
+        except aio_pika.exceptions.PublishError as exc:
+            # The message came back unrouted: the pending queue is not there at all.
+            await self._handle_publish_failure(conn_id, message, exc)
+            raise
+        except aio_pika.exceptions.DeliveryError:
+            log.debug(
+                "Cooldown placeholder for DAG %s was rejected by %s — a cooldown window "
+                "is already open, acknowledging the delivery",
+                dag_id, pending_queue,
+            )
+            self._publish_timeouts.pop(conn_id, None)
+            await message.ack()
+            return
         except Exception as exc:
             await self._handle_publish_failure(conn_id, message, exc)
             raise
@@ -1509,7 +1747,7 @@ class RMQConsumerManager:
         self._publish_timeouts.pop(conn_id, None)
         await self._drop_connection(conn_id, role=_ROLE_PUBLISH)
 
-    async def _consume_fire_queue(self, connection: Any, conn_id: str | None = None) -> None:
+    async def _consume_fire_queue(self, connection: Any, conn_id: str) -> None:
         """Consumer for rmq_watcher.fire queue — triggers DAGs after cooldown expires via DLX."""
         state = self._fire_state_of()
         while True:
@@ -1520,6 +1758,8 @@ class RMQConsumerManager:
                 queue = await _call_with_timeout(
                     channel.declare_queue(_FIRE_QUEUE, passive=True), timeout=rpc_timeout
                 )
+                fire_tag = _consumer_tag("fire", _attach_nonce())
+                state.consumer_tag = fire_tag
                 await state.write("listening")
                 log.info(
                     "Cooldown fire consumer is consuming queue %r on conn_id=%r",
@@ -1527,7 +1767,7 @@ class RMQConsumerManager:
                 )
                 _incr("rmq_watcher.consumer_reconnect")
 
-                async with queue.iterator(consumer_tag=_consumer_tag("fire")) as q_iter:
+                async with queue.iterator(consumer_tag=fire_tag) as q_iter:
                     async for message in q_iter:
                         dag_id = message.routing_key or ""
                         if not dag_id:
@@ -1619,9 +1859,7 @@ class RMQConsumerManager:
         )
 
 
-async def _ensure_fire_infrastructure(
-    channel: Any, timeout: float = DEFAULT_RPC_TIMEOUT
-) -> None:
+async def _ensure_fire_infrastructure(channel: Any, timeout: float) -> None:
     """Declare the fire exchange and queue idempotently.
 
     - Exchange: rmq_watcher.fire (topic, durable)
@@ -1645,9 +1883,7 @@ async def _ensure_fire_infrastructure(
     await _call_with_timeout(queue.bind(exchange, routing_key="#"), timeout=timeout)
 
 
-async def _ensure_pending_queue(
-    channel: Any, dag_id: str, timeout: float = DEFAULT_RPC_TIMEOUT
-) -> None:
+async def _ensure_pending_queue(channel: Any, dag_id: str, timeout: float) -> None:
     """Declare the per-DAG pending queue idempotently.
 
     Queue: rmq_watcher.pending.{dag_id}
@@ -1676,7 +1912,7 @@ async def _ensure_pending_queue(
 
 
 async def _ensure_exchange_infrastructure(
-    channel: Any, exchange: str, timeout: float = DEFAULT_RPC_TIMEOUT
+    channel: Any, exchange: str, timeout: float
 ) -> None:
     """Declare the exchange-mode RMQ infrastructure for a given exchange, idempotently.
 
@@ -1735,9 +1971,7 @@ async def _ensure_exchange_infrastructure(
     await _call_with_timeout(log_queue.bind(exchange_obj, routing_key="#"), timeout=timeout)
 
 
-async def _ensure_sub_queue(
-    channel: Any, dag_id: str, timeout: float = DEFAULT_RPC_TIMEOUT
-) -> Any:
+async def _ensure_sub_queue(channel: Any, dag_id: str, timeout: float) -> Any:
     """Declare the per-DAG exchange-mode sub queue idempotently and return it.
 
     Queue: ``rmq_watcher.sub.{dag_id}`` — durable, ``x-message-ttl=_EXCHANGE_TTL_MS`` (8h).
@@ -1763,7 +1997,7 @@ async def _sync_bindings(
     exchange: str,
     desired: set[str],
     current: set[str],
-    timeout: float = DEFAULT_RPC_TIMEOUT,
+    timeout: float,
 ) -> None:
     """Bind/unbind a queue to an exchange so its live bindings match ``desired``.
 
