@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,7 +18,11 @@ from airflow.models import DagModel
 from sqlalchemy.exc import IntegrityError
 
 from airflow_provider_rmq.utils.amqp import (
+    DEFAULT_RPC_TIMEOUT,
+    AmqpTimeouts,
     build_amqp_connection,
+    call_with_timeout as _call_with_timeout,
+    get_amqp_timeouts,
     match_and_ack,
     match as _match,
     nack_and_sleep as _nack_and_sleep,
@@ -34,10 +41,33 @@ log = logging.getLogger(__name__)
 
 _RECONNECT_DELAY = 5.0
 
+#: Seconds granted to a best-effort ``close()`` of a connection or channel.
+_CLOSE_TIMEOUT = 5.0
+
+#: Roles a connection is pooled under. Publishing lives on its own connection because
+#: a resource alarm blocks publishing connections by making the broker stop reading
+#: their socket — which stalls ``basic.ack`` of every consumer sharing that connection.
+_ROLE_CONSUME = "consume"
+_ROLE_PUBLISH = "publish"
+
+#: Consecutive publish timeouts on one ``conn_id`` that condemn its publish connection.
+_PUBLISH_TIMEOUTS_BEFORE_DROP = 2
+
 _FIRE_EXCHANGE = "rmq_watcher.fire"
 _FIRE_QUEUE = "rmq_watcher.fire"
 _PENDING_QUEUE_PREFIX = "rmq_watcher.pending."
 _EXCHANGE_TTL_MS = 28800000  # 8h — safety net against unbounded orphan queue growth
+
+
+def _consumer_tag(suffix: Any) -> str:
+    """Build the consumer tag this process registers on a queue.
+
+    The tag carries host, pid and subscription id, so a liveness check can pick our
+    own consumer out of the queue's consumer list: the same queue legitimately
+    carries foreign consumers and the second scheduler replica in HA mode, and a
+    plain consumer count cannot tell them apart from ours.
+    """
+    return f"rmq_watcher.{socket.gethostname()}.{os.getpid()}.{suffix}"
 
 
 def _build_run_id(queue_name: str) -> str:
@@ -81,6 +111,11 @@ class _ConsumerState:
         self._sub_id = sub_id
         self._last_status: str | None = None
 
+    @property
+    def status(self) -> str | None:
+        """Status last written for this subscription, ``None`` before the first write."""
+        return self._last_status
+
     def write(self, status: str, last_error: str | None = None) -> None:
         if status == self._last_status:
             return
@@ -95,18 +130,25 @@ class _ActiveSub:
     """Snapshot of a running subscription consumer task."""
     task: asyncio.Task
     sub: dict  # full snapshot of sub at task start time
+    state: _ConsumerState  # status the task reports, readable by the manager
 
 
 class RMQConsumerManager:
     """Manages a pool of asyncio tasks — one per subscription — each consuming one RMQ queue.
 
-    Connection pooling: one ``connect_robust`` connection per ``conn_id``; multiple subscriptions
-    sharing the same conn_id reuse the same connection (each gets its own channel).
+    Connection pooling: one ``connect_robust`` connection per ``(conn_id, role)``, where role
+    is ``consume`` or ``publish``; multiple subscriptions sharing the same conn_id reuse the
+    same consuming connection (each gets its own channel), while cooldown publishing runs on
+    a lazily opened publish connection of that conn_id.
     """
 
     def __init__(self) -> None:
         self._active: dict[int, _ActiveSub] = {}  # sub_id → _ActiveSub
-        self._connections: dict[str, Any] = {}  # conn_id → RobustConnection
+        self._connections: dict[tuple[str, str], Any] = {}  # (conn_id, role) → RobustConnection
+        self._publish_channels: dict[str, Any] = {}  # conn_id → channel of the publish connection
+        self._timeouts: dict[str, AmqpTimeouts] = {}  # conn_id → call timeouts from its extra
+        self._publish_timeouts: dict[str, int] = {}  # conn_id → consecutive publish timeouts
+        self._last_drop_at: dict[str, float] = {}  # conn_id → monotonic time of last drop
         self._conn_lock = asyncio.Lock()  # prevents duplicate connections on concurrent starts
         self._fire_task: asyncio.Task | None = None
         self._cooldown_tracker = OrphanTracker()  # dag_ids for which pending queues were created
@@ -133,11 +175,13 @@ class RMQConsumerManager:
 
         for conn in list(self._connections.values()):
             try:
-                await conn.close()
+                await _call_with_timeout(conn.close(), timeout=_CLOSE_TIMEOUT)
             except Exception:
                 pass
         self._active.clear()
         self._connections.clear()
+        self._publish_channels.clear()
+        self._publish_timeouts.clear()
 
         if self._http_client is not None:
             try:
@@ -192,15 +236,20 @@ class RMQConsumerManager:
                     entry.task.cancel()
                     await asyncio.gather(entry.task, return_exceptions=True)
                 task = asyncio.create_task(self._consume_subscription(sub))
-                self._active[sub_id] = _ActiveSub(task=task, sub=sub.copy())
+                self._active[sub_id] = _ActiveSub(
+                    task=task, sub=sub.copy(), state=_ConsumerState(sub_id)
+                )
 
         # close connections no longer referenced by any subscription
         active_conn_ids = {sub["conn_id"] for sub in subscriptions}
-        for conn_id in [c for c in list(self._connections) if c not in active_conn_ids]:
+        for key in [k for k in list(self._connections) if k[0] not in active_conn_ids]:
+            conn_id, role = key
             try:
-                await self._connections.pop(conn_id).close()
+                await _call_with_timeout(self._connections.pop(key).close(), timeout=_CLOSE_TIMEOUT)
             except Exception:
                 pass
+            if role == _ROLE_PUBLISH:
+                self._publish_channels.pop(conn_id, None)
 
         # manage cooldown infrastructure
         cooldown_dag_ids: set[str] = set()
@@ -214,10 +263,10 @@ class RMQConsumerManager:
         if cooldown_dag_ids and fire_conn_id is not None:
             await self._provision_cooldown(cooldown_dag_ids, fire_conn_id)
             if self._fire_task is None or self._fire_task.done():
-                connection = self._connections.get(fire_conn_id)
+                connection = self._connections.get((fire_conn_id, _ROLE_CONSUME))
                 if connection is not None:
                     self._fire_task = asyncio.create_task(
-                        self._consume_fire_queue(connection)
+                        self._consume_fire_queue(connection, fire_conn_id)
                     )
                 else:
                     log.warning(
@@ -267,15 +316,16 @@ class RMQConsumerManager:
         """
         try:
             connection = await self._get_or_create_connection(conn_id)
+            rpc_timeout = self._rpc_timeout(conn_id)
             # Use a short-lived channel for setup operations
-            setup_channel = await connection.channel()
+            setup_channel = await _call_with_timeout(connection.channel(), timeout=rpc_timeout)
             try:
-                await _ensure_fire_infrastructure(setup_channel)
+                await _ensure_fire_infrastructure(setup_channel, timeout=rpc_timeout)
                 for dag_id in cooldown_dag_ids:
-                    await _ensure_pending_queue(setup_channel, dag_id)
+                    await _ensure_pending_queue(setup_channel, dag_id, timeout=rpc_timeout)
             finally:
                 try:
-                    await setup_channel.close()
+                    await _call_with_timeout(setup_channel.close(), timeout=_CLOSE_TIMEOUT)
                 except Exception:
                     pass
         except asyncio.CancelledError:
@@ -362,26 +412,82 @@ class RMQConsumerManager:
             except Exception:
                 pass
 
-    async def _get_or_create_connection(self, conn_id: str) -> Any:
-        # Fast path: connection already exists
-        if conn_id in self._connections:
-            return self._connections[conn_id]
+    def _rpc_timeout(self, conn_id: str | None) -> float:
+        """Seconds allowed for a single AMQP RPC on ``conn_id``.
+
+        The value comes from the connection's ``extra`` and is cached when the
+        connection is built; before that — and for callers that have no conn_id — the
+        provider default applies.
+        """
+        timeouts = self._timeouts.get(conn_id) if conn_id else None
+        return timeouts.rpc if timeouts else DEFAULT_RPC_TIMEOUT
+
+    async def _drop_connection(self, conn_id: str, role: str | None = None) -> None:
+        """Close and forget the connection(s) of ``conn_id`` — both roles, or one named.
+
+        The entry leaves the pool before ``close()`` is attempted, so a connection whose
+        close hangs is still gone from the cache: a zombie connection answers every call
+        with silence, and keeping it would hand the same dead object to the next caller.
+        """
+        roles = (role,) if role is not None else (_ROLE_CONSUME, _ROLE_PUBLISH)
+        for pooled_role in roles:
+            connection = self._connections.pop((conn_id, pooled_role), None)
+            if pooled_role == _ROLE_PUBLISH:
+                self._publish_channels.pop(conn_id, None)
+            if connection is None:
+                continue
+            try:
+                await _call_with_timeout(connection.close(), timeout=_CLOSE_TIMEOUT)
+            except Exception as exc:
+                log.warning(
+                    "Closing the %s connection of conn_id=%r failed: %s — dropped from the "
+                    "pool anyway",
+                    pooled_role, conn_id, exc,
+                )
+        self._last_drop_at[conn_id] = time.monotonic()
+
+    async def _get_publish_channel(self, conn_id: str) -> Any:
+        """Return a channel on the publish connection of ``conn_id``, opening it on demand."""
+        channel = self._publish_channels.get(conn_id)
+        if channel is not None and not channel.is_closed:
+            return channel
+        connection = await self._get_or_create_connection(conn_id, role=_ROLE_PUBLISH)
+        channel = await _call_with_timeout(
+            connection.channel(), timeout=self._rpc_timeout(conn_id)
+        )
+        self._publish_channels[conn_id] = channel
+        return channel
+
+    async def _get_or_create_connection(self, conn_id: str, role: str = _ROLE_CONSUME) -> Any:
+        key = (conn_id, role)
+        # Fast path: a live connection is already pooled
+        connection = self._connections.get(key)
+        if connection is not None and not connection.is_closed:
+            return connection
 
         # Slow path: acquire lock to prevent duplicate connection creation
         async with self._conn_lock:
-            if conn_id in self._connections:
-                return self._connections[conn_id]
+            connection = self._connections.get(key)
+            if connection is not None:
+                if not connection.is_closed:
+                    return connection
+                # A closed connection never revives — replace it with a fresh one.
+                del self._connections[key]
+                if role == _ROLE_PUBLISH:
+                    self._publish_channels.pop(conn_id, None)
 
             loop = asyncio.get_running_loop()
             conn_info = await loop.run_in_executor(None, BaseHook.get_connection, conn_id)
             url, ssl_context = build_amqp_connection(conn_info)
-            kwargs: dict[str, Any] = {"url": url}
+            timeouts = get_amqp_timeouts(conn_info)
+            self._timeouts[conn_id] = timeouts
+            kwargs: dict[str, Any] = {"url": url, "timeout": timeouts.connect}
             if ssl_context is not None:
                 kwargs["ssl_context"] = ssl_context
 
             try:
                 connection = await aio_pika.connect_robust(**kwargs)
-                self._connections[conn_id] = connection
+                self._connections[key] = connection
             except Exception as exc:
                 try:
                     with WatcherSession() as session:
@@ -403,6 +509,7 @@ class RMQConsumerManager:
         sub: dict,
         http_client: httpx.AsyncClient,
         loop: asyncio.AbstractEventLoop,
+        rpc_timeout: float = DEFAULT_RPC_TIMEOUT,
     ) -> bool:
         """Provision the sub queue + bind-diff for a single exchange-mode subscription.
 
@@ -417,7 +524,7 @@ class RMQConsumerManager:
         dag_id = sub["dag_id"]
         conn_id = sub["conn_id"]
         try:
-            queue = await _ensure_sub_queue(setup_channel, dag_id)
+            queue = await _ensure_sub_queue(setup_channel, dag_id, timeout=rpc_timeout)
 
             conn_info = await loop.run_in_executor(None, BaseHook.get_connection, conn_id)
             vhost = conn_info.schema or "/"
@@ -456,7 +563,7 @@ class RMQConsumerManager:
                 return True
 
             desired = set(sub.get("routing_keys") or [])
-            await _sync_bindings(queue, exchange, desired, current)
+            await _sync_bindings(queue, exchange, desired, current, timeout=rpc_timeout)
         except asyncio.CancelledError:
             raise
         except aio_pika.exceptions.ChannelClosed:
@@ -506,15 +613,20 @@ class RMQConsumerManager:
         for (conn_id, exchange), group in groups.items():
             try:
                 connection = await self._get_or_create_connection(conn_id)
-                setup_channel = await connection.channel()
+                rpc_timeout = self._rpc_timeout(conn_id)
+                setup_channel = await _call_with_timeout(
+                    connection.channel(), timeout=rpc_timeout
+                )
                 try:
-                    await _ensure_exchange_infrastructure(setup_channel, exchange)
+                    await _ensure_exchange_infrastructure(
+                        setup_channel, exchange, timeout=rpc_timeout
+                    )
 
                     for sub in group:
                         dag_id = sub["dag_id"]
                         try:
                             provisioned = await self._provision_one_exchange_sub(
-                                setup_channel, exchange, sub, http_client, loop,
+                                setup_channel, exchange, sub, http_client, loop, rpc_timeout,
                             )
                         except asyncio.CancelledError:
                             raise
@@ -543,7 +655,9 @@ class RMQConsumerManager:
                             # the same (conn_id, exchange) group are not collaterally
                             # broken by this one DAG's conflict.
                             try:
-                                setup_channel = await connection.channel()
+                                setup_channel = await _call_with_timeout(
+                                    connection.channel(), timeout=rpc_timeout
+                                )
                             except Exception as reopen_exc:
                                 log.error(
                                     "Failed to reopen channel on conn_id=%r after "
@@ -557,7 +671,7 @@ class RMQConsumerManager:
                             self._exchange_tracker.mark_provisioned({dag_id})
                 finally:
                     try:
-                        await setup_channel.close()
+                        await _call_with_timeout(setup_channel.close(), timeout=_CLOSE_TIMEOUT)
                     except Exception:
                         pass
             except asyncio.CancelledError:
@@ -587,6 +701,16 @@ class RMQConsumerManager:
                 )
                 continue
 
+    def _state_of(self, sub_id: int) -> _ConsumerState:
+        """State record the manager keeps for a subscription.
+
+        The consumer task reports its status into this object, which is what lets the
+        manager tell a subscription that believes it is listening from one still
+        connecting or backing off after an error.
+        """
+        entry = self._active.get(sub_id)
+        return entry.state if entry is not None else _ConsumerState(sub_id)
+
     async def _consume_subscription(self, sub: dict) -> None:
         sub_id: int = sub["id"]
         dag_id: str = sub["dag_id"]
@@ -594,39 +718,42 @@ class RMQConsumerManager:
         conn_id: str = sub["conn_id"]
         cooldown: int = sub.get("cooldown", 0) or 0
         msg_filter = MessageFilter.deserialize(sub.get("filter_data") or {})
-        state = _ConsumerState(sub_id)
+        state = self._state_of(sub_id)
+        consumer_tag = _consumer_tag(sub_id)
 
         while True:
             state.write("connecting")
             try:
                 connection = await self._get_or_create_connection(conn_id)
-                channel = await connection.channel()
-                queue = await channel.declare_queue(queue_name, passive=True)
+                rpc_timeout = self._rpc_timeout(conn_id)
+                channel = await _call_with_timeout(connection.channel(), timeout=rpc_timeout)
+                queue = await _call_with_timeout(
+                    channel.declare_queue(queue_name, passive=True), timeout=rpc_timeout
+                )
+                # No set_qos on purpose: messages that miss the filter are NACKed with
+                # requeue (ADR-0002) and come back to the head of the queue, so any finite
+                # prefetch window fills up with them and consumption stops for good once
+                # the misses reach the window size. The unacked window stays unbounded.
                 state.write("listening", last_error=None)
 
-                async with queue.iterator() as q_iter:
+                async with queue.iterator(consumer_tag=consumer_tag) as q_iter:
                     async for message in q_iter:
                         if cooldown > 0:
                             # Cooldown mode: match-only check, then publish to pending queue
                             if not _match(message, msg_filter):
                                 await _nack_and_sleep(message)
                                 continue
-                            msg_id = str(uuid.uuid4())
-                            pending_queue = f"{_PENDING_QUEUE_PREFIX}{dag_id}"
-                            await channel.default_exchange.publish(
-                                aio_pika.Message(
-                                    b"",
-                                    expiration=str(cooldown * 1000),
-                                    message_id=msg_id,
-                                ),
-                                routing_key=pending_queue,
-                            )
-                            await message.ack()
+                            await self._publish_pending(conn_id, dag_id, cooldown, message)
                         else:
                             # Immediate mode: existing match_and_ack + trigger_dag
                             matched = await match_and_ack(message, msg_filter)
                             if matched:
                                 await self._trigger_dag(dag_id, queue_name, sub_id, message)
+
+                # The iterator finished without an exception — the broker cancelled the
+                # consumer. Pause before subscribing again so a broker that keeps ending
+                # it right away cannot spin this loop.
+                await asyncio.sleep(_RECONNECT_DELAY)
 
             except asyncio.CancelledError:
                 return
@@ -655,14 +782,88 @@ class RMQConsumerManager:
                 )
                 await asyncio.sleep(_RECONNECT_DELAY)
 
-    async def _consume_fire_queue(self, connection: Any) -> None:
+    async def _publish_pending(
+        self, conn_id: str, dag_id: str, cooldown: int, message: Any
+    ) -> None:
+        """Publish the cooldown placeholder for ``dag_id`` and ACK the delivery behind it.
+
+        The publish runs on the publish connection of ``conn_id``, so a broker blocking
+        publishers under a resource alarm leaves the consuming connection — and with it
+        every ``basic.ack`` — untouched.
+
+        A failed publish returns the delivery to the queue right away: leaving the loop
+        hands back only what is still buffered in the iterator, and this message, already
+        taken out of it, would otherwise sit unacknowledged on the abandoned channel until
+        the broker's ``consumer_timeout``.
+        """
+        pending_queue = f"{_PENDING_QUEUE_PREFIX}{dag_id}"
+        try:
+            channel = await self._get_publish_channel(conn_id)
+            await _call_with_timeout(
+                channel.default_exchange.publish(
+                    aio_pika.Message(
+                        b"",
+                        expiration=str(cooldown * 1000),
+                        message_id=str(uuid.uuid4()),
+                    ),
+                    routing_key=pending_queue,
+                ),
+                timeout=self._rpc_timeout(conn_id),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_publish_failure(conn_id, message, exc)
+            raise
+        self._publish_timeouts.pop(conn_id, None)
+        await message.ack()
+
+    async def _handle_publish_failure(
+        self, conn_id: str, message: Any, exc: BaseException
+    ) -> None:
+        """Requeue the delivery and condemn the publish connection after repeated timeouts.
+
+        A publish connection carries no consumers, so the broker-side liveness check never
+        sees it and a zombie there would be handed out of the cache forever. Its own probe
+        is the publish itself: two timeouts in a row mean the connection is gone, and only
+        the publish role is recreated.
+        """
+        try:
+            await message.nack(requeue=True)
+        except Exception as nack_exc:
+            log.warning(
+                "Requeueing the delivery after a failed publish on conn_id=%r failed: %s",
+                conn_id, nack_exc,
+            )
+
+        if not isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            self._publish_timeouts.pop(conn_id, None)
+            return
+
+        count = self._publish_timeouts.get(conn_id, 0) + 1
+        self._publish_timeouts[conn_id] = count
+        if count < _PUBLISH_TIMEOUTS_BEFORE_DROP:
+            return
+
+        log.warning(
+            "Publish timed out %d times in a row on conn_id=%r — recreating its publish "
+            "connection; consumers of this conn_id keep their own connection",
+            count, conn_id,
+        )
+        self._publish_timeouts.pop(conn_id, None)
+        await self._drop_connection(conn_id, role=_ROLE_PUBLISH)
+
+    async def _consume_fire_queue(self, connection: Any, conn_id: str | None = None) -> None:
         """Consumer for rmq_watcher.fire queue — triggers DAGs after cooldown expires via DLX."""
         while True:
             try:
-                channel = await connection.channel()
-                queue = await channel.declare_queue(_FIRE_QUEUE, passive=True)
+                rpc_timeout = self._rpc_timeout(conn_id)
+                channel = await _call_with_timeout(connection.channel(), timeout=rpc_timeout)
+                queue = await _call_with_timeout(
+                    channel.declare_queue(_FIRE_QUEUE, passive=True), timeout=rpc_timeout
+                )
 
-                async with queue.iterator() as q_iter:
+                async with queue.iterator(consumer_tag=_consumer_tag("fire")) as q_iter:
                     async for message in q_iter:
                         dag_id = message.routing_key or ""
                         if not dag_id:
@@ -744,25 +945,35 @@ class RMQConsumerManager:
         await loop.run_in_executor(None, _sync_trigger, dag_id, conf, run_id)
 
 
-async def _ensure_fire_infrastructure(channel: Any) -> None:
+async def _ensure_fire_infrastructure(
+    channel: Any, timeout: float = DEFAULT_RPC_TIMEOUT
+) -> None:
     """Declare the fire exchange and queue idempotently.
 
     - Exchange: rmq_watcher.fire (topic, durable)
     - Queue:    rmq_watcher.fire (durable, binding key=#)
     """
-    exchange = await channel.declare_exchange(
-        _FIRE_EXCHANGE,
-        type=aio_pika.ExchangeType.TOPIC,
-        durable=True,
+    exchange = await _call_with_timeout(
+        channel.declare_exchange(
+            _FIRE_EXCHANGE,
+            type=aio_pika.ExchangeType.TOPIC,
+            durable=True,
+        ),
+        timeout=timeout,
     )
-    queue = await channel.declare_queue(
-        _FIRE_QUEUE,
-        durable=True,
+    queue = await _call_with_timeout(
+        channel.declare_queue(
+            _FIRE_QUEUE,
+            durable=True,
+        ),
+        timeout=timeout,
     )
-    await queue.bind(exchange, routing_key="#")
+    await _call_with_timeout(queue.bind(exchange, routing_key="#"), timeout=timeout)
 
 
-async def _ensure_pending_queue(channel: Any, dag_id: str) -> None:
+async def _ensure_pending_queue(
+    channel: Any, dag_id: str, timeout: float = DEFAULT_RPC_TIMEOUT
+) -> None:
     """Declare the per-DAG pending queue idempotently.
 
     Queue: rmq_watcher.pending.{dag_id}
@@ -775,19 +986,24 @@ async def _ensure_pending_queue(channel: Any, dag_id: str) -> None:
     dead-lettered to rmq_watcher.fire with routing_key=dag_id.
     """
     queue_name = f"{_PENDING_QUEUE_PREFIX}{dag_id}"
-    await channel.declare_queue(
-        queue_name,
-        durable=True,
-        arguments={
-            "x-dead-letter-exchange": _FIRE_EXCHANGE,
-            "x-dead-letter-routing-key": dag_id,
-            "x-max-length": 1,
-            "x-overflow": "reject-publish",
-        },
+    await _call_with_timeout(
+        channel.declare_queue(
+            queue_name,
+            durable=True,
+            arguments={
+                "x-dead-letter-exchange": _FIRE_EXCHANGE,
+                "x-dead-letter-routing-key": dag_id,
+                "x-max-length": 1,
+                "x-overflow": "reject-publish",
+            },
+        ),
+        timeout=timeout,
     )
 
 
-async def _ensure_exchange_infrastructure(channel: Any, exchange: str) -> None:
+async def _ensure_exchange_infrastructure(
+    channel: Any, exchange: str, timeout: float = DEFAULT_RPC_TIMEOUT
+) -> None:
     """Declare the exchange-mode RMQ infrastructure for a given exchange, idempotently.
 
     - Exchange ``{exchange}``: topic, durable, ``arguments={"alternate-exchange": "{exchange}.unrouted"}``
@@ -806,34 +1022,48 @@ async def _ensure_exchange_infrastructure(channel: Any, exchange: str) -> None:
     unrouted_exchange_name = f"{exchange}.unrouted"
     log_queue_name = f"{exchange}.log"
 
-    exchange_obj = await channel.declare_exchange(
-        exchange,
-        type=aio_pika.ExchangeType.TOPIC,
-        durable=True,
-        arguments={"alternate-exchange": unrouted_exchange_name},
+    exchange_obj = await _call_with_timeout(
+        channel.declare_exchange(
+            exchange,
+            type=aio_pika.ExchangeType.TOPIC,
+            durable=True,
+            arguments={"alternate-exchange": unrouted_exchange_name},
+        ),
+        timeout=timeout,
     )
 
-    unrouted_exchange_obj = await channel.declare_exchange(
-        unrouted_exchange_name,
-        type=aio_pika.ExchangeType.FANOUT,
-        durable=True,
+    unrouted_exchange_obj = await _call_with_timeout(
+        channel.declare_exchange(
+            unrouted_exchange_name,
+            type=aio_pika.ExchangeType.FANOUT,
+            durable=True,
+        ),
+        timeout=timeout,
     )
-    unrouted_queue = await channel.declare_queue(
-        unrouted_exchange_name,
-        durable=True,
-        arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+    unrouted_queue = await _call_with_timeout(
+        channel.declare_queue(
+            unrouted_exchange_name,
+            durable=True,
+            arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+        ),
+        timeout=timeout,
     )
-    await unrouted_queue.bind(unrouted_exchange_obj)
+    await _call_with_timeout(unrouted_queue.bind(unrouted_exchange_obj), timeout=timeout)
 
-    log_queue = await channel.declare_queue(
-        log_queue_name,
-        durable=True,
-        arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+    log_queue = await _call_with_timeout(
+        channel.declare_queue(
+            log_queue_name,
+            durable=True,
+            arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+        ),
+        timeout=timeout,
     )
-    await log_queue.bind(exchange_obj, routing_key="#")
+    await _call_with_timeout(log_queue.bind(exchange_obj, routing_key="#"), timeout=timeout)
 
 
-async def _ensure_sub_queue(channel: Any, dag_id: str) -> Any:
+async def _ensure_sub_queue(
+    channel: Any, dag_id: str, timeout: float = DEFAULT_RPC_TIMEOUT
+) -> Any:
     """Declare the per-DAG exchange-mode sub queue idempotently and return it.
 
     Queue: ``rmq_watcher.sub.{dag_id}`` — durable, ``x-message-ttl=_EXCHANGE_TTL_MS`` (8h).
@@ -844,10 +1074,13 @@ async def _ensure_sub_queue(channel: Any, dag_id: str) -> Any:
     ADR-0005), not a timer mechanism.
     """
     queue_name = f"{_SUB_QUEUE_PREFIX}{dag_id}"
-    return await channel.declare_queue(
-        queue_name,
-        durable=True,
-        arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+    return await _call_with_timeout(
+        channel.declare_queue(
+            queue_name,
+            durable=True,
+            arguments={"x-message-ttl": _EXCHANGE_TTL_MS},
+        ),
+        timeout=timeout,
     )
 
 
@@ -856,6 +1089,7 @@ async def _sync_bindings(
     exchange: str,
     desired: set[str],
     current: set[str],
+    timeout: float = DEFAULT_RPC_TIMEOUT,
 ) -> None:
     """Bind/unbind a queue to an exchange so its live bindings match ``desired``.
 
@@ -866,14 +1100,14 @@ async def _sync_bindings(
     to_unbind = current - desired
 
     for routing_key in sorted(to_bind):
-        await queue.bind(exchange, routing_key=routing_key)
+        await _call_with_timeout(queue.bind(exchange, routing_key=routing_key), timeout=timeout)
         log.info(
             "Bound queue %s to exchange %r with routing_key=%r",
             queue.name, exchange, routing_key,
         )
 
     for routing_key in sorted(to_unbind):
-        await queue.unbind(exchange, routing_key=routing_key)
+        await _call_with_timeout(queue.unbind(exchange, routing_key=routing_key), timeout=timeout)
         log.info(
             "Unbound queue %s from exchange %r with routing_key=%r",
             queue.name, exchange, routing_key,

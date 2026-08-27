@@ -113,6 +113,38 @@ def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
     )
 
 
+async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
+    """Await ``awaitable``, raising :exc:`asyncio.TimeoutError` after ``timeout`` seconds.
+
+    :param awaitable: Coroutine or future to await; it is cancelled when the timeout hits.
+    :param timeout: Seconds allowed for the call.
+
+    Cancellation of the *caller* is passed on untouched. ``asyncio.wait_for`` on Python
+    below 3.11 returns the inner result instead when the caller is cancelled in the same
+    moment the inner future completes, so the ``CancelledError`` disappears and the caller
+    keeps running — a consumer task would then ignore ``stop()`` and reconcile would wait
+    for it forever.
+    """
+    loop = asyncio.get_running_loop()
+    future = asyncio.ensure_future(awaitable)
+    expired = False
+
+    def _on_timeout() -> None:
+        nonlocal expired
+        expired = True
+        future.cancel()
+
+    timer = loop.call_later(timeout, _on_timeout)
+    try:
+        return await future
+    except asyncio.CancelledError:
+        if expired:
+            raise asyncio.TimeoutError() from None
+        raise
+    finally:
+        timer.cancel()
+
+
 class _PropsShim:
     """Shim to bridge aio_pika message headers to MessageFilter's HasHeaders protocol."""
 

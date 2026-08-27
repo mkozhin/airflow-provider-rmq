@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import aio_pika
@@ -8,11 +9,17 @@ import aio_pika.exceptions
 import httpx
 import pytest
 
+from airflow_provider_rmq.utils.amqp import AmqpTimeouts
+
 from airflow_provider_rmq.watcher.consumer import (
     RMQConsumerManager,
     _ActiveSub,
+    _CLOSE_TIMEOUT,
     _ConsumerState,
     _RECONNECT_DELAY,
+    _ROLE_CONSUME,
+    _ROLE_PUBLISH,
+    _consumer_tag,
     _build_run_id,
     _sync_trigger,
     _ensure_fire_infrastructure,
@@ -551,6 +558,8 @@ class TestConsumeSubscription:
         channel.declare_queue = AsyncMock(return_value=_make_push_queue())
         connection.channel = AsyncMock(return_value=channel)
 
+        connection.is_closed = False
+
         conn_info = MagicMock()
         conn_info.extra_dejson = {}
         conn_info.schema = "/"
@@ -772,27 +781,27 @@ class TestSubsChanged:
     def test_no_change_returns_false(self):
         manager = RMQConsumerManager()
         sub = _sub(id=1, cooldown=300, filter_data={"k": "v"}, conn_id="c1")
-        manager._active[1] = _ActiveSub(task=MagicMock(), sub=sub.copy())
+        manager._active[1] = _ActiveSub(task=MagicMock(), sub=sub.copy(), state=_ConsumerState(1))
         assert manager._subs_changed(1, sub) is False
 
     def test_cooldown_change_returns_true(self):
         manager = RMQConsumerManager()
         old_sub = _sub(id=1, cooldown=300)
-        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy())
+        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy(), state=_ConsumerState(1))
         new_sub = _sub(id=1, cooldown=600)
         assert manager._subs_changed(1, new_sub) is True
 
     def test_filter_data_change_returns_true(self):
         manager = RMQConsumerManager()
         old_sub = _sub(id=1, filter_data={"type": "order"})
-        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy())
+        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy(), state=_ConsumerState(1))
         new_sub = _sub(id=1, filter_data={"type": "payment"})
         assert manager._subs_changed(1, new_sub) is True
 
     def test_conn_id_change_returns_true(self):
         manager = RMQConsumerManager()
         old_sub = _sub(id=1, conn_id="conn_a")
-        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy())
+        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy(), state=_ConsumerState(1))
         new_sub = _sub(id=1, conn_id="conn_b")
         assert manager._subs_changed(1, new_sub) is True
 
@@ -806,7 +815,7 @@ class TestSubsChanged:
         _provision_exchange_subs reacts to it, the consumer task/queue stay the same."""
         manager = RMQConsumerManager()
         old_sub = _exchange_sub(id=1, exchange="jetstat.airflow", routing_keys=["a.succeeded"])
-        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy())
+        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy(), state=_ConsumerState(1))
 
         new_sub = _exchange_sub(id=1, exchange="jetstat.airflow", routing_keys=["b.failed", "c.*"])
         assert manager._subs_changed(1, new_sub) is False
@@ -816,7 +825,7 @@ class TestSubsChanged:
         also does not restart the task — same rationale as routing_keys change."""
         manager = RMQConsumerManager()
         old_sub = _exchange_sub(id=1, exchange="jetstat.airflow")
-        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy())
+        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy(), state=_ConsumerState(1))
 
         new_sub = _exchange_sub(id=1, exchange="some.other.exchange")
         assert manager._subs_changed(1, new_sub) is False
@@ -994,7 +1003,7 @@ class TestProvisionCooldown:
         setup_channel.declare_exchange = AsyncMock(return_value=AsyncMock())
         setup_channel.declare_queue = AsyncMock(return_value=AsyncMock())
         connection.channel = AsyncMock(return_value=setup_channel)
-        manager._connections["rmq_default"] = connection
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = connection
 
         with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
              patch.object(manager, "_consume_fire_queue", side_effect=lambda c: asyncio.Future()), \
@@ -1007,7 +1016,7 @@ class TestProvisionCooldown:
 
         # Cancel running tasks for clean state
         await manager.stop()
-        manager._connections["rmq_default"] = connection
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = connection
 
         # Second reconcile: remove ALL cooldown subscriptions (empty list)
         with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
@@ -1660,13 +1669,13 @@ class TestConsumeFireQueue:
         async def blocking_consume(sub):
             await asyncio.Future()
 
-        async def blocking_fire(conn):
+        async def blocking_fire(conn, conn_id=None):
             await asyncio.Future()
 
         connection = AsyncMock()
 
         # Pre-populate _connections so reconcile can find it after _provision_cooldown
-        manager._connections["rmq_default"] = connection
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = connection
 
         with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
              patch.object(manager, "_consume_fire_queue", side_effect=blocking_fire), \
@@ -1694,13 +1703,13 @@ class TestConsumeFireQueue:
         async def blocking_consume(sub):
             await asyncio.Future()
 
-        async def blocking_fire(conn):
+        async def blocking_fire(conn, conn_id=None):
             await asyncio.Future()
 
         connection = AsyncMock()
 
         # Pre-populate _connections so reconcile can find it after _provision_cooldown
-        manager._connections["rmq_default"] = connection
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = connection
 
         with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
              patch.object(manager, "_consume_fire_queue", side_effect=blocking_fire), \
@@ -2582,3 +2591,577 @@ class TestHttpClientLifecycle:
             await manager.stop()
         mock_aclose.assert_awaited_once()
         assert manager._http_client is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for connection health, roles, timeouts and consumer tags
+# ---------------------------------------------------------------------------
+
+def _make_live_connection(channel=None):
+    """AsyncMock connection that reports itself open."""
+    connection = AsyncMock()
+    connection.is_closed = False
+    if channel is not None:
+        connection.channel = AsyncMock(return_value=channel)
+    return connection
+
+
+def _make_live_channel(queue=None):
+    channel = AsyncMock()
+    channel.is_closed = False
+    channel.default_exchange = AsyncMock()
+    channel.default_exchange.publish = AsyncMock()
+    if queue is not None:
+        channel.declare_queue = AsyncMock(return_value=queue)
+    return channel
+
+
+def _make_conn_info():
+    conn_info = MagicMock()
+    conn_info.extra_dejson = {}
+    conn_info.schema = "/"
+    conn_info.port = None
+    conn_info.login = "guest"
+    conn_info.password = "guest"
+    conn_info.host = "localhost"
+    return conn_info
+
+
+def _hanging_call(*args, **kwargs):
+    """Coroutine that never resolves — models a zombie connection swallowing an RPC."""
+    return asyncio.Future()
+
+
+def _fast_timeouts(manager, conn_id: str = "rmq_default", rpc: float = 0.05) -> None:
+    manager._timeouts[conn_id] = AmqpTimeouts(connect=0.05, rpc=rpc)
+
+
+class TestConnectionPool:
+    @pytest.mark.asyncio
+    async def test_closed_connection_is_replaced(self, manager):
+        closed = AsyncMock()
+        closed.is_closed = True
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = closed
+        fresh = _make_live_connection()
+
+        with patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
+                   new_callable=AsyncMock, return_value=fresh) as mock_connect, \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=_make_conn_info()):
+            result = await manager._get_or_create_connection("rmq_default")
+
+        assert result is fresh
+        assert manager._connections[("rmq_default", _ROLE_CONSUME)] is fresh
+        assert closed not in manager._connections.values()
+        assert mock_connect.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_live_connection_is_reused(self, manager):
+        live = _make_live_connection()
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = live
+
+        with patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
+                   new_callable=AsyncMock) as mock_connect:
+            first = await manager._get_or_create_connection("rmq_default")
+            second = await manager._get_or_create_connection("rmq_default")
+
+        assert first is live and second is live
+        mock_connect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_connect_robust_gets_connect_timeout_from_extra(self, manager):
+        conn_info = _make_conn_info()
+        conn_info.extra_dejson = {"connect_timeout": 3}
+
+        with patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
+                   new_callable=AsyncMock, return_value=_make_live_connection()) as mock_connect, \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info):
+            await manager._get_or_create_connection("rmq_default")
+
+        assert mock_connect.await_args.kwargs["timeout"] == 3
+
+    @pytest.mark.asyncio
+    async def test_consume_and_publish_roles_are_separate_connections(self, manager):
+        consume_conn = _make_live_connection()
+        publish_conn = _make_live_connection()
+        created = [consume_conn, publish_conn]
+
+        async def fake_connect(**kwargs):
+            return created.pop(0)
+
+        with patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
+                   side_effect=fake_connect), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=_make_conn_info()):
+            first = await manager._get_or_create_connection("rmq_default")
+            second = await manager._get_or_create_connection("rmq_default", role=_ROLE_PUBLISH)
+
+        assert first is consume_conn
+        assert second is publish_conn
+        assert manager._connections[("rmq_default", _ROLE_CONSUME)] is consume_conn
+        assert manager._connections[("rmq_default", _ROLE_PUBLISH)] is publish_conn
+
+    @pytest.mark.asyncio
+    async def test_drop_connection_removes_both_roles_when_close_hangs(self, manager):
+        consume_conn = _make_live_connection()
+        consume_conn.close = _hanging_call
+        publish_conn = _make_live_connection()
+        publish_conn.close = _hanging_call
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = consume_conn
+        manager._connections[("rmq_default", _ROLE_PUBLISH)] = publish_conn
+        manager._publish_channels["rmq_default"] = _make_live_channel()
+
+        with patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05), \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            await manager._drop_connection("rmq_default")
+
+        assert manager._connections == {}
+        assert "rmq_default" not in manager._publish_channels
+        assert "rmq_default" in manager._last_drop_at
+        assert mock_log.warning.call_args_list, "a close that never returns must be logged"
+
+    @pytest.mark.asyncio
+    async def test_drop_connection_with_publish_role_keeps_consume(self, manager):
+        consume_conn = _make_live_connection()
+        publish_conn = _make_live_connection()
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = consume_conn
+        manager._connections[("rmq_default", _ROLE_PUBLISH)] = publish_conn
+
+        await manager._drop_connection("rmq_default", role=_ROLE_PUBLISH)
+
+        assert manager._connections == {("rmq_default", _ROLE_CONSUME): consume_conn}
+        publish_conn.close.assert_awaited_once()
+        consume_conn.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_keeps_connections_of_active_subscriptions(self, manager):
+        """Regression: pool keys are tuples, so comparing them with plain conn_id strings
+        would close the connection under every running consumer on each cycle."""
+        connection = _make_live_connection()
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = connection
+
+        async def blocking_consume(sub):
+            await asyncio.Future()
+
+        with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch.object(manager, "_provision_cooldown"):
+            await manager.reconcile([_sub(id=1)])
+
+        assert manager._connections[("rmq_default", _ROLE_CONSUME)] is connection
+        connection.close.assert_not_awaited()
+
+        manager._active[1].task.cancel()
+        await asyncio.gather(manager._active[1].task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_closes_connections_of_removed_conn_id(self, manager):
+        connection = _make_live_connection()
+        manager._connections[("gone_conn", _ROLE_CONSUME)] = connection
+
+        with patch.object(manager, "_update_all_conn_counts"), \
+             patch.object(manager, "_provision_cooldown"):
+            await manager.reconcile([])
+
+        assert manager._connections == {}
+        connection.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fire_task_starts_on_pooled_consume_connection(self, manager):
+        """Regression: the fire task reads the pool by ``(conn_id, role)``; a plain
+        conn_id lookup returns nothing and cooldown DAGs stop being triggered."""
+        setup_channel = _make_live_channel(queue=AsyncMock())
+        setup_channel.declare_exchange = AsyncMock(return_value=AsyncMock())
+        connection = _make_live_connection(channel=setup_channel)
+
+        async def blocking_consume(sub):
+            await asyncio.Future()
+
+        async def blocking_fire(conn, conn_id=None):
+            await asyncio.Future()
+
+        with patch("airflow_provider_rmq.watcher.consumer.aio_pika.connect_robust",
+                   new_callable=AsyncMock, return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=_make_conn_info()), \
+             patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_consume_fire_queue", side_effect=blocking_fire), \
+             patch.object(manager, "_update_all_conn_counts"):
+            await manager.reconcile([_sub(id=1, cooldown=300)])
+            await asyncio.sleep(0)
+
+            assert manager._fire_task is not None
+            assert not manager._fire_task.done()
+
+        await manager.stop()
+
+
+class TestPublishConnection:
+    def _cooldown_manager(self, publish_channel):
+        manager = RMQConsumerManager()
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = _make_live_connection()
+        manager._connections[("rmq_default", _ROLE_PUBLISH)] = _make_live_connection()
+        manager._publish_channels["rmq_default"] = publish_channel
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_cooldown_publishes_on_publish_connection(self):
+        msg = _make_fake_message(b"order")
+        queue = _make_push_queue([msg])
+        consume_channel = _make_live_channel(queue=queue)
+        publish_channel = _make_live_channel()
+        consume_conn = _make_live_connection(channel=consume_channel)
+        publish_conn = _make_live_connection(channel=publish_channel)
+
+        manager = RMQConsumerManager()
+        published = asyncio.Event()
+
+        async def capture_publish(amqp_msg, routing_key):
+            published.set()
+
+        publish_channel.default_exchange.publish = capture_publish
+
+        async def get_conn(conn_id, role=_ROLE_CONSUME):
+            return publish_conn if role == _ROLE_PUBLISH else consume_conn
+
+        with patch.object(manager, "_get_or_create_connection", side_effect=get_conn), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"):
+            task = asyncio.create_task(manager._consume_subscription(_sub(cooldown=300)))
+            await asyncio.wait_for(published.wait(), timeout=2.0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert published.is_set()
+        consume_channel.default_exchange.publish.assert_not_called()
+        msg.ack.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_publish_failure_requeues_the_delivery(self):
+        publish_channel = _make_live_channel()
+        publish_channel.default_exchange.publish = AsyncMock(
+            side_effect=aio_pika.exceptions.AMQPError("publish refused")
+        )
+        manager = self._cooldown_manager(publish_channel)
+        msg = _make_fake_message(b"order")
+
+        with pytest.raises(aio_pika.exceptions.AMQPError):
+            await manager._publish_pending("rmq_default", "my_dag", 300, msg)
+
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_publish_timeouts_recreate_only_publish_connection(self):
+        publish_channel = _make_live_channel()
+        publish_channel.default_exchange.publish = _hanging_call
+        manager = self._cooldown_manager(publish_channel)
+        consume_conn = manager._connections[("rmq_default", _ROLE_CONSUME)]
+        publish_conn = manager._connections[("rmq_default", _ROLE_PUBLISH)]
+        _fast_timeouts(manager)
+
+        for _ in range(2):
+            with pytest.raises(asyncio.TimeoutError):
+                await manager._publish_pending(
+                    "rmq_default", "my_dag", 300, _make_fake_message(b"order")
+                )
+
+        assert manager._connections == {("rmq_default", _ROLE_CONSUME): consume_conn}
+        assert "rmq_default" not in manager._publish_channels
+        publish_conn.close.assert_awaited_once()
+        consume_conn.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_single_publish_timeout_keeps_publish_connection(self):
+        publish_channel = _make_live_channel()
+        publish_channel.default_exchange.publish = _hanging_call
+        manager = self._cooldown_manager(publish_channel)
+        _fast_timeouts(manager)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await manager._publish_pending(
+                "rmq_default", "my_dag", 300, _make_fake_message(b"order")
+            )
+
+        assert ("rmq_default", _ROLE_PUBLISH) in manager._connections
+        assert manager._publish_timeouts["rmq_default"] == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_publish_resets_the_timeout_counter(self):
+        publish_channel = _make_live_channel()
+        manager = self._cooldown_manager(publish_channel)
+        manager._publish_timeouts["rmq_default"] = 1
+
+        await manager._publish_pending(
+            "rmq_default", "my_dag", 300, _make_fake_message(b"order")
+        )
+
+        assert "rmq_default" not in manager._publish_timeouts
+
+    @pytest.mark.asyncio
+    async def test_hanging_publish_does_not_hang_the_consumer_task(self):
+        msg = _make_fake_message(b"order")
+        queue = _make_push_queue([msg])
+        consume_channel = _make_live_channel(queue=queue)
+        publish_channel = _make_live_channel()
+        publish_channel.default_exchange.publish = _hanging_call
+        manager = RMQConsumerManager()
+        manager._publish_channels["rmq_default"] = publish_channel
+        _fast_timeouts(manager)
+
+        consume_conn = _make_live_connection(channel=consume_channel)
+        publish_conn = _make_live_connection(channel=publish_channel)
+
+        async def get_conn(conn_id, role=_ROLE_CONSUME):
+            return publish_conn if role == _ROLE_PUBLISH else consume_conn
+
+        nacked = asyncio.Event()
+
+        async def capture_nack(*args, **kwargs):
+            nacked.set()
+
+        msg.nack = capture_nack
+
+        with patch.object(manager, "_get_or_create_connection", side_effect=get_conn), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
+             patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep", new_callable=AsyncMock):
+            task = asyncio.create_task(manager._consume_subscription(_sub(cooldown=300)))
+            await asyncio.wait_for(nacked.wait(), timeout=2.0)
+            assert not task.done()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+class TestAmqpCallTimeouts:
+    @pytest.mark.asyncio
+    async def test_hanging_channel_is_transient_and_task_retries(self, manager):
+        connection = _make_live_connection()
+        connection.channel = _hanging_call
+        _fast_timeouts(manager)
+        retried = asyncio.Event()
+        attempts = 0
+
+        async def counting_get_conn(conn_id, role=_ROLE_CONSUME):
+            nonlocal attempts
+            attempts += 1
+            if attempts >= 2:
+                retried.set()
+            return connection
+
+        with patch.object(manager, "_get_or_create_connection", side_effect=counting_get_conn), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
+             patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep", new_callable=AsyncMock):
+            task = asyncio.create_task(manager._consume_subscription(_sub()))
+            await asyncio.wait_for(retried.wait(), timeout=2.0)
+            assert not task.done()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert attempts >= 2
+
+    @pytest.mark.asyncio
+    async def test_hanging_declare_does_not_hang_provisioning(self, manager):
+        setup_channel = _make_live_channel()
+        setup_channel.declare_exchange = _hanging_call
+        connection = _make_live_connection(channel=setup_channel)
+        _fast_timeouts(manager)
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+            await asyncio.wait_for(
+                manager._provision_cooldown({"my_dag"}, "rmq_default"), timeout=2.0
+            )
+
+        assert mock_log.error.call_args_list, "a declare that never returns must be logged"
+
+    @pytest.mark.asyncio
+    async def test_hanging_declare_does_not_hang_reconcile(self, manager):
+        setup_channel = _make_live_channel()
+        setup_channel.declare_exchange = _hanging_call
+        connection = _make_live_connection(channel=setup_channel)
+        manager._connections[("rmq_default", _ROLE_CONSUME)] = connection
+        _fast_timeouts(manager)
+
+        async def blocking_consume(sub):
+            await asyncio.Future()
+
+        async def blocking_fire(conn, conn_id=None):
+            await asyncio.Future()
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_consume_fire_queue", side_effect=blocking_fire), \
+             patch.object(manager, "_update_all_conn_counts"):
+            await asyncio.wait_for(
+                manager.reconcile([_sub(id=1, cooldown=300)]), timeout=2.0
+            )
+
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_hanging_exchange_provisioning_does_not_hang_reconcile(self, manager):
+        setup_channel = _make_live_channel()
+        setup_channel.declare_exchange = _hanging_call
+        connection = _make_live_connection(channel=setup_channel)
+        _fast_timeouts(manager)
+        await manager.start()
+
+        async def blocking_consume(sub):
+            await asyncio.Future()
+
+        try:
+            with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+                 patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+                 patch.object(manager, "_update_all_conn_counts"), \
+                 patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
+                await asyncio.wait_for(
+                    manager.reconcile([_exchange_sub(id=1)]), timeout=2.0
+                )
+            assert mock_log.error.call_args_list
+        finally:
+            await manager.stop()
+
+
+class TestConsumerTag:
+    def test_tag_is_stable_and_distinguishes_subscriptions(self):
+        assert _consumer_tag(1) == _consumer_tag(1)
+        assert _consumer_tag(1) != _consumer_tag(2)
+        assert _consumer_tag(1) != _consumer_tag("fire")
+        assert str(os.getpid()) in _consumer_tag(1)
+        assert _consumer_tag(1).startswith("rmq_watcher.")
+
+    @pytest.mark.asyncio
+    async def test_subscription_consumes_under_its_own_tag(self, manager):
+        queue = _make_push_queue()
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"):
+            task = await _run_then_cancel(manager._consume_subscription(_sub(id=7)), timeout=0.2)
+
+        assert queue.iterator.call_args.kwargs["consumer_tag"] == _consumer_tag(7)
+        assert task.done()
+
+    @pytest.mark.asyncio
+    async def test_fire_consumer_uses_the_fire_tag(self, manager):
+        queue = _make_push_queue()
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+
+        await _run_then_cancel(manager._consume_fire_queue(connection, "rmq_default"), timeout=0.2)
+
+        assert queue.iterator.call_args.kwargs["consumer_tag"] == _consumer_tag("fire")
+
+
+class TestSubscriptionStateVisibleToManager:
+    @pytest.mark.asyncio
+    async def test_state_moves_from_connecting_to_listening(self, manager):
+        queue = _make_push_queue()
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             _patch_watcher_session(), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch.object(manager, "_provision_cooldown"):
+            await manager.reconcile([_sub(id=1)])
+            assert manager._active[1].state.status is None
+
+            await asyncio.sleep(0.05)
+            assert manager._active[1].state.status == "listening"
+
+            manager._active[1].task.cancel()
+            await asyncio.gather(manager._active[1].task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_state_reports_connecting_while_the_broker_is_unreachable(self, manager):
+        real_sleep = asyncio.sleep
+
+        async def failing_get_conn(conn_id, role=_ROLE_CONSUME):
+            raise ConnectionError("broker down")
+
+        async def instant_sleep(delay):
+            await real_sleep(0)
+
+        with patch.object(manager, "_get_or_create_connection", side_effect=failing_get_conn), \
+             _patch_watcher_session(), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch.object(manager, "_provision_cooldown"), \
+             patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep", side_effect=instant_sleep):
+            await manager.reconcile([_sub(id=1)])
+            await real_sleep(0.05)
+
+            assert manager._active[1].state.status == "connecting"
+
+            manager._active[1].task.cancel()
+            await asyncio.gather(manager._active[1].task, return_exceptions=True)
+
+
+class TestConsumptionKeepsGoing:
+    @pytest.mark.asyncio
+    async def test_run_of_non_matching_messages_does_not_stop_consumption(self, manager):
+        misses = [_make_fake_message(b"p", headers={"type": "payment"}) for _ in range(3)]
+        hit = _make_fake_message(b"o", headers={"type": "order"})
+        queue = _make_push_queue([*misses, hit])
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+
+        triggered: list = []
+        got_hit = asyncio.Event()
+
+        async def mock_trigger(dag_id, queue_name, sub_id, message):
+            triggered.append(message)
+            got_hit.set()
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch.object(manager, "_trigger_dag", side_effect=mock_trigger), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
+             patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            task = asyncio.create_task(
+                manager._consume_subscription(
+                    _sub(filter_data={"filter_headers": {"type": "order"}})
+                )
+            )
+            await asyncio.wait_for(got_hit.wait(), timeout=2.0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert triggered == [hit]
+        for miss in misses:
+            miss.nack.assert_awaited_with(requeue=True)
+
+    @pytest.mark.asyncio
+    async def test_iterator_ending_pauses_before_resubscribing(self, manager):
+        class _EndingIterCtx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        queue = MagicMock()
+        queue.iterator.return_value = _EndingIterCtx()
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+
+        delays: list = []
+        paused = asyncio.Event()
+        real_sleep = asyncio.sleep
+
+        async def recording_sleep(delay):
+            delays.append(delay)
+            paused.set()
+            await real_sleep(0)
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
+             patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep", side_effect=recording_sleep):
+            task = asyncio.create_task(manager._consume_subscription(_sub()))
+            await asyncio.wait_for(paused.wait(), timeout=2.0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert delays[0] == _RECONNECT_DELAY
+        assert queue.iterator.call_count >= 1

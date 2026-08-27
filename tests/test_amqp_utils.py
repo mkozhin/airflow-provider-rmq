@@ -12,6 +12,7 @@ from airflow_provider_rmq.utils.amqp import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_HEARTBEAT,
     DEFAULT_RPC_TIMEOUT,
+    call_with_timeout,
     match as _match,
     nack_and_sleep as _nack_and_sleep,
     build_amqp_connection,
@@ -362,3 +363,63 @@ class TestNackAndSleep:
         with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
             await _nack_and_sleep(msg)
         msg.ack.assert_not_called()
+
+
+class TestCallWithTimeout:
+    @pytest.mark.asyncio
+    async def test_returns_the_result_of_a_prompt_call(self):
+        async def quick():
+            return "done"
+
+        assert await call_with_timeout(quick(), 1.0) == "done"
+
+    @pytest.mark.asyncio
+    async def test_raises_timeout_and_cancels_the_call(self):
+        import asyncio
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def hangs():
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with pytest.raises(asyncio.TimeoutError):
+            await call_with_timeout(hangs(), 0.05)
+
+        assert started.is_set()
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_is_not_swallowed(self):
+        """The cancel must reach the caller even when the inner call has just finished.
+
+        ``asyncio.wait_for`` below Python 3.11 returns the inner result in that race and
+        the consumer task would keep running after stop() asked it to end.
+        """
+        import asyncio
+
+        finished = asyncio.Event()
+        resumed = False
+
+        async def inner():
+            finished.set()
+            return "value"
+
+        async def caller():
+            nonlocal resumed
+            await call_with_timeout(inner(), 10.0)
+            resumed = True
+
+        task = asyncio.create_task(caller())
+        await finished.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert resumed is False
