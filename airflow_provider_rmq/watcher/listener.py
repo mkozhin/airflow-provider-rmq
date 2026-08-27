@@ -15,9 +15,9 @@ from typing import Any
 
 from airflow.listeners import hookimpl
 
-from airflow_provider_rmq.utils.amqp import call_with_timeout
+from airflow_provider_rmq.utils.amqp import call_with_timeout, next_backoff
 from airflow_provider_rmq.utils.executor import BoundedExecutor
-from airflow_provider_rmq.utils.metrics import incr as _incr
+from airflow_provider_rmq.utils.metrics import incr
 from airflow_provider_rmq.watcher.consumer import RMQConsumerManager
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -35,6 +35,7 @@ from airflow_provider_rmq.watcher.tunables import (
     CYCLE_TIMEOUT_VAR,
     DEFAULT_RECONCILE_INTERVAL,
     RECONCILE_INTERVAL_VAR,
+    read_positive,
 )
 
 log = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ _STEP_TIMEOUT = 60.0
 #: Cycles to skip after a failed migration attempt: one, then doubling up to the
 #: cap (an hour of cycles at the default interval).
 _MIGRATION_BACKOFF_START = 1
-_MIGRATION_BACKOFF_CAP = 60
+_MIGRATION_BACKOFF_MAX = 60
 
 #: Seconds allowed for the manager to stop before the loop is torn down anyway.
 _STOP_TIMEOUT = 30.0
@@ -568,23 +569,10 @@ def _read_settings() -> tuple[int | None, float | None]:
     Variable is unset or holds something that is not a positive number, which the
     caller reads as "keep the built-in default".
     """
-    from airflow.models import Variable
-
-    def _positive(name: str, cast: Any) -> Any:
-        raw = Variable.get(name, default_var=None)
-        if raw is None:
-            return None
-        try:
-            value = cast(raw)
-        except (TypeError, ValueError):
-            log.warning("RMQ Watcher: Variable %s=%r is not a number — ignoring", name, raw)
-            return None
-        if value <= 0:
-            log.warning("RMQ Watcher: Variable %s=%r must be positive — ignoring", name, raw)
-            return None
-        return value
-
-    return _positive(RECONCILE_INTERVAL_VAR, int), _positive(CYCLE_TIMEOUT_VAR, float)
+    return (
+        read_positive(RECONCILE_INTERVAL_VAR, int),
+        read_positive(CYCLE_TIMEOUT_VAR, float),
+    )
 
 
 def _read_active_subs(exchange_meta: dict) -> list[dict]:
@@ -649,12 +637,10 @@ class RMQWatcherListener:
         # the loop at a point the cycle watchdog does not cover.
         self._reconcile_interval = DEFAULT_RECONCILE_INTERVAL
         self._cycle_timeout_override: float | None = None
-        self._settings_attempt: Future | None = None
         # Blocking cycle steps that are still in a worker, keyed by step name, so the
         # next cycle asks whether the previous attempt returned instead of adding one.
         self._step_attempts: dict[str, Future] = {}
         # Schema migration retry state
-        self._migration_attempt: Future | None = None
         self._migration_backoff = 0          # cycles to skip after the last failure
         self._migration_skip_cycles = 0
         #: Step the current cycle is on, reported when the cycle runs out of budget.
@@ -790,7 +776,7 @@ class RMQWatcherListener:
                         "%.0fs — recreating the event loop",
                         budget, self._phase, time.monotonic() - started,
                     )
-                    _incr("rmq_watcher.cycle_timeout")
+                    incr("rmq_watcher.cycle_timed_out")
                     raise
                 await self._wait_for_next_cycle()
         finally:
@@ -860,27 +846,33 @@ class RMQWatcherListener:
         except Exception:
             log.exception("Error in RMQ Watcher reconciliation cycle")
 
-    async def _cycle_step(self, name: str, fn: Any, *args: Any) -> Any:
+    async def _cycle_step(
+        self, name: str, fn: Any, *args: Any, timeout: float | None = None
+    ) -> Any:
         """Run one blocking step of the cycle in the cycle pool, bounded and unrepeated.
 
         :param name: Step name, used for the in-flight bookkeeping and the log line.
         :param fn: Blocking callable to run in the cycle pool.
+        :param timeout: Seconds this step is given; the steps of the cycle proper leave
+            it out and share :data:`_STEP_TIMEOUT`, the tunable read and the migration
+            name one of their own.
         :returns: Whatever ``fn`` returned.
         :raises _StepInFlight: The previous attempt at this step has not returned.
-        :raises asyncio.TimeoutError: The attempt outlived :data:`_STEP_TIMEOUT`.
+        :raises asyncio.TimeoutError: The attempt outlived ``timeout``.
 
-        Either failure ends the cycle: the steps feed each other, and a reconcile run on
-        a subscription list that could not be read would cancel every consumer of a
-        subscription the query simply did not return.
+        For the steps of the cycle proper either failure ends the cycle: they feed each
+        other, and a reconcile run on a subscription list that could not be read would
+        cancel every consumer of a subscription the query simply did not return.
 
         The bound buys back the coroutine, not the worker — a running thread cannot be
         interrupted — hence the second half: one attempt of a step in flight at a time.
         Resubmitting every cycle would fill the four-worker pool with stuck copies of the
         same call, and the steps that need no database would stop running with it.
         """
+        timeout = _STEP_TIMEOUT if timeout is None else timeout
         attempt = self._step_attempts.get(name)
         if attempt is not None and not attempt.done():
-            _incr("rmq_watcher.cycle_step_in_flight")
+            incr("rmq_watcher.cycle_step_skipped")
             raise _StepInFlight(
                 f"the {name!r} step of an earlier cycle is still running in the "
                 f"{self._cycle_pool.name!r} pool "
@@ -890,13 +882,13 @@ class RMQWatcherListener:
         attempt = self._cycle_pool.submit(fn, *args)
         self._step_attempts[name] = attempt
         try:
-            return await call_with_timeout(asyncio.wrap_future(attempt), _STEP_TIMEOUT)
+            return await call_with_timeout(asyncio.wrap_future(attempt), timeout)
         except asyncio.TimeoutError:
-            _incr("rmq_watcher.cycle_step_timeout")
+            incr("rmq_watcher.cycle_step_timed_out")
             log.warning(
                 "RMQ Watcher: the %r step did not finish within %ss — ending this cycle; "
                 "its worker stays busy until the call itself returns",
-                name, _STEP_TIMEOUT,
+                name, timeout,
             )
             raise
 
@@ -936,14 +928,12 @@ class RMQWatcherListener:
         next one from starting, so an unresponsive database costs one worker rather
         than one per cycle, and a changed Variable takes effect on the next cycle.
         """
-        if self._settings_attempt is not None and not self._settings_attempt.done():
-            return
-        attempt = self._cycle_pool.submit(_read_settings)
-        self._settings_attempt = attempt
         try:
-            interval, cycle_timeout = await call_with_timeout(
-                asyncio.wrap_future(attempt), _VARIABLE_TIMEOUT
+            interval, cycle_timeout = await self._cycle_step(
+                "settings", _read_settings, timeout=_VARIABLE_TIMEOUT
             )
+        except _StepInFlight:
+            return
         except Exception:
             log.warning(
                 "RMQ Watcher: cannot read tunables from Airflow Variables — keeping "
@@ -983,16 +973,16 @@ class RMQWatcherListener:
         """
         if is_schema_ready():
             return
-        if self._migration_attempt is not None and not self._migration_attempt.done():
-            return
         if self._migration_skip_cycles > 0:
             self._migration_skip_cycles -= 1
             return
 
-        attempt = self._cycle_pool.submit(ensure_table_exists)
-        self._migration_attempt = attempt
         try:
-            await call_with_timeout(asyncio.wrap_future(attempt), _MIGRATION_TIMEOUT)
+            await self._cycle_step(
+                "migrate", ensure_table_exists, timeout=_MIGRATION_TIMEOUT
+            )
+        except _StepInFlight:
+            return
         except Exception:
             log.warning(
                 "RMQ Watcher: schema migration attempt failed or exceeded %ss",
@@ -1010,9 +1000,10 @@ class RMQWatcherListener:
 
     def _defer_migration(self) -> None:
         """Hold off the next migration attempt, doubling the wait up to the cap."""
-        self._migration_backoff = min(
-            max(self._migration_backoff * 2, _MIGRATION_BACKOFF_START),
-            _MIGRATION_BACKOFF_CAP,
+        self._migration_backoff = next_backoff(
+            self._migration_backoff,
+            _MIGRATION_BACKOFF_MAX,
+            minimum=_MIGRATION_BACKOFF_START,
         )
         self._migration_skip_cycles = self._migration_backoff
         log.warning(

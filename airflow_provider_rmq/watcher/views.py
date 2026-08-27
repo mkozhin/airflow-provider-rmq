@@ -20,6 +20,7 @@ from airflow_provider_rmq.watcher.subscription_form import parse_cooldown, parse
 from airflow_provider_rmq.watcher.tunables import (
     DEFAULT_RECONCILE_INTERVAL,
     RECONCILE_INTERVAL_VAR,
+    read_positive,
 )
 
 log = logging.getLogger(__name__)
@@ -119,7 +120,7 @@ class ConnStatusRow:
 
     conn_id: str
     status: str
-    consumer_count: int | None
+    consumer_count: int
     broker_consumer_count: int | None
     last_error: str | None
     age_seconds: float | None
@@ -150,17 +151,13 @@ def _reconcile_interval() -> int:
     """Reconcile interval the watcher runs on, in seconds.
 
     The view lives in the webserver process and cannot see the listener's
-    state, so it reads the same Airflow Variable the listener reads. Anything
-    that goes wrong — an unreachable database, an unset or non-numeric
-    Variable — falls back to the built-in default.
+    state, so it reads the same Airflow Variable through the same parser the
+    listener reads it with. Anything that goes wrong — an unreachable database,
+    an unset or unusable Variable — leaves the built-in default, which is what
+    the loop falls back to as well.
     """
     try:
-        from airflow.models import Variable
-
-        raw = Variable.get(RECONCILE_INTERVAL_VAR, default_var=None)
-        if raw is None:
-            return DEFAULT_RECONCILE_INTERVAL
-        interval = int(raw)
+        interval = read_positive(RECONCILE_INTERVAL_VAR, int)
     except Exception:
         log.warning(
             "Failed to read Airflow Variable %s — assuming the default "
@@ -170,14 +167,7 @@ def _reconcile_interval() -> int:
             exc_info=True,
         )
         return DEFAULT_RECONCILE_INTERVAL
-    if interval <= 0:
-        log.warning(
-            "Airflow Variable %s=%r must be positive — assuming the default "
-            "reconcile interval of %ss for the staleness check",
-            RECONCILE_INTERVAL_VAR, raw, DEFAULT_RECONCILE_INTERVAL,
-        )
-        return DEFAULT_RECONCILE_INTERVAL
-    return interval
+    return interval if interval is not None else DEFAULT_RECONCILE_INTERVAL
 
 
 def _build_conn_status_rows(conn_statuses: list[Any], interval: int) -> list[ConnStatusRow]:
@@ -276,6 +266,7 @@ class RMQWatcherView(BaseView):
             subscriptions=rows,
             conn_statuses=conn_status_rows,
             conn_status_error=conn_status_error,
+            stale_interval_factor=_STALE_INTERVAL_FACTOR,
             active_dag_ids=active_dag_ids,
         )
 

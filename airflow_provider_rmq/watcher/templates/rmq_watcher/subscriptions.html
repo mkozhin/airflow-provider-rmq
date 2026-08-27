@@ -64,7 +64,7 @@
               —
             {% elif cs.is_stale %}
               <span class="label label-warning"
-                    title="The last reconcile cycle for this conn_id is older than two reconcile intervals — the watcher loop is stuck, restarting, or not running at all.">
+                    title="The last reconcile cycle for this conn_id is older than {{ stale_interval_factor }} reconcile intervals — the watcher loop is stuck, restarting, or not running at all.">
                 ⚠ {{ cs.age_display }} ago
               </span>
             {% else %}

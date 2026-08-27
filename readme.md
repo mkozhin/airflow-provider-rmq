@@ -732,6 +732,7 @@ conf = context["dag_run"].conf
 # Cooldown trigger (fired after TTL expires in rmq_watcher.fire):
 # {
 #     "source":          "cooldown",
+#     "dag_id":          "<dag_id>",
 #     "body":            "",        # empty — original message body not preserved
 #     "headers":         {},        # empty — original headers not preserved
 #     "routing_key":     "<dag_id>",
@@ -779,7 +780,7 @@ Both are re-read at the start of every cycle in a thread pool under a short time
 
 | Column | Meaning |
 |---|---|
-| Status | `connected` when the broker confirmed every one of our consumer tags on this `conn_id`; `error` on a negative verdict — a consumer the broker did not confirm, no running task of this `conn_id` at all, or a failed connection attempt (the reason is in Last Error); `degraded` when a negative verdict was held back by the recreation rate limit and the connection was left in place instead of being recreated again so soon; `unknown` for a `conn_id` no liveness check has ever reached a verdict on; `disconnected` only as a value carried over from an older row. The status follows the verdict alone — a `conn_id` with no verdict keeps whatever is stored, and the number of tasks the watcher started never makes a row green |
+| Status | `connected` when the broker confirmed every one of our consumer tags on this `conn_id`; `error` on a negative verdict — a consumer the broker did not confirm, no running task of this `conn_id` at all, or a failed connection attempt (the reason is in Last Error); `degraded` when a negative verdict was held back by the recreation rate limit and the connection was left in place instead of being recreated again so soon; `unknown` for a `conn_id` no liveness check has ever reached a verdict on; `disconnected` as the column default a row carries until the first verdict is written to it. The status follows the verdict alone — a `conn_id` with no verdict keeps whatever is stored, and the number of tasks the watcher started never makes a row green |
 | Consumers | How many live consumer tasks the watcher holds for this `conn_id`, the cooldown fire task included when it runs there |
 | Broker consumers | How many consumers the broker reports on the queues of the subscriptions that were actually probed — those whose own status is `listening` — plus `rmq_watcher.fire` when the fire consumer runs on this `conn_id`. `—` means there is no number at all: the passive-declare fallback never returns one, so a connection without `management_url` keeps the em dash even when the verdict is positive. A number that differs from the previous column is highlighted — lower means a subscription that has not attached yet (still connecting, or backing off after an error) and is therefore not probed, higher means other clients or another scheduler replica on the same queues |
 | Last reconcile | Age of the last cycle for this `conn_id`, flagged when it is older than two reconcile intervals — the loop is stuck, restarting, or not running at all |

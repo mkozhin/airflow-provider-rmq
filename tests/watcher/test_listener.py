@@ -365,20 +365,37 @@ class TestExtractDagIdUnpacking:
 # on_starting / before_stopping
 # ---------------------------------------------------------------------------
 
+class SchedulerJobRunner:
+    """Airflow component the watcher starts in — recognised by its class name."""
+
+
+class GunicornWebServer:
+    """Airflow component the watcher stays out of, recognised the same way."""
+
+
+def _blocked_by(release: threading.Event, result=None, calls: list | None = None):
+    """A blocking call that holds its worker until ``release`` is set.
+
+    :param result: What the call returns once it is released.
+    :param calls: Collects one entry per invocation, for tests that count attempts.
+    """
+    def blocked(*_args, **_kwargs):
+        if calls is not None:
+            calls.append(1)
+        release.wait(timeout=5)
+        return result
+
+    return blocked
+
+
 class TestListenerLifecycle:
     def test_on_starting_with_scheduler_starts_thread(self):
-        class SchedulerJobRunner:
-            pass
-
         listener = RMQWatcherListener()
         with patch.object(listener, "_start") as mock_start:
             listener.on_starting(SchedulerJobRunner())
         mock_start.assert_called_once()
 
     def test_on_starting_with_webserver_ignores(self):
-        class GunicornWebServer:
-            pass
-
         listener = RMQWatcherListener()
         with patch.object(listener, "_start") as mock_start:
             listener.on_starting(GunicornWebServer())
@@ -451,9 +468,6 @@ class TestListenerLifecycle:
 
     def test_duplicate_on_starting_creates_only_one_thread(self):
         """L2: второй on_starting при живом потоке должен игнорироваться."""
-        class SchedulerJobRunner:
-            pass
-
         listener = RMQWatcherListener()
 
         with patch("threading.Thread") as mock_thread_cls:
@@ -1887,12 +1901,7 @@ class TestCycleWorkOffTheLoop:
         listener._cycle_timeout_override = 0.1
         manager = _fake_manager()
         release = threading.Event()
-
-        def blocked():
-            release.wait(timeout=5)
-            return []
-
-        listener._scan_subscriptions = blocked
+        listener._scan_subscriptions = _blocked_by(release, result=[])
         try:
             with _cycle_patches(manager), pytest.raises(asyncio.TimeoutError):
                 await listener._main()
@@ -1921,16 +1930,11 @@ class TestCycleStepsAreBounded:
         manager = _fake_manager()
         listener._manager = manager
         release = threading.Event()
-
-        def blocked():
-            release.wait(timeout=5)
-            return []
-
-        listener._scan_subscriptions = blocked
+        listener._scan_subscriptions = _blocked_by(release, result=[])
         try:
             with _cycle_patches(manager), patch(
                 "airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.05
-            ), patch("airflow_provider_rmq.watcher.listener._incr") as incr, \
+            ), patch("airflow_provider_rmq.watcher.listener.incr") as incr, \
                     caplog.at_level(
                         logging.WARNING,
                         logger="airflow_provider_rmq.watcher.listener",
@@ -1940,7 +1944,7 @@ class TestCycleStepsAreBounded:
             release.set()
 
         manager.reconcile.assert_not_awaited()
-        incr.assert_any_call("rmq_watcher.cycle_step_timeout")
+        incr.assert_any_call("rmq_watcher.cycle_step_timed_out")
         assert any("did not finish" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -1950,17 +1954,11 @@ class TestCycleStepsAreBounded:
         listener._manager = manager
         release = threading.Event()
         starts = []
-
-        def blocked():
-            starts.append(1)
-            release.wait(timeout=5)
-            return []
-
-        listener._scan_subscriptions = blocked
+        listener._scan_subscriptions = _blocked_by(release, result=[], calls=starts)
         try:
             with _cycle_patches(manager), patch(
                 "airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.05
-            ), patch("airflow_provider_rmq.watcher.listener._incr") as incr, \
+            ), patch("airflow_provider_rmq.watcher.listener.incr") as incr, \
                     caplog.at_level(
                         logging.WARNING,
                         logger="airflow_provider_rmq.watcher.listener",
@@ -1972,7 +1970,7 @@ class TestCycleStepsAreBounded:
             release.set()
 
         assert starts == [1], "one attempt of a step at a time, whatever the cycle count"
-        incr.assert_any_call("rmq_watcher.cycle_step_in_flight")
+        incr.assert_any_call("rmq_watcher.cycle_step_skipped")
         assert any("still running" in r.getMessage() for r in caplog.records)
         manager.reconcile.assert_not_awaited()
 
@@ -2002,7 +2000,7 @@ class TestCycleStepsAreBounded:
             "airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.05
         ), patch(
             "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
-            side_effect=lambda session: release.wait(timeout=5) or [],
+            side_effect=_blocked_by(release, result=[]),
         ):
             try:
                 await listener._run_cycle()
@@ -2040,13 +2038,13 @@ class TestCycleWatchdog:
         manager.reconcile = _never_returns
 
         with _cycle_patches(manager), patch(
-            "airflow_provider_rmq.watcher.listener._incr"
+            "airflow_provider_rmq.watcher.listener.incr"
         ) as incr, caplog.at_level(
             logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
         ), pytest.raises(asyncio.TimeoutError):
             await listener._main()
 
-        incr.assert_called_once_with("rmq_watcher.cycle_timeout")
+        incr.assert_called_once_with("rmq_watcher.cycle_timed_out")
         assert any("reconcile" in record.getMessage() for record in caplog.records)
 
     @pytest.mark.asyncio
@@ -2212,10 +2210,7 @@ class TestCycleTunables:
         listener = RMQWatcherListener()
         listener._reconcile_interval = 17
         release = threading.Event()
-
-        def blocked():
-            release.wait(timeout=5)
-            return (999, None)
+        blocked = _blocked_by(release, result=(999, None))
 
         try:
             with patch(
@@ -2366,10 +2361,7 @@ class TestSchemaMigrationRetry:
         listener = _cycle_listener()
         release = threading.Event()
         calls = []
-
-        def blocked():
-            calls.append(1)
-            release.wait(timeout=5)
+        blocked = _blocked_by(release, calls=calls)
 
         try:
             with patch(
@@ -2399,7 +2391,7 @@ class TestSchemaMigrationRetry:
                 "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=False
             ), patch(
                 "airflow_provider_rmq.watcher.listener.ensure_table_exists",
-                side_effect=lambda: release.wait(timeout=5),
+                side_effect=_blocked_by(release),
             ), patch("airflow_provider_rmq.watcher.listener._MIGRATION_TIMEOUT", 0.05):
                 started = time.monotonic()
                 await listener._run_cycle()
@@ -2492,9 +2484,6 @@ class TestGracefulStop:
 
 class TestLifecycleDiagnostics:
     def test_unrecognised_component_logs_why_the_watcher_is_not_started(self, caplog):
-        class GunicornWebServer:
-            pass
-
         listener = RMQWatcherListener()
         with caplog.at_level(
             logging.INFO, logger="airflow_provider_rmq.watcher.listener"
@@ -2507,9 +2496,6 @@ class TestLifecycleDiagnostics:
         assert "watcher not started" in messages[0]
 
     def test_scheduler_component_is_logged_without_a_reason(self, caplog):
-        class SchedulerJobRunner:
-            pass
-
         listener = RMQWatcherListener()
         with caplog.at_level(
             logging.INFO, logger="airflow_provider_rmq.watcher.listener"

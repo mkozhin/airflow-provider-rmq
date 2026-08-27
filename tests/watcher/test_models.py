@@ -29,8 +29,9 @@ def _naive(stamp: str) -> datetime:
     return datetime.fromisoformat(stamp)
 
 
-# schema of rmq_watcher_conn_status as it was before the diagnostic columns
-LEGACY_CONN_STATUS_DDL = """
+#: Table the migration has to bring up to date: rmq_watcher_conn_status without the
+#: two diagnostic columns.
+_conn_status_ddl_without_diagnostics = """
 CREATE TABLE rmq_watcher_conn_status (
     conn_id VARCHAR(250) NOT NULL PRIMARY KEY,
     status VARCHAR(20) NOT NULL,
@@ -367,7 +368,7 @@ class TestGetActiveDagIds:
 class TestSchemaMigration:
     def test_adds_columns_missing_from_legacy_table(self, schema_engine):
         with schema_engine.begin() as conn:
-            conn.execute(text(LEGACY_CONN_STATUS_DDL))
+            conn.execute(text(_conn_status_ddl_without_diagnostics))
 
         ensure_table_exists()
 
@@ -378,7 +379,7 @@ class TestSchemaMigration:
 
     def test_migrated_table_accepts_diagnostic_writes(self, schema_engine):
         with schema_engine.begin() as conn:
-            conn.execute(text(LEGACY_CONN_STATUS_DDL))
+            conn.execute(text(_conn_status_ddl_without_diagnostics))
         ensure_table_exists()
 
         session = sessionmaker(bind=schema_engine)()

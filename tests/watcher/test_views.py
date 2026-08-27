@@ -81,17 +81,6 @@ def _make_sub(
     return sub
 
 
-def _make_conn_status(conn_id: str = "rmq_default", status: str = "connected") -> MagicMock:
-    cs = MagicMock()
-    cs.conn_id = conn_id
-    cs.status = status
-    cs.consumer_count = 1
-    cs.broker_consumer_count = 1
-    cs.last_error = None
-    cs.last_reconcile_at = None
-    return cs
-
-
 def _make_conn_status_row(
     *,
     conn_id: str = "rmq_default",
@@ -170,7 +159,7 @@ class TestSubscriptionsList:
 
     def test_subscriptions_list_shows_conn_status(self, app, view):
         """render_template receives conn_statuses from DB."""
-        cs = _make_conn_status()
+        cs = _make_conn_status_row()
         ctx, _ = _session_ctx()
         with app.test_request_context("/subscriptions"), \
              patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
@@ -889,16 +878,17 @@ def _render_subscriptions_html(rows, **ctx):
     return template.render(**render_ctx)
 
 
-def _badge_present(html: str) -> bool:
-    """True iff the dag-not-found badge markup is present: the
-    ``label label-warning`` span AND its visible text nested inside it (not
-    just "dag not found" hiding in e.g. the ``title`` attribute).
-    Whitespace-normalized so it's robust to line wrapping in the template.
+def _badge_present(html: str, text: str = "⚠ dag not found") -> bool:
+    """True iff a warning badge whose visible text matches ``text`` is rendered.
+
+    The text has to sit inside the ``label label-warning`` span rather than in an
+    attribute such as ``title``. Whitespace-normalized so it is robust to line
+    wrapping in the template.
     """
     normalized = re.sub(r"\s+", " ", html)
     return (
         re.search(
-            r'<span class="label label-warning"[^>]*>\s*⚠ dag not found\s*</span>',
+            rf'<span class="label label-warning"[^>]*>\s*{text}\s*</span>',
             normalized,
         )
         is not None
@@ -1092,32 +1082,6 @@ class TestSubscriptionsDagLookupSessionIsolationReal:
 # cycle, broker consumer count and the schema notice.
 # ---------------------------------------------------------------------------
 
-def _stale_badge_present(html: str) -> bool:
-    """True iff a 'last reconcile too old' badge is rendered: the warning span
-    around an age reading. Whitespace-normalized against template wrapping."""
-    normalized = re.sub(r"\s+", " ", html)
-    return (
-        re.search(
-            r'<span class="label label-warning"[^>]*>\s*⚠ [^<]*ago\s*</span>',
-            normalized,
-        )
-        is not None
-    )
-
-
-def _broker_mismatch_badge_present(html: str) -> bool:
-    """True iff a consumer-count mismatch badge (warning span around a bare
-    number) is rendered."""
-    normalized = re.sub(r"\s+", " ", html)
-    return (
-        re.search(
-            r'<span class="label label-warning"[^>]*>\s*⚠ \d+\s*</span>',
-            normalized,
-        )
-        is not None
-    )
-
-
 class TestReconcileIntervalFromVariable:
     def test_variable_value_is_used(self):
         with patch("airflow.models.Variable") as variable:
@@ -1245,14 +1209,14 @@ class TestConnectionsTableRendering:
         )
         html = _render_subscriptions_html([], conn_statuses=rows)
         assert "ago" in html
-        assert not _stale_badge_present(html)
+        assert not _badge_present(html, r"⚠ [^<]*ago")
 
     def test_stale_reconcile_shows_badge(self):
         rows = _build_conn_status_rows(
             [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(3600))], 60
         )
         html = _render_subscriptions_html([], conn_statuses=rows)
-        assert _stale_badge_present(html)
+        assert _badge_present(html, r"⚠ [^<]*ago")
 
     def test_null_reconcile_time_renders_dash(self):
         """A row written before the migration added the column holds NULL —
@@ -1260,7 +1224,7 @@ class TestConnectionsTableRendering:
         rows = _build_conn_status_rows([_make_conn_status_row(last_reconcile_at=None)], 60)
         html = _render_subscriptions_html([], conn_statuses=rows)
         assert "rmq_default" in html
-        assert not _stale_badge_present(html)
+        assert not _badge_present(html, r"⚠ [^<]*ago")
         assert "—" in html
 
     def test_naive_timestamp_renders_without_type_error(self):
@@ -1279,21 +1243,21 @@ class TestConnectionsTableRendering:
         # Equal counts: both cells carry the number and neither carries a badge.
         assert re.search(r"<td>\s*3\s*</td>\s*<td>\s*3\s*</td>", html), html
         assert "label-warning" not in html
-        assert not _broker_mismatch_badge_present(html)
+        assert not _badge_present(html, r"⚠ \d+")
 
     def test_count_mismatch_is_marked(self):
         rows = _build_conn_status_rows(
             [_make_conn_status_row(consumer_count=3, broker_consumer_count=1)], 60
         )
         html = _render_subscriptions_html([], conn_statuses=rows)
-        assert _broker_mismatch_badge_present(html)
+        assert _badge_present(html, r"⚠ \d+")
 
     def test_null_broker_count_renders_dash(self):
         rows = _build_conn_status_rows(
             [_make_conn_status_row(consumer_count=3, broker_consumer_count=None)], 60
         )
         html = _render_subscriptions_html([], conn_statuses=rows)
-        assert not _broker_mismatch_badge_present(html)
+        assert not _badge_present(html, r"⚠ \d+")
         assert "—" in html
 
     def test_schema_notice_replaces_the_table(self):

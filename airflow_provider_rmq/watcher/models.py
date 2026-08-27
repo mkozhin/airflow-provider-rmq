@@ -66,7 +66,7 @@ class RMQConnStatus(WatcherBase):
 
 #: Marker for an argument the caller left out, which ``None`` cannot express here:
 #: ``None`` is itself a meaningful value for the nullable columns below.
-UNSET: Any = object()
+_UNSET: Any = object()
 
 
 def _make_session_factory():
@@ -217,8 +217,8 @@ def upsert_conn_status(
     status: str,
     consumer_count: int,
     last_error: str | None = None,
-    broker_consumer_count: int | None = UNSET,
-    last_reconcile_at: datetime | None = UNSET,
+    broker_consumer_count: int | None = _UNSET,
+    last_reconcile_at: datetime | None = _UNSET,
 ) -> RMQConnStatus:
     """Insert or update connection status. Caller must commit.
 
@@ -233,9 +233,9 @@ def upsert_conn_status(
     row.status = status
     row.consumer_count = consumer_count
     row.last_error = last_error
-    if broker_consumer_count is not UNSET:
+    if broker_consumer_count is not _UNSET:
         row.broker_consumer_count = broker_consumer_count
-    if last_reconcile_at is not UNSET:
+    if last_reconcile_at is not _UNSET:
         row.last_reconcile_at = last_reconcile_at
     return row
 

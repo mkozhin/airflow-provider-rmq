@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import ssl
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -375,8 +376,6 @@ class TestCallWithTimeout:
 
     @pytest.mark.asyncio
     async def test_raises_timeout_and_cancels_the_call(self):
-        import asyncio
-
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
@@ -401,8 +400,6 @@ class TestCallWithTimeout:
         ``asyncio.wait_for`` below Python 3.11 returns the inner result in that race and
         the consumer task would keep running after stop() asked it to end.
         """
-        import asyncio
-
         finished = asyncio.Event()
         resumed = False
 
@@ -437,26 +434,30 @@ class TestCallWithTimeout:
     async def test_the_timer_is_dropped_once_the_call_returns(self):
         """The fast path leaves no timer behind: one per AMQP call, and every call of
         a busy watcher would otherwise keep a callback scheduled for its full timeout."""
-        import asyncio
-
         loop = asyncio.get_running_loop()
-        before = list(loop._scheduled)
+        handles = []
+        real_call_later = loop.call_later
+
+        def recording_call_later(delay, callback, *args):
+            handle = real_call_later(delay, callback, *args)
+            handles.append(handle)
+            return handle
 
         async def quick():
             return "value"
 
-        assert await call_with_timeout(quick(), 3600.0) == "value"
+        with patch.object(loop, "call_later", recording_call_later):
+            assert await call_with_timeout(quick(), 3600.0) == "value"
 
-        added = [handle for handle in loop._scheduled if handle not in before]
-        assert all(handle.cancelled() for handle in added), added
+        assert handles, "the helper schedules a timer for the call it bounds"
+        assert all(handle.cancelled() for handle in handles), handles
 
     @pytest.mark.asyncio
     async def test_a_cancel_in_the_same_tick_as_the_timeout_is_still_a_cancel(self):
-        """The race the incident hinged on: the timer fires, the caller is cancelled in
-        the same tick, and the handler must not read the caller's cancel as its own
-        timeout — a consumer task would then ignore stop() and keep consuming."""
-        import asyncio
+        """The timer fires and the caller is cancelled in the same tick.
 
+        The handler reads that as a cancel, not as its own timeout: read the other way
+        round, a consumer task would ignore stop() and keep consuming."""
         survived = False
 
         async def slow():
