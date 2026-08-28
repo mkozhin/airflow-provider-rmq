@@ -731,9 +731,11 @@ class _ConnState:
     #: leaves its attempt here rather than starting a second one, so one conn_id costs
     #: the broker one connection however many callers are waiting for it.
     connecting: dict[str, asyncio.Task] = field(default_factory=dict)
-    #: Serialises building the connections of this one conn_id. One lock per conn_id and
-    #: not one for the manager: everything it guards waits on a single broker, so a
-    #: broker that stopped answering holds up the conn_ids that use it and no others.
+    #: Serialises starting a connect of this one conn_id, so that however many callers
+    #: want the connection the broker is asked for one. They wait for that attempt side
+    #: by side, outside this lock. One lock per conn_id and not one for the manager:
+    #: everything it guards concerns a single broker, so a broker that stopped answering
+    #: holds up the conn_ids that use it and no others.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     #: Channel of the publish connection, opened on demand.
     publish_channel: Any = None
@@ -1310,13 +1312,13 @@ class RMQConsumerManager:
         uses the consumer pool, everything the reconcile cycle awaits uses the cycle
         pool, so a stalled delivery and a stalled cycle never share a worker.
 
-        The metadata read stays outside the lock and the lock belongs to this one
-        conn_id, so what a broker that stopped answering costs is bounded by the conn_ids
-        that use it: behind a single manager-wide lock every consumer task of every
-        conn_id queues up in front of the reconcile cycle's own probes, and the wait
-        those probes inherit grows with the number of subscriptions until it outlasts the
-        cycle's budget — which tears the manager down and cancels the consumer tasks of
-        the healthy brokers along with it.
+        The metadata read stays outside the lock, the lock belongs to this one conn_id
+        and it covers starting the connect rather than waiting for it, so what a broker
+        that stopped answering costs any caller is one ``connect_timeout``. What the
+        three together rule out is a wait that grows with the number of subscriptions:
+        inherited by the reconcile cycle's own probes it outlasts the cycle's budget,
+        which tears the manager down and cancels the consumer tasks of the healthy
+        brokers along with it.
 
         The connection object is pooled before it is connected and stays pooled while its
         connect is in flight: an attempt nobody waits for any more is still an attempt
@@ -1353,8 +1355,24 @@ class RMQConsumerManager:
         ssl_context: Any,
         timeouts: AmqpTimeouts,
     ) -> Any:
-        """Connect the pooled connection of ``(conn_id, role)``, under that conn_id's lock."""
+        """Connect the pooled connection of ``(conn_id, role)``, one attempt at a time.
+
+        The lock covers starting the attempt and nothing else. What every caller then
+        waits for is the one task that attempt created, and they wait for it side by
+        side: a broker that answers nothing costs each of them ``connect_timeout`` once,
+        not ``connect_timeout`` times the number of callers ahead of them. Held across
+        the wait instead, the lock would hand the reconcile cycle a queue that grows with
+        the subscriptions of that conn_id until it outlasts the cycle's own budget —
+        which tears the manager down and cancels the consumer tasks of every healthy
+        broker with it.
+
+        The wait is bounded but the attempt behind it is not: on Python 3.10 a connect
+        that times out raises ``asyncio.TimeoutError``, which is not one of aio_pika's
+        ``CONNECTION_EXCEPTIONS``, so its reconnect factory logs it, sleeps and tries
+        again while ``connect()`` waits on a future that is never resolved.
+        """
         state = self._conn(conn_id)
+        what = f"the {role} connection of conn_id={conn_id!r}"
         async with state.lock:
             connection = state.ready(role)
             if connection is not None:
@@ -1379,19 +1397,34 @@ class RMQConsumerManager:
                 task.add_done_callback(_retrieve_outcome)
                 state.connecting[role] = task
 
-            try:
-                await _await_connected(
-                    task, timeouts.connect, f"the {role} connection of conn_id={conn_id!r}"
-                )
-            except Exception:
-                if task.done():
-                    # The connect failed rather than outstayed its bound. The connection
-                    # object holds that failure and answers every later ``connect()``
-                    # with it, so it goes and the next attempt starts from a fresh one.
-                    await self._drop_connection(conn_id, role=role)
-                raise
-            state.connecting.pop(role, None)
-            return connection
+        try:
+            await _await_connected(task, timeouts.connect, what)
+        except Exception:
+            if task.done():
+                # The connect failed rather than outstayed its bound. The connection
+                # object holds that failure and answers every later ``connect()`` with
+                # it, so it goes and the next attempt starts from a fresh one.
+                async with state.lock:
+                    if state.connections.get(role) is connection:
+                        await self._drop_connection(conn_id, role=role)
+            raise
+
+        async with state.lock:
+            if state.connecting.get(role) is task:
+                state.connecting.pop(role, None)
+            if state.connections.get(role) is connection:
+                return connection
+            replacement = state.ready(role)
+
+        # Recovery replaced the pooled connection while this attempt was landing. The
+        # object this call built belongs to nobody now, and holding an open connection
+        # the pool cannot reach costs the broker a connection for the life of the
+        # process.
+        log.info("%s was replaced while it connected — closing the connection it built", what)
+        await _close_quietly(connection, what)
+        if replacement is not None:
+            return replacement
+        raise ConnectionError(f"{what} was replaced while it connected")
 
     async def _record_conn_error(
         self, conn_id: str, exc: Exception, pool: BoundedExecutor

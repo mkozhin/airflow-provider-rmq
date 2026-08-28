@@ -3147,58 +3147,61 @@ def _fast_timeouts(manager, conn_id: str = "rmq_default", rpc: float = 0.05) -> 
     manager._conn(conn_id).timeouts = AmqpTimeouts(connect=0.05, rpc=rpc)
 
 
+class _BlockedBroker:
+    """An ``aiormq`` connection that completes its handshake and stops there.
+
+    ``Connection.ready()`` waits out a ``Connection.Blocked`` frame, which the broker
+    sends to every client advertising the capability — ``aiormq`` does — for as long as
+    a resource alarm lasts.
+    """
+
+    def __init__(self) -> None:
+        self.closing = asyncio.get_event_loop().create_future()
+        self.closed = False
+
+    async def ready(self) -> None:
+        await asyncio.Event().wait()
+
+    async def close(self, exc=None) -> None:
+        self.closed = True
+        if not self.closing.done():
+            self.closing.set_result(None)
+
+    @property
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+@contextlib.contextmanager
+def _blocked_broker():
+    """Patch the socket-level connect, leaving every ``aio_pika`` path real."""
+    opened = []
+
+    async def connect(url, **kwargs):
+        opened.append(_BlockedBroker())
+        return opened[-1]
+
+    with patch.object(aiormq, "connect", connect):
+        yield opened
+
+
 class TestConnectionSetup:
     """Building a connection is bounded, cancellable, and costs one conn_id at a time.
 
     ``connect_robust(timeout=...)`` bounds the TCP connect and the AMQP handshake only.
     What follows is ``ready()``, which waits for the broker to declare the connection
     unblocked, and a broker under a resource alarm keeps every connection blocked until
-    the alarm clears — so an unbounded connect is a connect that can never come back,
-    and the whole manager used to wait behind it on one lock.
+    the alarm clears — so an unbounded connect is a connect that can never come back.
+    The bound therefore belongs here, and the wait for it outside the lock that starts
+    the attempt.
     """
-
-    class _BlockedBroker:
-        """An ``aiormq`` connection that completes its handshake and stops there.
-
-        ``Connection.ready()`` waits out a ``Connection.Blocked`` frame, which the broker
-        sends to every client advertising the capability — ``aiormq`` does — for as long
-        as a resource alarm lasts.
-        """
-
-        def __init__(self) -> None:
-            self.closing = asyncio.get_event_loop().create_future()
-            self.closed = False
-
-        async def ready(self) -> None:
-            await asyncio.Event().wait()
-
-        async def close(self, exc=None) -> None:
-            self.closed = True
-            if not self.closing.done():
-                self.closing.set_result(None)
-
-        @property
-        def is_closed(self) -> bool:
-            return self.closed
-
-    @contextlib.contextmanager
-    def _blocked_broker(self):
-        """Patch the socket-level connect, leaving every ``aio_pika`` path real."""
-        opened = []
-
-        async def connect(url, **kwargs):
-            opened.append(self._BlockedBroker())
-            return opened[-1]
-
-        with patch.object(aiormq, "connect", connect):
-            yield opened
 
     @pytest.mark.asyncio
     async def test_a_connect_the_broker_never_finishes_is_bounded(self, manager):
         conn_info = _make_conn_info()
         conn_info.extra_dejson = {"connect_timeout": 0.2}
 
-        with self._blocked_broker() as opened, \
+        with _blocked_broker() as opened, \
              patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
                    return_value=conn_info), \
              patch("airflow_provider_rmq.watcher.consumer._write_conn_error"), \
@@ -3225,7 +3228,7 @@ class TestConnectionSetup:
         conn_info = _make_conn_info()
         conn_info.extra_dejson = {"connect_timeout": 0.2}
 
-        with self._blocked_broker() as opened, \
+        with _blocked_broker() as opened, \
              patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
                    return_value=conn_info), \
              patch("airflow_provider_rmq.watcher.consumer._write_conn_error"), \
@@ -3249,7 +3252,7 @@ class TestConnectionSetup:
         conn_info = _make_conn_info()
         conn_info.extra_dejson = {"connect_timeout": 30}
 
-        with self._blocked_broker() as opened, \
+        with _blocked_broker() as opened, \
              patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
                    return_value=conn_info), \
              _patch_watcher_session():
@@ -3313,6 +3316,105 @@ class TestConnectionSetup:
             f"the cycle waited {waited:.2f}s on {len(stuck_conn_ids)} conn_ids it does "
             f"not share a broker with — the wait grows with every subscription"
         )
+
+    @pytest.mark.asyncio
+    async def test_callers_of_one_conn_id_wait_for_the_same_attempt_side_by_side(self):
+        """Waiting for the connect under the lock costs each caller the full
+        connect_timeout in turn, and most deployments put every subscription on one
+        conn_id. The reconcile cycle needs that same lock, so the wait it inherits grows
+        with the number of subscriptions until it outlasts the cycle's budget — and the
+        manager is torn down over one broker that stopped answering.
+        """
+        manager = _make_manager()
+        callers = 6
+        connect_timeout = 0.3
+        conn_info = _make_conn_info()
+        conn_info.extra_dejson = {"connect_timeout": connect_timeout}
+
+        with _blocked_broker() as opened, \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             patch("airflow_provider_rmq.watcher.consumer._write_conn_error"), \
+             _patch_watcher_session():
+            started = time.monotonic()
+            outcomes = await asyncio.gather(
+                *(manager._get_or_create_connection("rmq_default")
+                  for _ in range(callers)),
+                return_exceptions=True,
+            )
+            waited = time.monotonic() - started
+            await manager._drop_connection("rmq_default")
+
+        assert all(isinstance(o, asyncio.TimeoutError) for o in outcomes)
+        assert len(opened) == 1, "the broker was asked for more than one connection"
+        assert waited < connect_timeout * 2, (
+            f"{callers} callers of one conn_id took {waited:.2f}s, about "
+            f"{waited / connect_timeout:.0f} connect_timeouts — they are queueing "
+            f"rather than waiting for the one attempt together"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_connection_replaced_while_it_connected_is_closed(self, manager):
+        """Recovery is free to replace the pooled connection while a connect is landing.
+        The object this attempt built then belongs to nobody, and an open connection the
+        pool cannot reach costs the broker one for the life of the process."""
+        landed = asyncio.Event()
+        built = _make_live_connection()
+        replacement = _make_live_connection()
+
+        async def lands_on_cue(timeout=None):
+            await landed.wait()
+
+        built.connect = lands_on_cue
+        state = manager._conn("rmq_default")
+
+        with patch("airflow_provider_rmq.watcher.consumer._new_connection",
+                   return_value=built), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=_make_conn_info()):
+            task = asyncio.create_task(manager._get_or_create_connection("rmq_default"))
+            await _wait_for(lambda: _ROLE_CONSUME in state.connecting)
+            state.connections[_ROLE_CONSUME] = replacement
+            landed.set()
+            result = await asyncio.wait_for(task, timeout=2.0)
+
+        assert result is replacement
+        built.close.assert_awaited()
+        assert state.connections[_ROLE_CONSUME] is replacement
+
+    @pytest.mark.asyncio
+    async def test_a_failed_connect_leaves_the_connection_that_replaced_it_alone(
+        self, manager
+    ):
+        """A connect that failed takes its own connection out of the pool. Whichever
+        object the pool holds by then may be another caller's, and dropping that one
+        would tear down a healthy connection the moment an old attempt reports back."""
+        failed = asyncio.Event()
+        built = _make_live_connection()
+        replacement = _make_live_connection()
+
+        async def fails_on_cue(timeout=None):
+            await failed.wait()
+            raise aio_pika.exceptions.AMQPConnectionError("connection refused")
+
+        built.connect = fails_on_cue
+        state = manager._conn("rmq_default")
+
+        with patch("airflow_provider_rmq.watcher.consumer._new_connection",
+                   return_value=built), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=_make_conn_info()), \
+             patch("airflow_provider_rmq.watcher.consumer._write_conn_error"), \
+             _patch_watcher_session():
+            task = asyncio.create_task(manager._get_or_create_connection("rmq_default"))
+            await _wait_for(lambda: _ROLE_CONSUME in state.connecting)
+            state.connections[_ROLE_CONSUME] = replacement
+            failed.set()
+            with pytest.raises(aio_pika.exceptions.AMQPConnectionError):
+                await asyncio.wait_for(task, timeout=2.0)
+
+        assert state.connections[_ROLE_CONSUME] is replacement
+        replacement.close.assert_not_awaited()
 
 
 class TestConnectionPool:
