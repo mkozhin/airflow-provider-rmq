@@ -3354,6 +3354,53 @@ class TestConnectionSetup:
         )
 
     @pytest.mark.asyncio
+    async def test_a_connection_whose_reconnect_never_finished_is_replaced(self, manager):
+        """Observed in production: aio_pika's reconnect factory clears the transport
+        before each attempt, and a reconnect that never finishes leaves the object in
+        the pool reporting is_closed False with nothing under it. Every channel() on it
+        raises RuntimeError("Connection was not opened"), so a consumer task handed that
+        object fails, pauses, and is handed the same object again — for days, until the
+        process is restarted."""
+        broken = _make_live_connection()
+        broken.transport = None
+        fresh = _make_live_connection()
+        state = manager._conn("rmq_default")
+        state.connections[_ROLE_CONSUME] = broken
+
+        assert state.ready(_ROLE_CONSUME) is None, "an object with no transport is not usable"
+
+        with patch("airflow_provider_rmq.watcher.consumer._new_connection",
+                   return_value=fresh) as new_connection, \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=_make_conn_info()):
+            result = await manager._get_or_create_connection("rmq_default")
+
+        assert result is fresh
+        assert state.connections[_ROLE_CONSUME] is fresh
+        assert new_connection.call_count == 1
+        broken.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_connect_in_flight_keeps_its_connection(self, manager):
+        """A connection has no transport until its connect lands, and that object is
+        what every waiter is waiting on. Replacing it mid-attempt would open a second
+        connection to a broker that is already struggling."""
+        conn_info = _make_conn_info()
+        conn_info.extra_dejson = {"connect_timeout": 0.2}
+
+        with _blocked_broker() as opened, \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             patch("airflow_provider_rmq.watcher.consumer._write_conn_error"), \
+             _patch_watcher_session():
+            for _ in range(3):
+                with pytest.raises(asyncio.TimeoutError):
+                    await manager._get_or_create_connection("rmq_default")
+
+            assert len(opened) == 1, "the attempt in flight was replaced"
+            await manager._drop_connection("rmq_default")
+
+    @pytest.mark.asyncio
     async def test_a_connection_replaced_while_it_connected_is_closed(self, manager):
         """Recovery is free to replace the pooled connection while a connect is landing.
         The object this attempt built then belongs to nobody, and an open connection the

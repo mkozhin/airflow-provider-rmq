@@ -527,6 +527,21 @@ async def _attached(queue: Any, consumer_tag: str, timeout: float) -> AsyncItera
         await _close_quietly(q_iter, f"the consumer {consumer_tag!r}")
 
 
+def _usable(connection: Any) -> bool:
+    """Whether ``connection`` can carry a call right now.
+
+    Two states have to be told apart from a healthy connection, and only one of them
+    says ``is_closed``. The other is a reconnect that has not finished: aio_pika's
+    factory clears the transport before each attempt it makes, so a connection it is
+    still rebuilding — or has stopped rebuilding — reports ``is_closed`` False with
+    nothing underneath, and answers every ``channel()`` with
+    ``RuntimeError("Connection was not opened")``. Handed that object, a consumer task
+    fails on it, pauses, and asks the pool for the same object again for as long as the
+    process runs.
+    """
+    return not connection.is_closed and getattr(connection, "transport", None) is not None
+
+
 def _raised_while_cancelling(exc: BaseException) -> bool:
     """Whether ``exc`` came out of handling a cancellation.
 
@@ -797,9 +812,11 @@ class _ConnState:
         attempt somebody can close, and until that connect lands every call made through
         it fails. Whoever asks while it is under way waits for that one attempt rather
         than opening a second connection to a broker that is already struggling.
+
+        Nor is "not closed" the same as usable — see :func:`_usable`.
         """
         connection = self.connections.get(role)
-        if connection is None or connection.is_closed or role in self.connecting:
+        if connection is None or role in self.connecting or not _usable(connection):
             return None
         return connection
 
@@ -1425,6 +1442,7 @@ class RMQConsumerManager:
         """
         state = self._conn(conn_id)
         what = f"the {role} connection of conn_id={conn_id!r}"
+        discarded: Any = None
         async with state.lock:
             connection = state.ready(role)
             if connection is not None:
@@ -1432,12 +1450,19 @@ class RMQConsumerManager:
             state.timeouts = timeouts
             connection = state.connections.get(role)
 
-            if connection is None or connection.is_closed:
+            attempt = state.connecting.get(role)
+            in_flight = attempt is not None and not attempt.done()
+            # A connect still under way keeps its connection: that object is what every
+            # waiter is waiting on, and it has no transport until the attempt lands.
+            # Once no attempt is left, one without a transport is a reconnect that never
+            # finished, and it answers every call with the same failure forever.
+            if connection is None or (not in_flight and not _usable(connection)):
                 stale = state.connecting.pop(role, None)
                 if stale is not None and not stale.done():
                     # It was building the connection being replaced, and the factory that
                     # would have answered it is gone with it.
                     stale.cancel()
+                discarded = connection
                 connection = _new_connection(url, ssl_context)
                 state.connections[role] = connection
                 if role == _ROLE_PUBLISH:
@@ -1448,6 +1473,12 @@ class RMQConsumerManager:
                 task = asyncio.ensure_future(connection.connect(timeout=timeouts.connect))
                 task.add_done_callback(_retrieve_outcome)
                 state.connecting[role] = task
+
+        if discarded is not None and not discarded.is_closed:
+            # Closed outside the lock, and closed rather than dropped: the object owns a
+            # reconnect task that goes on trying for the life of the process, and the
+            # socket under it is the broker's to keep until somebody says otherwise.
+            await _close_quietly(discarded, f"the replaced {what}")
 
         try:
             await _await_connected(task, timeouts.connect, what)
