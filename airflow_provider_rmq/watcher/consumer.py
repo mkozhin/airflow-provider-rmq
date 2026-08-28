@@ -656,6 +656,11 @@ class _FireSub(_Checked):
     """
     conn_id: str
     state: _ConsumerState
+    #: The connection object the task was handed and holds for its whole life. The pool
+    #: replaces that object whenever the connect behind it fails, and a task left on the
+    #: replaced one answers every call with the failure it holds, so the manager compares
+    #: the two and restarts the task when they part.
+    connection: Any = None
     negative_checks: int = 0
 
 
@@ -803,11 +808,6 @@ class RMQConsumerManager:
             len(fresh), len(self._abandoned),
         )
 
-    def _pooled(self, conn_id: str, role: str) -> Any:
-        """The pooled connection of ``(conn_id, role)``, ``None`` when there is none."""
-        state = self._conns.get(conn_id)
-        return state.connections.get(role) if state is not None else None
-
     async def start(self) -> None:
         """Create the shared Management API HTTP client. Connections/tasks are created on demand."""
         self._http_client = httpx.AsyncClient(timeout=_MGMT_HTTP_TIMEOUT)
@@ -929,6 +929,12 @@ class RMQConsumerManager:
         touched, and every status transition updates exactly these rows. Reading the
         choice off that order would move the fire consumer during the reconnect
         turbulence this feature exists to survive, and each move costs a cancel.
+
+        The task starts on a connection that is connected and answers, never on one
+        whose connect is still in flight: an object is pooled from the moment its
+        connect starts and reports ``is_closed`` False until it is closed, so a task
+        started on it fails every call it makes for as long as it runs, and its own
+        retry loop keeps it alive — and therefore out of every restart path.
         """
         cooldown_dag_ids: set[str] = set()
         cooldown_conn_ids: set[str] = set()
@@ -943,22 +949,34 @@ class RMQConsumerManager:
             await self._provision_cooldown(cooldown_dag_ids, fire_conn_id)
             running = self._fire_state
             moved = running is not None and running.conn_id != fire_conn_id
-            if moved and self._fire_task is not None:
+            # Raw pool read rather than ``ready()``: the question is which object the
+            # pool holds, not whether it can be used yet, and a connect in flight must
+            # not read as a connection the fire consumer has to be taken off.
+            pooled = self._conn(fire_conn_id).connections.get(_ROLE_CONSUME)
+            replaced = running is not None and not moved and running.connection is not pooled
+            if (moved or replaced) and self._fire_task is not None:
                 # The fire consumer holds the connection object it was handed for its
-                # whole life. Left running against the old conn_id it would keep
-                # rmq_watcher.fire without a consumer on the new one and cooldown DAGs
-                # would silently stop firing.
-                log.info(
-                    "Cooldown subscriptions moved from conn_id=%r to %r — restarting the "
-                    "fire consumer on the new connection",
-                    running.conn_id if running else None, fire_conn_id,
-                )
+                # whole life. Left running against the old conn_id, or against an object
+                # the pool has replaced, it would keep rmq_watcher.fire without a
+                # consumer and cooldown DAGs would silently stop firing.
+                if moved:
+                    log.info(
+                        "Cooldown subscriptions moved from conn_id=%r to %r — restarting "
+                        "the fire consumer on the new connection",
+                        running.conn_id if running else None, fire_conn_id,
+                    )
+                else:
+                    log.warning(
+                        "The fire consumer of conn_id=%r holds a connection the pool no "
+                        "longer has — restarting it on the pooled one",
+                        fire_conn_id,
+                    )
                 self._fire_task.cancel()
                 self._abandon(await _wait_cancelled([self._fire_task]))
                 self._fire_task = None
                 self._fire_state = None
             if self._fire_task is None or self._fire_task.done():
-                connection = self._pooled(fire_conn_id, _ROLE_CONSUME)
+                connection = self._conn(fire_conn_id).ready(_ROLE_CONSUME)
                 if connection is not None:
                     self._launch_fire_task(fire_conn_id, connection)
                 else:
@@ -1616,7 +1634,9 @@ class RMQConsumerManager:
         connection has to know which task is holding the old one.
         """
         self._fire_state = _FireSub(
-            conn_id=conn_id, state=_ConsumerState(None, self._executor)
+            conn_id=conn_id,
+            state=_ConsumerState(None, self._executor),
+            connection=connection,
         )
         self._fire_task = asyncio.create_task(
             self._consume_fire_queue(connection, conn_id)

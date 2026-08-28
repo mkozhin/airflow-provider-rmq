@@ -2031,7 +2031,7 @@ class TestConsumeFireQueue:
         async def blocking_fire(conn, conn_id=None):
             await asyncio.Future()
 
-        connection = AsyncMock()
+        connection = _make_live_connection()
 
         # Pre-populate _connections so reconcile can find it after _provision_cooldown
         manager._conn("rmq_default").connections[_ROLE_CONSUME] = connection
@@ -2065,7 +2065,7 @@ class TestConsumeFireQueue:
         async def blocking_fire(conn, conn_id=None):
             await asyncio.Future()
 
-        connection = AsyncMock()
+        connection = _make_live_connection()
 
         # Pre-populate _connections so reconcile can find it after _provision_cooldown
         manager._conn("rmq_default").connections[_ROLE_CONSUME] = connection
@@ -3333,6 +3333,75 @@ class TestConnectionPool:
 
         await manager.stop()
 
+    @pytest.mark.asyncio
+    async def test_fire_task_waits_for_a_connect_that_has_not_landed(self, manager):
+        """A connection is pooled from the moment its connect starts and reports
+        ``is_closed`` False until it is closed, so being in the pool does not say the
+        fire consumer can run on it. Started on one whose connect is still in flight,
+        the task fails every call it makes and its retry loop keeps it alive — and
+        therefore out of every restart path, leaving rmq_watcher.fire without a
+        consumer for good."""
+        state = manager._conn("rmq_default")
+        state.connections[_ROLE_CONSUME] = _make_live_connection()
+        never_lands = asyncio.get_running_loop().create_future()
+        state.connecting[_ROLE_CONSUME] = asyncio.ensure_future(never_lands)
+
+        async def blocking_consume(sub):
+            await asyncio.Future()
+
+        with patch.object(manager, "_provision_cooldown"), \
+             patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_consume_fire_queue") as fire, \
+             patch.object(manager, "_update_all_conn_counts"):
+            await manager.reconcile([_sub(id=1, cooldown=300)])
+            await asyncio.sleep(0)
+
+            assert manager._fire_task is None
+            fire.assert_not_called()
+
+        never_lands.cancel()
+        await manager.stop()
+
+    @pytest.mark.asyncio
+    async def test_fire_task_restarts_when_the_pool_replaces_its_connection(self, manager):
+        """The fire consumer holds the connection object it was handed for its whole
+        life. A connect that failed takes its object with it — the object answers every
+        later call with that failure — so a task left on the replaced one spins in its
+        retry loop while the pool is healthy again."""
+        first = _make_live_connection()
+        replacement = _make_live_connection()
+        state = manager._conn("rmq_default")
+        state.connections[_ROLE_CONSUME] = first
+        handed: list = []
+
+        async def blocking_fire(conn, conn_id=None):
+            handed.append(conn)
+            await asyncio.Future()
+
+        async def blocking_consume(sub):
+            await asyncio.Future()
+
+        with patch.object(manager, "_provision_cooldown"), \
+             patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_consume_fire_queue", side_effect=blocking_fire), \
+             patch.object(manager, "_update_all_conn_counts"):
+            await manager.reconcile([_sub(id=1, cooldown=300)])
+            await asyncio.sleep(0)
+            first_task = manager._fire_task
+            assert handed == [first]
+
+            state.connections[_ROLE_CONSUME] = replacement
+            await manager.reconcile([_sub(id=1, cooldown=300)])
+            await asyncio.sleep(0)
+
+        assert first_task.done()
+        assert manager._fire_task is not None
+        assert manager._fire_task is not first_task
+        assert handed == [first, replacement]
+        assert manager._fire_state.connection is replacement
+
+        await manager.stop()
+
 
 class TestPublishConnection:
     def _cooldown_manager(self, publish_channel):
@@ -3906,7 +3975,14 @@ def _register_fire(
 ):
     """Put a running fire consumer into the manager, mirroring :func:`_register_active`."""
     manager._fire_task = _registered_task(real_task)
-    manager._fire_state = _FireSub(conn_id=conn_id, state=_state_with(status, None))
+    manager._fire_state = _FireSub(
+        conn_id=conn_id,
+        state=_state_with(status, None),
+        # The connection the task holds is the one the pool has, as it is for a task
+        # the manager started itself; a fire consumer holding any other object is what
+        # :meth:`_sync_fire_consumer` restarts.
+        connection=manager._conn(conn_id).connections.get(_ROLE_CONSUME),
+    )
     return manager._fire_state
 
 
