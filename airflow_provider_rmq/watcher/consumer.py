@@ -17,6 +17,7 @@ from typing import Any
 import aio_pika
 import aio_pika.exceptions
 import httpx
+from aio_pika.connection import make_url
 from airflow.exceptions import DagRunAlreadyExists
 from airflow.hooks.base import BaseHook
 from airflow.models import DagModel
@@ -287,6 +288,20 @@ class _StatusWriter:
         self._lock = threading.Lock()
         self._pending: tuple[str, str | None] | None = None
         self._storing = False
+        self._stored: str | None = None
+
+    @property
+    def stored(self) -> str | None:
+        """The status last committed to the row, ``None`` while none has been.
+
+        The one honest answer to "does the row already say this?", and the reason it is
+        kept here rather than by the caller: a write the caller stopped waiting for still
+        reaches the database, so a caller that recorded what it *asked* for would hold a
+        marker the row disagrees with, and the guard that skips an unchanged status would
+        then suppress every write that could put the two back together.
+        """
+        with self._lock:
+            return self._stored
 
     def record(self, status: str, last_error: str | None) -> None:
         """Note ``status`` as the one to store next, in place of any still unstored."""
@@ -316,6 +331,8 @@ class _StatusWriter:
                 with WatcherSession() as session:
                     set_consumer_status(session, self._sub_id, status, last_error=last_error)
                     session.commit()
+                with self._lock:
+                    self._stored = status
         except BaseException:
             with self._lock:
                 self._storing = False
@@ -400,6 +417,60 @@ class _Backoff:
         self.seconds = next_backoff(self.seconds, self._maximum)
 
 
+def _error_text(exc: BaseException) -> str:
+    """One line naming ``exc``, falling back to its type when it carries no message.
+
+    ``asyncio.TimeoutError`` is raised with no arguments at all, and a ``last_error`` of
+    ``""`` tells the operator no more than an empty row would: which call gave up is the
+    whole of what there is to say about it.
+    """
+    return str(exc) or type(exc).__name__
+
+
+def _new_connection(url: str, ssl_context: Any) -> Any:
+    """Build the robust connection to ``url``, before anything is awaited on it.
+
+    Whoever asks for a connection pools this object first and connects it afterwards.
+    ``RobustConnection`` runs the connect in a task of its own and hands the caller only
+    a future to wait on, so an attempt the caller stops waiting for — a timeout, a
+    cancelled consumer task — leaves a live connection to the broker that is in no pool,
+    that nothing closes, and that the connection factory goes on reconnecting.
+    """
+    return aio_pika.RobustConnection(make_url(url), ssl_context=ssl_context)
+
+
+def _retrieve_outcome(task: asyncio.Task) -> None:
+    """Read a finished connect's outcome, so a failure nobody waited for is not reported
+    as an exception that was never retrieved."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def _await_connected(task: asyncio.Task, timeout: float, what: str) -> None:
+    """Give ``task`` — one ``connect()`` of a connection — ``timeout`` seconds to land.
+
+    The bound has to be here rather than in ``connect_robust(timeout=...)``, which covers
+    the TCP connect and the AMQP handshake and stops there. What follows it is
+    ``ready()``, and that waits for the broker to declare the connection unblocked: a
+    broker under a resource alarm sends ``Connection.Blocked`` to every client that
+    advertises the capability, as ``aiormq`` does, so a connect made during an alarm does
+    not return until the alarm clears — however small the ``timeout`` was.
+
+    A connect the caller gives up on is left running and never cancelled: ``connect()``
+    waits on a future its connection factory resolves, and cancelling that wait cancels
+    the future itself, after which every later ``connect()`` of the same connection
+    raises :exc:`~asyncio.CancelledError` at once. Left alone, the attempt stays in
+    flight for the next caller to wait on and the connection becomes usable the moment
+    it lands.
+
+    :raises asyncio.TimeoutError: When the connect has not landed in ``timeout`` seconds.
+    """
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        raise asyncio.TimeoutError(f"{what} did not connect within {timeout:g}s")
+    task.result()
+
+
 async def _close_quietly(closeable: Any, what: str, method: str = "close") -> None:
     """Close ``closeable``, giving up after :data:`_CLOSE_TIMEOUT`.
 
@@ -481,7 +552,6 @@ class _ConsumerState:
         self._sub_id = sub_id
         self._executor = executor
         self._status: str | None = None
-        self._stored_status: str | None = None
         #: Tag the task registered on its queue during its current attach, ``None``
         #: while it is not attached. The liveness check asks the broker for this exact
         #: tag rather than recomputing one.
@@ -498,7 +568,7 @@ class _ConsumerState:
         last_error: str | None = None,
         executor: BoundedExecutor | None = None,
     ) -> None:
-        """Record ``status``, storing it if it differs from the one already stored.
+        """Record ``status``, storing it unless the row already holds it.
 
         :param executor: Pool the blocking write runs in; the consumer pool by default.
             The reconcile cycle passes its own so that a stalled delivery and a stalled
@@ -511,41 +581,35 @@ class _ConsumerState:
 
         The store is a blocking database write, so it runs in a pool under a timeout:
         the consumer task awaits it, and a database that never answers would otherwise
-        hold the task open forever. A write that does not land leaves the *stored*
-        marker untouched, so the next call tries again, and it never propagates —
-        diagnostics must not stop consumption. A write the caller stopped waiting for
-        still reaches the database eventually, which is why every write of one
-        subscription goes through that subscription's own writer
-        (:class:`_StatusWriter`). Handing the status to a write already running there
-        also leaves the marker alone: it is the running write that decides whether the
-        status reaches the row.
+        hold the task open forever. It never propagates either — diagnostics must not
+        stop consumption — so a write that does not land is simply tried again by the
+        next call.
+
+        What "already stored" means is the writer's to say, not this call's. Every write
+        of one subscription goes through that subscription's own writer
+        (:class:`_StatusWriter`), which is the only thing that knows what reached the
+        row: a write the caller stopped waiting for still gets there, and a status handed
+        to a write already running gets there through that one. A caller marking down
+        what it *asked* for would end up holding the opposite of what the row says, and
+        the guard right below would then suppress every write that could correct it.
         """
         self._status = status
-        if status == self._stored_status:
+        if self._sub_id is None:
             return
-        if self._sub_id is not None:
-            writer = _status_writer(self._sub_id)
-            writer.record(status, last_error)
-            pool = executor if executor is not None else self._executor
-            try:
-                stored = await call_with_timeout(
-                    pool.run(writer.store), timeout=_DB_TIMEOUT
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.warning(
-                    "Cannot store status %r of subscription %s: %s",
-                    status, self._sub_id, exc,
-                )
-                return
-            if not stored:
-                log.debug(
-                    "Status %r of subscription %s left to the write already running",
-                    status, self._sub_id,
-                )
-                return
-        self._stored_status = status
+        writer = _status_writer(self._sub_id)
+        if status == writer.stored:
+            return
+        writer.record(status, last_error)
+        pool = executor if executor is not None else self._executor
+        try:
+            await call_with_timeout(pool.run(writer.store), timeout=_DB_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Cannot store status %r of subscription %s: %s",
+                status, self._sub_id, exc,
+            )
 
 
 class _Checked:
@@ -633,6 +697,14 @@ class _ConnState:
 
     #: Pooled connections by role — :data:`_ROLE_CONSUME`, :data:`_ROLE_PUBLISH`, or both.
     connections: dict[str, Any] = field(default_factory=dict)
+    #: The connect of each role that has not landed yet. A caller that stopped waiting
+    #: leaves its attempt here rather than starting a second one, so one conn_id costs
+    #: the broker one connection however many callers are waiting for it.
+    connecting: dict[str, asyncio.Task] = field(default_factory=dict)
+    #: Serialises building the connections of this one conn_id. One lock per conn_id and
+    #: not one for the manager: everything it guards waits on a single broker, so a
+    #: broker that stopped answering holds up the conn_ids that use it and no others.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     #: Channel of the publish connection, opened on demand.
     publish_channel: Any = None
     #: Call timeouts read off the Airflow connection's ``extra``.
@@ -647,6 +719,20 @@ class _ConnState:
     mgmt_failures: int = 0
     #: Consecutive cycles with live tasks of which not one reaches ``listening``.
     stuck_cycles: int = 0
+
+    def ready(self, role: str) -> Any:
+        """The connection of ``role`` a caller can use right now, ``None`` when there is none.
+
+        Pooled is not the same as usable: the connection object is pooled from the moment
+        its connect starts, so that an attempt nobody waits for any more is still an
+        attempt somebody can close, and until that connect lands every call made through
+        it fails. Whoever asks while it is under way waits for that one attempt rather
+        than opening a second connection to a broker that is already struggling.
+        """
+        connection = self.connections.get(role)
+        if connection is None or connection.is_closed or role in self.connecting:
+            return None
+        return connection
 
 
 class RMQConsumerManager:
@@ -675,7 +761,6 @@ class RMQConsumerManager:
         self._cycle_no = 0  # liveness checks performed, i.e. reconcile cycles
         # (management_url, vhost) → queue → consumer tags, for the current cycle only
         self._consumer_cache: dict[tuple[str, str], dict[str, set[str]]] = {}
-        self._conn_lock = asyncio.Lock()  # prevents duplicate connections on concurrent starts
         self._fire_task: asyncio.Task | None = None
         self._fire_state: _FireSub | None = None  # state record of the running fire task
         self._fire_needs_restart = False  # last check found the fire consumer gone
@@ -1103,6 +1188,12 @@ class RMQConsumerManager:
         state = self._conn(conn_id)
         roles = (role,) if role is not None else (_ROLE_CONSUME, _ROLE_PUBLISH)
         for pooled_role in roles:
+            # A connect still in flight is cancelled with the connection it was building:
+            # closing cancels the factory that would have resolved it, so left alone it
+            # would wait for an answer that can no longer come.
+            task = state.connecting.pop(pooled_role, None)
+            if task is not None and not task.done():
+                task.cancel()
             connection = state.connections.pop(pooled_role, None)
             if pooled_role == _ROLE_PUBLISH:
                 state.publish_channel = None
@@ -1175,49 +1266,103 @@ class RMQConsumerManager:
         ``executor`` names the pool the blocking metadata read runs in: a consumer task
         uses the consumer pool, everything the reconcile cycle awaits uses the cycle
         pool, so a stalled delivery and a stalled cycle never share a worker.
+
+        The metadata read stays outside the lock and the lock belongs to this one
+        conn_id, so what a broker that stopped answering costs is bounded by the conn_ids
+        that use it: behind a single manager-wide lock every consumer task of every
+        conn_id queues up in front of the reconcile cycle's own probes, and the wait
+        those probes inherit grows with the number of subscriptions until it outlasts the
+        cycle's budget — which tears the manager down and cancels the consumer tasks of
+        the healthy brokers along with it.
+
+        The connection object is pooled before it is connected and stays pooled while its
+        connect is in flight: an attempt nobody waits for any more is still an attempt
+        somebody has to close, and the caller that comes next waits on that same attempt
+        instead of opening a second connection to a broker that is already struggling.
+        A connect that *failed* takes its connection with it — the object holds the
+        failure and hands it to every later ``connect()`` — so the next attempt starts
+        from a fresh one.
         """
         pool = executor if executor is not None else self._executor
         state = self._conn(conn_id)
-        # Fast path: a live connection is already pooled
-        connection = state.connections.get(role)
-        if connection is not None and not connection.is_closed:
+        # Fast path: a usable connection is already pooled
+        connection = state.ready(role)
+        if connection is not None:
             return connection
 
-        # Slow path: acquire lock to prevent duplicate connection creation
-        async with self._conn_lock:
-            connection = state.connections.get(role)
+        conn_info = await self._get_connection_info(conn_id, pool)
+        url, ssl_context = build_amqp_connection(conn_info)
+        timeouts = get_amqp_timeouts(conn_info)
+        try:
+            return await self._connect_pooled(conn_id, role, url, ssl_context, timeouts)
+        except Exception as exc:
+            # The lock is already released: writing the row is a database call, and a
+            # database that stopped answering must not decide how long the next caller
+            # waits for the broker.
+            await self._record_conn_error(conn_id, exc, pool)
+            raise
+
+    async def _connect_pooled(
+        self,
+        conn_id: str,
+        role: str,
+        url: str,
+        ssl_context: Any,
+        timeouts: AmqpTimeouts,
+    ) -> Any:
+        """Connect the pooled connection of ``(conn_id, role)``, under that conn_id's lock."""
+        state = self._conn(conn_id)
+        async with state.lock:
+            connection = state.ready(role)
             if connection is not None:
-                if not connection.is_closed:
-                    return connection
-                # A closed connection never revives — replace it with a fresh one.
-                del state.connections[role]
+                return connection
+            state.timeouts = timeouts
+            connection = state.connections.get(role)
+
+            if connection is None or connection.is_closed:
+                stale = state.connecting.pop(role, None)
+                if stale is not None and not stale.done():
+                    # It was building the connection being replaced, and the factory that
+                    # would have answered it is gone with it.
+                    stale.cancel()
+                connection = _new_connection(url, ssl_context)
+                state.connections[role] = connection
                 if role == _ROLE_PUBLISH:
                     state.publish_channel = None
 
-            conn_info = await self._get_connection_info(conn_id, pool)
-            url, ssl_context = build_amqp_connection(conn_info)
-            state.timeouts = timeouts = get_amqp_timeouts(conn_info)
-            kwargs: dict[str, Any] = {"url": url, "timeout": timeouts.connect}
-            if ssl_context is not None:
-                kwargs["ssl_context"] = ssl_context
+            task = state.connecting.get(role)
+            if task is None or task.done():
+                task = asyncio.ensure_future(connection.connect(timeout=timeouts.connect))
+                task.add_done_callback(_retrieve_outcome)
+                state.connecting[role] = task
 
             try:
-                connection = await aio_pika.connect_robust(**kwargs)
-                state.connections[role] = connection
-            except Exception as exc:
-                try:
-                    await call_with_timeout(
-                        pool.run(_write_conn_error, conn_id, str(exc)),
-                        timeout=_DB_TIMEOUT,
-                    )
-                except Exception as write_exc:
-                    log.warning(
-                        "Cannot store the failed connection attempt for conn_id=%r: %s",
-                        conn_id, write_exc,
-                    )
+                await _await_connected(
+                    task, timeouts.connect, f"the {role} connection of conn_id={conn_id!r}"
+                )
+            except Exception:
+                if task.done():
+                    # The connect failed rather than outstayed its bound. The connection
+                    # object holds that failure and answers every later ``connect()``
+                    # with it, so it goes and the next attempt starts from a fresh one.
+                    await self._drop_connection(conn_id, role=role)
                 raise
-
+            state.connecting.pop(role, None)
             return connection
+
+    async def _record_conn_error(
+        self, conn_id: str, exc: Exception, pool: BoundedExecutor
+    ) -> None:
+        """Store a failed connection attempt of ``conn_id``, best effort."""
+        try:
+            await call_with_timeout(
+                pool.run(_write_conn_error, conn_id, _error_text(exc)), timeout=_DB_TIMEOUT
+            )
+        except Exception as write_exc:
+            log.warning(
+                "Cannot store the failed connection attempt for conn_id=%r: %s",
+                conn_id, write_exc,
+            )
 
     async def _provision_one_exchange_sub(
         self,
@@ -2076,7 +2221,7 @@ class RMQConsumerManager:
 
             except aio_pika.exceptions.ChannelNotFoundEntity as exc:
                 # Fatal: queue doesn't exist — exit and wait for reconciliation to restart
-                await state.write(_SUB_ERROR, last_error=str(exc))
+                await state.write(_SUB_ERROR, last_error=_error_text(exc))
                 log.error(
                     "Queue %r not found for subscription %d (DAG %s): %s",
                     queue_name, sub_id, dag_id, exc,
@@ -2085,6 +2230,7 @@ class RMQConsumerManager:
 
             except aio_pika.exceptions.ChannelClosed as exc:
                 # Recoverable: channel dropped (e.g. queue deleted at runtime)
+                await state.write(_SUB_ERROR, last_error=_error_text(exc))
                 log.warning(
                     "Channel closed for subscription %d (queue %r): %s — retrying in %ss",
                     sub_id, queue_name, exc, _RECONNECT_DELAY,
@@ -2092,6 +2238,11 @@ class RMQConsumerManager:
                 await asyncio.sleep(_RECONNECT_DELAY)
 
             except Exception as exc:
+                # The row says what went wrong, not merely that the task is trying: a
+                # registration the broker never confirms leaves the subscription
+                # ``connecting`` for as long as the fault lasts, and an operator reading
+                # that sees a task starting up rather than one that cannot.
+                await state.write(_SUB_ERROR, last_error=_error_text(exc))
                 log.warning(
                     "Transient error in consumer %d (queue %r): %s — retrying in %ss",
                     sub_id, queue_name, exc, _RECONNECT_DELAY,
@@ -2152,7 +2303,7 @@ class RMQConsumerManager:
                 dag_id, sub_id, exc, backoff.seconds,
             )
             await message.nack(requeue=True)
-            await state.write(_SUB_ERROR, last_error=str(exc))
+            await state.write(_SUB_ERROR, last_error=_error_text(exc))
             await backoff.wait()
             return
         backoff.reset()
@@ -2268,6 +2419,9 @@ class RMQConsumerManager:
     async def _consume_fire_queue(self, connection: Any, conn_id: str) -> None:
         """Consumer for rmq_watcher.fire queue — triggers DAGs after cooldown expires via DLX."""
         state = self._fire_state_of()
+        # Kept across reconnects: a broken trigger path stays broken through the
+        # reconnect a requeued fire event may well cause.
+        trigger_backoff = _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
         while True:
             await state.write(_SUB_CONNECTING)
             try:
@@ -2289,7 +2443,9 @@ class RMQConsumerManager:
                         incr("rmq_watcher.consumer_attached")
 
                         async for message in q_iter:
-                            await self._handle_fire_delivery(message)
+                            await self._handle_fire_delivery(
+                                message, state, trigger_backoff
+                            )
                 finally:
                     state.consumer_tag = None
                     await _close_quietly(
@@ -2300,7 +2456,7 @@ class RMQConsumerManager:
                 return
 
             except aio_pika.exceptions.ChannelNotFoundEntity as exc:
-                await state.write(_SUB_ERROR, last_error=str(exc))
+                await state.write(_SUB_ERROR, last_error=_error_text(exc))
                 log.error(
                     "Fire queue %r not found: %s — exiting fire consumer, "
                     "will restart on next reconcile cycle.",
@@ -2309,7 +2465,7 @@ class RMQConsumerManager:
                 return
 
             except aio_pika.exceptions.ChannelClosed as exc:
-                await state.write(_SUB_ERROR, last_error=str(exc))
+                await state.write(_SUB_ERROR, last_error=_error_text(exc))
                 log.warning(
                     "Fire queue channel closed: %s — retrying in %ss",
                     exc, _RECONNECT_DELAY,
@@ -2317,20 +2473,28 @@ class RMQConsumerManager:
                 await asyncio.sleep(_RECONNECT_DELAY)
 
             except Exception as exc:
-                await state.write(_SUB_ERROR, last_error=str(exc))
+                await state.write(_SUB_ERROR, last_error=_error_text(exc))
                 log.warning(
                     "Transient error in fire consumer: %s — retrying in %ss",
                     exc, _RECONNECT_DELAY,
                 )
                 await asyncio.sleep(_RECONNECT_DELAY)
 
-    async def _handle_fire_delivery(self, message: Any) -> None:
+    async def _handle_fire_delivery(
+        self, message: Any, state: _ConsumerState, backoff: _Backoff
+    ) -> None:
         """Start the DAG run one expired cooldown window calls for, then acknowledge it.
 
-        A trigger that fails puts the fire event back on the queue before the error
-        leaves the loop: leaving it hands back only what is still buffered in the
-        iterator, and this message, already taken out of it, would otherwise sit
-        unacknowledged until the broker's ``consumer_timeout`` expires.
+        A trigger that fails puts the fire event back on the queue and pauses for a
+        growing interval before the next one. The pause is what keeps the event: a fire
+        event is the only record that a cooldown window expired, ``rmq_watcher.fire`` is
+        declared with no dead-letter exchange, and a redelivery every reconnect delay
+        spends the default delivery limit of a quorum queue in about a hundred seconds —
+        after which the broker drops the message the requeue was meant to keep.
+
+        The fire consumer reports the failure as its own status for the same reason a
+        subscription does: the connection is fine and the iterator keeps running, so
+        nothing else would say that expired cooldown windows stopped starting DAG runs.
         """
         dag_id = message.routing_key or ""
         if not dag_id:
@@ -2351,12 +2515,16 @@ class RMQConsumerManager:
         except Exception as exc:
             log.warning(
                 "Triggering DAG %s for an expired cooldown window failed: %s — the fire "
-                "event is back on the queue",
-                dag_id, exc,
+                "event is back on the queue, pausing %.1fs",
+                dag_id, exc, backoff.seconds,
             )
             await message.nack(requeue=True)
-            raise
+            await state.write(_SUB_ERROR, last_error=_error_text(exc))
+            await backoff.wait()
+            return
 
+        backoff.reset()
+        await state.write(_SUB_LISTENING, last_error=None)
         if outcome == _OUTCOME_TRIGGERED:
             incr("rmq_watcher.dag_triggered")
         # Known limitation: if _sync_trigger returned early because the DAG is

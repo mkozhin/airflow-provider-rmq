@@ -413,7 +413,25 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
   коротким `wait_for` и удаление из `self._connections`: обеих ролей `conn_id` по
   умолчанию, либо одной названной. Используется watchdog'ом и при фатальных
   ошибках соединения.
-- `aio_pika.connect_robust(..., timeout=timeouts.connect)`.
+- Соединение строится объектом (`aio_pika.RobustConnection`), кладётся в пул до
+  того, как его начали подключать, и уже потом подключается под собственным
+  `timeout=timeouts.connect`. `connect_robust(timeout=...)` границей не является:
+  он покрывает TCP-connect и AMQP-handshake, а следующий за ними `ready()` —
+  ожидание, пока брокер объявит соединение разблокированным, — остаётся снаружи,
+  и connect, попавший на resource alarm, не возвращается, пока alarm не снят.
+  Отменять такой connect нельзя: `RobustConnection.connect` ждёт future, который
+  резолвит его connection factory, и отмена этого ожидания отменяет сам future —
+  после чего каждый следующий `connect()` того же соединения сразу бросает
+  `CancelledError`. Поэтому попытка остаётся в полёте, а следующий вызывающий
+  ждёт её же вместо второго соединения к и без того тяжёлому брокеру; попытка,
+  завершившаяся *ошибкой*, забирает соединение с собой (объект хранит эту ошибку
+  и отдаёт её всем последующим `connect()`).
+- Создание соединения сериализуется локом **своего** `conn_id`
+  (`_ConnState.lock`), а чтение Airflow-подключения выполняется до захвата лока:
+  за общим локом менеджера очереди из consumer-тасок всех `conn_id` выстраивались
+  перед пробами самого reconcile-цикла, и это ожидание росло с числом подписок,
+  пока не превышало бюджет цикла — а его превышение сносит менеджер и отменяет
+  таски всех `conn_id`, включая живые.
 - `asyncio.wait_for(..., timeout=timeouts.rpc)` вокруг всех AMQP-RPC:
   `connection.channel()`, `declare_queue`, `publish` — как в consumer-ветках
   (`_consume_subscription`, `_consume_fire_queue`), так и в provisioning-ветках
@@ -701,9 +719,11 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 
 ### Метрики (`airflow.stats.Stats`, no-op без statsd)
 
-`rmq_watcher.consumer_reconnect`, `rmq_watcher.consumer_restarted`,
-`rmq_watcher.cycle_timeout`, `rmq_watcher.dag_triggered`. Вызовы обёрнуты так,
-что сбой Stats не влияет на поток управления.
+`rmq_watcher.consumer_attached`, `rmq_watcher.consumer_restarted`,
+`rmq_watcher.cycle_timed_out`, `rmq_watcher.cycle_step_timed_out`,
+`rmq_watcher.cycle_step_skipped`, `rmq_watcher.dag_triggered`,
+`rmq_watcher.tasks_abandoned`. Вызовы обёрнуты так, что сбой Stats не влияет на
+поток управления.
 
 ## What Goes Where
 
@@ -745,7 +765,9 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 - [x] считать два подряд таймаута `publish` на `conn_id` отрицательным вердиктом для publish-роли и сбрасывать `_drop_connection(conn_id, role="publish")`: у publish-соединения нет потребителей, поэтому watchdog Task 5 его не видит и зомби на нём не лечится ничем
 - [x] при ошибке `publish` явно NACK-ать текущую доставку: выход из итератора возвращает только то, что осталось в его внутренней очереди, а извлечённое сообщение иначе висит до `consumer_timeout`
 - [x] добавить `_drop_connection(conn_id)` — best-effort `close()` под коротким `wait_for` + удаление из кеша обеих ролей
-- [x] `connect_robust` вызывать с `timeout` из `get_amqp_timeouts`
+- [x] connect выполнять под `timeout` из `get_amqp_timeouts` вокруг `connection.connect(...)`, а не полагаться на `connect_robust(timeout=...)`: он не покрывает `ready()`
+- [x] класть объект соединения в пул до подключения и не отменять connect, который не уложился в границу
+- [x] сериализовать создание соединения локом своего `conn_id`, чтение Airflow-подключения выносить за лок
 - [x] обернуть в `asyncio.wait_for` с `rpc`-таймаутом все AMQP-RPC в consumer-ветках: `channel()`, `declare_queue`, `publish` в cooldown-ветке
 - [x] обернуть тем же таймаутом AMQP-RPC в provisioning-ветках: `_provision_cooldown` (`consumer.py:269-280`) и `_provision_exchange_subs` (`consumer.py:508-560`), включая declare/bind внутри `_ensure_*`
 - [x] подписываться с детерминированным `consumer_tag` (`rmq_watcher.{hostname}.{pid}.{sub_id}`, для fire-таски — `.fire`), чтобы проверка живости могла опознать своего consumer'а среди чужих
@@ -814,7 +836,7 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 - [x] таймаут или ошибка миграции → WARNING, флаг не выставляется, цикл продолжается
 - [x] попытка миграции единственная в полёте, между неудачными — растущий backoff (цикл → удвоение → потолок порядка часа): таймаут не освобождает воркер, поэтому повтор каждый цикл исчерпал бы пул цикла застрявшими попытками и удерживал бы соединения общего движка Airflow
 - [x] писать текущую фазу цикла в атрибут перед каждым шагом (migrate / scan / sync / read subs / reconcile)
-- [x] при `TimeoutError` — ERROR с фазой и длительностью, `Stats.incr("rmq_watcher.cycle_timeout")`, проброс наружу `_main`, чтобы `_run_loop` пересоздал event loop
+- [x] при `TimeoutError` — ERROR с фазой и длительностью, `incr("rmq_watcher.cycle_timed_out")`, проброс наружу `_main`, чтобы `_run_loop` пересоздал event loop
 - [x] обернуть `await self._manager.stop()` в `finally` собственным коротким `wait_for`; неудачу логировать
 - [x] завести два собственных `ThreadPoolExecutor` вне event loop — для цикла и для consumer-веток — и использовать их во всех `run_in_executor`; общий пул давал бы каскад: зависшие `_sync_trigger` съедают воркеры, за ними встают операции цикла, петля пересоздаётся и виснет снова
 - [x] `shutdown_default_executor()` не применять — на Python 3.10/3.11 он завершается `thread.join()` без таймаута, который `wait_for` не отменяет, и при зависшей БД вешает петлю намертво
@@ -997,7 +1019,7 @@ DEFAULT_RPC_TIMEOUT = 30          # сек; на channel()/declare/bind/publish
 - [x] `_main`: `asyncio.wait_for(event.wait(), timeout=interval)` вместо `asyncio.sleep(interval)` — через `call_with_timeout` в `_wait_for_next_cycle`
 - [x] дополнить существующий лог `on_starting` явной причиной «watcher not started» при нераспознанном компоненте — не добавляя вторую запись рядом (причина дописана суффиксом в ту же запись)
 - [x] INFO-лог при успешном старте треда (с интервалом цикла и бюджетом таймаута)
-- [x] INFO-лог при каждом успешном (пере)подключении к брокеру с `conn_id` и именем очереди; инкремент `rmq_watcher.consumer_reconnect`
+- [x] INFO-лог при каждом успешном (пере)подключении к брокеру с `conn_id` и именем очереди; инкремент `rmq_watcher.consumer_attached`
 - [x] тест: `before_stopping` будит петлю немедленно, `manager.stop()` вызван
 - [x] тест: `before_stopping` при закрытом loop не бросает, `threading.Event` выставлен
 - [x] тест: нераспознанный компонент → лог с причиной, тред не стартует
