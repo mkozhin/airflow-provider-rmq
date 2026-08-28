@@ -513,6 +513,31 @@ async def _attached(queue: Any, consumer_tag: str, timeout: float) -> AsyncItera
         await _close_quietly(q_iter, f"the consumer {consumer_tag!r}")
 
 
+def _raised_while_cancelling(exc: BaseException) -> bool:
+    """Whether ``exc`` came out of handling a cancellation.
+
+    aio_pika cancels the consumer from inside ``QueueIterator.__anext__`` while it
+    handles the ``CancelledError``, waits for that cancel without a bound of its own and
+    catches only a timeout of it. A broker that rejects the pending ``basic.cancel`` —
+    which every connection torn down mid-call does — therefore lets its own error out in
+    place of the cancellation. A retry loop reading that as a transient fault subscribes
+    again, and a task the manager counts as cancelled goes on consuming the queue under
+    no supervision: nothing holds it, nothing can cancel it, and it writes status into
+    the row its replacement owns.
+
+    ``Task.cancelling()`` would answer this directly and arrived in Python 3.11, so the
+    chain the exception carries is what there is to read on 3.10.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, asyncio.CancelledError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 async def _wait_cancelled(tasks: list[asyncio.Task]) -> set[asyncio.Task]:
     """Wait for already-cancelled ``tasks``, giving up after :data:`_CANCEL_TIMEOUT`.
 
@@ -2213,18 +2238,29 @@ class RMQConsumerManager:
                         )
                         incr("rmq_watcher.consumer_attached")
 
-                        async for message in q_iter:
-                            if not match(message, msg_filter):
-                                await nack_and_sleep(message)
-                                continue
-                            if cooldown > 0:
-                                await self._handle_cooldown_delivery(
-                                    conn_id, dag_id, cooldown, message, publish_backoff
-                                )
-                            else:
-                                await self._handle_immediate_delivery(
-                                    sub, message, state, trigger_backoff
-                                )
+                        try:
+                            async for message in q_iter:
+                                if not match(message, msg_filter):
+                                    await nack_and_sleep(message)
+                                    continue
+                                if cooldown > 0:
+                                    await self._handle_cooldown_delivery(
+                                        conn_id, dag_id, cooldown, message,
+                                        publish_backoff,
+                                    )
+                                else:
+                                    await self._handle_immediate_delivery(
+                                        sub, message, state, trigger_backoff
+                                    )
+                        except Exception as exc:
+                            if not _raised_while_cancelling(exc):
+                                raise
+                            log.warning(
+                                "Cancelling consumer %s of subscription %d failed: %s — "
+                                "the task ends as the cancelled task it is",
+                                consumer_tag, sub_id, exc,
+                            )
+                            raise asyncio.CancelledError from exc
                 finally:
                     state.consumer_tag = None
                     await _close_quietly(
@@ -2462,10 +2498,20 @@ class RMQConsumerManager:
                         )
                         incr("rmq_watcher.consumer_attached")
 
-                        async for message in q_iter:
-                            await self._handle_fire_delivery(
-                                message, state, trigger_backoff
+                        try:
+                            async for message in q_iter:
+                                await self._handle_fire_delivery(
+                                    message, state, trigger_backoff
+                                )
+                        except Exception as exc:
+                            if not _raised_while_cancelling(exc):
+                                raise
+                            log.warning(
+                                "Cancelling the fire consumer %s of conn_id=%r failed: "
+                                "%s — the task ends as the cancelled task it is",
+                                fire_tag, conn_id, exc,
                             )
+                            raise asyncio.CancelledError from exc
                 finally:
                     state.consumer_tag = None
                     await _close_quietly(

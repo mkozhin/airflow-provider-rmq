@@ -132,6 +132,56 @@ class _QueueIterCtx:
         await asyncio.Future()  # block until cancelled → raises CancelledError
 
 
+class _QueueIterFailingCancel:
+    """Iterator whose consumer cancellation fails, the way aio_pika's does.
+
+    ``QueueIterator.__anext__`` cancels the consumer from inside its own handling of the
+    CancelledError, waits for that cancel without a bound and catches only a timeout of
+    it. A broker that rejects the pending ``basic.cancel`` — which every connection torn
+    down mid-call does — therefore leaves ``__anext__`` with its own error in place of
+    the cancellation, carrying the CancelledError as context.
+    """
+
+    def __init__(self, error: BaseException):
+        self._error = error
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def consume(self):
+        self.consumed = True
+
+    async def close(self):
+        self.closed = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise self._error
+
+
+def _queue_failing_cancel(error: BaseException):
+    """Queue whose iterator fails the cancellation of its consumer with ``error``."""
+    queue = MagicMock()
+    queue.iterator.return_value = _QueueIterFailingCancel(error)
+    return queue
+
+
+async def _wait_for(condition, timeout: float = 2.0) -> None:
+    """Wait until ``condition`` holds, failing the test when it does not in ``timeout``."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition never held"
+        await asyncio.sleep(0.01)
+
+
 def _make_push_queue(messages: list = ()):
     queue = MagicMock()
     queue.iterator.return_value = _QueueIterCtx(list(messages))
@@ -876,6 +926,66 @@ class TestConsumeSubscription:
             await asyncio.gather(task1, task2, return_exceptions=True)
 
         assert mock_connect.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_consumer_cancel_still_ends_the_task(self, manager):
+        """A cancel the broker rejects leaves aio_pika's own error in place of the
+        CancelledError. Read as a transient fault it would send the task around the
+        loop again, and it would consume the queue with nothing holding it: the manager
+        has already dropped it, so neither reconcile nor stop can reach it, while it
+        writes status into the row its replacement owns."""
+        queue = _queue_failing_cancel(
+            aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+        )
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+        q_iter = queue.iterator.return_value
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"):
+            task = asyncio.create_task(manager._consume_subscription(_sub()))
+            await _wait_for(lambda: getattr(q_iter, "consumed", False))
+            task.cancel()
+            outcome = await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), timeout=2.0
+            )
+
+        # The task ends the way a cancelled consumer does — off the ``CancelledError``
+        # branch, which returns — rather than going around the loop for a second
+        # consumer on the queue it was cancelled off.
+        assert outcome[0] is None
+        assert task.done()
+        assert queue.iterator.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_the_same_error_outside_a_cancellation_still_retries(self, manager):
+        """The task stops on the cancelled path alone. The identical error raised while
+        nothing is cancelling it is the transient fault it has always been, and the
+        subscription is retried."""
+        attempts = 0
+        retried = asyncio.Event()
+
+        async def failing_declare(queue_name, passive):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+            retried.set()
+            return _make_push_queue()
+
+        channel = _make_live_channel()
+        channel.declare_queue = failing_declare
+        connection = _make_live_connection(channel=channel)
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
+             patch("airflow_provider_rmq.watcher.consumer.asyncio.sleep",
+                   new_callable=AsyncMock):
+            task = asyncio.create_task(manager._consume_subscription(_sub()))
+            await asyncio.wait_for(retried.wait(), timeout=2.0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert attempts >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -2084,6 +2194,34 @@ class TestConsumeFireQueue:
             await manager.reconcile([])
             assert fire_task.done()
             assert manager._fire_task is None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_consumer_cancel_still_ends_the_fire_task(self):
+        """A cancel the broker rejects leaves aio_pika's own error in place of the
+        CancelledError. Read as a transient fault it would send the fire consumer around
+        the loop again, and a second one would consume rmq_watcher.fire with nothing
+        holding it — one expired cooldown window would reach whichever got there first,
+        and neither reconcile nor stop could reach the one the manager has dropped."""
+        manager = _make_manager()
+        queue = _queue_failing_cancel(
+            aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+        )
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+        q_iter = queue.iterator.return_value
+
+        with patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"):
+            task = asyncio.create_task(
+                manager._consume_fire_queue(connection, "rmq_default")
+            )
+            await _wait_for(lambda: getattr(q_iter, "consumed", False))
+            task.cancel()
+            outcome = await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), timeout=2.0
+            )
+
+        assert outcome[0] is None
+        assert task.done()
+        assert queue.iterator.call_count == 1
 
     @pytest.mark.asyncio
     async def test_reconcile_warns_when_fire_connection_unavailable_after_provisioning(self):
