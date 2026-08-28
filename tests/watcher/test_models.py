@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
@@ -412,6 +413,52 @@ class TestSchemaMigration:
         if dialect_name == "postgresql":
             assert rendered["last_reconcile_at"].upper() == "TIMESTAMP WITHOUT TIME ZONE"
         assert all(value for value in rendered.values())
+
+    @pytest.mark.parametrize("dialect_name", ["postgresql", "sqlite"])
+    def test_the_migration_renders_its_ddl_with_the_engine_dialect(self, dialect_name):
+        """The claim above is about the migration, so put the migration to it. A DDL
+        built from a hard-coded type name or ``str(column.type)`` would render
+        ``DATETIME`` on PostgreSQL, where ``ALTER TABLE ... ADD COLUMN x DATETIME``
+        fails with `type "datetime" does not exist` — the migration then never completes
+        and the Subscriptions page keeps showing the not-migrated notice."""
+        from sqlalchemy.dialects import registry
+
+        statements: list[str] = []
+
+        class _Conn:
+            def execute(self, clause):
+                statements.append(str(clause))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class _Engine:
+            dialect = registry.load(dialect_name)()
+
+            def begin(self):
+                return _Conn()
+
+        class _Inspector:
+            def get_columns(self, table_name):
+                # Every column reads as missing, so each one is rendered into DDL.
+                return []
+
+        engine = _Engine()
+        # ``inspect`` is imported inside the function, so the patch goes to its source.
+        with patch("sqlalchemy.inspect", return_value=_Inspector()):
+            complete = models._add_missing_columns(engine)
+
+        assert complete is True
+        ddl = "\n".join(statements)
+        assert "last_reconcile_at" in ddl
+        if dialect_name == "postgresql":
+            assert "TIMESTAMP WITHOUT TIME ZONE" in ddl
+            assert "DATETIME" not in ddl.upper()
+        else:
+            assert "DATETIME" in ddl.upper()
 
     def test_repeated_call_on_current_schema_is_safe(self, schema_engine):
         ensure_table_exists()

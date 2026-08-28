@@ -17,3 +17,6 @@ build/
 # Generated version file (setuptools-scm)
 airflow_provider_rmq/_version.py
 /.claude/
+
+# revmux review artifacts
+.revmux/

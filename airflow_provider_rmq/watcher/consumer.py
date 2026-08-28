@@ -70,6 +70,10 @@ _CLOSE_TIMEOUT = 5.0
 #: A cancelled task, before the cycle moves on without it. A task that ignores its
 #: cancellation must not hold up the cycle that cancelled it.
 _CANCEL_TIMEOUT = 30.0
+#: Seconds ``stop()`` waits for cancelled tasks. Shorter than the listener's own
+#: ``_STOP_TIMEOUT`` on purpose: the wait and the closing that follows it share that one
+#: budget, and a wait that spends all of it leaves connections and the HTTP client open.
+_STOP_CANCEL_TIMEOUT = 10.0
 
 #: A blocking database write. The worker stays busy until the call itself returns — a
 #: running thread cannot be interrupted — so the timeout buys back the coroutine, not
@@ -288,17 +292,21 @@ class _StatusWriter:
         self._lock = threading.Lock()
         self._pending: tuple[str, str | None] | None = None
         self._storing = False
-        self._stored: str | None = None
+        self._stored: tuple[str, str | None] | None = None
 
     @property
-    def stored(self) -> str | None:
-        """The status last committed to the row, ``None`` while none has been.
+    def stored(self) -> tuple[str, str | None] | None:
+        """The ``(status, last_error)`` last committed to the row, ``None`` while none has been.
 
         The one honest answer to "does the row already say this?", and the reason it is
         kept here rather than by the caller: a write the caller stopped waiting for still
         reaches the database, so a caller that recorded what it *asked* for would hold a
         marker the row disagrees with, and the guard that skips an unchanged status would
         then suppress every write that could put the two back together.
+
+        The reason it is the pair and not the status alone: the row carries both, and a
+        second failure of the same kind changes only the text. Compared on status alone,
+        the row keeps naming the cause that has already been dealt with.
         """
         with self._lock:
             return self._stored
@@ -339,7 +347,7 @@ class _StatusWriter:
                     set_consumer_status(session, self._sub_id, status, last_error=last_error)
                     session.commit()
                 with self._lock:
-                    self._stored = status
+                    self._stored = (status, last_error)
                     pending = None
         except BaseException:
             with self._lock:
@@ -567,8 +575,14 @@ def _raised_while_cancelling(exc: BaseException) -> bool:
     return False
 
 
-async def _wait_cancelled(tasks: list[asyncio.Task]) -> set[asyncio.Task]:
-    """Wait for already-cancelled ``tasks``, giving up after :data:`_CANCEL_TIMEOUT`.
+async def _wait_cancelled(
+    tasks: list[asyncio.Task], timeout: float | None = None
+) -> set[asyncio.Task]:
+    """Wait for already-cancelled ``tasks``, giving up after ``timeout``.
+
+    :param timeout: Seconds to wait; :data:`_CANCEL_TIMEOUT` when not given. Read here
+        rather than defaulted in the signature, where it would be bound once at import
+        and stop following the constant.
 
     :returns: The tasks that were still running when the wait gave up.
 
@@ -579,7 +593,8 @@ async def _wait_cancelled(tasks: list[asyncio.Task]) -> set[asyncio.Task]:
     """
     if not tasks:
         return set()
-    done, pending = await asyncio.wait(tasks, timeout=_CANCEL_TIMEOUT)
+    timeout = _CANCEL_TIMEOUT if timeout is None else timeout
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
     for task in done:
         if not task.cancelled():
             task.exception()  # retrieved so it is not reported as never awaited
@@ -587,7 +602,7 @@ async def _wait_cancelled(tasks: list[asyncio.Task]) -> set[asyncio.Task]:
         log.warning(
             "%d consumer task(s) are still running %.0fs after being cancelled — the "
             "cycle continues without waiting for them",
-            len(pending), _CANCEL_TIMEOUT,
+            len(pending), timeout,
         )
     return pending
 
@@ -651,7 +666,10 @@ class _ConsumerState:
         if self._sub_id is None:
             return
         writer = _status_writer(self._sub_id)
-        if status == writer.stored:
+        if (status, last_error) == writer.stored and not writer.has_pending:
+            # Skipped only when the row already says this *and* nothing is waiting to be
+            # written: a status left behind by a write that failed is the row's only way
+            # back to the truth, and returning here would drop it.
             return
         writer.record(status, last_error)
         pool = executor if executor is not None else self._executor
@@ -902,19 +920,26 @@ class RMQConsumerManager:
 
         for task in tasks_to_cancel:
             task.cancel()
-        await _wait_cancelled(tasks_to_cancel)
+        try:
+            # A task that answers its cancellation slowly must not spend the whole
+            # budget the caller allows this call: what is left of it is what closes the
+            # connections, and the broker holds the consumers of an unclosed one until
+            # the socket drops — beside the consumers of the loop that replaces this one.
+            await _wait_cancelled(tasks_to_cancel, timeout=_STOP_CANCEL_TIMEOUT)
+        finally:
+            self._fire_task = None
+            self._fire_state = None
 
-        self._fire_task = None
-        self._fire_state = None
+            for conn_id in list(self._conns):
+                await self._drop_connection(conn_id)
+            self._active.clear()
+            self._conns.clear()
 
-        for conn_id in list(self._conns):
-            await self._drop_connection(conn_id)
-        self._active.clear()
-        self._conns.clear()
-
-        if self._http_client is not None:
-            await _close_quietly(self._http_client, "the Management API client", "aclose")
-            self._http_client = None
+            if self._http_client is not None:
+                await _close_quietly(
+                    self._http_client, "the Management API client", "aclose"
+                )
+                self._http_client = None
 
     async def reconcile(self, subscriptions: list[dict]) -> None:
         """Sync running tasks, connections and infrastructure with the subscription list.
@@ -1413,7 +1438,16 @@ class RMQConsumerManager:
             # The lock is already released: writing the row is a database call, and a
             # database that stopped answering must not decide how long the next caller
             # waits for the broker.
-            await self._record_conn_error(conn_id, exc, pool)
+            #
+            # The row describes the consuming connection, and only a consume-role failure
+            # writes it. Under a resource alarm the publish connection is the one the
+            # broker blocks, while consumers of the same conn_id keep working and the
+            # broker keeps confirming their tags: a publish failure written here would
+            # overwrite that verdict with `error` and no consumers, once per cooldown
+            # retry, until the next cycle rewrote it. The publish role reports through
+            # its own consecutive-timeout gate and the subscription that publishes.
+            if role == _ROLE_CONSUME:
+                await self._record_conn_error(conn_id, exc, pool)
             raise
 
     async def _connect_pooled(
@@ -1482,6 +1516,16 @@ class RMQConsumerManager:
 
         try:
             await _await_connected(task, timeouts.connect, what)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                # The caller is the one being cancelled — pass it on untouched.
+                raise
+            # The connect was cancelled under this caller: recovery dropped the
+            # connection while the caller was waiting for it. Reported as a cancellation
+            # it would end the consumer task through its own ``except CancelledError``
+            # branch — silently, with no status and no restart — where the drop it
+            # followed is an ordinary transient failure the task retries through.
+            raise ConnectionError(f"{what} was dropped while it connected") from None
         except Exception:
             if task.done():
                 # The connect failed rather than outstayed its bound. The connection

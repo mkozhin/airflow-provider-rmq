@@ -16,9 +16,10 @@ log = logging.getLogger(__name__)
 AMQP_PORT = 5672
 AMQPS_PORT = 5671
 
-#: Seconds between AMQP heartbeat frames. The client declares the connection dead
-#: after two missed intervals, so a broken link surfaces as an exception in about
-#: ``2 * DEFAULT_HEARTBEAT`` seconds and ``connect_robust`` reconnects.
+#: Seconds between AMQP heartbeat frames. ``aiormq`` allows three missed intervals
+#: (``HEARTBEAT_GRACE_MULTIPLIER``) and checks every half-interval, so a broken link
+#: surfaces as an exception in about ``3 * DEFAULT_HEARTBEAT`` seconds — some 90 s at
+#: the default — and ``connect_robust`` reconnects.
 DEFAULT_HEARTBEAT = 30
 #: Seconds allowed for establishing an AMQP connection.
 DEFAULT_CONNECT_TIMEOUT = 15
@@ -66,7 +67,12 @@ def _read_number(
         return default
     try:
         value = cast(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError belongs here: ``extra_dejson`` parses 1e400 to ``inf`` and a
+        # 400-digit literal to an int no float can hold, and either one raises out of
+        # the cast rather than reaching the finiteness check below. Unhandled it leaves
+        # ``build_amqp_connection`` altogether, past the caller that would have written
+        # the reason into the connection row.
         log.warning("RMQ connection extra %r=%r is not a number, using %s", key, raw, default)
         return default
     if not math.isfinite(value):
@@ -92,10 +98,20 @@ def _read_heartbeat(extras: dict[str, Any]) -> int:
     ``0`` is accepted as a deliberate opt-out and logged as a WARNING, because it
     turns off broken-link detection entirely. Unusable values fall back to
     :data:`DEFAULT_HEARTBEAT` with a WARNING.
+
+    The interval is read as a number and only then made whole, so that a value between
+    zero and one second falls back rather than truncating to zero: an interval too short
+    to express is a mistake, and reading it as the opt-out would silently turn off the
+    detection the caller was asking to tighten.
     """
-    value = _read_number(
-        extras, HEARTBEAT_KEY, DEFAULT_HEARTBEAT, lambda raw: int(float(raw)), 0
-    )
+    value = _read_number(extras, HEARTBEAT_KEY, DEFAULT_HEARTBEAT, float, 0)
+    if 0 < value < 1:
+        log.warning(
+            "RMQ connection extra %r=%r is shorter than a second, using %s",
+            HEARTBEAT_KEY, value, DEFAULT_HEARTBEAT,
+        )
+        return DEFAULT_HEARTBEAT
+    value = int(value)
     if value == 0:
         log.warning(
             "RMQ connection extra %r=0 turns off the AMQP heartbeat: a broken link stays "

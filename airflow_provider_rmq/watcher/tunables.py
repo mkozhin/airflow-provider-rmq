@@ -2,9 +2,9 @@
 
 The reconcile interval is read by two processes that share nothing else: the
 scheduler runs the loop, and the webserver renders the Subscriptions page and needs
-the same number to tell a fresh status row from a stale one. Keeping the names here
-lets the view read them without importing the listener, whose module chain pulls
-``aio_pika`` and ``httpx`` into a process that never opens a connection.
+the same number to tell a fresh status row from a stale one. The names and their
+defaults therefore have one home that both read, and the view does not reach into
+the listener for them.
 """
 from __future__ import annotations
 

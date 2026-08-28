@@ -112,7 +112,7 @@ Three optional **Extra** keys control AMQP timing. All of them are plain JSON va
 
 | Key | Default | Used by | Meaning |
 |---|---|---|---|
-| `heartbeat` | `30` on the async path, `600` in `RMQHook` | every AMQP connection | Seconds between AMQP heartbeat frames. The client declares the link dead after two missed intervals, so a broken connection becomes an exception in roughly `2 × heartbeat` seconds and `connect_robust` reconnects |
+| `heartbeat` | `30` on the async path, `600` in `RMQHook` | every AMQP connection | Seconds between AMQP heartbeat frames. `aiormq` allows three missed intervals and checks every half-interval, so a broken connection becomes an exception in roughly `3 × heartbeat` seconds — about 90 s at the default — and `connect_robust` reconnects |
 | `connect_timeout` | `15` | RMQ Watcher | Seconds allowed for establishing an async connection |
 | `rpc_timeout` | `30` | RMQ Watcher | Seconds allowed for a single async AMQP call — `channel()`, declare, bind, publish |
 

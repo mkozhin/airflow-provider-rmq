@@ -508,11 +508,15 @@ class TestConsumerState:
         with patch("airflow_provider_rmq.watcher.consumer.WatcherSession", return_value=ctx), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status", side_effect=capture):
             state = _ConsumerState(sub_id=1, executor=_test_pool())
-            state._last_status = "error"  # simulate being in error state
+            await state.write("error", last_error="broker refused the connection")
             await state.write("connecting")
             await state.write("listening", last_error=None)
 
-        assert ("listening", None) in writes
+        assert writes == [
+            ("error", "broker refused the connection"),
+            ("connecting", None),
+            ("listening", None),
+        ], "leaving error must clear the reason in the row"
 
     @pytest.mark.asyncio
     async def test_status_write_runs_in_the_consumer_pool(self):
@@ -3352,6 +3356,54 @@ class TestConnectionSetup:
             f"{waited / connect_timeout:.0f} connect_timeouts — they are queueing "
             f"rather than waiting for the one attempt together"
         )
+
+    @pytest.mark.asyncio
+    async def test_a_drop_under_a_waiting_caller_is_a_transient_failure(self):
+        """Recovery drops a connection while consumer tasks wait for its connect, and
+        the shared connect task is cancelled with it. Reported as a cancellation, that
+        would end each waiting task through its own ``except CancelledError`` branch —
+        no status written, no restart counted, consumption stopped until the next
+        cycle notices the task is done."""
+        manager = _make_manager()
+        conn_info = _make_conn_info()
+        conn_info.extra_dejson = {"connect_timeout": 30}
+
+        with _blocked_broker(), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             patch("airflow_provider_rmq.watcher.consumer._write_conn_error"), \
+             _patch_watcher_session():
+            waiter = asyncio.create_task(manager._get_or_create_connection("rmq_default"))
+            state = manager._conn("rmq_default")
+            await _wait_for(lambda: _ROLE_CONSUME in state.connecting)
+
+            await manager._drop_connection("rmq_default")
+
+            with pytest.raises(ConnectionError):
+                await asyncio.wait_for(waiter, timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_caller_itself_stays_a_cancellation(self):
+        """The waiter's own cancellation is the one case that must pass through
+        untouched: recovery, a subscription edit and stop() all cancel consumer tasks,
+        and a task that swallowed that would ignore stop()."""
+        manager = _make_manager()
+        conn_info = _make_conn_info()
+        conn_info.extra_dejson = {"connect_timeout": 30}
+
+        with _blocked_broker(), \
+             patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                   return_value=conn_info), \
+             _patch_watcher_session():
+            waiter = asyncio.create_task(manager._get_or_create_connection("rmq_default"))
+            state = manager._conn("rmq_default")
+            await _wait_for(lambda: _ROLE_CONSUME in state.connecting)
+
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            await manager._drop_connection("rmq_default")
 
     @pytest.mark.asyncio
     async def test_a_connection_whose_reconnect_never_finished_is_replaced(self, manager):
@@ -6342,8 +6394,56 @@ class TestStatusWriteOrder:
             writer.store()
 
         assert stored == ["listening"]
-        assert writer.stored == "listening"
+        assert writer.stored == ("listening", None)
         assert not writer.has_pending
+
+    @pytest.mark.asyncio
+    async def test_a_status_left_unwritten_is_not_skipped_by_a_later_matching_one(self):
+        """The guard skips a write the row already carries. A status left behind by a
+        write that failed is the row's only way back to the truth, so a later status
+        equal to what the row says must not return early and strand it — the reconcile
+        cycle would then commit the stale one over a subscription that recovered."""
+        state = _ConsumerState(7, _test_pool("test-stale-pending"))
+        stored = []
+        fail_on_error = True
+
+        def write(session, sub_id, status, last_error=None):
+            if status == "error" and fail_on_error:
+                raise RuntimeError("metadata database is away")
+            stored.append((status, last_error))
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await state.write("listening", last_error=None)
+            await state.write("error", last_error="trigger failed")   # dropped by the outage
+            fail_on_error = False
+            await state.write("listening", last_error=None)           # equals the stored one
+
+        assert stored == [("listening", None), ("listening", None)]
+        assert not _status_writer(7).has_pending, "the stale error is still waiting"
+
+    @pytest.mark.asyncio
+    async def test_a_new_reason_under_an_unchanged_status_reaches_the_row(self):
+        """The row carries the status and the reason. A second failure of the same kind
+        changes only the text, and an operator reading a cause that has already been
+        dealt with looks in the wrong place."""
+        state = _ConsumerState(7, _test_pool("test-error-text"))
+        stored = []
+
+        def write(session, sub_id, status, last_error=None):
+            stored.append((status, last_error))
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await state.write("error", last_error="metadata DB refused")
+            await state.write("error", last_error="DAG run limit reached")
+
+        assert stored == [
+            ("error", "metadata DB refused"),
+            ("error", "DAG run limit reached"),
+        ]
 
     def test_a_write_finding_the_writer_busy_gives_its_worker_straight_back(self):
         """A status write must never queue behind another one.
