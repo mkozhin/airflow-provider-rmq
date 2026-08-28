@@ -6,7 +6,10 @@ import logging
 import os
 import re
 import socket
+import threading
 import uuid
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -255,11 +258,70 @@ def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> str:
     return _OUTCOME_TRIGGERED
 
 
-def _write_consumer_status(sub_id: int, status: str, last_error: str | None) -> None:
-    """Store the status of one subscription. Blocking — belongs in a pool."""
-    with WatcherSession() as session:
-        set_consumer_status(session, sub_id, status, last_error=last_error)
-        session.commit()
+class _StatusOrder:
+    """Keeps the status writes of one subscription in the order they were made.
+
+    A write runs in a pool worker while the caller waits only :data:`_DB_TIMEOUT` for
+    it; the call itself carries on afterwards. Two writes are therefore in the pool at
+    once whenever the first one is slow, and the database would otherwise end up
+    holding whichever of them the workers happened to commit last — a row saying
+    ``listening`` for a subscription that has since reported an error, with nothing to
+    correct it, because the manager already counts the newer value as stored.
+
+    Each write takes a number before it is handed to the pool. The lock serialises the
+    writes of one subscription, and the number is compared again inside it, so a write
+    a newer one has already overtaken is dropped instead of landing.
+    """
+
+    def __init__(self) -> None:
+        self._issue_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._issued = 0
+        self._written = 0
+
+    def issue(self) -> int:
+        """Take the number of the next write. Called before the write is submitted."""
+        with self._issue_lock:
+            self._issued += 1
+            return self._issued
+
+    def run(self, generation: int, write: Callable[[], None]) -> bool:
+        """Run ``write`` unless a later write has already reached the database.
+
+        :param generation: The number :meth:`issue` gave this write.
+        :returns: Whether the write ran.
+        """
+        with self._write_lock:
+            if generation <= self._written:
+                return False
+            write()
+            self._written = generation
+            return True
+
+
+def _write_consumer_status(
+    sub_id: int,
+    status: str,
+    last_error: str | None,
+    order: _StatusOrder,
+    generation: int,
+) -> None:
+    """Store the status of one subscription. Blocking — belongs in a pool.
+
+    The write is skipped when a later one has already stored a newer status for this
+    subscription: see :class:`_StatusOrder`.
+    """
+
+    def write() -> None:
+        with WatcherSession() as session:
+            set_consumer_status(session, sub_id, status, last_error=last_error)
+            session.commit()
+
+    if not order.run(generation, write):
+        log.debug(
+            "Status %r of subscription %s is stale — a newer one already stored",
+            status, sub_id,
+        )
 
 
 def _write_conn_error(conn_id: str, error: str) -> None:
@@ -343,15 +405,43 @@ async def _close_quietly(closeable: Any, what: str, method: str = "close") -> No
         log.warning("Closing %s failed: %s — continuing without it", what, exc)
 
 
-async def _wait_cancelled(tasks: list[asyncio.Task]) -> None:
+@asynccontextmanager
+async def _attached(queue: Any, consumer_tag: str, timeout: float) -> AsyncIterator[Any]:
+    """Register ``consumer_tag`` on ``queue`` and hand out the iterator of that consumer.
+
+    ``basic.consume`` is performed here instead of inside the iterator's own
+    ``__aenter__`` so that the registration is bounded. Unbounded it is the third way
+    into the incident this watchdog exists for: the manager would report the
+    subscription as attached and hand the liveness check a tag the broker never
+    registered, and the connection would read as healthy with nothing consuming.
+
+    Leaving the block cancels the consumer under :data:`_CLOSE_TIMEOUT` — aio_pika
+    cancels it with no bound of its own, and ``basic.cancel`` is exactly the call a
+    zombie connection never answers, which would leave the cancelled task and its
+    channel alive for as long as the process runs.
+
+    :param timeout: Seconds the broker is given to confirm the registration.
+    """
+    q_iter = queue.iterator(consumer_tag=consumer_tag)
+    await call_with_timeout(q_iter.consume(), timeout=timeout)
+    try:
+        yield q_iter
+    finally:
+        await _close_quietly(q_iter, f"the consumer {consumer_tag!r}")
+
+
+async def _wait_cancelled(tasks: list[asyncio.Task]) -> set[asyncio.Task]:
     """Wait for already-cancelled ``tasks``, giving up after :data:`_CANCEL_TIMEOUT`.
+
+    :returns: The tasks that were still running when the wait gave up.
 
     A task is free to catch its own ``CancelledError`` and keep going, and the cycle
     that cancelled it has a budget of its own to keep. Waiting without a bound is what
-    turns one uncooperative task into a cycle that never ends.
+    turns one uncooperative task into a cycle that never ends. The caller keeps what is
+    handed back so that a task the recovery walked away from is still accounted for.
     """
     if not tasks:
-        return
+        return set()
     done, pending = await asyncio.wait(tasks, timeout=_CANCEL_TIMEOUT)
     for task in done:
         if not task.cancelled():
@@ -362,6 +452,7 @@ async def _wait_cancelled(tasks: list[asyncio.Task]) -> None:
             "cycle continues without waiting for them",
             len(pending), _CANCEL_TIMEOUT,
         )
+    return pending
 
 
 class _ConsumerState:
@@ -379,6 +470,7 @@ class _ConsumerState:
         self._executor = executor
         self._status: str | None = None
         self._stored_status: str | None = None
+        self._order = _StatusOrder()
         #: Tag the task registered on its queue during its current attach, ``None``
         #: while it is not attached. The liveness check asks the broker for this exact
         #: tag rather than recomputing one.
@@ -389,28 +481,45 @@ class _ConsumerState:
         """Status the task last reported, ``None`` before it reported anything."""
         return self._status
 
-    async def write(self, status: str, last_error: str | None = None) -> None:
+    async def write(
+        self,
+        status: str,
+        last_error: str | None = None,
+        executor: BoundedExecutor | None = None,
+    ) -> None:
         """Record ``status``, storing it if it differs from the one already stored.
+
+        :param executor: Pool the blocking write runs in; the consumer pool by default.
+            The reconcile cycle passes its own so that a stalled delivery and a stalled
+            cycle never share a worker.
 
         The reported status is the manager's own view of the task and is updated
         whatever the database does: it gates the liveness check, and a subscription
         left out of that check because one write timed out would never be verified
         again for the life of the task.
 
-        The store is a blocking database write, so it runs in the consumer pool under a
-        timeout: the consumer task awaits it, and a database that never answers would
-        otherwise hold the task open forever. A write that does not land leaves the
-        *stored* marker untouched, so the next call tries again, and it never
-        propagates — diagnostics must not stop consumption.
+        The store is a blocking database write, so it runs in a pool under a timeout:
+        the consumer task awaits it, and a database that never answers would otherwise
+        hold the task open forever. A write that does not land leaves the *stored*
+        marker untouched, so the next call tries again, and it never propagates —
+        diagnostics must not stop consumption. A write the caller stopped waiting for
+        still reaches the database eventually, which is why the writes of one
+        subscription carry the order they were made in (:class:`_StatusOrder`).
         """
         self._status = status
         if status == self._stored_status:
             return
         if self._sub_id is not None:
+            pool = executor if executor is not None else self._executor
             try:
                 await call_with_timeout(
-                    self._executor.run(
-                        _write_consumer_status, self._sub_id, status, last_error
+                    pool.run(
+                        _write_consumer_status,
+                        self._sub_id,
+                        status,
+                        last_error,
+                        self._order,
+                        self._order.issue(),
                     ),
                     timeout=_DB_TIMEOUT,
                 )
@@ -561,6 +670,8 @@ class RMQConsumerManager:
         self._http_client: httpx.AsyncClient | None = None  # Management API client
         # conn_ids the split-cooldown warning last named, so it is logged on change
         self._split_cooldown_warned: set[str] = set()
+        #: Cancelled tasks that had not finished when the cycle stopped waiting for them.
+        self._abandoned: set[asyncio.Task] = set()
 
     def _conn(self, conn_id: str) -> _ConnState:
         """The record of ``conn_id``, created empty the first time it is asked for."""
@@ -568,6 +679,25 @@ class RMQConsumerManager:
         if state is None:
             state = self._conns[conn_id] = _ConnState()
         return state
+
+    def _abandon(self, tasks: set[asyncio.Task]) -> None:
+        """Keep hold of cancelled ``tasks`` that outlived the wait for them.
+
+        Recovery starts a replacement without them, so nothing else refers to such a
+        task and asyncio itself keeps only a weak reference. Holding them here keeps
+        each one alive until it really finishes, and makes the number of them a thing
+        the operator can see: a count that keeps growing means the connection they hang
+        on answers nothing at all, which no reconnect of ours can mend.
+        """
+        self._abandoned = {task for task in self._abandoned if not task.done()}
+        self._abandoned |= {task for task in tasks if not task.done()}
+        if self._abandoned:
+            log.warning(
+                "%d cancelled consumer task(s) have still not finished — they are kept "
+                "until they do",
+                len(self._abandoned),
+            )
+            incr("rmq_watcher.tasks_abandoned")
 
     def _pooled(self, conn_id: str, role: str) -> Any:
         """The pooled connection of ``(conn_id, role)``, ``None`` when there is none."""
@@ -650,20 +780,20 @@ class RMQConsumerManager:
         for sub_id in to_remove:
             self._active[sub_id].task.cancel()
         if to_remove:
-            await _wait_cancelled([self._active[sub_id].task for sub_id in to_remove])
+            self._abandon(
+                await _wait_cancelled(
+                    [self._active[sub_id].task for sub_id in to_remove]
+                )
+            )
             for sub_id in to_remove:
-                try:
-                    await call_with_timeout(
-                        self._cycle_executor.run(
-                            _write_consumer_status, sub_id, _SUB_DISCONNECTED, None
-                        ),
-                        timeout=_DB_TIMEOUT,
+                # Through the state of the task that has just been cancelled: it owns
+                # the order the status writes of this subscription reach the database
+                # in, and a write that task started may still be in a worker.
+                entry = self._active.pop(sub_id, None)
+                if entry is not None:
+                    await entry.state.write(
+                        _SUB_DISCONNECTED, executor=self._cycle_executor
                     )
-                except Exception as exc:
-                    log.warning(
-                        "Cannot mark removed subscription %s disconnected: %s", sub_id, exc
-                    )
-                self._active.pop(sub_id, None)
 
         for sub in subscriptions:
             sub_id = sub["id"]
@@ -671,7 +801,7 @@ class RMQConsumerManager:
             if entry is None or entry.task.done() or self._subs_changed(sub_id, sub):
                 if entry is not None and not entry.task.done():
                     entry.task.cancel()
-                    await _wait_cancelled([entry.task])
+                    self._abandon(await _wait_cancelled([entry.task]))
                 task = asyncio.create_task(self._consume_subscription(sub))
                 self._active[sub_id] = _ActiveSub(
                     task=task, sub=sub.copy(), state=_ConsumerState(sub_id, self._executor)
@@ -720,7 +850,7 @@ class RMQConsumerManager:
                     running.conn_id if running else None, fire_conn_id,
                 )
                 self._fire_task.cancel()
-                await _wait_cancelled([self._fire_task])
+                self._abandon(await _wait_cancelled([self._fire_task]))
                 self._fire_task = None
                 self._fire_state = None
             if self._fire_task is None or self._fire_task.done():
@@ -735,7 +865,7 @@ class RMQConsumerManager:
         elif not cooldown_dag_ids:
             if self._fire_task is not None and not self._fire_task.done():
                 self._fire_task.cancel()
-                await _wait_cancelled([self._fire_task])
+                self._abandon(await _wait_cancelled([self._fire_task]))
             self._fire_task = None
             self._fire_state = None
 
@@ -981,14 +1111,23 @@ class RMQConsumerManager:
         return last_cycle is None or self._cycle_no - last_cycle >= _CYCLES_BEFORE_REDROP
 
     async def _get_publish_channel(self, conn_id: str) -> Any:
-        """Return a channel on the publish connection of ``conn_id``, opening it on demand."""
+        """Return a channel on the publish connection of ``conn_id``, opening it on demand.
+
+        The channel raises on a returned message. A cooldown placeholder is published
+        ``mandatory``, and the broker answers an unroutable one — the pending queue is
+        not there — with ``basic.return`` followed by an ack. On aio_pika's default
+        channel that pair resolves the publish successfully and hands the returned
+        message back as its result, so a caller that only watches for exceptions would
+        acknowledge the delivery behind an event that reached no queue at all.
+        """
         state = self._conn(conn_id)
         channel = state.publish_channel
         if channel is not None and not channel.is_closed:
             return channel
         connection = await self._get_or_create_connection(conn_id, role=_ROLE_PUBLISH)
         channel = await call_with_timeout(
-            connection.channel(), timeout=self._rpc_timeout(conn_id)
+            connection.channel(on_return_raises=True),
+            timeout=self._rpc_timeout(conn_id),
         )
         state.publish_channel = channel
         return channel
@@ -1372,7 +1511,7 @@ class RMQConsumerManager:
             self._fire_task = None
             self._fire_state = None
 
-        await _wait_cancelled(cancelled)
+        self._abandon(await _wait_cancelled(cancelled))
 
         for conn_id in sorted(to_recreate):
             await self._drop_connection(conn_id)
@@ -1870,40 +2009,47 @@ class RMQConsumerManager:
                 connection = await self._get_or_create_connection(conn_id)
                 rpc_timeout = self._rpc_timeout(conn_id)
                 channel = await call_with_timeout(connection.channel(), timeout=rpc_timeout)
-                queue = await call_with_timeout(
-                    channel.declare_queue(queue_name, passive=True), timeout=rpc_timeout
-                )
-                # No set_qos on purpose: messages that miss the filter are NACKed with
-                # requeue (ADR-0002) and come back to the head of the queue, so any finite
-                # prefetch window fills up with them and consumption stops for good once
-                # the misses reach the window size. The unacked window stays unbounded.
-                consumer_tag = _consumer_tag(sub_id, _attach_nonce())
-                state.consumer_tag = consumer_tag
-                await state.write(_SUB_LISTENING, last_error=None)
-                log.info(
-                    "Subscription %d (DAG %s) is consuming queue %r on conn_id=%r",
-                    sub_id, dag_id, queue_name, conn_id,
-                )
-                incr("rmq_watcher.consumer_attached")
+                try:
+                    queue = await call_with_timeout(
+                        channel.declare_queue(queue_name, passive=True),
+                        timeout=rpc_timeout,
+                    )
+                    # No set_qos on purpose: messages that miss the filter are NACKed
+                    # with requeue (ADR-0002) and come back to the head of the queue, so
+                    # any finite prefetch window fills up with them and consumption stops
+                    # for good once the misses reach the window size. The unacked window
+                    # stays unbounded.
+                    consumer_tag = _consumer_tag(sub_id, _attach_nonce())
+                    async with _attached(queue, consumer_tag, rpc_timeout) as q_iter:
+                        state.consumer_tag = consumer_tag
+                        await state.write(_SUB_LISTENING, last_error=None)
+                        log.info(
+                            "Subscription %d (DAG %s) is consuming queue %r on conn_id=%r",
+                            sub_id, dag_id, queue_name, conn_id,
+                        )
+                        incr("rmq_watcher.consumer_attached")
 
-                async with queue.iterator(consumer_tag=consumer_tag) as q_iter:
-                    async for message in q_iter:
-                        if not match(message, msg_filter):
-                            await nack_and_sleep(message)
-                            continue
-                        if cooldown > 0:
-                            await self._handle_cooldown_delivery(
-                                conn_id, dag_id, cooldown, message, publish_backoff
-                            )
-                        else:
-                            await self._handle_immediate_delivery(
-                                sub, message, state, trigger_backoff
-                            )
+                        async for message in q_iter:
+                            if not match(message, msg_filter):
+                                await nack_and_sleep(message)
+                                continue
+                            if cooldown > 0:
+                                await self._handle_cooldown_delivery(
+                                    conn_id, dag_id, cooldown, message, publish_backoff
+                                )
+                            else:
+                                await self._handle_immediate_delivery(
+                                    sub, message, state, trigger_backoff
+                                )
+                finally:
+                    state.consumer_tag = None
+                    await _close_quietly(
+                        channel, f"the channel of subscription {sub_id}"
+                    )
 
                 # The iterator finished without an exception — the broker cancelled the
                 # consumer. Pause before subscribing again so a broker that keeps ending
                 # it right away cannot spin this loop.
-                state.consumer_tag = None
                 await asyncio.sleep(_RECONNECT_DELAY)
 
             except asyncio.CancelledError:
@@ -2005,12 +2151,18 @@ class RMQConsumerManager:
         publishers under a resource alarm leaves the consuming connection — and with it
         every ``basic.ack`` — untouched.
 
-        A broker that rejects the publish has done its job: the pending queue is declared
-        ``x-max-length=1`` with ``x-overflow=reject-publish``, so a rejection means the
-        cooldown for this dag_id is already counting down and a second placeholder would
-        add nothing. That is the ordinary case while a cooldown window is open, and the
-        delivery is acknowledged — requeueing it would redeliver the same message for the
-        whole window and burn the quorum-queue delivery limit on it.
+        A broker that *rejects* the publish has done its job: the pending queue is
+        declared ``x-max-length=1`` with ``x-overflow=reject-publish``, so a rejection
+        means the cooldown for this dag_id is already counting down and a second
+        placeholder would add nothing. That is the ordinary case while a cooldown window
+        is open, and the delivery is acknowledged — requeueing it would redeliver the
+        same message for the whole window and burn the quorum-queue delivery limit on it.
+
+        A broker that *returns* the publish says the opposite: the pending queue is
+        missing, so nothing is counting down and nothing will ever fire this window. The
+        delivery goes back on the queue and the next reconcile cycle declares the queue
+        again. The two answers are told apart by the channel, which is opened to raise on
+        a returned message (see :meth:`_get_publish_channel`).
 
         A publish that fails for any other reason returns the delivery to the queue right
         away: leaving the loop hands back only what is still buffered in the iterator, and
@@ -2034,7 +2186,14 @@ class RMQConsumerManager:
         except asyncio.CancelledError:
             raise
         except aio_pika.exceptions.PublishError as exc:
-            # The message came back unrouted: the pending queue is not there at all.
+            # The broker returned the message: the pending queue is not there at all, so
+            # nothing will ever fire this cooldown window. The delivery goes back on the
+            # queue and the next reconcile cycle declares the queue again.
+            log.warning(
+                "Cooldown placeholder for DAG %s reached no queue (%s) — the delivery "
+                "is back on the queue",
+                dag_id, exc,
+            )
             await self._handle_publish_failure(conn_id, message, exc)
             raise
         except aio_pika.exceptions.DeliveryError:
@@ -2095,43 +2254,28 @@ class RMQConsumerManager:
             try:
                 rpc_timeout = self._rpc_timeout(conn_id)
                 channel = await call_with_timeout(connection.channel(), timeout=rpc_timeout)
-                queue = await call_with_timeout(
-                    channel.declare_queue(_FIRE_QUEUE, passive=True), timeout=rpc_timeout
-                )
-                fire_tag = _consumer_tag("fire", _attach_nonce())
-                state.consumer_tag = fire_tag
-                await state.write(_SUB_LISTENING)
-                log.info(
-                    "Cooldown fire consumer is consuming queue %r on conn_id=%r",
-                    _FIRE_QUEUE, conn_id,
-                )
-                incr("rmq_watcher.consumer_attached")
+                try:
+                    queue = await call_with_timeout(
+                        channel.declare_queue(_FIRE_QUEUE, passive=True),
+                        timeout=rpc_timeout,
+                    )
+                    fire_tag = _consumer_tag("fire", _attach_nonce())
+                    async with _attached(queue, fire_tag, rpc_timeout) as q_iter:
+                        state.consumer_tag = fire_tag
+                        await state.write(_SUB_LISTENING)
+                        log.info(
+                            "Cooldown fire consumer is consuming queue %r on conn_id=%r",
+                            _FIRE_QUEUE, conn_id,
+                        )
+                        incr("rmq_watcher.consumer_attached")
 
-                async with queue.iterator(consumer_tag=fire_tag) as q_iter:
-                    async for message in q_iter:
-                        dag_id = message.routing_key or ""
-                        if not dag_id:
-                            log.warning(
-                                "Fire queue message has no routing_key — skipping"
-                            )
-                            await message.ack()
-                            continue
-                        if not message.message_id:
-                            log.warning(
-                                "Fire queue message has no message_id — skipping (idempotency broken)"
-                            )
-                            await message.ack()
-                            continue
-                        outcome = await self._trigger_fire_dag(dag_id, message)
-                        if outcome == _OUTCOME_TRIGGERED:
-                            incr("rmq_watcher.dag_triggered")
-                        # Known limitation: if _sync_trigger returned early because the
-                        # DAG is paused/inactive, the message is still ACKed here and the
-                        # fire event is permanently lost. This is intentional — the DLX
-                        # message has already spent its TTL and re-queuing would cause an
-                        # infinite loop. Operators should ensure DAGs are active before
-                        # enabling cooldown subscriptions.
-                        await message.ack()
+                        async for message in q_iter:
+                            await self._handle_fire_delivery(message)
+                finally:
+                    state.consumer_tag = None
+                    await _close_quietly(
+                        channel, f"the fire consumer channel of conn_id={conn_id!r}"
+                    )
 
             except asyncio.CancelledError:
                 return
@@ -2160,6 +2304,48 @@ class RMQConsumerManager:
                     exc, _RECONNECT_DELAY,
                 )
                 await asyncio.sleep(_RECONNECT_DELAY)
+
+    async def _handle_fire_delivery(self, message: Any) -> None:
+        """Start the DAG run one expired cooldown window calls for, then acknowledge it.
+
+        A trigger that fails puts the fire event back on the queue before the error
+        leaves the loop: leaving it hands back only what is still buffered in the
+        iterator, and this message, already taken out of it, would otherwise sit
+        unacknowledged until the broker's ``consumer_timeout`` expires.
+        """
+        dag_id = message.routing_key or ""
+        if not dag_id:
+            log.warning("Fire queue message has no routing_key — skipping")
+            await message.ack()
+            return
+        if not message.message_id:
+            log.warning(
+                "Fire queue message has no message_id — skipping (idempotency broken)"
+            )
+            await message.ack()
+            return
+
+        try:
+            outcome = await self._trigger_fire_dag(dag_id, message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Triggering DAG %s for an expired cooldown window failed: %s — the fire "
+                "event is back on the queue",
+                dag_id, exc,
+            )
+            await message.nack(requeue=True)
+            raise
+
+        if outcome == _OUTCOME_TRIGGERED:
+            incr("rmq_watcher.dag_triggered")
+        # Known limitation: if _sync_trigger returned early because the DAG is
+        # paused/inactive, the message is still ACKed here and the fire event is
+        # permanently lost. This is intentional — the DLX message has already spent its
+        # TTL and re-queuing would cause an infinite loop. Operators should ensure DAGs
+        # are active before enabling cooldown subscriptions.
+        await message.ack()
 
     async def _trigger_fire_dag(self, dag_id: str, message: Any) -> str:
         """Start the DAG run one expired cooldown window calls for, and report how it ended.
