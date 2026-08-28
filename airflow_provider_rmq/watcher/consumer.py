@@ -8,7 +8,7 @@ import re
 import socket
 import threading
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -258,70 +258,82 @@ def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> str:
     return _OUTCOME_TRIGGERED
 
 
-class _StatusOrder:
-    """Keeps the status writes of one subscription in the order they were made.
+class _StatusWriter:
+    """The one writer of the ``consumer_status`` row of a single subscription.
 
-    A write runs in a pool worker while the caller waits only :data:`_DB_TIMEOUT` for
-    it; the call itself carries on afterwards. Two writes are therefore in the pool at
-    once whenever the first one is slow, and the database would otherwise end up
-    holding whichever of them the workers happened to commit last — a row saying
-    ``listening`` for a subscription that has since reported an error, with nothing to
-    correct it, because the manager already counts the newer value as stored.
+    A status write is a blocking database call: it runs in a pool worker while the
+    caller waits only :data:`_DB_TIMEOUT` for it, and it carries on afterwards. Two
+    writes of the same subscription running at once would leave the row holding
+    whichever of them a worker happened to commit last — ``listening`` for a
+    subscription that has since reported an error, with nothing to correct it, because
+    the manager already counts the newer value as stored.
 
-    Each write takes a number before it is handed to the pool. The lock serialises the
-    writes of one subscription, and the number is compared again inside it, so a write
-    a newer one has already overtaken is dropped instead of landing.
+    So one write of a subscription runs at a time. Each caller notes the status it
+    wants stored and asks the writer to store; whoever gets there first stores status
+    after status until none is left, and the others find the writer taken and return
+    on the spot. Of the statuses noted while a write runs only the newest survives — an
+    older one it replaced was never going to be the truth about the subscription — and
+    no caller ever waits for another caller's write, so a database that has stopped
+    answering costs one worker and holds up nothing else.
+
+    A writer is kept for the life of the process, because the row outlives everything
+    that writes to it: recovery replaces the task, the state that tracks it and the
+    manager itself, and an authority replaced along with them could not rule on the
+    write the one before it left running.
     """
 
-    def __init__(self) -> None:
-        self._issue_lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._issued = 0
-        self._written = 0
+    def __init__(self, sub_id: int) -> None:
+        self._sub_id = sub_id
+        self._lock = threading.Lock()
+        self._pending: tuple[str, str | None] | None = None
+        self._storing = False
 
-    def issue(self) -> int:
-        """Take the number of the next write. Called before the write is submitted."""
-        with self._issue_lock:
-            self._issued += 1
-            return self._issued
+    def record(self, status: str, last_error: str | None) -> None:
+        """Note ``status`` as the one to store next, in place of any still unstored."""
+        with self._lock:
+            self._pending = (status, last_error)
 
-    def run(self, generation: int, write: Callable[[], None]) -> bool:
-        """Run ``write`` unless a later write has already reached the database.
+    def store(self) -> bool:
+        """Store noted statuses until none is left. Blocking — belongs in a pool.
 
-        :param generation: The number :meth:`issue` gave this write.
-        :returns: Whether the write ran.
+        :returns: Whether this call did the storing. ``False`` means a write of this
+            subscription is already running and takes the noted status with it, which
+            is why the call gives its worker straight back instead of waiting for it.
         """
-        with self._write_lock:
-            if generation <= self._written:
+        with self._lock:
+            if self._storing:
                 return False
-            write()
-            self._written = generation
-            return True
+            self._storing = True
+        try:
+            while True:
+                with self._lock:
+                    pending = self._pending
+                    self._pending = None
+                    if pending is None:
+                        self._storing = False
+                        return True
+                status, last_error = pending
+                with WatcherSession() as session:
+                    set_consumer_status(session, self._sub_id, status, last_error=last_error)
+                    session.commit()
+        except BaseException:
+            with self._lock:
+                self._storing = False
+            raise
 
 
-def _write_consumer_status(
-    sub_id: int,
-    status: str,
-    last_error: str | None,
-    order: _StatusOrder,
-    generation: int,
-) -> None:
-    """Store the status of one subscription. Blocking — belongs in a pool.
+#: The writer of each subscription, by ``sub_id``: see :class:`_StatusWriter`.
+_status_writers: dict[int, _StatusWriter] = {}
+_status_writers_lock = threading.Lock()
 
-    The write is skipped when a later one has already stored a newer status for this
-    subscription: see :class:`_StatusOrder`.
-    """
 
-    def write() -> None:
-        with WatcherSession() as session:
-            set_consumer_status(session, sub_id, status, last_error=last_error)
-            session.commit()
-
-    if not order.run(generation, write):
-        log.debug(
-            "Status %r of subscription %s is stale — a newer one already stored",
-            status, sub_id,
-        )
+def _status_writer(sub_id: int) -> _StatusWriter:
+    """The writer of subscription ``sub_id``, made the first time it is asked for."""
+    with _status_writers_lock:
+        writer = _status_writers.get(sub_id)
+        if writer is None:
+            writer = _status_writers[sub_id] = _StatusWriter(sub_id)
+        return writer
 
 
 def _write_conn_error(conn_id: str, error: str) -> None:
@@ -470,7 +482,6 @@ class _ConsumerState:
         self._executor = executor
         self._status: str | None = None
         self._stored_status: str | None = None
-        self._order = _StatusOrder()
         #: Tag the task registered on its queue during its current attach, ``None``
         #: while it is not attached. The liveness check asks the broker for this exact
         #: tag rather than recomputing one.
@@ -503,25 +514,22 @@ class _ConsumerState:
         hold the task open forever. A write that does not land leaves the *stored*
         marker untouched, so the next call tries again, and it never propagates —
         diagnostics must not stop consumption. A write the caller stopped waiting for
-        still reaches the database eventually, which is why the writes of one
-        subscription carry the order they were made in (:class:`_StatusOrder`).
+        still reaches the database eventually, which is why every write of one
+        subscription goes through that subscription's own writer
+        (:class:`_StatusWriter`). Handing the status to a write already running there
+        also leaves the marker alone: it is the running write that decides whether the
+        status reaches the row.
         """
         self._status = status
         if status == self._stored_status:
             return
         if self._sub_id is not None:
+            writer = _status_writer(self._sub_id)
+            writer.record(status, last_error)
             pool = executor if executor is not None else self._executor
             try:
-                await call_with_timeout(
-                    pool.run(
-                        _write_consumer_status,
-                        self._sub_id,
-                        status,
-                        last_error,
-                        self._order,
-                        self._order.issue(),
-                    ),
-                    timeout=_DB_TIMEOUT,
+                stored = await call_with_timeout(
+                    pool.run(writer.store), timeout=_DB_TIMEOUT
                 )
             except asyncio.CancelledError:
                 raise
@@ -529,6 +537,12 @@ class _ConsumerState:
                 log.warning(
                     "Cannot store status %r of subscription %s: %s",
                     status, self._sub_id, exc,
+                )
+                return
+            if not stored:
+                log.debug(
+                    "Status %r of subscription %s left to the write already running",
+                    status, self._sub_id,
                 )
                 return
         self._stored_status = status
@@ -685,19 +699,24 @@ class RMQConsumerManager:
 
         Recovery starts a replacement without them, so nothing else refers to such a
         task and asyncio itself keeps only a weak reference. Holding them here keeps
-        each one alive until it really finishes, and makes the number of them a thing
-        the operator can see: a count that keeps growing means the connection they hang
-        on answers nothing at all, which no reconnect of ours can mend.
+        each one alive until it really finishes — it lets go of itself the moment it
+        does — and counts each one once, as it is abandoned, so
+        ``rmq_watcher.tasks_abandoned`` counts tasks: a number that keeps growing means
+        the connection they hang on answers nothing at all, which no reconnect of ours
+        can mend.
         """
-        self._abandoned = {task for task in self._abandoned if not task.done()}
-        self._abandoned |= {task for task in tasks if not task.done()}
-        if self._abandoned:
-            log.warning(
-                "%d cancelled consumer task(s) have still not finished — they are kept "
-                "until they do",
-                len(self._abandoned),
-            )
+        fresh = {task for task in tasks if not task.done() and task not in self._abandoned}
+        if not fresh:
+            return
+        for task in fresh:
+            self._abandoned.add(task)
+            task.add_done_callback(self._abandoned.discard)
             incr("rmq_watcher.tasks_abandoned")
+        log.warning(
+            "%d cancelled consumer task(s) have still not finished — they are kept "
+            "until they do (%d in all)",
+            len(fresh), len(self._abandoned),
+        )
 
     def _pooled(self, conn_id: str, role: str) -> Any:
         """The pooled connection of ``(conn_id, role)``, ``None`` when there is none."""
@@ -786,9 +805,9 @@ class RMQConsumerManager:
                 )
             )
             for sub_id in to_remove:
-                # Through the state of the task that has just been cancelled: it owns
-                # the order the status writes of this subscription reach the database
-                # in, and a write that task started may still be in a worker.
+                # Through the state of the task that has just been cancelled: the
+                # write it may have left running in a worker is a write of this same
+                # row, and both go through the one writer of this subscription.
                 entry = self._active.pop(sub_id, None)
                 if entry is not None:
                     await entry.state.write(

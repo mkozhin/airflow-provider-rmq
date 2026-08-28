@@ -29,7 +29,7 @@ from airflow_provider_rmq.watcher.consumer import (
     _ConnLiveness,
     _ConsumerState,
     _CYCLES_BEFORE_REDROP,
-    _StatusOrder,
+    _StatusWriter,
     _FireSub,
     _RECONNECT_DELAY,
     _ROLE_CONSUME,
@@ -42,7 +42,8 @@ from airflow_provider_rmq.watcher.consumer import (
     _sync_trigger,
     _wait_cancelled,
     _write_conn_error,
-    _write_consumer_status,
+    _status_writer,
+    _status_writers,
     _OUTCOME_DUPLICATE,
     _OUTCOME_SKIPPED,
     _OUTCOME_TRIGGERED,
@@ -165,8 +166,8 @@ def _offloading_executor(outcome: str = _OUTCOME_TRIGGERED) -> _FakeExecutor:
     async def handler(fn, *args):
         if fn is _sync_trigger:
             return outcome
-        if fn is _write_consumer_status:
-            return None
+        if isinstance(getattr(fn, "__self__", None), _StatusWriter):
+            return True   # the subscription's status writer; nothing to store here
         return fn(*args)
 
     return _FakeExecutor(handler)
@@ -215,6 +216,19 @@ def _make_manager(executor=None, cycle_executor=None) -> RMQConsumerManager:
             cycle_executor if cycle_executor is not None else _test_pool("test-cycle")
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def fresh_status_writers():
+    """Start each test with no writer holding anything for any subscription.
+
+    Writers live as long as the process, because the row each one owns outlives every
+    object that writes to it (see :class:`_StatusWriter`), so one test would otherwise
+    hand the next one a write of its own that is still running.
+    """
+    _status_writers.clear()
+    yield
+    _status_writers.clear()
 
 
 def _mock_session():
@@ -4928,19 +4942,20 @@ class TestCycleWritesOffTheLoop:
         consumer_calls = []
 
         async def cycle_handler(fn, *args):
-            cycle_calls.append((fn.__name__, args))
+            cycle_calls.append(fn)
+            return True
 
         async def consumer_handler(fn, *args):
-            consumer_calls.append((fn.__name__, args))
+            consumer_calls.append(fn)
+            return True
 
         manager._cycle_executor = _FakeExecutor(cycle_handler)
         manager._executor = _FakeExecutor(consumer_handler)
 
         await manager.reconcile([])   # the subscription is gone — mark it disconnected
-        assert any(
-            name == "_write_consumer_status" and args[:3] == (7, "disconnected", None)
-            for name, args in cycle_calls
-        ), cycle_calls
+        writer = _status_writer(7)
+        assert any(getattr(fn, "__self__", None) is writer for fn in cycle_calls), cycle_calls
+        assert writer._pending == ("disconnected", None)
 
         # A cycle with subscriptions on it writes the status row of every conn_id, and
         # that write belongs in the cycle pool as well.
@@ -4950,7 +4965,7 @@ class TestCycleWritesOffTheLoop:
         with patch.object(manager, "_recover_dead_consumers", new_callable=AsyncMock):
             await manager.reconcile([still_there])
 
-        assert any(name == "_write_conn_status_rows" for name, _ in cycle_calls), cycle_calls
+        assert any(fn.__name__ == "_write_conn_status_rows" for fn in cycle_calls), cycle_calls
         assert consumer_calls == [], "the cycle must never borrow a consumer worker"
         await _drain(manager)
 
@@ -5029,9 +5044,10 @@ class TestHungTrigger:
             with patch.object(manager, "_get_or_create_connection", return_value=connection), \
                  patch("airflow_provider_rmq.watcher.consumer._sync_trigger", hang), \
                  patch("airflow_provider_rmq.watcher.consumer._TRIGGER_TIMEOUT", 0.05), \
+                 _patch_watcher_session(), \
                  patch(
-                     "airflow_provider_rmq.watcher.consumer._write_consumer_status",
-                     lambda sub_id, status, last_error, order, generation: (
+                     "airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                     lambda session, sub_id, status, last_error=None: (
                          statuses.append(status)
                      ),
                  ), \
@@ -5596,24 +5612,120 @@ class TestStatusWriteOrder:
 
         assert stored[-1] == "error", stored
 
-    def test_a_write_that_a_newer_one_overtook_is_dropped(self):
-        """The lock alone only orders writes that reach it in order. The number each
-        write takes before it is submitted is what settles the other case: the newer
-        write got there first, so the older one has nothing left to say."""
-        order = _StatusOrder()
-        first, second = order.issue(), order.issue()
-        landed = []
+    @pytest.mark.asyncio
+    async def test_a_write_from_a_replaced_state_cannot_overtake_the_new_one(self):
+        """Recovery replaces the state along with the task it tracks.
 
-        assert order.run(second, lambda: landed.append("error")) is True
-        assert order.run(first, lambda: landed.append("listening")) is False
-        assert landed == ["error"]
+        The write the old state left in a worker is a write to the same row, so it must
+        not land on top of what the state that replaced it has to say — a numbering that
+        starts afresh with each state could not rule on it at all.
+        """
+        pool = BoundedExecutor("test-status-cross-state", 4)
+        old = _ConsumerState(sub_id=7, executor=pool)
+        new = _ConsumerState(sub_id=7, executor=pool)
+        stored = []
+        release = threading.Event()
+        entered = threading.Event()
+
+        def write(session, sub_id, status, last_error=None):
+            if status == "listening":
+                entered.set()
+                release.wait(5)   # the write the caller has already timed out on
+            stored.append(status)
+
+        ctx, _ = _mock_session()
+        try:
+            with patch("airflow_provider_rmq.watcher.consumer.WatcherSession", return_value=ctx), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write), \
+                 patch("airflow_provider_rmq.watcher.consumer._DB_TIMEOUT", 0.2):
+                await old.write("listening")
+                assert entered.is_set()
+                await new.write("error")
+                release.set()
+                deadline = time.monotonic() + 5
+                while len(stored) < 2 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+        finally:
+            release.set()
+            pool.shutdown()
+
+        assert stored[-1] == "error", stored
+
+    def test_a_status_a_newer_one_replaced_is_gone_even_if_the_newer_one_fails(self):
+        """It is the newer status that retires the older one, not the newer write.
+
+        A failed ``error`` write that left ``listening`` free to land afterwards would
+        restore the false-green row the writer exists to prevent.
+        """
+        writer = _StatusWriter(7)
+        stored = []
+
+        def write(session, sub_id, status, last_error=None):
+            if status == "error":
+                raise RuntimeError("database write failed")
+            stored.append(status)
+
+        writer.record("listening", None)   # the write the caller timed out on
+        writer.record("error", "gone")     # the status that replaced it
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            with pytest.raises(RuntimeError):
+                writer.store()
+            writer.store()   # whatever writes next has nothing stale left to write
+
+        assert stored == []
+
+    def test_a_write_finding_the_writer_busy_gives_its_worker_straight_back(self):
+        """A status write must never queue behind another one.
+
+        The pool cannot interrupt a running call, so a write waiting for one to finish
+        holds a second worker for as long as the database is stuck — enough of them and
+        the pool that carries the DAG triggers is full.
+        """
+        pool = BoundedExecutor("test-status-busy", 2)
+        writer = _StatusWriter(7)
+        release = threading.Event()
+        entered = threading.Event()
+
+        def write(session, sub_id, status, last_error=None):
+            entered.set()
+            release.wait(5)
+
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                writer.record("listening", None)
+                hung = pool.submit(writer.store)
+                assert entered.wait(2)
+
+                writer.record("error", "gone")
+                assert pool.submit(writer.store).result(timeout=1) is False
+
+                unrelated = pool.submit(lambda: "a trigger of another subscription")
+                assert unrelated.result(timeout=1) == "a trigger of another subscription"
+        finally:
+            release.set()
+            with suppress(Exception):
+                hung.result(timeout=2)
+            pool.shutdown()
 
     def test_writes_that_arrive_in_order_all_land(self):
-        order = _StatusOrder()
+        writer = _StatusWriter(7)
         landed = []
 
-        for status in ("connecting", "listening", "error"):
-            assert order.run(order.issue(), lambda s=status: landed.append(s)) is True
+        def write(session, sub_id, status, last_error=None):
+            landed.append(status)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            for status in ("connecting", "listening", "error"):
+                writer.record(status, None)
+                assert writer.store() is True
 
         assert landed == ["connecting", "listening", "error"]
 
@@ -5671,7 +5783,7 @@ class TestConsumerRegistration:
 
         with patch.object(manager, "_get_or_create_connection", return_value=connection), \
              patch.object(manager, "_rpc_timeout", return_value=0.05), \
-             patch("airflow_provider_rmq.watcher.consumer._write_consumer_status"):
+             patch("airflow_provider_rmq.watcher.consumer._StatusWriter.store"):
             await _run_then_cancel(manager._consume_subscription(sub), timeout=0.5)
 
         assert state.consumer_tag is None
@@ -5827,5 +5939,31 @@ class TestAbandonedTasks:
         manager._abandon(pending)
         assert task in manager._abandoned
         await task
-        manager._abandon(set())
-        assert manager._abandoned == set(), "a task that finished is let go"
+        await real_sleep(0)
+        assert manager._abandoned == set(), "a task that finished lets go of itself"
+
+    @pytest.mark.asyncio
+    async def test_each_task_is_counted_once(self, manager):
+        """``tasks_abandoned`` counts tasks, not the cycles that go on holding them.
+
+        The number is read as "consumers stuck on a connection that answers nothing";
+        counting the same task again every cycle, or counting a cycle that abandoned
+        nothing at all, would make a single stuck task look like a spreading outage.
+        """
+        gate = asyncio.Event()
+        first = asyncio.create_task(gate.wait())
+        second = asyncio.create_task(gate.wait())
+        await asyncio.sleep(0)
+
+        try:
+            with patch("airflow_provider_rmq.watcher.consumer.incr") as incr:
+                manager._abandon({first})
+                manager._abandon({first})       # the same task, still not finished
+                manager._abandon(set())         # a cycle that abandoned nothing
+                assert incr.call_count == 1
+
+                manager._abandon({second})
+                assert incr.call_count == 2
+        finally:
+            gate.set()
+            await asyncio.gather(first, second)

@@ -114,11 +114,32 @@ def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
     )
 
 
+def _abandon_call(future: Any) -> None:
+    """Stop watching ``future``, whenever it may end.
+
+    A cancelled call takes as long as it takes to notice — an ``aiormq`` RPC answers a
+    cancellation by closing its channel, which writes a frame to the socket that may be
+    exactly what is stuck — so nothing waits for it and nothing cancels it a second
+    time. Its outcome is read once it lands only so a failure of an abandoned call is
+    not reported as an exception nobody retrieved.
+    """
+    future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+
+
 async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
     """Await ``awaitable``, raising :exc:`asyncio.TimeoutError` after ``timeout`` seconds.
 
     :param awaitable: Coroutine or future to await; it is cancelled when the timeout hits.
     :param timeout: Seconds allowed for the call.
+
+    ``timeout`` bounds the caller and nothing else: a call that has not returned by then
+    is cancelled and left to finish on its own while the caller gets its
+    :exc:`~asyncio.TimeoutError` straight away. Waiting for the cancellation to complete
+    would put the bound back in the hands of the call being bounded — cancelling an
+    ``aiormq`` RPC makes it close its channel, and a channel closes by writing a frame
+    to the same socket the call is stuck on, so the recovery paths that exist to survive
+    a silent broker (a bounded ``basic.consume``, a best-effort ``close()``) would hang
+    on exactly the connection they are recovering from.
 
     Cancellation of the *caller* is passed on untouched, including when it lands in the
     same event-loop tick as the timeout. The caller waits on a private future that only
@@ -136,8 +157,13 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
 
     def _on_timeout() -> None:
         nonlocal expired
+        if waiter.done():
+            return
         expired = True
+        # The call is cancelled before the caller is woken, so a call that answers its
+        # cancellation at once still gets that tick to do it in.
         future.cancel()
+        waiter.set_result(None)
 
     def _on_done(_future: Any) -> None:
         if not waiter.done():
@@ -149,12 +175,17 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
         await waiter
     except asyncio.CancelledError:
         future.remove_done_callback(_on_done)
-        if future.done() and not future.cancelled():
-            future.exception()  # retrieved so it is not reported as never awaited
         future.cancel()
+        _abandon_call(future)
         raise
     finally:
         timer.cancel()
+
+    future.remove_done_callback(_on_done)
+    if not future.done():
+        # Already cancelled by the timer; it is left to run its cancellation out.
+        _abandon_call(future)
+        raise asyncio.TimeoutError()
 
     try:
         return future.result()

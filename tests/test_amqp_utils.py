@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import ssl
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -392,6 +394,70 @@ class TestCallWithTimeout:
 
         assert started.is_set()
         assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_a_call_slow_to_cancel_does_not_stretch_the_timeout(self):
+        """The bound holds even when the call takes its time answering the cancel.
+
+        An ``aiormq`` RPC answers a cancel by closing its channel, and the close writes
+        a frame to the very socket the call is stuck on. Waiting for that would hand the
+        bound back to the broker that stopped answering — the one case the timeout is
+        there for.
+        """
+        cleaning_up = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stubborn():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cleaning_up.set()
+                await release.wait()
+                raise
+
+        call = asyncio.create_task(stubborn())
+        bounded = asyncio.create_task(call_with_timeout(call, 0.05))
+        started = time.monotonic()
+        done, _ = await asyncio.wait({bounded}, timeout=1.0)
+        try:
+            assert bounded in done, "the caller is still waiting out the cancellation"
+            with pytest.raises(asyncio.TimeoutError):
+                bounded.result()
+
+            assert time.monotonic() - started < 0.5
+            assert cleaning_up.is_set(), "the call is cancelled, just not waited for"
+            assert not call.done(), "the call is still cleaning up in the background"
+        finally:
+            bounded.cancel()
+            release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_caller_does_not_wait_for_a_slow_cancel_either(self):
+        """stop() must reach the caller at once, whatever the call it is inside does."""
+        release = asyncio.Event()
+
+        async def stubborn():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+
+        call = asyncio.create_task(stubborn())
+        caller = asyncio.create_task(call_with_timeout(call, 3600.0))
+        await asyncio.sleep(0)
+        caller.cancel()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 0.5)
+            assert not call.done()
+        finally:
+            release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call
 
     @pytest.mark.asyncio
     async def test_caller_cancellation_is_not_swallowed(self):
