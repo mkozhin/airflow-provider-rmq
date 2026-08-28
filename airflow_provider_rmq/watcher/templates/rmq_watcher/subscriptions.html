@@ -52,7 +52,7 @@
               —
             {% elif cs.counts_mismatch %}
               <span class="label label-warning"
-                    title="The broker reports a different number of consumers than the watcher has started for this conn_id. A lower number means a subscription the broker does not see — the watchdog restarts it; a higher number means other clients, or another scheduler replica, consume the same queues.">
+                    title="The broker reports a different number of consumers than the watcher has started for this conn_id. A lower number means a subscription that has not attached yet — still connecting, or backing off after an error — and is therefore not probed; a higher number means other clients, or another scheduler replica, consume the same queues. A consumer the broker is asked about and does not confirm is restarted by the watchdog, and says so in the status of its own subscription.">
                 ⚠ {{ cs.broker_consumer_count }}
               </span>
             {% else %}

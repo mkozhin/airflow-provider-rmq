@@ -303,6 +303,12 @@ class _StatusWriter:
         with self._lock:
             return self._stored
 
+    @property
+    def has_pending(self) -> bool:
+        """Whether a noted status is still waiting to reach the row."""
+        with self._lock:
+            return self._pending is not None
+
     def record(self, status: str, last_error: str | None) -> None:
         """Note ``status`` as the one to store next, in place of any still unstored."""
         with self._lock:
@@ -319,6 +325,7 @@ class _StatusWriter:
             if self._storing:
                 return False
             self._storing = True
+        pending: tuple[str, str | None] | None = None
         try:
             while True:
                 with self._lock:
@@ -333,8 +340,15 @@ class _StatusWriter:
                     session.commit()
                 with self._lock:
                     self._stored = status
+                    pending = None
         except BaseException:
             with self._lock:
+                # The status this call took on never reached the row, so it goes back to
+                # being the one to store next. A subscription that reached its steady
+                # state and then went quiet makes no further write to carry it, and its
+                # row would say ``connecting`` for as long as the task runs.
+                if pending is not None and self._pending is None:
+                    self._pending = pending
                 self._storing = False
             raise
 
@@ -636,6 +650,29 @@ class _ConsumerState:
                 status, self._sub_id, exc,
             )
 
+    async def flush(self, executor: BoundedExecutor) -> None:
+        """Store the status an earlier write did not get into the row.
+
+        A write that fails is put back by the writer, and what carries it after that is
+        the next write of the same subscription. A subscription whose consumer is
+        attached and whose queue is quiet makes none, so without a nudge of its own its
+        row would keep the status it had while the database was away.
+        """
+        if self._sub_id is None:
+            return
+        writer = _status_writer(self._sub_id)
+        if not writer.has_pending:
+            return
+        try:
+            await call_with_timeout(executor.run(writer.store), timeout=_DB_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Cannot store the unwritten status of subscription %s: %s",
+                self._sub_id, exc,
+            )
+
 
 class _Checked:
     """Liveness bookkeeping shared by the two kinds of consumer the check judges."""
@@ -896,6 +933,21 @@ class RMQConsumerManager:
         await self._recover_dead_consumers(subscriptions)
 
         await self._update_all_conn_counts(subscriptions)
+
+        await self._store_unwritten_statuses()
+
+    async def _store_unwritten_statuses(self) -> None:
+        """Carry the statuses a database outage left unwritten into their rows.
+
+        The consumer that writes a status has moved on by the time the database answers
+        again, and one whose queue is quiet writes nothing further, so the cycle is what
+        gets the row and the subscription back into agreement.
+        """
+        for entry in list(self._active.values()):
+            await entry.state.flush(self._cycle_executor)
+        fire = self._fire_state
+        if fire is not None:
+            await fire.state.flush(self._cycle_executor)
 
     async def _sync_consumer_tasks(self, subscriptions: list[dict]) -> None:
         """Cancel the tasks of removed subscriptions and start the ones that are missing.

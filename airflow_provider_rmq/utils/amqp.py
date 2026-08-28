@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import ssl
 from dataclasses import dataclass
 from typing import Any
@@ -58,7 +59,7 @@ def _read_number(
     """Read a number from ``extra``, falling back to ``default``.
 
     A missing key uses the default silently; a present but unusable value
-    (non-numeric, or below ``minimum``) uses the default and logs a WARNING.
+    (non-numeric, not finite, or below ``minimum``) uses the default and logs a WARNING.
     """
     raw = extras.get(key, _MISSING)
     if raw is _MISSING:
@@ -67,6 +68,14 @@ def _read_number(
         value = cast(raw)
     except (TypeError, ValueError):
         log.warning("RMQ connection extra %r=%r is not a number, using %s", key, raw, default)
+        return default
+    if not math.isfinite(value):
+        # ``float`` reads "inf" and "nan" happily, and both pass the comparison below:
+        # an infinite timeout is a call with no bound at all, which is what every bound
+        # here exists to prevent.
+        log.warning(
+            "RMQ connection extra %r=%r is not a finite number, using %s", key, raw, default
+        )
         return default
     if value < minimum:
         log.warning(

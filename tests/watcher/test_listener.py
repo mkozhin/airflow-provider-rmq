@@ -2299,6 +2299,21 @@ class TestReadSettings:
             for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
 
+    @pytest.mark.parametrize("raw", ["inf", "1e400", "nan", "-inf"])
+    def test_a_value_that_is_not_finite_is_ignored_with_a_warning(self, caplog, raw):
+        """``float`` reads these happily and they pass a plain positivity check: an
+        infinite cycle budget is a watchdog that never fires, and a NaN one compares
+        False against everything, which leaves the timers in no order at all."""
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+        ), self._variables({CYCLE_TIMEOUT_VAR: raw}):
+            _, budget = _read_settings()
+
+        assert budget is None
+        assert any(
+            CYCLE_TIMEOUT_VAR in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
     def test_one_bad_variable_does_not_hide_the_other(self):
         with self._variables({
             RECONCILE_INTERVAL_VAR: "nope",

@@ -6224,13 +6224,16 @@ class TestStatusWriteOrder:
         """It is the newer status that retires the older one, not the newer write.
 
         A failed ``error`` write that left ``listening`` free to land afterwards would
-        restore the false-green row the writer exists to prevent.
+        restore the false-green row the writer exists to prevent. The failed status is
+        the one tried again, and the one it replaced is gone for good.
         """
         writer = _StatusWriter(7)
         stored = []
+        attempts = []
 
         def write(session, sub_id, status, last_error=None):
-            if status == "error":
+            attempts.append(status)
+            if len(attempts) == 1:
                 raise RuntimeError("database write failed")
             stored.append(status)
 
@@ -6242,9 +6245,58 @@ class TestStatusWriteOrder:
                    side_effect=write):
             with pytest.raises(RuntimeError):
                 writer.store()
-            writer.store()   # whatever writes next has nothing stale left to write
+            writer.store()
 
-        assert stored == []
+        assert attempts == ["error", "error"]
+        assert stored == ["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_cycle_carries_a_dropped_status_into_the_row(self, manager):
+        """Nothing else would: the consumer that wrote the status has moved on, and one
+        whose queue is quiet makes no further write to carry it."""
+        entry = _register_active(manager, _sub(id=7))
+        _status_writer(7).record("listening", None)
+        stored = []
+
+        def write(session, sub_id, status, last_error=None):
+            stored.append(status)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await manager._store_unwritten_statuses()
+
+        assert stored == ["listening"]
+        assert not _status_writer(7).has_pending
+        assert entry.state.status == "listening"
+
+    def test_a_status_that_did_not_reach_the_row_is_stored_by_the_next_call(self):
+        """A subscription that reached its steady state and went quiet writes nothing
+        further, so a status dropped on a database outage would leave the row saying
+        what it said while the database was away — for as long as the task runs."""
+        writer = _StatusWriter(7)
+        stored = []
+        attempts = []
+
+        def write(session, sub_id, status, last_error=None):
+            attempts.append(status)
+            if len(attempts) == 1:
+                raise RuntimeError("database is away")
+            stored.append(status)
+
+        writer.record("listening", None)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            with pytest.raises(RuntimeError):
+                writer.store()
+            assert writer.has_pending, "the status the outage dropped is gone"
+            writer.store()
+
+        assert stored == ["listening"]
+        assert writer.stored == "listening"
+        assert not writer.has_pending
 
     def test_a_write_finding_the_writer_busy_gives_its_worker_straight_back(self):
         """A status write must never queue behind another one.

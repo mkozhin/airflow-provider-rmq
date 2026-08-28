@@ -223,6 +223,16 @@ class TestGetAmqpTimeouts:
         assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
         assert caplog.records
 
+    @pytest.mark.parametrize("raw", ['"Infinity"', '"NaN"', "1e400"])
+    def test_a_value_that_is_not_finite_falls_back(self, caplog, raw):
+        """An infinite timeout is a call with no bound at all, which is what every bound
+        here exists to prevent, and NaN compares False against every minimum."""
+        conn = FakeAirflowConnection(extra=f'{{"connect_timeout": {raw}}}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert caplog.records
+
     def test_missing_key_does_not_warn(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
             get_amqp_timeouts(FakeAirflowConnection())
