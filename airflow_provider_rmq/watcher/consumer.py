@@ -322,16 +322,16 @@ class _StatusWriter:
         with self._lock:
             self._pending = (status, last_error)
 
-    def store(self) -> bool:
+    def store(self) -> None:
         """Store noted statuses until none is left. Blocking — belongs in a pool.
 
-        :returns: Whether this call did the storing. ``False`` means a write of this
-            subscription is already running and takes the noted status with it, which
-            is why the call gives its worker straight back instead of waiting for it.
+        A call that finds a write of this subscription already running returns on the
+        spot, giving its worker straight back: the running write takes the noted status
+        with it.
         """
         with self._lock:
             if self._storing:
-                return False
+                return
             self._storing = True
         pending: tuple[str, str | None] | None = None
         try:
@@ -341,7 +341,7 @@ class _StatusWriter:
                     self._pending = None
                     if pending is None:
                         self._storing = False
-                        return True
+                        return
                 status, last_error = pending
                 with WatcherSession() as session:
                     set_consumer_status(session, self._sub_id, status, last_error=last_error)

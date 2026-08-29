@@ -6899,8 +6899,10 @@ class TestStatusWriteOrder:
         writer = _StatusWriter(7)
         release = threading.Event()
         entered = threading.Event()
+        commits = []
 
         def write(session, sub_id, status, last_error=None):
+            commits.append(status)
             entered.set()
             release.wait(5)
 
@@ -6913,7 +6915,8 @@ class TestStatusWriteOrder:
                 assert entered.wait(2)
 
                 writer.record("error", "gone")
-                assert pool.submit(writer.store).result(timeout=1) is False
+                pool.submit(writer.store).result(timeout=1)
+                assert commits == ["listening"], "the busy writer let a second write in"
 
                 unrelated = pool.submit(lambda: "a trigger of another subscription")
                 assert unrelated.result(timeout=1) == "a trigger of another subscription"
@@ -6935,9 +6938,48 @@ class TestStatusWriteOrder:
                    side_effect=write):
             for status in ("connecting", "listening", "error"):
                 writer.record(status, None)
-                assert writer.store() is True
+                writer.store()
+                assert not writer.has_pending
 
         assert landed == ["connecting", "listening", "error"]
+        assert writer.stored == ("error", None)
+
+    def test_a_status_noted_while_a_write_runs_is_taken_by_that_write(self):
+        """The caller that finds the writer busy leaves without storing, so the status
+        it noted reaches the row only because the running write picks it up before it
+        gives up its worker."""
+        pool = BoundedExecutor("test-status-handover", 2)
+        writer = _StatusWriter(7)
+        release = threading.Event()
+        entered = threading.Event()
+        landed = []
+
+        def write(session, sub_id, status, last_error=None):
+            landed.append(status)
+            if status == "listening":
+                entered.set()
+                release.wait(5)
+
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                writer.record("listening", None)
+                running = pool.submit(writer.store)
+                assert entered.wait(2)
+
+                writer.record("error", "gone")
+                pool.submit(writer.store).result(timeout=1)
+
+                release.set()
+                running.result(timeout=2)
+        finally:
+            release.set()
+            pool.shutdown()
+
+        assert landed == ["listening", "error"]
+        assert not writer.has_pending
+        assert writer.stored == ("error", "gone")
 
     @pytest.mark.asyncio
     async def test_a_write_the_caller_gave_up_on_still_counts_as_stored(self):

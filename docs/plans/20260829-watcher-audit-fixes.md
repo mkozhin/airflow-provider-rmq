@@ -541,16 +541,24 @@ HTTP-запрос успешен. Пересоздание соединения 
 - Modify: `airflow_provider_rmq/watcher/consumer.py`
 - Modify: `tests/watcher/test_consumer.py`
 
-- [ ] сделать `_StatusWriter.store()` возвращающим `None` и убрать из docstring
+- [x] сделать `_StatusWriter.store()` возвращающим `None` и убрать из docstring
       абзац про возвращаемое значение, оставив описание того, что метод делает
       при уже идущей записи
-- [ ] переписать `tests/watcher/test_consumer.py:6473` на наблюдаемое поведение:
+- [x] переписать `tests/watcher/test_consumer.py:6473` на наблюдаемое поведение:
       завершение `.result(timeout=1)` и есть «воркер отдан сразу»
-- [ ] переписать `tests/watcher/test_consumer.py:6495` на наблюдаемое поведение:
+      - ⚠️ ссылка на строку устарела: тест
+        `test_a_write_finding_the_writer_busy_gives_its_worker_straight_back`
+        стоит на `6891`. Наблюдаемое: второй вызов возвращается за секунду и
+        второй записи не начинает (`commits == ["listening"]`)
+- [x] переписать `tests/watcher/test_consumer.py:6495` на наблюдаемое поведение:
       каждый записанный статус доходит до строки
-- [ ] тест: запись, начатая вторым вызовом при идущем первом, не теряет
+      - ⚠️ ссылка на строку устарела: тест
+        `test_writes_that_arrive_in_order_all_land` стоит на `6926`. Наблюдаемое:
+        порядок в `landed`, пустой `has_pending` после каждой записи и `stored`
+- [x] тест: запись, начатая вторым вызовом при идущем первом, не теряет
       отложенный статус
-- [ ] run tests - must pass before next task
+      (`test_a_status_noted_while_a_write_runs_is_taken_by_that_write`)
+- [x] run tests - must pass before next task
 
 ### Task 5: Дописывать финальный статус исчезнувшей подписки
 
