@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import logging
 import os
 import re
@@ -71,8 +72,10 @@ _CLOSE_TIMEOUT = 5.0
 #: cancellation must not hold up the cycle that cancelled it.
 _CANCEL_TIMEOUT = 30.0
 #: Seconds ``stop()`` waits for cancelled tasks. Shorter than the listener's own
-#: ``_STOP_TIMEOUT`` on purpose: the wait and the closing that follows it share that one
+#: ``_STOP_TIMEOUT`` on purpose: the wait, the status pass and the closing share that one
 #: budget, and a wait that spends all of it leaves connections and the HTTP client open.
+#: The closing costs at most the two roles of one conn_id — one :data:`_CLOSE_TIMEOUT`
+#: each — however many connections there are, because ``stop()`` closes them all at once.
 _STOP_CANCEL_TIMEOUT = 10.0
 
 #: A blocking database write. The worker stays busy until the call itself returns — a
@@ -418,8 +421,27 @@ def _write_conn_error(conn_id: str, error: str) -> None:
         session.commit()
 
 
-def _write_conn_status_rows(rows: list[tuple], now: datetime) -> None:
+#: Serialises the writes of ``rmq_watcher_conn_status`` and the mark of how far they
+#: have got, so that an older snapshot cannot land on top of a newer one. Held for the
+#: length of a write, so nothing on the event loop may ever take it.
+_conn_status_lock = threading.Lock()
+#: Numbers the snapshots in the order they were taken; read on the loop thread only.
+_conn_status_snapshots = itertools.count(1)
+#: The newest snapshot that reached the rows.
+_conn_status_written = 0
+
+
+def _write_conn_status_rows(rows: list[tuple], now: datetime, snapshot: int) -> None:
     """Store one status row per conn_id. Blocking.
+
+    :param snapshot: Where these rows come in the order the cycles took them.
+
+    One write of these rows runs at a time and an older snapshot loses to a newer one.
+    The caller stops waiting after :data:`_DB_TIMEOUT` while the worker carries on, so
+    a write a slow database is still holding meets the write of the cycle behind it;
+    committed in that order, a ``connected`` taken before an outage would land on top of
+    the ``error`` that followed it and stay there, with the manager counting the newer
+    value as stored and nothing left to correct the row until the verdict changes again.
 
     A row whose ``status`` is ``None`` carries no verdict — the check produced no data —
     and keeps whatever is already stored, so an unreachable Management API does not
@@ -431,23 +453,35 @@ def _write_conn_status_rows(rows: list[tuple], now: datetime) -> None:
     The stored statuses are read only when some row actually needs the fallback, so an
     all-verdict cycle costs one write and no extra full-table scan.
     """
-    with WatcherSession() as session:
-        stored: dict[str, str] | None = None
-        for conn_id, count, status, reason, broker_count in rows:
-            if status is None:
-                if stored is None:
-                    stored = {row.conn_id: row.status for row in get_conn_statuses(session)}
-                status = stored.get(conn_id, _CONN_UNKNOWN)
-            upsert_conn_status(
-                session,
-                conn_id,
-                status,
-                consumer_count=count,
-                last_error=reason,
-                broker_consumer_count=broker_count,
-                last_reconcile_at=now,
+    global _conn_status_written
+    with _conn_status_lock:
+        if snapshot <= _conn_status_written:
+            log.warning(
+                "Connection status snapshot %d is older than snapshot %d, which is "
+                "already in the rows — dropping it",
+                snapshot, _conn_status_written,
             )
-        session.commit()
+            return
+        with WatcherSession() as session:
+            stored: dict[str, str] | None = None
+            for conn_id, count, status, reason, broker_count in rows:
+                if status is None:
+                    if stored is None:
+                        stored = {
+                            row.conn_id: row.status for row in get_conn_statuses(session)
+                        }
+                    status = stored.get(conn_id, _CONN_UNKNOWN)
+                upsert_conn_status(
+                    session,
+                    conn_id,
+                    status,
+                    consumer_count=count,
+                    last_error=reason,
+                    broker_consumer_count=broker_count,
+                    last_reconcile_at=now,
+                )
+            session.commit()
+        _conn_status_written = snapshot
 
 
 class _Backoff:
@@ -774,9 +808,22 @@ class _ConsumerState:
         to a write already running gets there through that one. A caller marking down
         what it *asked* for would end up holding the opposite of what the row says, and
         the guard would then suppress every write that could correct it.
+
+        ``listening`` is the one status the row can refuse, and the channel the consumer
+        is registered on is what refuses it (:func:`_cancelled_by_broker`). A broker that
+        cancels a consumer of ours goes on handing over whatever it had already buffered
+        for it, so a delivery can be triggered, acknowledged and reported on a
+        registration that is already gone — landing on the row after the liveness check
+        wrote the verdict that condemned it. The registration is the fact the row is
+        about; the delivery says only that one message arrived. The reported status is
+        moved all the same: it is what keeps the subscription a candidate of the liveness
+        check, and a subscription taken out of that check is left to a retry loop that a
+        task waiting on a cancelled consumer's iterator does not have.
         """
         self._status = status
         if self._sub_id is None:
+            return
+        if status == _SUB_LISTENING and _cancelled_by_broker(self):
             return
         writer = _status_writer(self._sub_id)
         if not writer.record_if_needed(status, last_error):
@@ -1066,16 +1113,30 @@ class RMQConsumerManager:
                 budget=_STOP_STATUS_TIMEOUT, first=set(self._active)
             )
 
-            for conn_id in list(self._conns):
-                await self._drop_connection(conn_id)
+            # Every close runs at once, so what the budget has to cover is the slowest
+            # of them rather than their sum. A broker that has gone silent answers no
+            # ``close`` at all and each one costs its full :data:`_CLOSE_TIMEOUT`; run
+            # one after another, a handful of pooled connections would take the whole
+            # stop over the bound the caller sets, and the ones behind the bound — and
+            # the HTTP client with them — would be left open for the loop that replaces
+            # this one to compete with.
+            closes: list[Any] = [
+                self._drop_connection(conn_id) for conn_id in list(self._conns)
+            ]
+            client, self._http_client = self._http_client, None
+            if client is not None:
+                closes.append(
+                    _close_quietly(client, "the Management API client", "aclose")
+                )
+            # Nothing here raises in the ordinary course — closing is best effort
+            # wherever it happens — and one that did must still not leave the closes
+            # beside it half awaited, which is the state this whole block exists to
+            # avoid.
+            for outcome in await asyncio.gather(*closes, return_exceptions=True):
+                if isinstance(outcome, BaseException):
+                    log.warning("Closing what the manager held failed: %s", outcome)
             self._active.clear()
             self._conns.clear()
-
-            if self._http_client is not None:
-                await _close_quietly(
-                    self._http_client, "the Management API client", "aclose"
-                )
-                self._http_client = None
 
     async def reconcile(self, subscriptions: list[dict]) -> None:
         """Sync running tasks, connections and infrastructure with the subscription list.
@@ -1552,7 +1613,9 @@ class RMQConsumerManager:
 
         try:
             await call_with_timeout(
-                self._cycle_executor.run(_write_conn_status_rows, rows, now),
+                self._cycle_executor.run(
+                    _write_conn_status_rows, rows, now, next(_conn_status_snapshots)
+                ),
                 timeout=_DB_TIMEOUT,
             )
         except Exception as exc:
@@ -2343,10 +2406,11 @@ class RMQConsumerManager:
             )
 
         fire_unseen = False
+        fire_condemned = False
         if fire_here and fire is not None:
             seen = _seen(fire.state, live_tags)
             if fire.record(seen):
-                self._fire_needs_restart = True
+                self._fire_needs_restart = fire_condemned = True
             if not seen:
                 fire_unseen = True
                 log.warning(
@@ -2363,7 +2427,16 @@ class RMQConsumerManager:
             return set(), False
 
         unseen_reason = _unseen_reason(len(unseen), fire_unseen)
-        if not dead_subs:
+        # A conn_id the fire consumer is the only candidate of has nothing else that
+        # could vouch for its connection, so the fire consumer's verdict is the
+        # connection's and recovery recreates it: the restart would otherwise be handed
+        # the same pooled object every cycle, and this conn_id reaches no other judge —
+        # :meth:`_judge_without_candidates`, which is what would eventually condemn a
+        # connection its tasks cannot consume on, skips every conn_id that has a
+        # candidate. A subscription the broker confirms on the same conn_id is that
+        # vouching, and the fire consumer is then restarted on its own.
+        fire_alone = fire_condemned and not subs
+        if not dead_subs and not fire_alone:
             # The restart waits for a second negative check in a row, the reported
             # status does not: the broker is holding none of these consumers right
             # now, and a green row would claim the opposite for a whole reconcile
@@ -2390,10 +2463,10 @@ class RMQConsumerManager:
         confirmed = sorted(sub["id"] for sub, _ in subs if sub["id"] not in dead_subs)
         if confirmed:
             log.warning(
-                "The connection of conn_id=%r is being recreated for %d condemned "
-                "subscription(s); subscription(s) %s share it and keep their own retry "
-                "loop — they surface the drop as a transient consumer error",
-                conn_id, len(dead_subs), confirmed,
+                "The connection of conn_id=%r is being recreated (%s); subscription(s) "
+                "%s share it and keep their own retry loop — they surface the drop as a "
+                "transient consumer error",
+                conn_id, unseen_reason, confirmed,
             )
         state.liveness = _ConnLiveness(
             status=_CONN_ERROR,

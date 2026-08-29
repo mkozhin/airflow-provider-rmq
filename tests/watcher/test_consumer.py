@@ -49,6 +49,7 @@ from airflow_provider_rmq.watcher.consumer import (
     _sync_trigger,
     _wait_cancelled,
     _write_conn_error,
+    _write_conn_status_rows,
     _status_writer,
     _status_writers,
     _OUTCOME_DUPLICATE,
@@ -366,14 +367,53 @@ def _exchange_sub(
 
 class TestStopBudgets:
     def test_cancel_wait_leaves_room_for_the_closing_that_follows_it(self):
-        """The stop budget covers the wait and the closing; the wait may not take it all."""
+        """The stop budget covers the wait, the status pass and the closing.
+
+        The closing costs the two roles of one conn_id — a broker that has gone silent
+        answers no ``close`` at all and each one runs to its full timeout — because
+        ``stop()`` closes every connection at once. Summing it per connection instead
+        would put the arithmetic over the caller's bound at three pooled conn_ids.
+        """
         from airflow_provider_rmq.watcher import listener
         from airflow_provider_rmq.watcher.consumer import (
+            _CLOSE_TIMEOUT,
             _STOP_CANCEL_TIMEOUT,
             _STOP_STATUS_TIMEOUT,
         )
 
-        assert _STOP_CANCEL_TIMEOUT + _STOP_STATUS_TIMEOUT < listener._STOP_TIMEOUT
+        assert (
+            _STOP_CANCEL_TIMEOUT + _STOP_STATUS_TIMEOUT + 2 * _CLOSE_TIMEOUT
+            < listener._STOP_TIMEOUT
+        )
+
+    @pytest.mark.asyncio
+    async def test_connections_that_answer_no_close_do_not_cost_one_timeout_each(self):
+        """A stop is what a fresh event loop waits on, and the loop that replaces this
+        one opens its own connections: everything this manager holds has to be reached
+        inside the caller's bound, not just what fits before it runs out."""
+        manager = _make_manager()
+        blocked = []
+        for index in range(8):
+            connection = AsyncMock()
+            connection.is_closed = False
+            connection.close = _hanging_call
+            manager._conn(f"rmq_{index}").connections[_ROLE_CONSUME] = connection
+            blocked.append(connection)
+        client = MagicMock()
+        client.aclose = AsyncMock(side_effect=_never_returns)
+        manager._http_client = client
+
+        with patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.1):
+            started = time.monotonic()
+            await manager.stop()
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 0.4, (
+            f"the closes ran one after another: {elapsed:.2f}s for {len(blocked)} "
+            f"connections that answer nothing"
+        )
+        client.aclose.assert_awaited_once()
+        assert manager._http_client is None
 
 
 # ---------------------------------------------------------------------------
@@ -5254,6 +5294,56 @@ class TestFireTaskLiveness:
         assert "fire consumer" in manager._conn("rmq_default").liveness.reason
 
     @pytest.mark.asyncio
+    async def test_a_dead_fire_task_alone_on_its_conn_id_condemns_the_connection(
+        self, manager
+    ):
+        """Nothing else on this conn_id can be asked about: its subscription tasks are
+        in their own retry loop, and a conn_id that has a candidate is skipped by the
+        judge that would otherwise condemn a connection its tasks cannot consume on. So
+        the fire consumer's verdict is the connection's — without that, the restart is
+        handed the same pooled object every cycle."""
+        sub = _sub(id=7, queue_name="orders", cooldown=300)
+        _register_active(manager, sub, status="connecting")
+        _register_fire(manager)
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection():
+            first = await manager._check_liveness([sub])
+            second = await manager._check_liveness([sub])
+
+        assert first == (set(), set())
+        assert second == (set(), {"rmq_default"})
+        assert manager._fire_needs_restart is True
+        assert manager._conn("rmq_default").liveness.status == "error"
+
+    @pytest.mark.asyncio
+    async def test_the_fire_consumer_alone_on_its_conn_id_restarts_on_a_fresh_one(self):
+        """The recovery that follows the verdict: the pooled connection is dropped, so
+        the relaunched fire task asks the pool for a connection it has to build."""
+        manager = _make_manager()
+        sub = _sub(id=7, queue_name="orders", cooldown=300)
+        _register_active(manager, sub, status="connecting", real_task=True)
+        _register_fire(manager, real_task=True)
+        old_conn = _make_live_connection()
+        fresh = _make_live_connection()
+        manager._conn("rmq_default").connections[_ROLE_CONSUME] = old_conn
+        manager._http_client = _mgmt_client([])
+
+        with _patch_mgmt_connection(), \
+             patch.object(manager, "_consume_fire_queue", side_effect=_never_returns), \
+             patch.object(manager, "_get_or_create_connection",
+                          new_callable=AsyncMock, return_value=fresh):
+            await manager._recover_dead_consumers([sub])
+            await manager._recover_dead_consumers([sub])
+
+        assert old_conn not in _pooled_connections(manager)
+        old_conn.close.assert_awaited()
+        assert manager._fire_state is not None
+        assert manager._fire_state.connection is fresh
+        await _drain(manager)
+        await manager._http_client.aclose()
+
+    @pytest.mark.asyncio
     async def test_live_fire_tag_clears_its_counter(self, manager):
         sub = _sub(id=7, queue_name="orders", cooldown=300)
         _register_active(manager, sub)
@@ -5465,6 +5555,52 @@ class TestServerSideCancel:
 
         assert first == (set(), set())
         assert second == ({7}, {"rmq_default"})
+
+    @pytest.mark.asyncio
+    async def test_a_delivery_finishing_after_the_cancel_does_not_take_the_verdict_back(
+        self, manager
+    ):
+        """The broker goes on handing over what it had already buffered for a consumer
+        it has just cancelled, so the trigger runs, the delivery is acknowledged and the
+        subscription reports 'listening' — after the check wrote the verdict that
+        condemned the registration. The registration is what the row is about."""
+        sub, entry, channel = self._cancelled_sub(manager)
+        await _server_cancels(channel, entry.state.consumer_tag)
+        stored = []
+
+        def write(session, sub_id, status, last_error=None):
+            stored.append(status)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await manager._check_liveness([sub])
+            await entry.state.write(_SUB_LISTENING, last_error=None)
+            await manager._store_unwritten_statuses()
+
+        assert stored == ["error"]
+        assert entry.state.status == _SUB_LISTENING, (
+            "the reported status keeps the subscription a candidate of the check"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_delivery_on_a_registration_the_channel_holds_reports_listening(
+        self, manager
+    ):
+        """The refusal is about the lost registration and nothing else: a consumer the
+        channel still carries is what every ordinary delivery reports through."""
+        _sub_row, entry, _channel = self._cancelled_sub(manager)
+        stored = []
+
+        def write(session, sub_id, status, last_error=None):
+            stored.append(status)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await entry.state.write(_SUB_LISTENING, last_error=None)
+
+        assert stored == [_SUB_LISTENING]
 
     @pytest.mark.asyncio
     async def test_a_channel_that_cannot_be_read_leaves_the_verdict_to_the_probe(
@@ -6411,6 +6547,104 @@ class TestConnStatusRows:
                 await manager._update_all_conn_counts([sub])
 
         assert mock_log.warning.called
+
+
+class TestConnStatusWriteOrder:
+    """Two writes of ``rmq_watcher_conn_status`` at once, and which of them the rows keep.
+
+    The caller stops waiting after ``_DB_TIMEOUT`` and the worker carries on, so a write
+    a slow database is still holding meets the write of the cycle behind it. Committed
+    in that order, a snapshot taken before an outage lands on top of the one that
+    reported it and stays there — the page reads green, and the manager counts the newer
+    value as stored.
+    """
+
+    @staticmethod
+    def _row(status: str) -> tuple:
+        return ("rmq_default", 1, status, None, 1)
+
+    @staticmethod
+    def _now() -> datetime:
+        """The naive UTC stamp the cycle takes, which the view compares its own with."""
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def test_a_snapshot_older_than_the_rows_is_dropped(self):
+        upsert = MagicMock()
+
+        with ExitStack() as stack:
+            for patcher in _patch_status_writer(upsert):
+                stack.enter_context(patcher)
+            stack.enter_context(
+                patch("airflow_provider_rmq.watcher.consumer._conn_status_written", 0)
+            )
+            _write_conn_status_rows([self._row("error")], self._now(), 2)
+            _write_conn_status_rows([self._row("connected")], self._now(), 1)
+
+        assert [c.args[2] for c in upsert.call_args_list] == ["error"]
+
+    def test_one_write_of_the_rows_runs_at_a_time(self):
+        """Serialising them is what makes the drop above the only way an older snapshot
+        can lose: two writes interleaving inside the session commit in whatever order
+        their transactions land in."""
+        order = []
+        committing = threading.Event()
+        release = threading.Event()
+
+        def upsert(session, conn_id, status, **kwargs):
+            order.append(f"enter {status}")
+            if status == "error":
+                committing.set()
+                release.wait(5)
+            order.append(f"leave {status}")
+
+        with ExitStack() as stack:
+            for patcher in _patch_status_writer(upsert):
+                stack.enter_context(patcher)
+            stack.enter_context(
+                patch("airflow_provider_rmq.watcher.consumer._conn_status_written", 0)
+            )
+            stalled = threading.Thread(
+                target=_write_conn_status_rows,
+                args=([self._row("error")], self._now(), 1),
+            )
+            stalled.start()
+            assert committing.wait(5), "the first write never reached the database"
+            behind = threading.Thread(
+                target=_write_conn_status_rows,
+                args=([self._row("connected")], self._now(), 2),
+            )
+            behind.start()
+            try:
+                behind.join(0.1)
+                assert behind.is_alive(), "the second write got in on top of the first"
+            finally:
+                release.set()
+                stalled.join(5)
+                behind.join(5)
+
+        assert order == [
+            "enter error", "leave error", "enter connected", "leave connected",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_every_cycle_stamps_a_newer_snapshot_than_the_one_before(self, manager):
+        """The stamp is what tells the two writes apart, so it has to keep moving for
+        as long as the process does — a manager replaced by loop recreation included."""
+        sub = _sub(id=7)
+        _register_active(manager, sub)
+        stamps = []
+
+        async def run(fn, *args):
+            stamps.append(args[-1])
+
+        replacement = _make_manager()
+        with patch.object(manager._cycle_executor, "run", side_effect=run), \
+             patch.object(replacement._cycle_executor, "run", side_effect=run):
+            await manager._update_all_conn_counts([sub])
+            await replacement._update_all_conn_counts([sub])
+
+        assert len(stamps) == 2
+        assert stamps[1] > stamps[0]
 
 
 class TestFailedConnectionAttempt:
