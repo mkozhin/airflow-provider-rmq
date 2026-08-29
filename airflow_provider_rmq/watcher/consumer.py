@@ -79,7 +79,7 @@ _STOP_CANCEL_TIMEOUT = 10.0
 #: running thread cannot be interrupted — so the timeout buys back the coroutine, not
 #: the worker.
 _DB_TIMEOUT = 30.0
-#: The pass ``stop()`` makes over the noted statuses once the connections are closed.
+#: The pass ``stop()`` makes over the noted statuses, before the connections are closed.
 #: Short because a stop is either the last thing the process does — where this pass is
 #: the only chance the rows get — or the teardown a fresh event loop is waiting on.
 _STOP_STATUS_TIMEOUT = 3.0
@@ -690,6 +690,11 @@ class _ConsumerState:
         #: while it is not attached. The liveness check asks the broker for this exact
         #: tag rather than recomputing one.
         self.consumer_tag: str | None = None
+        #: The connection object the tag above is registered on, ``None`` while the task
+        #: is not attached. The pool replaces that object whenever the connect behind it
+        #: fails or the connection is recreated, and a registration goes down with the
+        #: object it was made on, so the manager compares the two.
+        self.connection: Any = None
 
     @property
     def status(self) -> str | None:
@@ -1121,13 +1126,44 @@ class RMQConsumerManager:
                     sub_id, exc,
                 )
 
+    def _pooled_consume_connection(self, conn_id: str) -> Any:
+        """The consuming connection object the pool holds for ``conn_id``, ``None`` for none.
+
+        A raw pool read rather than :meth:`_ConnState.ready`: the question is which
+        object the pool holds, not whether it can be used yet, so a connect in flight
+        answers with the object every waiter is waiting on.
+        """
+        state = self._conns.get(conn_id)
+        return state.connections.get(_ROLE_CONSUME) if state is not None else None
+
+    def _attached_to_replaced(self, entry: _ActiveSub, conn_id: str) -> bool:
+        """Whether ``entry``'s consumer is registered on a connection the pool has replaced.
+
+        A task registers its consumer on the object the pool handed it and holds that
+        object for the whole attach. The pool replaces it whenever the connect behind it
+        fails or the connection is recreated, and the replaced object can go quiet
+        without ever raising: closing one whose transport is already gone resolves
+        nothing, so the queue iterator waits for a message that cannot come, the task
+        neither ends nor reports anything, and the registration the broker lost is one
+        nothing rebuilds. So the two objects are compared and a task left on the
+        replaced one is restarted.
+
+        Only an attached task is judged this way — one connecting or backing off after
+        an error is between connections by definition and is handled by its own retry
+        loop.
+        """
+        if entry.state.status != _SUB_LISTENING or entry.state.connection is None:
+            return False
+        return entry.state.connection is not self._pooled_consume_connection(conn_id)
+
     async def _sync_consumer_tasks(self, subscriptions: list[dict]) -> None:
         """Cancel the tasks of removed subscriptions and start the ones that are missing.
 
         A subscription gets a fresh task when it has none, when its task has finished —
-        a consumer only ever finishes on a fatal error — and when a field the running
-        task read at startup has changed, which is what makes an edit in the UI take
-        effect within a cycle.
+        a consumer only ever finishes on a fatal error — when a field the running task
+        read at startup has changed, which is what makes an edit in the UI take effect
+        within a cycle, and when its consumer is registered on a connection the pool has
+        replaced (:meth:`_attached_to_replaced`).
         """
         new_ids = {sub["id"] for sub in subscriptions}
 
@@ -1153,7 +1189,19 @@ class RMQConsumerManager:
         for sub in subscriptions:
             sub_id = sub["id"]
             entry = self._active.get(sub_id)
-            if entry is None or entry.task.done() or self._subs_changed(sub_id, sub):
+            orphaned = entry is not None and self._attached_to_replaced(entry, sub["conn_id"])
+            if orphaned:
+                log.warning(
+                    "Subscription %d is attached to a connection of conn_id=%r the pool "
+                    "no longer has — restarting it on the pooled one",
+                    sub_id, sub["conn_id"],
+                )
+            if (
+                entry is None
+                or entry.task.done()
+                or self._subs_changed(sub_id, sub)
+                or orphaned
+            ):
                 if entry is not None and not entry.task.done():
                     entry.task.cancel()
                     self._abandon(await _wait_cancelled([entry.task]))
@@ -1200,10 +1248,7 @@ class RMQConsumerManager:
             await self._provision_cooldown(cooldown_dag_ids, fire_conn_id)
             running = self._fire_state
             moved = running is not None and running.conn_id != fire_conn_id
-            # Raw pool read rather than ``ready()``: the question is which object the
-            # pool holds, not whether it can be used yet, and a connect in flight must
-            # not read as a connection the fire consumer has to be taken off.
-            pooled = self._conn(fire_conn_id).connections.get(_ROLE_CONSUME)
+            pooled = self._pooled_consume_connection(fire_conn_id)
             replaced = running is not None and not moved and running.connection is not pooled
             if (moved or replaced) and self._fire_task is not None:
                 # The fire consumer holds the connection object it was handed for its
@@ -2142,6 +2187,28 @@ class RMQConsumerManager:
             candidates.setdefault(fire.conn_id, [])
         return candidates, stalled, live_tasks
 
+    def _note_verdict(self, sub_id: int, status: str, last_error: str | None) -> None:
+        """Put what the broker answered about one subscription into that subscription's row.
+
+        The restart of a consumer the broker denies waits for a second negative check,
+        and while a connection is held back by the recreation rate limit it waits longer
+        still. The report does not wait with it: the row an operator reads is the
+        subscription's own, and a subscription reported as consuming next to a broker
+        that holds no consumer of it is the report the incident this watchdog exists for
+        lived behind. A consumer the broker confirms again gets its ``listening`` back
+        the same way, so one negative answer does not leave the row red for the life of
+        the task.
+
+        The verdict is noted on the subscription's :class:`_StatusWriter` — the one
+        authority on that row, which the task writes through as well, so the two are
+        ordered rather than racing and the newest of them is what the row ends up
+        holding: a consumer restarted later in this cycle writes ``connecting`` over the
+        verdict that condemned it. The pass at the end of the cycle carries whatever is
+        left into the database, which is also what keeps a database that stopped
+        answering from costing this loop one timeout per subscription.
+        """
+        _status_writer(sub_id).record_if_needed(status, last_error)
+
     async def _judge_candidates(
         self, conn_id: str, subs: list[tuple[dict, _ActiveSub]]
     ) -> tuple[set[int], bool]:
@@ -2172,9 +2239,14 @@ class RMQConsumerManager:
         dead_subs: set[int] = set()
         for sub, entry in subs:
             seen = entry.state.consumer_tag in live_tags
+            # The row of this subscription carries a verdict of an earlier cycle exactly
+            # when the count is up, and that verdict is this check's to take back.
+            reported_unseen = entry.negative_checks > 0
             if entry.record(seen):
                 dead_subs.add(sub["id"])
             if seen:
+                if reported_unseen and entry.state.status == _SUB_LISTENING:
+                    self._note_verdict(sub["id"], _SUB_LISTENING, None)
                 continue
             unseen.add(sub["id"])
             log.warning(
@@ -2182,6 +2254,15 @@ class RMQConsumerManager:
                 "conn_id=%r) — negative check %d of %d",
                 entry.state.consumer_tag, sub["id"], sub["queue_name"], conn_id,
                 entry.negative_checks, _NEGATIVE_CHECKS_BEFORE_RESTART,
+            )
+            self._note_verdict(
+                sub["id"],
+                _SUB_ERROR,
+                (
+                    f"the broker does not hold consumer {entry.state.consumer_tag} of "
+                    f"this subscription — negative check {entry.negative_checks} of "
+                    f"{_NEGATIVE_CHECKS_BEFORE_RESTART}"
+                ),
             )
 
         fire_unseen = False
@@ -2441,10 +2522,25 @@ class RMQConsumerManager:
     async def _probe_by_passive_declare(
         self, conn_id: str, queues: set[str], expected_tags: set[str]
     ) -> tuple[set[str], int | None, str | None]:
-        """Verify ``conn_id`` by passive-declaring one of its queues on a fresh channel."""
+        """Verify ``conn_id`` by passive-declaring one of its queues on a fresh channel.
+
+        The declare is answered by whichever connection the pool holds when it runs, and
+        the probe builds one where the pool has none usable. A tag is registered on a
+        single connection object, so a declare that succeeded on a different object than
+        the one the probe started with says nothing about the tags of this conn_id: they
+        belong to the object that was replaced, and the broker dropped them with it.
+        Vouching for them there is what leaves a subscription reported as consuming while
+        the broker holds no consumer of ours at all.
+        """
+        before = self._pooled_consume_connection(conn_id)
         answers, reason = await self._probe_connection(conn_id, queues)
         if not answers:
             return set(), None, reason
+        if self._pooled_consume_connection(conn_id) is not before:
+            return set(), None, (
+                "the connection answering the probe is not the one these consumers are "
+                "registered on: the pool replaced it while the probe ran"
+            )
         return set(expected_tags), None, None
 
     async def _probe_connection(
@@ -2525,6 +2621,7 @@ class RMQConsumerManager:
                     consumer_tag = _consumer_tag(sub_id, _attach_nonce())
                     async with _attached(queue, consumer_tag, rpc_timeout) as q_iter:
                         state.consumer_tag = consumer_tag
+                        state.connection = connection
                         await state.write(_SUB_LISTENING, last_error=None)
                         log.info(
                             "Subscription %d (DAG %s) is consuming queue %r on conn_id=%r",
@@ -2568,6 +2665,7 @@ class RMQConsumerManager:
                             raise asyncio.CancelledError from exc
                 finally:
                     state.consumer_tag = None
+                    state.connection = None
                     await _close_quietly(
                         channel, f"the channel of subscription {sub_id}"
                     )
