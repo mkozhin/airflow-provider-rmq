@@ -924,8 +924,10 @@ class RMQConsumerManager:
         self._active: dict[int, _ActiveSub] = {}  # sub_id → _ActiveSub
         self._conns: dict[str, _ConnState] = {}  # conn_id → its connections and bookkeeping
         self._cycle_no = 0  # liveness checks performed, i.e. reconcile cycles
-        # (management_url, vhost) → queue → consumer tags, for the current cycle only
-        self._consumer_cache: dict[tuple[str, str], dict[str, set[str]]] = {}
+        # (management_url, vhost, login) → queue → consumer tags, for the current cycle
+        # only. The login is part of the key because the reply is shaped by the rights of
+        # whoever asked: a user tagged ``management`` is shown only its own channels.
+        self._consumer_cache: dict[tuple[str, str, str], dict[str, set[str]]] = {}
         self._fire_task: asyncio.Task | None = None
         self._fire_state: _FireSub | None = None  # state record of the running fire task
         self._fire_needs_restart = False  # last check found the fire consumer gone
@@ -2294,9 +2296,13 @@ class RMQConsumerManager:
             of ``None`` means the check produced no data and the counters stay untouched.
 
         With a ``management_url`` the answer comes from ``GET /api/consumers/{vhost}``,
-        whose reply covers the whole vhost and is therefore cached for the cycle: several
-        conn_ids often point at one broker, and asking it once per conn_id multiplies the
-        same request. Without a ``management_url`` — and after
+        whose reply is shaped by the rights of the account that asked — a user tagged
+        ``management`` is shown its own channels, the whole vhost is visible to
+        ``monitoring`` and ``administrator``. It is therefore cached for the cycle under
+        the account as well as the broker and vhost, and reused only between conn_ids
+        that log in as the same user: several of them often point at one broker, and
+        asking it once per conn_id multiplies the same request. Without a
+        ``management_url`` — and after
         :data:`_MGMT_FAILURES_BEFORE_FALLBACK` failed Management API calls in a row, which
         is what a wrong URL or credentials without the ``management`` tag look like — the
         probe is a passive declare on a fresh channel: it says nothing about individual
@@ -2323,7 +2329,7 @@ class RMQConsumerManager:
             and conn_info.password is not None
         ):
             vhost = conn_info.schema or "/"
-            cache_key = (management_url, vhost)
+            cache_key = (management_url, vhost, conn_info.login)
             by_queue = self._consumer_cache.get(cache_key)
             if by_queue is None:
                 try:

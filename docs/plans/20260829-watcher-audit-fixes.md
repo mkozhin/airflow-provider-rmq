@@ -470,27 +470,37 @@ HTTP-запрос успешен. Пересоздание соединения 
 - Modify: `tests/watcher/test_consumer.py`
 - Modify: `CHANGELOG.md`
 
-- [ ] расширить ключ кэша в `_probe_consumers` (`consumer.py:2224`, ключ кэша на `2265`) до
+- [x] расширить ключ кэша в `_probe_consumers` (`consumer.py:2224`, ключ кэша на `2265`) до
       `(management_url, vhost, login)`, обновить аннотацию типа
       (`consumer.py:867`) и комментарий над ней (`consumer.py:866`), который
       называет ключ словами
-- [ ] исправить docstring `_probe_consumers` (`consumer.py:2227-2243`, фраза на `2236`): ответ
+- [x] исправить docstring `_probe_consumers` (`consumer.py:2227-2243`, фраза на `2236`): ответ
       зависит от прав спрашивающего, поэтому переиспользуется только между
       conn_id с той же учётной записью
-- [ ] исправить то же утверждение в ADR-0007 (`docs/adr/0007-...:124`)
-- [ ] тест: два conn_id с одним `management_url` и vhost, но разными login,
+- [x] исправить то же утверждение в ADR-0007 (`docs/adr/0007-...:124`)
+- [x] тест: два conn_id с одним `management_url` и vhost, но разными login,
       получают каждый свой ответ, и второй не судится по первому
-- [ ] тест-страж: два conn_id с одинаковыми URL, vhost и login по-прежнему
+- [x] тест-страж: два conn_id с одинаковыми URL, vhost и login по-прежнему
       делают один HTTP-запрос на цикл
-- [ ] уточнить `CHANGELOG.md:16` — единственное место в changelog, где посылка
+- [x] уточнить `CHANGELOG.md:16` — единственное место в changelog, где посылка
       сформулирована явно («one `GET /api/consumers/{vhost}` is shared by every
       `conn_id` pointing at the same broker and vhost within a cycle»)
-- [ ] проверить docstring'и тестов `test_one_management_request_serves_every_conn_id_of_a_vhost`
+- [x] проверить docstring'и тестов `test_one_management_request_serves_every_conn_id_of_a_vhost`
       и `test_the_consumer_cache_lives_for_one_cycle_only`
       (`tests/watcher/test_consumer.py:4501`, `4527`) — они повторяют ту же посылку
-- [ ] снять правку: краснеет тест на двух пользователей, тест-страж остаётся
+      - ⚠️ ссылки на строки устарели: тесты стоят на `4823` и `4848`. Первый
+        переименован в `test_one_management_request_serves_conn_ids_of_one_account`
+        и задаёт обоим conn_id один login явно — иначе он не закреплял бы то,
+        что проверяет
+- [x] снять правку: краснеет тест на двух пользователей, тест-страж остаётся
       зелёным; вернуть
-- [ ] run tests - must pass before next task
+      - ⚠️ наблюдение при исполнении: со снятым login в ключе
+        `test_two_logins_on_one_vhost_each_get_their_own_answer` краснеет
+        (`conn_b` получает чужой ответ, HTTP-запрос всего один, и его consumer
+        получает «negative check 1 of 2»), а оба стража —
+        `test_one_management_request_serves_conn_ids_of_one_account` и
+        `test_the_consumer_cache_lives_for_one_cycle_only` — остаются зелёными
+- [x] run tests - must pass before next task
 
 ### Task 3: Дать fire-циклу паузу перед переподпиской
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import logging
@@ -4670,9 +4671,10 @@ def _mgmt_client(payload, requested: list | None = None, status_code: int = 200)
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-def _mgmt_conn_info(url: str = "https://mb.example"):
+def _mgmt_conn_info(url: str = "https://mb.example", login: str = "guest"):
     conn_info = _make_conn_info()
     conn_info.extra_dejson = {"management_url": url}
+    conn_info.login = login
     return conn_info
 
 
@@ -4681,6 +4683,22 @@ def _patch_mgmt_connection(url: str = "https://mb.example"):
         "airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
         return_value=_mgmt_conn_info(url),
     )
+
+
+def _patch_mgmt_connection_per_login(
+    logins: dict[str, str], url: str = "https://mb.example"
+):
+    """Patch the connection read so every conn_id of ``logins`` logs in as its own user."""
+    return patch(
+        "airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+        side_effect=lambda conn_id: _mgmt_conn_info(url, logins[conn_id]),
+    )
+
+
+def _basic_auth_login(request: httpx.Request) -> str:
+    """Login the Management API request authenticated as."""
+    raw = request.headers["Authorization"].split(" ", 1)[1]
+    return base64.b64decode(raw).decode().split(":", 1)[0]
 
 
 class TestSubscriptionLiveness:
@@ -4820,9 +4838,10 @@ class TestSubscriptionLiveness:
         assert entry.negative_checks == 0
 
     @pytest.mark.asyncio
-    async def test_one_management_request_serves_every_conn_id_of_a_vhost(self, manager):
-        """Several conn_ids often point at one broker, and GET /api/consumers/{vhost}
-        answers for the whole vhost — asking once per conn_id multiplies the same call."""
+    async def test_one_management_request_serves_conn_ids_of_one_account(self, manager):
+        """Several conn_ids often point at one broker with one account, and the answer
+        such a conn_id gets is the answer the next one would — asking once per conn_id
+        multiplies the same call."""
         a = _sub(id=7, queue_name="orders", conn_id="conn_a")
         b = _sub(id=8, queue_name="events", conn_id="conn_b")
         entry_a = _register_active(manager, a)
@@ -4836,7 +4855,7 @@ class TestSubscriptionLiveness:
             requested=requested,
         )
 
-        with _patch_mgmt_connection():
+        with _patch_mgmt_connection_per_login({"conn_a": "shared", "conn_b": "shared"}):
             result = await manager._check_subscription_liveness([a, b])
 
         assert result == (set(), set())
@@ -4845,11 +4864,42 @@ class TestSubscriptionLiveness:
         assert manager._conn("conn_b").liveness.status == "connected"
 
     @pytest.mark.asyncio
+    async def test_two_logins_on_one_vhost_each_get_their_own_answer(self, manager):
+        """``GET /api/consumers/{vhost}`` is answered according to the rights of the
+        account that asked: a user tagged ``management`` is shown only its own channels.
+        Judging one login by the reply fetched for another finds its tags missing and
+        condemns a perfectly healthy consumer, cycle after cycle."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        b = _sub(id=8, queue_name="events", conn_id="conn_b")
+        entry_a = _register_active(manager, a)
+        entry_b = _register_active(manager, b)
+        requested: list[str] = []
+        visible = {
+            "user_a": [_consumer_entry(entry_a.state.consumer_tag, "orders")],
+            "user_b": [_consumer_entry(entry_b.state.consumer_tag, "events")],
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            login = _basic_auth_login(request)
+            requested.append(login)
+            return httpx.Response(200, json=visible[login])
+
+        manager._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        with _patch_mgmt_connection_per_login({"conn_a": "user_a", "conn_b": "user_b"}):
+            result = await manager._check_subscription_liveness([a, b])
+
+        assert result == (set(), set())
+        assert sorted(requested) == ["user_a", "user_b"], requested
+        assert manager._conn("conn_a").liveness.status == "connected"
+        assert manager._conn("conn_b").liveness.status == "connected"
+
+    @pytest.mark.asyncio
     async def test_the_consumer_cache_lives_for_one_cycle_only(self, manager):
-        """The cached answer covers a whole vhost and saves one request per conn_id
-        inside a cycle. Kept across cycles it would hand every later check the consumer
-        list of the first one, and a consumer that has since disappeared would go on
-        vouching for itself forever."""
+        """The cached answer saves one request per conn_id of the same account inside a
+        cycle. Kept across cycles it would hand every later check the consumer list of
+        the first one, and a consumer that has since disappeared would go on vouching
+        for itself forever."""
         sub = _sub(id=7, queue_name="orders")
         entry = _register_active(manager, sub)
         requested: list[str] = []
