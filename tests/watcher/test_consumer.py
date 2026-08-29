@@ -20,7 +20,11 @@ import aiormq
 import httpx
 import pytest
 
-from airflow_provider_rmq.utils.amqp import DEFAULT_RPC_TIMEOUT, AmqpTimeouts
+from airflow_provider_rmq.utils.amqp import (
+    DEFAULT_RPC_TIMEOUT,
+    AmqpTimeouts,
+    call_with_timeout,
+)
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 
 from airflow_provider_rmq.watcher.consumer import (
@@ -38,6 +42,9 @@ from airflow_provider_rmq.watcher.consumer import (
     _attach_nonce,
     _attached,
     _consumer_tag,
+    _ends_as_cancelled,
+    _mark_delivery_fault,
+    _raised_while_cancelling,
     _build_run_id,
     _safe_run_id,
     _sync_trigger,
@@ -991,6 +998,321 @@ class TestConsumeSubscription:
 
         assert attempts >= 2
 
+
+# ---------------------------------------------------------------------------
+# Telling a cancellation apart from a fault the handling of a delivery raised
+# ---------------------------------------------------------------------------
+
+class _QueueIterCancelFailingThroughTaskWrapper:
+    """Iterator whose ``basic.cancel`` is failed by ``aiormq``'s own RPC wrapper.
+
+    ``aiormq`` runs an RPC inside a task and hands a torn-down connection to whoever is
+    waiting on it as ``raise self._exception from e``, where ``e`` is the
+    ``CancelledError`` that task was stopped with. Reached through the ``close()``
+    ``QueueIterator.__anext__`` makes while it handles its own cancellation, that error
+    comes out of the iterator carrying a ``CancelledError`` in both ``__cause__`` and
+    ``__context__`` — and it is a genuine cancellation all the same.
+    """
+
+    def __init__(self, error: BaseException):
+        self._error = error
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def consume(self):
+        self.consumed = True
+
+    def __aiter__(self):
+        return self
+
+    async def close(self):
+        try:
+            raise asyncio.CancelledError()  # the RPC task the teardown stopped
+        except asyncio.CancelledError as rpc_stopped:
+            raise self._error from rpc_stopped
+
+    async def __anext__(self):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await self.close()
+            raise
+
+
+async def _error_out_of_iterator(q_iter) -> BaseException:
+    """The exception ``q_iter`` lets out when the cancellation of its consumer fails."""
+    task = asyncio.create_task(q_iter.__anext__())
+    await asyncio.sleep(0)
+    task.cancel()
+    try:
+        await task
+    except BaseException as exc:  # noqa: BLE001 - the object under test
+        return exc
+    raise AssertionError("the iterator returned instead of raising")
+
+
+async def _timeout_out_of_call_with_timeout() -> BaseException:
+    """The ``TimeoutError`` a call that outran its bound hands its caller."""
+    try:
+        await call_with_timeout(asyncio.Future(), timeout=0.01)
+    except asyncio.TimeoutError as exc:
+        return exc
+    raise AssertionError("the call returned instead of timing out")
+
+
+class TestTellingCancellationFromDeliveryFaults:
+    """What each shape of exception chain means to a consumer loop.
+
+    The loop has two answers to an exception that reached it: end as the cancelled task
+    it is, or report the fault and subscribe again. Reading the first as the second
+    leaves a consumer on the queue with nothing holding it; reading the second as the
+    first ends the task silently, with no status written and no restart, and the row
+    keeps saying ``listening`` until the next reconcile cycle.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_error_out_of_a_cancellation_handler_is_a_cancellation(self):
+        """Form 1 — the plain shape ``QueueIterator.__anext__`` produces: a foreign
+        error raised inside an active ``except CancelledError``, carrying the
+        cancellation as its context."""
+        exc = await _error_out_of_iterator(
+            _QueueIterFailingCancel(
+                aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+            )
+        )
+
+        assert exc.__cause__ is None
+        assert isinstance(exc.__context__, asyncio.CancelledError)
+        assert not exc.__suppress_context__
+        assert _ends_as_cancelled(exc)
+
+    def test_a_cancellederror_is_recognised_without_reading_the_chain(self):
+        """Form 4 — a bare ``raise`` inside a cancellation handler re-raises that very
+        object, and it is answered by the type test at the top of the walk."""
+        exc = asyncio.CancelledError()
+
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+        assert _raised_while_cancelling(exc)
+
+    def test_an_error_that_disowns_the_cancellation_it_handled_is_not_one(self):
+        """Form 2 — ``raise ... from None`` inside a cancellation handler. The
+        cancellation is in ``__context__`` because Python puts it there, and
+        ``__suppress_context__`` is the raiser saying it is not the cause."""
+        try:
+            try:
+                raise asyncio.CancelledError()
+            except asyncio.CancelledError:
+                raise ConnectionError("connection was dropped while it connected") from None
+        except ConnectionError as raised:
+            exc = raised
+
+        assert isinstance(exc.__context__, asyncio.CancelledError)
+        assert exc.__suppress_context__
+        assert not _ends_as_cancelled(exc)
+
+    @pytest.mark.asyncio
+    async def test_a_call_that_outran_its_bound_is_not_a_cancellation(self):
+        """Form 2 as ``call_with_timeout`` writes it: the expired call is cancelled, and
+        the caller is handed ``TimeoutError`` with that cancellation disowned."""
+        exc = await _timeout_out_of_call_with_timeout()
+
+        assert isinstance(exc.__context__, asyncio.CancelledError)
+        assert exc.__suppress_context__
+        assert not _ends_as_cancelled(exc)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_cancel_reaching_the_iterator_through_aiormq_is_a_cancellation(self):
+        """Form 5 — the same ``basic.cancel`` failure as form 1, delivered by
+        ``aiormq``'s RPC wrapper instead of thrown directly, so it carries the
+        ``CancelledError`` in ``__cause__``."""
+        exc = await _error_out_of_iterator(
+            _QueueIterCancelFailingThroughTaskWrapper(
+                aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+            )
+        )
+
+        assert isinstance(exc.__cause__, asyncio.CancelledError)
+        assert exc.__suppress_context__
+        assert _ends_as_cancelled(exc)
+
+    def test_the_same_chain_raised_by_a_delivery_is_a_fault_to_retry(self):
+        """Form 3 — what ``aiormq`` hands a publish whose connection was torn down
+        mid-RPC. Its chain is form 5's, so nothing in the chain tells the two apart;
+        what does is that this one was raised by the handling of a delivery."""
+        try:
+            try:
+                raise asyncio.CancelledError()
+            except asyncio.CancelledError as rpc_stopped:
+                raise aio_pika.exceptions.AMQPConnectionError(
+                    "connection reset by peer"
+                ) from rpc_stopped
+        except aio_pika.exceptions.AMQPConnectionError as raised:
+            exc = raised
+
+        assert _raised_while_cancelling(exc), "the chain alone cannot tell it from form 5"
+
+        _mark_delivery_fault(exc)
+
+        assert not _ends_as_cancelled(exc)
+
+
+class TestDeliveryFaultsKeepTheSubscription:
+    """A cooldown subscription whose delivery handling failed reports it and retries.
+
+    Everything the handling of a delivery does reaches the broker or the metadata
+    database on its own — a publish, the channel it needs, the Airflow connection behind
+    that channel — and a failure of any of them arrives in the same shapes a rejected
+    consumer cancellation does. Ending the task on one of those leaves the row reading
+    ``listening`` with no consumer behind it until the next reconcile cycle.
+    """
+
+    async def _run_until_resubscribed(self, manager, connection, queue, publish_channel):
+        """Run the cooldown subscription until it attaches a second time.
+
+        :returns: The statuses the subscription wrote, in order.
+        """
+        writes: list[tuple] = []
+
+        async def record_write(self, status, last_error=None):
+            writes.append((status, last_error))
+
+        with _record_consumer_sleeps(lambda delay: None), \
+             patch.object(manager, "_get_publish_channel", side_effect=publish_channel), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write",
+                   new=record_write):
+            task = asyncio.create_task(
+                manager._consume_subscription(_sub(cooldown=300))
+            )
+            try:
+                await _wait_for(lambda: queue.iterator.call_count >= 2)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        return writes
+
+    @pytest.mark.asyncio
+    async def test_a_publish_that_outran_its_bound_reports_error_and_retries(self):
+        """The placeholder publish did not fit in ``rpc_timeout``, so the caller is
+        handed a ``TimeoutError`` with the cancellation of the expired call disowned."""
+        manager = _make_manager()
+        queue = _make_push_queue([_make_fake_message(b"order")])
+        connection = _make_live_connection(queue=queue)
+
+        async def timing_out_channel(conn_id):
+            return await call_with_timeout(asyncio.Future(), timeout=0.01)
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection):
+            writes = await self._run_until_resubscribed(
+                manager, connection, queue, timing_out_channel
+            )
+
+        assert _SUB_ERROR in [status for status, _ in writes]
+
+    @pytest.mark.asyncio
+    async def test_a_publish_connection_dropped_mid_rpc_reports_error_and_retries(self):
+        """The publish connection was torn down while ``channel()`` was pending, so
+        ``aiormq`` hands the caller its own error with the ``CancelledError`` of the
+        stopped RPC task as the cause — the chain of a genuine cancellation."""
+        manager = _make_manager()
+        queue = _make_push_queue([_make_fake_message(b"order")])
+        connection = _make_live_connection(queue=queue)
+
+        async def dropped_channel(conn_id):
+            try:
+                raise asyncio.CancelledError()  # the RPC task the teardown stopped
+            except asyncio.CancelledError as rpc_stopped:
+                raise aio_pika.exceptions.AMQPConnectionError(
+                    "connection reset by peer"
+                ) from rpc_stopped
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection):
+            writes = await self._run_until_resubscribed(
+                manager, connection, queue, dropped_channel
+            )
+
+        assert _SUB_ERROR in [status for status, _ in writes]
+
+    @pytest.mark.asyncio
+    async def test_a_publish_connection_stuck_on_the_metadata_db_reports_error_and_retries(self):
+        """Rebuilding the publish connection reads its Airflow connection first, and a
+        metadata database that stopped answering ends that read on ``_DB_TIMEOUT``."""
+        manager = _make_manager()
+        queue = _make_push_queue([_make_fake_message(b"order")])
+        connection = _make_live_connection(queue=queue)
+        release = threading.Event()
+
+        def blocking_get_connection(conn_id):
+            release.wait(5)
+            return _make_conn_info()
+
+        build_publish_connection = manager._get_or_create_connection
+
+        async def by_role(conn_id, role=_ROLE_CONSUME, executor=None):
+            if role == _ROLE_PUBLISH:
+                return await build_publish_connection(conn_id, role, executor)
+            return connection
+
+        writes: list[tuple] = []
+
+        async def record_write(self, status, last_error=None):
+            writes.append((status, last_error))
+
+        try:
+            with _record_consumer_sleeps(lambda delay: None), \
+                 patch("airflow_provider_rmq.watcher.consumer._DB_TIMEOUT", 0.05), \
+                 patch("airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+                       side_effect=blocking_get_connection), \
+                 patch.object(manager, "_get_or_create_connection", side_effect=by_role), \
+                 patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write",
+                       new=record_write):
+                task = asyncio.create_task(
+                    manager._consume_subscription(_sub(cooldown=300))
+                )
+                try:
+                    await _wait_for(lambda: queue.iterator.call_count >= 2, timeout=5.0)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+        finally:
+            release.set()
+
+        assert _SUB_ERROR in [status for status, _ in writes]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_cancel_of_the_consumer_itself_still_ends_the_task(self):
+        """What the iterator raises is still judged by the chain: a cancel the broker
+        rejected ends the task as the cancelled task it is, and writes no status."""
+        manager = _make_manager()
+        queue = _queue_failing_cancel(
+            aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+        )
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+        q_iter = queue.iterator.return_value
+        writes: list[tuple] = []
+
+        async def record_write(self, status, last_error=None):
+            writes.append((status, last_error))
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write",
+                   new=record_write):
+            task = asyncio.create_task(
+                manager._consume_subscription(_sub(cooldown=300))
+            )
+            await _wait_for(lambda: getattr(q_iter, "consumed", False))
+            task.cancel()
+            outcome = await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), timeout=2.0
+            )
+
+        assert outcome[0] is None
+        assert queue.iterator.call_count == 1
+        assert _SUB_ERROR not in [status for status, _ in writes]
 
 # ---------------------------------------------------------------------------
 # Tests for C5 (binary body) and C3 (status reset on reconcile removal)

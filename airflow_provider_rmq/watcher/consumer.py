@@ -550,6 +550,31 @@ def _usable(connection: Any) -> bool:
     return not connection.is_closed and getattr(connection, "transport", None) is not None
 
 
+_DELIVERY_FAULT = "_rmq_raised_by_delivery"
+
+
+def _mark_delivery_fault(exc: BaseException) -> None:
+    """Record on ``exc`` that it was raised by the handling of a delivery.
+
+    The mark is what draws the line the cancellation heuristic cannot draw for itself:
+    the heuristic reads an exception chain, and the chain a broken connection leaves
+    behind is the same one whether the call it interrupted was the queue iterator's
+    ``basic.cancel`` or a publish made for a message already taken off the queue. Only
+    the place the exception came from tells the two apart, so that is what is recorded
+    where it is still known.
+
+    An exception whose class refuses attributes stays unmarked and is judged by the
+    chain alone; every exception raised on this path so far accepts one.
+    """
+    try:
+        setattr(exc, _DELIVERY_FAULT, True)
+    except (AttributeError, TypeError):
+        log.debug(
+            "An exception of type %s takes no attribute, so the delivery that raised it "
+            "is not recorded on it", type(exc).__name__,
+        )
+
+
 def _raised_while_cancelling(exc: BaseException) -> bool:
     """Whether ``exc`` came out of handling a cancellation.
 
@@ -564,6 +589,24 @@ def _raised_while_cancelling(exc: BaseException) -> bool:
 
     ``Task.cancelling()`` would answer this directly and arrived in Python 3.11, so the
     chain the exception carries is what there is to read on 3.10.
+
+    What is read of that chain: ``__cause__`` always, ``__context__`` only while
+    ``__suppress_context__`` is unset. ``__cause__`` is the answer to a deliberate
+    ``raise ... from ...``, and ``aiormq`` hands a torn-down connection to a pending RPC
+    exactly that way — ``raise self._exception from e`` with ``e`` the ``CancelledError``
+    the RPC task was stopped with — which is how a rejected ``basic.cancel`` reaches
+    ``__anext__``. ``__context__`` carries what was merely being handled when this
+    exception was raised, and that is the plain form: an error escaping the
+    ``except CancelledError`` block inside ``__anext__``. ``__suppress_context__`` is
+    what a ``raise ... from None`` sets, and code that writes it is saying the
+    cancellation it was handling is not the cause of what it raises —
+    :func:`call_with_timeout` converting an expired call into a ``TimeoutError`` says
+    precisely that.
+
+    The chain is all this function reads, so it cannot see where the exception was
+    raised: an ``aiormq`` failure carrying a ``CancelledError`` in ``__cause__`` looks
+    the same whether it came from ``__anext__`` or from a publish. Callers keep the
+    handling of a delivery away from here with :func:`_mark_delivery_fault` instead.
     """
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -571,8 +614,26 @@ def _raised_while_cancelling(exc: BaseException) -> bool:
         if isinstance(current, asyncio.CancelledError):
             return True
         seen.add(id(current))
-        current = current.__cause__ or current.__context__
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            current = None
+        else:
+            current = current.__context__
     return False
+
+
+def _ends_as_cancelled(exc: BaseException) -> bool:
+    """Whether a consumer loop ends as cancelled on ``exc`` instead of retrying on it.
+
+    An exception the handling of a delivery raised is a transient fault, whatever chain
+    it carries: the mark says where it came from, and where it came from is the one
+    thing :func:`_raised_while_cancelling` cannot read. Everything else — that is,
+    whatever the queue iterator itself raised — is put to the heuristic.
+    """
+    if getattr(exc, _DELIVERY_FAULT, False):
+        return False
+    return _raised_while_cancelling(exc)
 
 
 async def _wait_cancelled(
@@ -2400,20 +2461,31 @@ class RMQConsumerManager:
 
                         try:
                             async for message in q_iter:
-                                if not match(message, msg_filter):
-                                    await nack_and_sleep(message)
-                                    continue
-                                if cooldown > 0:
-                                    await self._handle_cooldown_delivery(
-                                        conn_id, dag_id, cooldown, message,
-                                        publish_backoff,
-                                    )
-                                else:
-                                    await self._handle_immediate_delivery(
-                                        sub, message, state, trigger_backoff
-                                    )
+                                try:
+                                    if not match(message, msg_filter):
+                                        await nack_and_sleep(message)
+                                        continue
+                                    if cooldown > 0:
+                                        await self._handle_cooldown_delivery(
+                                            conn_id, dag_id, cooldown, message,
+                                            publish_backoff,
+                                        )
+                                    else:
+                                        await self._handle_immediate_delivery(
+                                            sub, message, state, trigger_backoff
+                                        )
+                                except Exception as delivery_exc:
+                                    # Handling a delivery reaches the broker on its own —
+                                    # a publish, an ACK, a connection it has to rebuild —
+                                    # and a connection torn down under any of those raises
+                                    # what a rejected consumer cancellation raises. The
+                                    # mark says which of the two this is, so the retry
+                                    # loop below keeps the subscription instead of ending
+                                    # it as cancelled.
+                                    _mark_delivery_fault(delivery_exc)
+                                    raise
                         except Exception as exc:
-                            if not _raised_while_cancelling(exc):
+                            if not _ends_as_cancelled(exc):
                                 raise
                             log.warning(
                                 "Cancelling consumer %s of subscription %d failed: %s — "
@@ -2660,11 +2732,19 @@ class RMQConsumerManager:
 
                         try:
                             async for message in q_iter:
-                                await self._handle_fire_delivery(
-                                    message, state, trigger_backoff
-                                )
+                                try:
+                                    await self._handle_fire_delivery(
+                                        message, state, trigger_backoff
+                                    )
+                                except Exception as delivery_exc:
+                                    # Same boundary the subscription loop draws: what the
+                                    # handling of a fire event raises is judged as the
+                                    # transient fault it is, not as a cancellation the
+                                    # chain happens to resemble.
+                                    _mark_delivery_fault(delivery_exc)
+                                    raise
                         except Exception as exc:
-                            if not _raised_while_cancelling(exc):
+                            if not _ends_as_cancelled(exc):
                                 raise
                             log.warning(
                                 "Cancelling the fire consumer %s of conn_id=%r failed: "
