@@ -744,29 +744,6 @@ class _ConsumerState:
                 status, self._sub_id, exc,
             )
 
-    async def flush(self, executor: BoundedExecutor) -> None:
-        """Store the status an earlier write did not get into the row.
-
-        A write that fails is put back by the writer, and what carries it after that is
-        the next write of the same subscription. A subscription whose consumer is
-        attached and whose queue is quiet makes none, so without a nudge of its own its
-        row would keep the status it had while the database was away.
-        """
-        if self._sub_id is None:
-            return
-        writer = _status_writer(self._sub_id)
-        if not writer.has_pending:
-            return
-        try:
-            await call_with_timeout(executor.run(writer.store), timeout=_DB_TIMEOUT)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning(
-                "Cannot store the unwritten status of subscription %s: %s",
-                self._sub_id, exc,
-            )
-
 
 class _Checked:
     """Liveness bookkeeping shared by the two kinds of consumer the check judges."""
@@ -1047,12 +1024,38 @@ class RMQConsumerManager:
         The consumer that writes a status has moved on by the time the database answers
         again, and one whose queue is quiet writes nothing further, so the cycle is what
         gets the row and the subscription back into agreement.
+
+        The pass goes over the writer registry rather than the manager's own
+        subscriptions, because the row of a subscription outlives the subscription. Its
+        final ``disconnected`` is written after reconcile has already let go of the
+        entry, and a subscription nothing holds any more is one nothing would come back
+        to: the row would keep saying ``listening`` about a consumer that no longer
+        exists. The registry belongs to the process and keeps that writer, so the row is
+        finished from here. Every active subscription's writer is in it too.
+
+        The snapshot is taken under the registry lock and the lock is let go before the
+        first await: holding it across a wait on the pool would shut every other caller
+        out of :func:`_status_writer` for as long as the database stays away.
+
+        A write that does not land is logged and the pass carries on to the next writer,
+        the same way a single stalled row does not cost the cycle the rest of them.
         """
-        for entry in list(self._active.values()):
-            await entry.state.flush(self._cycle_executor)
-        fire = self._fire_state
-        if fire is not None:
-            await fire.state.flush(self._cycle_executor)
+        with _status_writers_lock:
+            writers = list(_status_writers.items())
+        for sub_id, writer in writers:
+            if not writer.has_pending:
+                continue
+            try:
+                await call_with_timeout(
+                    self._cycle_executor.run(writer.store), timeout=_DB_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Cannot store the unwritten status of subscription %s: %s",
+                    sub_id, exc,
+                )
 
     async def _sync_consumer_tasks(self, subscriptions: list[dict]) -> None:
         """Cancel the tasks of removed subscriptions and start the ones that are missing.

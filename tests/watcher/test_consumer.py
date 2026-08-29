@@ -7041,6 +7041,200 @@ class TestStatusWriteOrder:
         assert ("disconnected", manager._cycle_executor) in writes
 
 
+class TestTheRowOfASubscriptionThatIsGone:
+    """The last status of a removed subscription still has to reach its row.
+
+    ``disconnected`` is written after reconcile has let go of the entry, so a write that
+    does not land leaves nothing holding the subscription that could come back to it.
+    The row then keeps saying ``listening`` about a consumer that no longer exists —
+    the false green the watchdog exists to prevent — and says it for good.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_next_cycle_writes_the_status_of_a_subscription_that_is_gone(
+        self, manager
+    ):
+        """The subscription is out of the manager by the time the write fails, so the
+        cycle is the only thing left that can finish its row."""
+        _register_active(manager, _sub(id=7), real_task=True)
+        landed = []
+        db_up = False
+
+        def write(session, sub_id, status, last_error=None):
+            if not db_up:
+                raise RuntimeError("metadata database is away")
+            landed.append((sub_id, status))
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write), \
+             patch.object(manager, "_update_all_conn_counts", new_callable=AsyncMock):
+            await manager.reconcile([])
+
+            assert landed == []
+            assert 7 not in manager._active
+            assert _status_writer(7).has_pending
+
+            db_up = True
+            await manager.reconcile([])
+
+        assert landed == [(7, "disconnected")], (
+            "the row of the removed subscription still reads what it read while the "
+            "database was away"
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_failed_cycles_in_a_row_do_not_lose_the_status(self, manager):
+        """An outage lasts as long as it lasts: the status is tried again every cycle
+        until one of them gets it into the row."""
+        _register_active(manager, _sub(id=7), real_task=True)
+        attempts = []
+        landed = []
+        db_up = False
+
+        def write(session, sub_id, status, last_error=None):
+            attempts.append(status)
+            if not db_up:
+                raise RuntimeError("metadata database is away")
+            landed.append(status)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write), \
+             patch.object(manager, "_update_all_conn_counts", new_callable=AsyncMock):
+            await manager.reconcile([])
+            await manager.reconcile([])
+
+            assert landed == []
+            assert _status_writer(7).has_pending
+
+            db_up = True
+            await manager.reconcile([])
+
+        assert landed == ["disconnected"]
+        assert len(attempts) >= 3, attempts
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_cancelled_on_the_final_write_does_not_lose_it(self, manager):
+        """The cycle budget runs out on exactly the write a stalled database holds up,
+        and the subscription it belongs to is already gone from the manager."""
+        _register_active(manager, _sub(id=7), real_task=True)
+        entered = threading.Event()
+        release = threading.Event()
+        landed = []
+        db_up = False
+
+        def write(session, sub_id, status, last_error=None):
+            if not db_up:
+                entered.set()
+                release.wait(5)
+                raise RuntimeError("metadata database is away")
+            landed.append(status)
+
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write), \
+                 patch.object(manager, "_update_all_conn_counts", new_callable=AsyncMock):
+                cycle = asyncio.create_task(manager.reconcile([]))
+                deadline = time.monotonic() + 5
+                while not entered.is_set() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert entered.is_set()
+
+                cycle.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await cycle
+
+                release.set()
+                while not _status_writer(7).has_pending and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert _status_writer(7).has_pending
+
+                db_up = True
+                await manager.reconcile([])
+        finally:
+            release.set()
+
+        assert landed == ["disconnected"]
+
+    @pytest.mark.asyncio
+    async def test_the_pass_survives_a_row_that_is_no_longer_there(self, manager):
+        """A subscription deleted from the table takes its status row with it.
+
+        The write is an ``UPDATE ... WHERE id = ...``, so a row that is gone matches
+        nothing and costs the cycle a no-op rather than an error.
+        """
+        _status_writer(7).record("disconnected", None)
+        matched = []
+
+        def write(session, sub_id, status, last_error=None):
+            matched.append(0)   # the UPDATE reached no row
+            return 0
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await manager._store_unwritten_statuses()
+
+        assert matched == [0]
+        assert not _status_writer(7).has_pending
+
+    @pytest.mark.asyncio
+    async def test_a_writer_with_nothing_left_does_not_touch_the_database(self, manager):
+        """The pass is a repair, not a heartbeat: a row that already agrees with its
+        subscription is not rewritten every cycle."""
+        _register_active(manager, _sub(id=7))
+        _status_writer(7)
+
+        session = MagicMock()
+        with patch("airflow_provider_rmq.watcher.consumer.WatcherSession", session), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status") as stored:
+            await manager._store_unwritten_statuses()
+
+        stored.assert_not_called()
+        session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_pass_does_not_start_a_second_write_beside_a_running_one(
+        self, manager
+    ):
+        """Two writes of one row at once are what the single writer exists to prevent,
+        and the pass goes through that writer like every other caller: it finds the
+        write running, leaves the status to it and returns its worker straight back."""
+        writer = _status_writer(7)
+        started = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        def write(session, sub_id, status, last_error=None):
+            started.append(status)
+            if status == "listening":
+                entered.set()
+                release.wait(5)
+
+        pool = BoundedExecutor("test-flush-overlap", 4)
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                writer.record("listening", None)
+                running = pool.submit(writer.store)
+                assert entered.wait(2)
+
+                writer.record("disconnected", None)
+                await asyncio.wait_for(manager._store_unwritten_statuses(), timeout=2)
+                assert started == ["listening"]
+
+                release.set()
+                running.result(timeout=5)
+        finally:
+            release.set()
+            pool.shutdown()
+
+        assert started == ["listening", "disconnected"]
+
+
 class TestConsumerRegistration:
     """The broker confirms the consumer before the manager says it has one.
 
