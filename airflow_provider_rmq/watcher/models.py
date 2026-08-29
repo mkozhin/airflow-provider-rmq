@@ -52,7 +52,8 @@ class RMQConnStatus(WatcherBase):
     __tablename__ = "rmq_watcher_conn_status"
 
     conn_id = Column(String(250), primary_key=True)
-    status = Column(String(20), nullable=False, default="disconnected")
+    # "unknown" until a liveness check reaches a verdict on this conn_id
+    status = Column(String(20), nullable=False, default="unknown")
     # how many consumer tasks the watcher itself has started
     consumer_count = Column(Integer, nullable=False, default=0)
     # how many consumers the broker reports for our queues; NULL means "no data"

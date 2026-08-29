@@ -118,6 +118,10 @@ _PROBE_FAILURES_BEFORE_FALLBACK = 2
 #: is not answering, and the check has no candidate to prove it with.
 _STUCK_CYCLES_BEFORE_DROP = 2
 
+# ---------------------------------------------------------------------------
+# Rate limits — how soon the same action may be taken again
+# ---------------------------------------------------------------------------
+
 #: Reconcile cycles that must pass before the same conn_id may be recreated again.
 #: A real disconnect needs one recreation, so the limit costs nothing there, while a
 #: misclassification turns from a continuous loop into a rare, logged event.
@@ -307,15 +311,8 @@ class _StatusWriter:
     def stored(self) -> tuple[str, str | None] | None:
         """The ``(status, last_error)`` last committed to the row, ``None`` while none has been.
 
-        The one honest answer to "does the row already say this?", and the reason it is
-        kept here rather than by the caller: a write the caller stopped waiting for still
-        reaches the database, so a caller that recorded what it *asked* for would hold a
-        marker the row disagrees with, and the guard that skips an unchanged status would
-        then suppress every write that could put the two back together.
-
-        The reason it is the pair and not the status alone: the row carries both, and a
-        second failure of the same kind changes only the text. Compared on status alone,
-        the row keeps naming the cause that has already been dealt with.
+        The pair rather than the status alone: the row carries both, and a second failure
+        of the same kind changes only the text.
         """
         with self._lock:
             return self._stored
@@ -601,6 +598,16 @@ def _cancelled_by_broker(state: _ConsumerState) -> bool:
     return tag not in consumers
 
 
+def _seen(state: _ConsumerState, live_tags: set[str]) -> bool:
+    """Whether the broker still holds this consumer's registration.
+
+    Two answers, and a consumer counts as seen only when both agree: the probe found the
+    tag among the ones the broker reports, and the channel the tag is registered on still
+    carries it (:func:`_cancelled_by_broker`).
+    """
+    return state.consumer_tag in live_tags and not _cancelled_by_broker(state)
+
+
 def _usable(connection: Any) -> bool:
     """Whether ``connection`` can carry a call right now.
 
@@ -703,9 +710,11 @@ async def _wait_cancelled(
 
 
 class _ConsumerState:
-    """In-memory guard: writes consumer_status to DB only when the status actually changes.
+    """What the manager knows about one running consumer task.
 
-    Prevents hot DB writes during reconnect storms (e.g. 20+/min → 2-4/min).
+    The status the task last reported, and — while it is attached — the consumer tag it
+    registered together with the connection and channel it registered on. The liveness
+    check reads all four; the task itself writes them.
 
     A ``sub_id`` of ``None`` tracks the status in memory only — the fire consumer runs
     on the shared ``rmq_watcher.fire`` queue and has no row in
@@ -812,11 +821,16 @@ class _Checked:
 
 @dataclass
 class _ActiveSub(_Checked):
-    """Snapshot of a running subscription consumer task."""
+    """What the manager knows about one running subscription consumer task."""
+
     task: asyncio.Task
-    sub: dict  # full snapshot of sub at task start time
-    state: _ConsumerState  # status the task reports, readable by the manager
-    negative_checks: int = 0  # consecutive liveness checks the broker answered negatively
+    #: The subscription row as the task read it at startup. A field the running task
+    #: acted on that has since changed is what makes the manager restart it.
+    sub: dict
+    #: What the task reports about itself and what it is attached to.
+    state: _ConsumerState
+    #: Consecutive liveness checks the broker answered negatively.
+    negative_checks: int = 0
 
 
 @dataclass
@@ -828,13 +842,21 @@ class _FireSub(_Checked):
     verdict to itself instead of expressing it through the ``conn_id`` it shares with
     ordinary subscriptions.
     """
+
+    #: The conn_id whose connection carries the task.
     conn_id: str
+    #: What the task reports about itself and what it is attached to.
     state: _ConsumerState
     #: The connection object the task was handed and holds for its whole life. The pool
     #: replaces that object whenever the connect behind it fails, and a task left on the
     #: replaced one answers every call with the failure it holds, so the manager compares
-    #: the two and restarts the task when they part.
+    #: the two and restarts the task when they part. It is the object the task holds,
+    #: not the one its current attach registered on, because a task between attaches is
+    #: holding the replaced object just as surely as an attached one and — unlike a
+    #: subscription task, which asks the pool again on every pass — cannot pick up the
+    #: replacement by itself.
     connection: Any = None
+    #: Consecutive liveness checks the broker answered negatively.
     negative_checks: int = 0
 
 
@@ -852,15 +874,18 @@ def _unseen_reason(unseen_subs: int, fire_unseen: bool) -> str:
 class _ConnLiveness:
     """Verdict one liveness check reached for a single ``conn_id``.
 
-    :param status: ``connected`` when the broker confirmed our consumers, ``error``
-        when it did not, ``degraded`` when a negative verdict was held back by the
-        recreation rate limit, and ``None`` when the check produced no data at all.
-    :param broker_consumer_count: Consumers the broker reports on our queues, ``None``
-        when the check cannot tell (Management API unavailable or not configured).
-    :param reason: Human-readable explanation for a non-``connected`` status.
+    One record per check, carried into the ``conn_id``'s status row at the end of the
+    cycle.
     """
+
+    #: ``connected`` when the broker confirmed our consumers, ``error`` when it did not,
+    #: ``degraded`` when a negative verdict was held back by the recreation rate limit,
+    #: and ``None`` when the check produced no data at all.
     status: str | None
+    #: Consumers the broker reports on our queues, ``None`` when the check cannot tell
+    #: (Management API unavailable or not configured).
     broker_consumer_count: int | None
+    #: Human-readable explanation for a non-``connected`` status.
     reason: str | None = None
 
 
@@ -923,7 +948,7 @@ class _ConnState:
 class RMQConsumerManager:
     """Manages a pool of asyncio tasks — one per subscription — each consuming one RMQ queue.
 
-    Connection pooling: one ``connect_robust`` connection per ``(conn_id, role)``, where role
+    Connection pooling: one ``RobustConnection`` per ``(conn_id, role)``, where role
     is ``consume`` or ``publish``; multiple subscriptions sharing the same conn_id reuse the
     same consuming connection (each gets its own channel), while cooldown publishing runs on
     a lazily opened publish connection of that conn_id.
@@ -1192,6 +1217,20 @@ class RMQConsumerManager:
             return False
         return entry.state.connection is not self._pooled_consume_connection(conn_id)
 
+    def _launch_subscription_task(self, sub: dict) -> _ActiveSub:
+        """Start a consumer task for ``sub`` and record it as this subscription's.
+
+        The snapshot the record keeps is a copy: the caller's dict is the row as this
+        cycle read it, and the next cycle reads its own.
+        """
+        entry = _ActiveSub(
+            task=asyncio.create_task(self._consume_subscription(sub)),
+            sub=sub.copy(),
+            state=_ConsumerState(sub["id"], self._executor),
+        )
+        self._active[sub["id"]] = entry
+        return entry
+
     async def _sync_consumer_tasks(self, subscriptions: list[dict]) -> None:
         """Cancel the tasks of removed subscriptions and start the ones that are missing.
 
@@ -1241,10 +1280,7 @@ class RMQConsumerManager:
                 if entry is not None and not entry.task.done():
                     entry.task.cancel()
                     self._abandon(await _wait_cancelled([entry.task]))
-                task = asyncio.create_task(self._consume_subscription(sub))
-                self._active[sub_id] = _ActiveSub(
-                    task=task, sub=sub.copy(), state=_ConsumerState(sub_id, self._executor)
-                )
+                self._launch_subscription_task(sub)
 
     async def _close_unreferenced_connections(self, active_conn_ids: set[str]) -> None:
         """Close and forget every conn_id no subscription mentions any more."""
@@ -1285,6 +1321,10 @@ class RMQConsumerManager:
             running = self._fire_state
             moved = running is not None and running.conn_id != fire_conn_id
             pooled = self._pooled_consume_connection(fire_conn_id)
+            # The task's own object against the pooled one, whatever the task reports:
+            # it holds what it was handed for its whole life, so a fire task between
+            # attaches is on the replaced object just as surely as an attached one, and
+            # nothing in its retry loop would ever pick up the replacement.
             replaced = running is not None and not moved and running.connection is not pooled
             if (moved or replaced) and self._fire_task is not None:
                 # The fire consumer holds the connection object it was handed for its
@@ -1658,7 +1698,7 @@ class RMQConsumerManager:
             # retry, until the next cycle rewrote it. The publish role reports through
             # its own consecutive-timeout gate and the subscription that publishes.
             if role == _ROLE_CONSUME:
-                await self._record_conn_error(conn_id, exc, pool)
+                await self._store_conn_error(conn_id, exc, pool)
             raise
 
     async def _connect_pooled(
@@ -1764,7 +1804,7 @@ class RMQConsumerManager:
             return replacement
         raise ConnectionError(f"{what} was replaced while it connected")
 
-    async def _record_conn_error(
+    async def _store_conn_error(
         self, conn_id: str, exc: Exception, pool: BoundedExecutor
     ) -> None:
         """Store a failed connection attempt of ``conn_id``, best effort."""
@@ -2012,7 +2052,7 @@ class RMQConsumerManager:
             return _ConsumerState(sub_id, self._executor)
         return entry.state
 
-    def _fire_state_of(self) -> _ConsumerState:
+    def _fire_consumer_state(self) -> _ConsumerState:
         """State record the manager keeps for the fire consumer."""
         if self._fire_state is None:
             log.error(
@@ -2056,7 +2096,7 @@ class RMQConsumerManager:
         life and never finishes on its own — left running it would spin on a closed
         connection while ``rmq_watcher.fire`` sits without a consumer.
         """
-        to_restart, to_recreate = await self._check_subscription_liveness(subscriptions)
+        to_restart, to_recreate = await self._check_liveness(subscriptions)
         fire = self._fire_state
         restart_fire = self._fire_needs_restart or (
             fire is not None and fire.conn_id in to_recreate
@@ -2100,11 +2140,7 @@ class RMQConsumerManager:
             sub = by_id.get(sub_id)
             if sub is None:
                 continue
-            self._active[sub_id] = _ActiveSub(
-                task=asyncio.create_task(self._consume_subscription(sub)),
-                sub=sub.copy(),
-                state=_ConsumerState(sub_id, self._executor),
-            )
+            self._launch_subscription_task(sub)
             incr("rmq_watcher.consumer_restarted")
 
         if restart_fire and fire_conn_id is not None:
@@ -2122,7 +2158,7 @@ class RMQConsumerManager:
                 self._launch_fire_task(fire_conn_id, connection)
                 incr("rmq_watcher.consumer_restarted")
 
-    async def _check_subscription_liveness(
+    async def _check_liveness(
         self, subscriptions: list[dict]
     ) -> tuple[set[int], set[str]]:
         """Ask the broker whether our consumers are still registered.
@@ -2279,9 +2315,7 @@ class RMQConsumerManager:
         unseen: set[int] = set()
         dead_subs: set[int] = set()
         for sub, entry in subs:
-            seen = entry.state.consumer_tag in live_tags and not _cancelled_by_broker(
-                entry.state
-            )
+            seen = _seen(entry.state, live_tags)
             # The row of this subscription carries a verdict of an earlier cycle exactly
             # when the count is up, and that verdict is this check's to take back.
             reported_unseen = entry.negative_checks > 0
@@ -2310,9 +2344,7 @@ class RMQConsumerManager:
 
         fire_unseen = False
         if fire_here and fire is not None:
-            seen = fire.state.consumer_tag in live_tags and not _cancelled_by_broker(
-                fire.state
-            )
+            seen = _seen(fire.state, live_tags)
             if fire.record(seen):
                 self._fire_needs_restart = True
             if not seen:
@@ -2358,15 +2390,15 @@ class RMQConsumerManager:
         confirmed = sorted(sub["id"] for sub, _ in subs if sub["id"] not in dead_subs)
         if confirmed:
             log.warning(
-                "The connection of conn_id=%r is being recreated for %d unseen subscription(s); "
-                "subscription(s) %s share it and keep their own retry loop — they "
-                "surface the drop as a transient consumer error",
+                "The connection of conn_id=%r is being recreated for %d condemned "
+                "subscription(s); subscription(s) %s share it and keep their own retry "
+                "loop — they surface the drop as a transient consumer error",
                 conn_id, len(dead_subs), confirmed,
             )
         state.liveness = _ConnLiveness(
             status=_CONN_ERROR,
             broker_consumer_count=broker_count,
-            reason=reason or "consumer not registered on the broker",
+            reason=f"{unseen_reason} — the connection is being recreated",
         )
         return dead_subs, True
 
@@ -2656,6 +2688,15 @@ class RMQConsumerManager:
         return True, None
 
     async def _consume_subscription(self, sub: dict) -> None:
+        """Consume one subscription's queue for as long as the task runs.
+
+        Each pass takes a pooled connection, opens a channel of its own on it, attaches
+        to the queue and hands every delivery on to the handler the subscription's mode
+        calls for. A pass that ends without a fatal error pauses and attaches again, so
+        one broken connection costs a reconnect delay rather than the subscription; a
+        queue that does not exist is fatal, and the reconcile cycle is what starts the
+        task again once the row changes.
+        """
         sub_id: int = sub["id"]
         dag_id: str = sub["dag_id"]
         queue_name: str = sub["queue_name"]
@@ -2943,7 +2984,7 @@ class RMQConsumerManager:
 
     async def _consume_fire_queue(self, connection: Any, conn_id: str) -> None:
         """Consumer for rmq_watcher.fire queue — triggers DAGs after cooldown expires via DLX."""
-        state = self._fire_state_of()
+        state = self._fire_consumer_state()
         # Kept across reconnects: a broken trigger path stays broken through the
         # reconnect a requeued fire event may well cause.
         trigger_backoff = _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
@@ -2961,7 +3002,7 @@ class RMQConsumerManager:
                     async with _attached(queue, fire_tag, rpc_timeout) as q_iter:
                         state.consumer_tag = fire_tag
                         state.channel = channel
-                        await state.write(_SUB_LISTENING)
+                        await state.write(_SUB_LISTENING, last_error=None)
                         log.info(
                             "Cooldown fire consumer is consuming queue %r on conn_id=%r",
                             _FIRE_QUEUE, conn_id,

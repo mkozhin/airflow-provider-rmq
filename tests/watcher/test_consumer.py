@@ -105,6 +105,9 @@ class _QueueIterCtx:
     def __init__(self, messages: list, ends: bool = False):
         self._messages = messages
         self._ends = ends
+        self._pos = 0
+        self.consumed = False
+        self.closed = False
 
     async def __aenter__(self):
         return self
@@ -123,12 +126,7 @@ class _QueueIterCtx:
     def __aiter__(self):
         return self
 
-    def __init_iter(self):
-        self._pos = 0
-
     async def __anext__(self):
-        if not hasattr(self, "_pos"):
-            self._pos = 0
         if self._pos < len(self._messages):
             msg = self._messages[self._pos]
             self._pos += 1
@@ -156,6 +154,8 @@ class _QueueIterFailingCancel:
     def __init__(self, error: BaseException, through_task_wrapper: bool = False):
         self._error = error
         self._through_task_wrapper = through_task_wrapper
+        self.consumed = False
+        self.closed = False
 
     async def __aenter__(self):
         return self
@@ -226,16 +226,16 @@ class _FakeExecutor:
         return await self._handler(fn, *args)
 
 
-def _offloading_executor(outcome: str = _OUTCOME_TRIGGERED) -> _FakeExecutor:
+def _offloading_executor() -> _FakeExecutor:
     """Executor stand-in for whole-scenario tests.
 
-    A trigger reports ``outcome``, a status write goes nowhere, and everything else —
-    reading the Airflow connection, for one — runs as the manager offloaded it.
+    A trigger reports a started DAG run, a status write goes nowhere, and everything
+    else — reading the Airflow connection, for one — runs as the manager offloaded it.
     """
 
     async def handler(fn, *args):
         if fn is _sync_trigger:
-            return outcome
+            return _OUTCOME_TRIGGERED
         if isinstance(getattr(fn, "__self__", None), _StatusWriter):
             return None   # the subscription's status writer; nothing to store here
         return fn(*args)
@@ -283,10 +283,10 @@ def _test_pool(name: str = "test-pool") -> BoundedExecutor:
     return BoundedExecutor(name, 4)
 
 
-def _make_manager(executor=None, cycle_executor=None) -> RMQConsumerManager:
+def _make_manager(cycle_executor=None) -> RMQConsumerManager:
     """Build a manager the way the listener does, with a pool for each role."""
     return RMQConsumerManager(
-        executor=executor if executor is not None else _test_pool("test-consumer"),
+        executor=_test_pool("test-consumer"),
         cycle_executor=(
             cycle_executor if cycle_executor is not None else _test_pool("test-cycle")
         ),
@@ -358,6 +358,22 @@ def _exchange_sub(
         "exchange": exchange,
         "routing_keys": routing_keys if routing_keys is not None else ["a.succeeded"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Tests for the timeout budgets
+# ---------------------------------------------------------------------------
+
+class TestStopBudgets:
+    def test_cancel_wait_leaves_room_for_the_closing_that_follows_it(self):
+        """The stop budget covers the wait and the closing; the wait may not take it all."""
+        from airflow_provider_rmq.watcher import listener
+        from airflow_provider_rmq.watcher.consumer import (
+            _STOP_CANCEL_TIMEOUT,
+            _STOP_STATUS_TIMEOUT,
+        )
+
+        assert _STOP_CANCEL_TIMEOUT + _STOP_STATUS_TIMEOUT < listener._STOP_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -495,9 +511,6 @@ class TestBuildRunId:
 # ---------------------------------------------------------------------------
 
 class TestConsumerState:
-    def _make_state(self, mock_ws, mock_set):
-        return _ConsumerState(sub_id=42, executor=_test_pool())
-
     @pytest.mark.asyncio
     async def test_state_guard_skips_duplicate_status_write(self):
         ctx, _ = _mock_session()
@@ -969,7 +982,7 @@ class TestConsumeSubscription:
         with patch.object(manager, "_get_or_create_connection", return_value=connection), \
              patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"):
             task = asyncio.create_task(manager._consume_subscription(_sub()))
-            await _wait_for(lambda: getattr(q_iter, "consumed", False))
+            await _wait_for(lambda: q_iter.consumed)
             task.cancel()
             outcome = await asyncio.wait_for(
                 asyncio.gather(task, return_exceptions=True), timeout=2.0
@@ -1277,7 +1290,7 @@ class TestDeliveryFaultsKeepTheSubscription:
             task = asyncio.create_task(
                 manager._consume_subscription(_sub(cooldown=300))
             )
-            await _wait_for(lambda: getattr(q_iter, "consumed", False))
+            await _wait_for(lambda: q_iter.consumed)
             task.cancel()
             outcome = await asyncio.wait_for(
                 asyncio.gather(task, return_exceptions=True), timeout=2.0
@@ -2614,7 +2627,7 @@ class TestConsumeFireQueue:
             task = asyncio.create_task(
                 manager._consume_fire_queue(connection, "rmq_default")
             )
-            await _wait_for(lambda: getattr(q_iter, "consumed", False))
+            await _wait_for(lambda: q_iter.consumed)
             task.cancel()
             outcome = await asyncio.wait_for(
                 asyncio.gather(task, return_exceptions=True), timeout=2.0
@@ -3544,8 +3557,8 @@ def _hanging_call(*args, **kwargs):
     return asyncio.Future()
 
 
-def _fast_timeouts(manager, conn_id: str = "rmq_default", rpc: float = 0.05) -> None:
-    manager._conn(conn_id).timeouts = AmqpTimeouts(connect=0.05, rpc=rpc)
+def _fast_timeouts(manager) -> None:
+    manager._conn("rmq_default").timeouts = AmqpTimeouts(connect=0.05, rpc=0.05)
 
 
 class _BlockedBroker:
@@ -4752,10 +4765,10 @@ def _mgmt_conn_info(url: str = "https://mb.example", login: str = "guest"):
     return conn_info
 
 
-def _patch_mgmt_connection(url: str = "https://mb.example"):
+def _patch_mgmt_connection():
     return patch(
         "airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
-        return_value=_mgmt_conn_info(url),
+        return_value=_mgmt_conn_info("https://mb.example"),
     )
 
 
@@ -4783,8 +4796,8 @@ class TestSubscriptionLiveness:
         manager._http_client = _mgmt_client([])
 
         with _patch_mgmt_connection():
-            first = await manager._check_subscription_liveness([sub])
-            second = await manager._check_subscription_liveness([sub])
+            first = await manager._check_liveness([sub])
+            second = await manager._check_liveness([sub])
 
         assert first == (set(), set())
         assert second == ({7}, {"rmq_default"})
@@ -4800,7 +4813,7 @@ class TestSubscriptionLiveness:
         manager._http_client = _mgmt_client([])
 
         with _patch_mgmt_connection():
-            first = await manager._check_subscription_liveness([sub])
+            first = await manager._check_liveness([sub])
 
         assert first == (set(), set())
         verdict = manager._conn("rmq_default").liveness
@@ -4816,7 +4829,7 @@ class TestSubscriptionLiveness:
         manager._http_client = _mgmt_client([])
 
         with _patch_mgmt_connection():
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert entry.negative_checks == 1
@@ -4833,8 +4846,8 @@ class TestSubscriptionLiveness:
         ])
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
-            result = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == ({7}, {"rmq_default"})
         assert manager._conn("rmq_default").liveness.broker_consumer_count == 2
@@ -4850,7 +4863,7 @@ class TestSubscriptionLiveness:
         ])
 
         with _patch_mgmt_connection():
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert entry.negative_checks == 0
@@ -4869,8 +4882,8 @@ class TestSubscriptionLiveness:
         )
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
-            result = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == ({7}, {"rmq_default"})
         assert requested and all("/api/nodes" not in url for url in requested)
@@ -4883,7 +4896,7 @@ class TestSubscriptionLiveness:
 
         with _patch_mgmt_connection(), \
              patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
-            first = await manager._check_subscription_liveness([sub])
+            first = await manager._check_liveness([sub])
 
         assert first == (set(), set())
         assert entry.negative_checks == 0
@@ -4903,9 +4916,9 @@ class TestSubscriptionLiveness:
 
         with _patch_mgmt_connection(), \
              patch.object(manager, "_probe_by_passive_declare", probe):
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
             assert probe.await_count == 0, "a single failure is still 'no data'"
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
 
         assert probe.await_count == 1
         assert manager._conn("rmq_default").liveness.status == "connected"
@@ -4930,7 +4943,7 @@ class TestSubscriptionLiveness:
         )
 
         with _patch_mgmt_connection_per_login({"conn_a": "shared", "conn_b": "shared"}):
-            result = await manager._check_subscription_liveness([a, b])
+            result = await manager._check_liveness([a, b])
 
         assert result == (set(), set())
         assert len(requested) == 1, requested
@@ -4961,7 +4974,7 @@ class TestSubscriptionLiveness:
         manager._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
         with _patch_mgmt_connection_per_login({"conn_a": "user_a", "conn_b": "user_b"}):
-            result = await manager._check_subscription_liveness([a, b])
+            result = await manager._check_liveness([a, b])
 
         assert result == (set(), set())
         assert sorted(requested) == ["user_a", "user_b"], requested
@@ -4982,8 +4995,8 @@ class TestSubscriptionLiveness:
         )
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            await manager._check_liveness([sub])
 
         assert len(requested) == 2, requested
 
@@ -4999,7 +5012,7 @@ class TestSubscriptionLiveness:
         manager._http_client = _mgmt_client([], requested=requested)
 
         with _patch_mgmt_connection():
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert requested == [], "a subscription with no tag of its own is not probed"
@@ -5016,7 +5029,7 @@ class TestSubscriptionLiveness:
         manager._http_client = _mgmt_client([], requested=requested)
 
         with _patch_mgmt_connection():
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert requested == [], "a subscription that is not listening is not probed"
@@ -5030,7 +5043,7 @@ class TestSubscriptionLiveness:
         manager._http_client = _mgmt_client([], requested=requested)
 
         with _patch_mgmt_connection():
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert requested == [], "a subscription that is not listening is not probed"
@@ -5049,10 +5062,10 @@ class TestSubscriptionLiveness:
         with _patch_mgmt_connection(), \
              patch.object(manager, "_get_or_create_connection", new_callable=AsyncMock,
                           side_effect=OSError("connection refused")):
-            first = await manager._check_subscription_liveness([sub])
+            first = await manager._check_liveness([sub])
             assert first == (set(), set())
             assert manager._conn("rmq_default").liveness.status is None
-            second = await manager._check_subscription_liveness([sub])
+            second = await manager._check_liveness([sub])
 
         assert second == (set(), {"rmq_default"}), (
             "the connection itself must be recreated, not the task that retries on it"
@@ -5078,9 +5091,9 @@ class TestSubscriptionLiveness:
         with _patch_mgmt_connection(), \
              patch.object(manager, "_get_or_create_connection", new_callable=AsyncMock,
                           return_value=healthy):
-            await manager._check_subscription_liveness([sub])
-            second = await manager._check_subscription_liveness([sub])
-            third = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            second = await manager._check_liveness([sub])
+            third = await manager._check_liveness([sub])
 
         assert second == (set(), set()), "the connection answers, so it stays"
         assert third == (set(), set()), "and it keeps staying, cycle after cycle"
@@ -5102,7 +5115,7 @@ class TestSubscriptionLiveness:
         with _patch_mgmt_connection(), \
              patch.object(manager, "_get_or_create_connection", new_callable=AsyncMock,
                           side_effect=OSError("connection refused")):
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
             assert manager._conn("rmq_default").stuck_cycles == 1
 
             # The task attaches, and the broker confirms it.
@@ -5110,13 +5123,13 @@ class TestSubscriptionLiveness:
             manager._http_client = _mgmt_client(
                 [_consumer_entry(entry.state.consumer_tag, "orders")]
             )
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
             assert manager._conn("rmq_default").stuck_cycles == 0
 
             # It drops back out of listening: the count starts from one again, so this
             # cycle alone cannot condemn the connection.
             entry.state._status = "connecting"
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert manager._conn("rmq_default").stuck_cycles == 1
@@ -5129,7 +5142,7 @@ class TestSubscriptionLiveness:
         manager._http_client = _mgmt_client([])
 
         with _patch_mgmt_connection():
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert manager._conn("rmq_default").liveness.status == "error"
@@ -5142,8 +5155,8 @@ class TestSubscriptionLiveness:
         manager._http_client = _mgmt_client([])
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
-            result = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert entry.negative_checks == 0
@@ -5158,10 +5171,10 @@ class TestLivenessDropRateLimit:
 
         with _patch_mgmt_connection(), \
              patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
-            await manager._check_subscription_liveness([sub])
-            condemned = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            condemned = await manager._check_liveness([sub])
             await manager._drop_connection("rmq_default")  # what reconcile does next
-            held_back = await manager._check_subscription_liveness([sub])
+            held_back = await manager._check_liveness([sub])
 
         assert condemned == ({7}, {"rmq_default"})
         assert held_back == (set(), set())
@@ -5178,12 +5191,12 @@ class TestLivenessDropRateLimit:
         manager._http_client = _mgmt_client([])
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            await manager._check_liveness([sub])
             await manager._drop_connection("rmq_default")
             for _ in range(_CYCLES_BEFORE_REDROP - 1):
-                assert await manager._check_subscription_liveness([sub]) == (set(), set())
-            again = await manager._check_subscription_liveness([sub])
+                assert await manager._check_liveness([sub]) == (set(), set())
+            again = await manager._check_liveness([sub])
 
         assert again == ({7}, {"rmq_default"})
 
@@ -5197,9 +5210,9 @@ class TestLivenessDropRateLimit:
         manager._http_client = _mgmt_client([])
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
             await manager._drop_connection("rmq_default", role=_ROLE_PUBLISH)
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == ({7}, {"rmq_default"})
 
@@ -5213,8 +5226,8 @@ class TestFireTaskLiveness:
         manager._http_client = _mgmt_client([_consumer_entry(_consumer_tag(7), "orders")])
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
-            result = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert fire.negative_checks == 0
@@ -5229,8 +5242,8 @@ class TestFireTaskLiveness:
         manager._http_client = _mgmt_client([_consumer_entry(_consumer_tag(7), "orders")])
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
-            result = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert manager._fire_needs_restart is True
@@ -5252,7 +5265,7 @@ class TestFireTaskLiveness:
         ])
 
         with _patch_mgmt_connection():
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert fire.negative_checks == 0
@@ -5287,8 +5300,8 @@ class TestLivenessAmqpProbe:
         manager._conn("rmq_default").connections[_ROLE_CONSUME] = self._hanging_declare_connection()
 
         with patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05):
-            first = await manager._check_subscription_liveness([sub])
-            second = await manager._check_subscription_liveness([sub])
+            first = await manager._check_liveness([sub])
+            second = await manager._check_liveness([sub])
 
         assert first == (set(), set())
         assert second == ({7}, {"rmq_default"})
@@ -5304,8 +5317,8 @@ class TestLivenessAmqpProbe:
         channel.declare_queue = AsyncMock(side_effect=ConnectionError("gone"))
         manager._conn("rmq_default").connections[_ROLE_CONSUME] = _make_live_connection(channel=channel)
 
-        await manager._check_subscription_liveness([sub])
-        result = await manager._check_subscription_liveness([sub])
+        await manager._check_liveness([sub])
+        result = await manager._check_liveness([sub])
 
         assert result == ({7}, {"rmq_default"})
 
@@ -5319,7 +5332,7 @@ class TestLivenessAmqpProbe:
         channel = _make_live_channel(queue=MagicMock())
         manager._conn("rmq_default").connections[_ROLE_CONSUME] = _make_live_connection(channel=channel)
 
-        result = await manager._check_subscription_liveness([sub])
+        result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert entry.negative_checks == 0
@@ -5346,7 +5359,7 @@ class TestLivenessAmqpProbe:
              patch.object(manager, "_provision_cooldown"):
             await manager.reconcile([sub])
             manager._active[7].state = _state_with("listening", 7)
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
 
             manager._active[7].task.cancel()
             await asyncio.gather(manager._active[7].task, return_exceptions=True)
@@ -5412,8 +5425,8 @@ class TestServerSideCancel:
         sub, entry, channel = self._cancelled_sub(manager)
         await _server_cancels(channel, entry.state.consumer_tag)
 
-        first = await manager._check_subscription_liveness([sub])
-        second = await manager._check_subscription_liveness([sub])
+        first = await manager._check_liveness([sub])
+        second = await manager._check_liveness([sub])
 
         assert first == (set(), set())
         assert manager._conn("rmq_default").liveness.status == "error"
@@ -5426,7 +5439,7 @@ class TestServerSideCancel:
         restart every one of them every second cycle for the life of the process."""
         sub, entry, _channel = self._cancelled_sub(manager)
 
-        result = await manager._check_subscription_liveness([sub])
+        result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert entry.negative_checks == 0
@@ -5447,8 +5460,8 @@ class TestServerSideCancel:
         await _server_cancels(channel, entry.state.consumer_tag)
 
         with _patch_mgmt_connection():
-            first = await manager._check_subscription_liveness([sub])
-            second = await manager._check_subscription_liveness([sub])
+            first = await manager._check_liveness([sub])
+            second = await manager._check_liveness([sub])
 
         assert first == (set(), set())
         assert second == ({7}, {"rmq_default"})
@@ -5462,7 +5475,7 @@ class TestServerSideCancel:
         sub, _entry, channel = self._cancelled_sub(manager)
         channel._channel = None
 
-        result = await manager._check_subscription_liveness([sub])
+        result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert manager._conn("rmq_default").liveness.status == "connected"
@@ -5481,8 +5494,8 @@ class TestServerSideCancel:
         )
         await _server_cancels(channel, fire.state.consumer_tag)
 
-        await manager._check_subscription_liveness([sub])
-        await manager._check_subscription_liveness([sub])
+        await manager._check_liveness([sub])
+        await manager._check_liveness([sub])
 
         assert manager._fire_needs_restart is True
         assert manager._conn("rmq_default").liveness.status == "error"
@@ -5517,11 +5530,11 @@ class TestUnreadableAirflowConnection:
             "airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
             side_effect=RuntimeError("connection 'rmq_default' is not defined"),
         ):
-            first = await manager._check_subscription_liveness([sub])
+            first = await manager._check_liveness([sub])
             unknown = manager._conn("rmq_default").liveness.status
-            second = await manager._check_subscription_liveness([sub])
+            second = await manager._check_liveness([sub])
             after_fallback = manager._conn("rmq_default").liveness.status
-            third = await manager._check_subscription_liveness([sub])
+            third = await manager._check_liveness([sub])
 
         assert (first, unknown) == ((set(), set()), None)
         assert (second, after_fallback) == ((set(), set()), "error")
@@ -5540,8 +5553,8 @@ class TestUnreadableAirflowConnection:
             "airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
             side_effect=RuntimeError("connection 'rmq_default' is not defined"),
         ):
-            await manager._check_subscription_liveness([sub])
-            second = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            second = await manager._check_liveness([sub])
 
         assert second == (set(), set())
         assert manager._conn("rmq_default").liveness.status == "connected"
@@ -5554,7 +5567,7 @@ class TestUnreadableAirflowConnection:
         manager._conn("rmq_default").conn_read_failures = 1
 
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
 
         assert manager._conn("rmq_default").conn_read_failures == 0
 
@@ -5679,8 +5692,8 @@ class TestRecoverDeadConsumers:
 
         with _patch_mgmt_connection(), \
              patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
-            await manager._check_subscription_liveness([dead, alive])
-            to_restart, to_recreate = await manager._check_subscription_liveness(
+            await manager._check_liveness([dead, alive])
+            to_restart, to_recreate = await manager._check_liveness(
                 [dead, alive]
             )
 
@@ -5960,7 +5973,7 @@ class TestTheRowOfAConsumerTheBrokerDenies:
 
         with _patch_mgmt_connection(), _patch_watcher_session(), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status", written):
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
             await manager._store_unwritten_statuses()
 
         assert self._captured_statuses(written.call_args_list) == [(7, "error")]
@@ -5979,7 +5992,7 @@ class TestTheRowOfAConsumerTheBrokerDenies:
 
         with _patch_mgmt_connection(), _patch_watcher_session(), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status", written):
-            result = await manager._check_subscription_liveness([sub])
+            result = await manager._check_liveness([sub])
             await manager._store_unwritten_statuses()
 
         assert result == (set(), set())  # nothing restarted, nothing recreated
@@ -5997,14 +6010,14 @@ class TestTheRowOfAConsumerTheBrokerDenies:
         with _patch_mgmt_connection(), _patch_watcher_session(), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status", written):
             manager._http_client = _mgmt_client([])
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
             await manager._store_unwritten_statuses()
             await manager._http_client.aclose()
 
             manager._http_client = _mgmt_client(
                 [_consumer_entry(entry.state.consumer_tag, "orders")]
             )
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
             await manager._store_unwritten_statuses()
 
         assert self._captured_statuses(written.call_args_list) == [
@@ -6023,7 +6036,7 @@ class TestTheRowOfAConsumerTheBrokerDenies:
 
         with _patch_mgmt_connection(), _patch_watcher_session(), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status", written):
-            await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
             await manager._store_unwritten_statuses()
 
         written.assert_not_called()
@@ -6234,7 +6247,7 @@ class TestCycleCallsUseTheCyclePool:
     @pytest.mark.asyncio
     async def test_restarting_the_fire_consumer_uses_the_cycle_pool(self, manager):
         _register_fire(manager, real_task=True)
-        with patch.object(manager, "_check_subscription_liveness", new_callable=AsyncMock,
+        with patch.object(manager, "_check_liveness", new_callable=AsyncMock,
                           return_value=(set(), {"rmq_default"})), \
              self._refusing_get_connection(manager) as get_conn:
             await manager._recover_dead_consumers([])
@@ -6964,8 +6977,8 @@ class TestIncidentRecovery:
             channel=channel
         )
 
-        await manager._check_subscription_liveness([sub])
-        await manager._check_subscription_liveness([sub])
+        await manager._check_liveness([sub])
+        await manager._check_liveness([sub])
         upsert = await _write_statuses(manager, [sub], stored={"rmq_default": "connected"})
 
         assert manager._conn("rmq_default").liveness.status == "error"
@@ -7055,8 +7068,8 @@ class TestIncidentRecovery:
             [_consumer_entry(entry.state.consumer_tag, "orders")]
         )
         with _patch_mgmt_connection():
-            await manager._check_subscription_liveness([sub])
-            result = await manager._check_subscription_liveness([sub])
+            await manager._check_liveness([sub])
+            result = await manager._check_liveness([sub])
 
         assert result == (set(), set())
         assert manager._conn("rmq_default").liveness.status == "connected"

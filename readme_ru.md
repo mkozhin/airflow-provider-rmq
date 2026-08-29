@@ -554,7 +554,7 @@ def my_pipeline():
 
 ### Как это работает
 
-Внутри процесса Scheduler запускается фоновый asyncio-цикл (через Airflow Listener API), который подписывается на очереди через AMQP `basic_consume`. При поступлении подходящего сообщения `trigger_dag()` вызывается напрямую внутри процесса. Одно соединение `connect_robust` на `conn_id` разделяется между всеми подписками к одному кластеру, а cooldown-публикация идёт по отдельному второму соединению (см. [Устойчивость соединения](#устойчивость-соединения)).
+Внутри процесса Scheduler запускается фоновый asyncio-цикл (через Airflow Listener API), который подписывается на очереди через AMQP `basic_consume`. При поступлении подходящего сообщения `trigger_dag()` вызывается напрямую внутри процесса. Одно соединение `RobustConnection` на `conn_id` разделяется между всеми подписками к одному кластеру, а cooldown-публикация идёт по отдельному второму соединению (см. [Устойчивость соединения](#устойчивость-соединения)).
 
 Каждые 60 секунд (настраивается через Airflow Variable `rmq_watcher_reconcile_interval`) цикл reconciliation пересканирует DAG-файлы на наличие декораторов `@rmq_trigger` (инкрементально по mtime — перепарсиваются только изменившиеся файлы) и синхронизирует подписки в БД.
 
@@ -858,9 +858,10 @@ airflow-provider-rmq/
 │       ├── subscription_builder.py  # build_subscriptions(), has_exchange_conflict()
 │       ├── subscription_form.py     # parse_cooldown(), parse_filter_data() (разбор формы UI)
 │       ├── models.py                # RMQSubscription, RMQConnStatus, WatcherSession
+│       ├── tunables.py              # Airflow-переменные, настраивающие watcher, и их дефолты
 │       ├── consumer.py              # RMQConsumerManager
-│       ├── orphan_tracker.py        # OrphanTracker (детект осиротевших очередей и биндингов)
-│       ├── listener.py              # RMQWatcherListener (Listener API)
+│       ├── orphan_tracker.py        # OrphanTracker (детект орфанов cooldown- и exchange-режима)
+│       ├── listener.py              # RMQWatcherListener (Scheduler Listener)
 │       ├── views.py                 # RMQWatcherView (Flask-AppBuilder UI)
 │       └── plugin.py                # RMQWatcherPlugin (AirflowPlugin)
 ├── docs/

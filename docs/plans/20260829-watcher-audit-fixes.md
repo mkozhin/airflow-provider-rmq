@@ -824,17 +824,17 @@ HTTP-запрос успешен. Пересоздание соединения 
         `call_with_timeout`) → не отмена, форма 4 → опознаётся входом по
         `isinstance` без обхода цепочки
       - форма 3: по цепочке эвристика отвечает «отмена» (тест это и закрепляет —
-        от формы 5 она неотличима), а вердикт цикла даёт `_ends_as_cancelled`
-        после `_mark_delivery_fault` — «не отмена», как и требует Overview
+        от формы 5 она неотличима), а вердикт цикла даёт отметку `delivery_fault`
+        — «не отмена», как и требует Overview
 - [x] проверить, что ни одно исключение из кода доставки не доходит до
       эвристики отмены
       - в `_consume_subscription` и в `_consume_fire_queue` тело `async for`
-        обёрнуто собственным `except Exception as delivery_exc`, который зовёт
-        `_mark_delivery_fault` и перевозбуждает; внешний `except Exception`
-        обоих циклов идёт через `_ends_as_cancelled`, читающий отметку до
-        эвристики
-      - `_raised_while_cancelling` в продакшн-коде вызывается ровно один раз —
-        из `_ends_as_cancelled`; других путей к ней нет
+        обёрнуто собственным `except Exception`, который поднимает кадровый флаг
+        `delivery_fault` и перевозбуждает; внешний `except Exception` обоих
+        циклов читает этот флаг до эвристики
+      - `_raised_while_cancelling` в продакшн-коде вызывается ровно дважды — по
+        разу во внешнем `except Exception` каждого из двух циклов, и только
+        когда `delivery_fault` не поднят; других путей к ней нет
 - [x] проверить, что в `CHANGELOG.md` не появилось пунктов о дефектах, которых
       не было ни в одном выпуске
       - по `git diff 9db910a..HEAD -- CHANGELOG.md`: пункты `**Fixed:**`
@@ -880,21 +880,22 @@ HTTP-запрос успешен. Пересоздание соединения 
       - прочитан целиком, все ссылки на символы и константы сверены с кодом
         (`_probe_by_passive_declare`, `_probe_connection`, `_may_drop_connection`,
         `_abandon`, `_CLOSE_TIMEOUT`, `_CANCEL_TIMEOUT`, `_NEGATIVE_CHECKS_BEFORE_RESTART`,
-        `_MGMT_FAILURES_BEFORE_FALLBACK`, `_STUCK_CYCLES_BEFORE_DROP`,
+        `_PROBE_FAILURES_BEFORE_FALLBACK`, `_STUCK_CYCLES_BEFORE_DROP`,
         `_CYCLES_BEFORE_REDROP`, `_PUBLISH_TIMEOUTS_BEFORE_DROP`, `_QUEUED_PER_WORKER`,
         `rmq_watcher.tasks_abandoned`, `rmq_watcher.cycle_timed_out`,
         `on_return_raises=True`) — существует всё; неверных утверждений после
         задачи 2 не осталось
       - ➕ дописаны два решения этого прогона, о которых ADR молчал, хотя обе
         соседние секции — про них: граница «отмена против отказа обработки
-        доставки» (`_mark_delivery_fault` / `_ends_as_cancelled`) в секции про
-        отменённую таску и проход по процесс-глобальному реестру писателей в
-        секции про `_StatusWriter`
+        доставки» (кадровый флаг `delivery_fault` против
+        `_raised_while_cancelling`) в секции про отменённую таску и проход по
+        процесс-глобальному реестру писателей в секции про `_StatusWriter`
 - [x] обновить `CONTEXT.md`, если появились новые точки входа
       - правок не требуется: `CONTEXT.md` — словарь предметной области
         (Subscription, Binding, Liveness watchdog, Degraded, Cycle timeout) и
         отношений между её понятиями, а не карта модулей; ни одна его статья не
-        называет приватную функцию. `_mark_delivery_fault`/`_ends_as_cancelled`,
+        называет приватную функцию. Отметка `delivery_fault` и
+        `_raised_while_cancelling`,
         логин в ключе кэша живости и проход по реестру писателей — внутренняя
         механика существующих понятий, нового термина разговора они не вводят.
         Точек входа прогон не менял

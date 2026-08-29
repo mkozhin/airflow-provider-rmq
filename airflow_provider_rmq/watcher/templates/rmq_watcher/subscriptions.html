@@ -204,6 +204,9 @@
                 <span class="label label-warning">connecting</span>
               {% elif item.consumer_status == 'error' %}
                 <span class="label label-danger">error</span>
+              {% elif item.consumer_status == 'disconnected' %}
+                <span class="label label-default"
+                      title="No consumer task is running for this subscription — the watcher let it go and the next reconcile cycle starts it again. Unlike 'disabled', the subscription is still on.">○ disconnected</span>
               {% else %}
                 <span class="label label-default">{{ item.consumer_status }}</span>
               {% endif %}
