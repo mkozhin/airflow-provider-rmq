@@ -6782,8 +6782,8 @@ class TestStatusWriteOrder:
                 raise RuntimeError("database write failed")
             stored.append(status)
 
-        writer.record("listening", None)   # the write the caller timed out on
-        writer.record("error", "gone")     # the status that replaced it
+        writer.record_if_needed("listening", None)   # the write the caller timed out on
+        writer.record_if_needed("error", "gone")     # the status that replaced it
 
         with _patch_watcher_session(), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
@@ -6800,7 +6800,7 @@ class TestStatusWriteOrder:
         """Nothing else would: the consumer that wrote the status has moved on, and one
         whose queue is quiet makes no further write to carry it."""
         entry = _register_active(manager, _sub(id=7))
-        _status_writer(7).record("listening", None)
+        _status_writer(7).record_if_needed("listening", None)
         stored = []
 
         def write(session, sub_id, status, last_error=None):
@@ -6829,7 +6829,7 @@ class TestStatusWriteOrder:
                 raise RuntimeError("database is away")
             stored.append(status)
 
-        writer.record("listening", None)
+        writer.record_if_needed("listening", None)
 
         with _patch_watcher_session(), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
@@ -6913,11 +6913,11 @@ class TestStatusWriteOrder:
             with _patch_watcher_session(), \
                  patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
                        side_effect=write):
-                writer.record("listening", None)
+                writer.record_if_needed("listening", None)
                 hung = pool.submit(writer.store)
                 assert entered.wait(2)
 
-                writer.record("error", "gone")
+                writer.record_if_needed("error", "gone")
                 pool.submit(writer.store).result(timeout=1)
                 assert commits == ["listening"], "the busy writer let a second write in"
 
@@ -6940,7 +6940,7 @@ class TestStatusWriteOrder:
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
                    side_effect=write):
             for status in ("connecting", "listening", "error"):
-                writer.record(status, None)
+                writer.record_if_needed(status, None)
                 writer.store()
                 assert not writer.has_pending
 
@@ -6967,11 +6967,11 @@ class TestStatusWriteOrder:
             with _patch_watcher_session(), \
                  patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
                        side_effect=write):
-                writer.record("listening", None)
+                writer.record_if_needed("listening", None)
                 running = pool.submit(writer.store)
                 assert entered.wait(2)
 
-                writer.record("error", "gone")
+                writer.record_if_needed("error", "gone")
                 pool.submit(writer.store).result(timeout=1)
 
                 release.set()
@@ -7042,6 +7042,56 @@ class TestStatusWriteOrder:
             await manager.reconcile([])
 
         assert ("disconnected", manager._cycle_executor) in writes
+
+    @pytest.mark.asyncio
+    async def test_a_write_made_while_a_store_runs_is_not_taken_for_a_repeat(self):
+        """"Does the row already say this?" cannot be answered beside a running store.
+
+        A store takes the noted status out of the writer before it commits, so while it
+        commits the writer holds the previous pair and nothing noted. A write of that
+        previous pair arriving in that window looks like a repeat of what the row says
+        and is skipped — and the store then puts the other status in the row. The
+        subscription reports one thing and its row says another, with nothing left to
+        correct it: a quiet queue makes no further write, so the row keeps the stale
+        value until the subscription is next reattached or removed.
+        """
+        pool = BoundedExecutor("test-status-store-race", 4)
+        state = _ConsumerState(7, pool)
+        row = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        def write(session, sub_id, status, last_error=None):
+            row.append((status, last_error))
+            if status == "error":
+                entered.set()
+                release.wait(5)
+
+        loop = asyncio.get_running_loop()
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                await state.write("listening")
+                # The status a failed write left behind, handed to a cycle-pool worker
+                # by the pass over the writers.
+                _status_writer(7).record_if_needed("error", "boom")
+                storing = pool.submit(_status_writer(7).store)
+                assert await loop.run_in_executor(None, entered.wait, 5)
+
+                await state.write("listening")
+
+                release.set()
+                await loop.run_in_executor(None, storing.result, 5)
+        finally:
+            release.set()
+            pool.shutdown()
+
+        assert row[-1] == ("listening", None), (
+            f"the row is left saying {row[-1]!r} about a listening subscription"
+        )
+        assert _status_writer(7).stored == ("listening", None)
+        assert not _status_writer(7).has_pending
 
 
 class TestTheRowOfASubscriptionThatIsGone:
@@ -7169,7 +7219,7 @@ class TestTheRowOfASubscriptionThatIsGone:
         nothing (``tests/watcher/test_models.py`` puts that to a real session) and costs
         the cycle one attempt that leaves nothing pending rather than an error.
         """
-        _status_writer(7).record("disconnected", None)
+        _status_writer(7).record_if_needed("disconnected", None)
         attempts = []
 
         def write(session, sub_id, status, last_error=None):
@@ -7186,8 +7236,8 @@ class TestTheRowOfASubscriptionThatIsGone:
     @pytest.mark.asyncio
     async def test_a_write_that_fails_does_not_stop_the_writers_behind_it(self, manager):
         """One row the database refuses costs the pass that row, not the rest of them."""
-        _status_writer(7).record("disconnected", None)
-        _status_writer(8).record("disconnected", None)
+        _status_writer(7).record_if_needed("disconnected", None)
+        _status_writer(8).record_if_needed("disconnected", None)
         landed = []
 
         def write(session, sub_id, status, last_error=None):
@@ -7210,7 +7260,7 @@ class TestTheRowOfASubscriptionThatIsGone:
         the process: a database answering nothing would spend the cycle's whole budget
         here and park a cycle-pool worker for each row it was asked about."""
         for sub_id in (1, 2, 3, 4, 5, 6):
-            _status_writer(sub_id).record("disconnected", None)
+            _status_writer(sub_id).record_if_needed("disconnected", None)
         attempts = []
         release = threading.Event()
 
@@ -7240,7 +7290,7 @@ class TestTheRowOfASubscriptionThatIsGone:
         :func:`_status_writer` for as long as the database stayed away, and reading the
         live registry instead of a snapshot would end the pass on the first writer another
         thread registers under it."""
-        _status_writer(7).record("disconnected", None)
+        _status_writer(7).record_if_needed("disconnected", None)
         entered = threading.Event()
         release = threading.Event()
 
@@ -7303,11 +7353,11 @@ class TestTheRowOfASubscriptionThatIsGone:
             with _patch_watcher_session(), \
                  patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
                        side_effect=write):
-                writer.record("listening", None)
+                writer.record_if_needed("listening", None)
                 running = pool.submit(writer.store)
                 assert entered.wait(2)
 
-                writer.record("disconnected", None)
+                writer.record_if_needed("disconnected", None)
                 await asyncio.wait_for(manager._store_unwritten_statuses(), timeout=2)
                 assert started == ["listening"]
 
@@ -7318,6 +7368,85 @@ class TestTheRowOfASubscriptionThatIsGone:
             pool.shutdown()
 
         assert started == ["listening", "disconnected"]
+
+
+class TestTheRowsAStopLeavesBehind:
+    """A stopped manager cancels every consumer, and a cancelled task writes nothing.
+
+    Whatever the stop was — the scheduler going down, or a cycle that outran its budget
+    and costs the watcher its event loop — the subscriptions it was consuming are not
+    being consumed by anything afterwards, and a row still saying ``listening`` is the
+    false green the watchdog exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stopping_writes_the_final_status_of_every_subscription(self, manager):
+        _register_active(manager, _sub(id=7), real_task=True)
+        _register_active(manager, _sub(id=8), real_task=True)
+        landed = []
+
+        def write(session, sub_id, status, last_error=None):
+            landed.append((sub_id, status))
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await manager.stop()
+
+        assert sorted(landed) == [(7, "disconnected"), (8, "disconnected")]
+
+    @pytest.mark.asyncio
+    async def test_a_status_the_stop_could_not_store_is_taken_by_the_next_manager(self):
+        """The status is noted on the writer before anything else in the teardown, and
+        the writer belongs to the process: the manager that replaces this one stores it
+        on its first cycle."""
+        mgr = _make_manager()
+        _register_active(mgr, _sub(id=7), real_task=True)
+        landed = []
+        db_up = False
+
+        def write(session, sub_id, status, last_error=None):
+            if not db_up:
+                raise RuntimeError("metadata database is away")
+            landed.append((sub_id, status))
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await mgr.stop()
+            assert landed == []
+            assert _status_writer(7).has_pending, "the final status is gone for good"
+
+            db_up = True
+            await _make_manager()._store_unwritten_statuses()
+
+        assert landed == [(7, "disconnected")]
+
+    @pytest.mark.asyncio
+    async def test_a_database_that_answers_nothing_costs_the_stop_its_bound(self):
+        """The teardown is what a fresh event loop — or a scheduler shutdown — waits on,
+        and the pass runs in the cycle pool, whose workers the next cycle reads the
+        database through. One bound covers the pass as a whole."""
+        pool = BoundedExecutor("test-stop-status-bound", 2)
+        mgr = _make_manager(cycle_executor=pool)
+        _register_active(mgr, _sub(id=7), real_task=True)
+        _register_active(mgr, _sub(id=8), real_task=True)
+        release = threading.Event()
+
+        def write(session, sub_id, status, last_error=None):
+            release.wait(5)
+
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer._STOP_STATUS_TIMEOUT", 0.05), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                await asyncio.wait_for(mgr.stop(), timeout=3)
+        finally:
+            release.set()
+            pool.shutdown()
+
+        assert pool.in_flight <= 1, "the stalled database was asked about a second row"
 
 
 class TestConsumerRegistration:

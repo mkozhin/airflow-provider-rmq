@@ -79,6 +79,10 @@ _STOP_CANCEL_TIMEOUT = 10.0
 #: running thread cannot be interrupted — so the timeout buys back the coroutine, not
 #: the worker.
 _DB_TIMEOUT = 30.0
+#: The pass ``stop()`` makes over the noted statuses once the connections are closed.
+#: Short because a stop is either the last thing the process does — where this pass is
+#: the only chance the rows get — or the teardown a fresh event loop is waiting on.
+_STOP_STATUS_TIMEOUT = 3.0
 
 #: A single ``trigger_dag``. A consumer task awaits it, not the reconcile cycle, so the
 #: cycle watchdog never sees it hang: without a timeout of its own the task would sit in
@@ -317,10 +321,35 @@ class _StatusWriter:
         with self._lock:
             return self._pending is not None
 
-    def record(self, status: str, last_error: str | None) -> None:
-        """Note ``status`` as the one to store next, in place of any still unstored."""
+    def record_if_needed(self, status: str, last_error: str | None) -> bool:
+        """Note ``(status, last_error)`` as the one to store next unless the row has settled on it.
+
+        :returns: Whether a store is wanted. ``False`` — and nothing noted — only when
+            the row already holds this pair, no noted status is waiting to reach it and
+            no store is running.
+
+        Asking and noting are one acquisition of the one lock, because a store in a
+        worker moves both halves of the answer and moves them apart: it takes the noted
+        status out of the writer before it commits, so between those two moments the
+        writer says the row holds the previous pair and says nothing is on its way to
+        it. A caller reading those two answers separately would be told a status it is
+        about to be given the opposite of, and would skip the write that makes the row
+        true; the row would then contradict the subscription with nothing left to
+        correct it until the subscription next changes state.
+
+        A running store therefore counts as unsettled: what it will leave in the row is
+        not known yet, and the caller's status goes to it rather than being dropped.
+        """
         with self._lock:
+            settled = (
+                not self._storing
+                and self._pending is None
+                and self._stored == (status, last_error)
+            )
+            if settled:
+                return False
             self._pending = (status, last_error)
+            return True
 
     def store(self) -> None:
         """Store noted statuses until none is left. Blocking — belongs in a pool.
@@ -689,18 +718,16 @@ class _ConsumerState:
         row: a write the caller stopped waiting for still gets there, and a status handed
         to a write already running gets there through that one. A caller marking down
         what it *asked* for would end up holding the opposite of what the row says, and
-        the guard right below would then suppress every write that could correct it.
+        the guard would then suppress every write that could correct it.
         """
         self._status = status
         if self._sub_id is None:
             return
         writer = _status_writer(self._sub_id)
-        if (status, last_error) == writer.stored and not writer.has_pending:
-            # Skipped only when the row already says this *and* nothing is waiting to be
-            # written: a status left behind by a write that failed is the row's only way
-            # back to the truth, and returning here would drop it.
+        if not writer.record_if_needed(status, last_error):
+            # The row already says this, nothing is waiting to reach it and no write is
+            # running: there is nothing for this call to put right.
             return
-        writer.record(status, last_error)
         pool = executor if executor is not None else self._executor
         try:
             await call_with_timeout(pool.run(writer.store), timeout=_DB_TIMEOUT)
@@ -920,6 +947,13 @@ class RMQConsumerManager:
         self._http_client = httpx.AsyncClient(timeout=_MGMT_HTTP_TIMEOUT)
 
     async def stop(self) -> None:
+        """Cancel every consumer, close what they ran on and finish their status rows.
+
+        The whole call runs under one budget the caller sets, so each part of it is
+        bounded: the wait for the cancelled tasks, the closing that follows and the pass
+        that stores the final status of each subscription, which comes last because the
+        broker holds the consumers of a connection that is still open.
+        """
         tasks_to_cancel: list[asyncio.Task] = [
             entry.task for entry in self._active.values()
         ]
@@ -935,6 +969,14 @@ class RMQConsumerManager:
             # the socket drops — beside the consumers of the loop that replaces this one.
             await _wait_cancelled(tasks_to_cancel, timeout=_STOP_CANCEL_TIMEOUT)
         finally:
+            # A cancelled task writes nothing, so the row of every subscription this
+            # call lets go of is finished from here. Noting the status is a lock and an
+            # assignment with no database in it, and it is done first: it costs the
+            # teardown nothing, and the writers belong to the process, so a status noted
+            # on them survives this manager whatever the rest of this block does.
+            for sub_id in self._active:
+                _status_writer(sub_id).record_if_needed(_SUB_DISCONNECTED, None)
+
             self._fire_task = None
             self._fire_state = None
 
@@ -948,6 +990,13 @@ class RMQConsumerManager:
                     self._http_client, "the Management API client", "aclose"
                 )
                 self._http_client = None
+
+            # Last, on what is left of the budget, and only once the connections are
+            # closed: a stop is often the last thing this process does, and a status
+            # only noted would then stay noted — the row would go on showing a green
+            # subscription for a consumer that ended with the scheduler. What this pass
+            # does not reach stays noted, and the next manager's cycle stores it.
+            await self._store_unwritten_statuses(budget=_STOP_STATUS_TIMEOUT)
 
     async def reconcile(self, subscriptions: list[dict]) -> None:
         """Sync running tasks, connections and infrastructure with the subscription list.
@@ -986,12 +1035,16 @@ class RMQConsumerManager:
 
         await self._store_unwritten_statuses()
 
-    async def _store_unwritten_statuses(self) -> None:
+    async def _store_unwritten_statuses(self, budget: float | None = None) -> None:
         """Carry the statuses a database outage left unwritten into their rows.
 
+        :param budget: Seconds the pass as a whole is given; :data:`_DB_TIMEOUT` when
+            left out, which is what a reconcile cycle gives it.
+
         The consumer that writes a status has moved on by the time the database answers
-        again, and one whose queue is quiet writes nothing further, so the cycle is what
-        gets the row and the subscription back into agreement.
+        again, and one whose queue is quiet writes nothing further, so this pass — at the
+        end of every reconcile cycle, and once more as the manager stops — is what gets
+        the row and the subscription back into agreement.
 
         The pass goes over the writer registry rather than the manager's own
         subscriptions, because the row of a subscription outlives the subscription. Its
@@ -1008,7 +1061,7 @@ class RMQConsumerManager:
         A write that does not land is logged and the pass carries on to the next writer,
         the same way a single stalled row does not cost the cycle the rest of them.
 
-        :data:`_DB_TIMEOUT` bounds the pass as a whole rather than each write in it. The
+        The budget bounds the pass as a whole rather than each write in it. The
         registry holds a writer for every subscription the process has ever written a
         status for, so the number of rows to dun is not the number of subscriptions there
         are now; a database that answers nothing would otherwise cost one full timeout
@@ -1019,10 +1072,11 @@ class RMQConsumerManager:
         saturating that pool. Whatever the budget did not reach stays pending, and the
         next cycle takes it.
         """
+        budget = _DB_TIMEOUT if budget is None else budget
         with _status_writers_lock:
             writers = list(_status_writers.items())
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _DB_TIMEOUT
+        deadline = loop.time() + budget
         for sub_id, writer in writers:
             if not writer.has_pending:
                 continue
@@ -1031,7 +1085,7 @@ class RMQConsumerManager:
                 log.warning(
                     "The pass over the status writers ran out of its %ss at subscription "
                     "%s — the statuses it did not reach are stored by the next cycle",
-                    _DB_TIMEOUT, sub_id,
+                    budget, sub_id,
                 )
                 return
             try:
