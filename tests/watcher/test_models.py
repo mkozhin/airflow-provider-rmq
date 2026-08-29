@@ -217,6 +217,16 @@ class TestConsumerStatus:
         assert refreshed.consumer_status == "error"
         assert refreshed.last_error == "queue not found"
 
+    def test_set_consumer_status_of_a_subscription_that_is_gone_is_a_no_op(self, session):
+        """The write is an ``UPDATE ... WHERE id = ...``, so the row a deleted
+        subscription took with it matches nothing. The reconcile cycle finishes the row
+        of a subscription it has already let go of, and a deleted one has to cost it a
+        no-op rather than an error."""
+        set_consumer_status(session, 4242, "disconnected")
+        session.commit()
+
+        assert session.query(RMQSubscription).filter_by(id=4242).one_or_none() is None
+
 
 class TestConnStatus:
     def test_upsert_conn_status_creates_and_updates(self, session):

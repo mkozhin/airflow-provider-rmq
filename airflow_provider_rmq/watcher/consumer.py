@@ -550,31 +550,6 @@ def _usable(connection: Any) -> bool:
     return not connection.is_closed and getattr(connection, "transport", None) is not None
 
 
-_DELIVERY_FAULT = "_rmq_raised_by_delivery"
-
-
-def _mark_delivery_fault(exc: BaseException) -> None:
-    """Record on ``exc`` that it was raised by the handling of a delivery.
-
-    The mark is what draws the line the cancellation heuristic cannot draw for itself:
-    the heuristic reads an exception chain, and the chain a broken connection leaves
-    behind is the same one whether the call it interrupted was the queue iterator's
-    ``basic.cancel`` or a publish made for a message already taken off the queue. Only
-    the place the exception came from tells the two apart, so that is what is recorded
-    where it is still known.
-
-    An exception whose class refuses attributes stays unmarked and is judged by the
-    chain alone; every exception raised on this path so far accepts one.
-    """
-    try:
-        setattr(exc, _DELIVERY_FAULT, True)
-    except (AttributeError, TypeError):
-        log.debug(
-            "An exception of type %s takes no attribute, so the delivery that raised it "
-            "is not recorded on it", type(exc).__name__,
-        )
-
-
 def _raised_while_cancelling(exc: BaseException) -> bool:
     """Whether ``exc`` came out of handling a cancellation.
 
@@ -588,25 +563,20 @@ def _raised_while_cancelling(exc: BaseException) -> bool:
     the row its replacement owns.
 
     ``Task.cancelling()`` would answer this directly and arrived in Python 3.11, so the
-    chain the exception carries is what there is to read on 3.10.
+    chain the exception carries is what there is to read on 3.10. Two writers of that
+    chain decide what it has to read: ``aiormq`` hands a torn-down connection to every
+    pending RPC as ``raise self._exception from e``, with ``e`` the ``CancelledError``
+    the RPC task was stopped with, which puts the cancellation in ``__cause__``; and
+    :func:`call_with_timeout` converts an expired call into a ``TimeoutError`` with
+    ``from None``, which is a raiser saying the cancellation it just made is not the
+    cause of what it raises. So ``__cause__`` is followed always, ``__context__`` only
+    while ``__suppress_context__`` is unset.
 
-    What is read of that chain: ``__cause__`` always, ``__context__`` only while
-    ``__suppress_context__`` is unset. ``__cause__`` is the answer to a deliberate
-    ``raise ... from ...``, and ``aiormq`` hands a torn-down connection to a pending RPC
-    exactly that way — ``raise self._exception from e`` with ``e`` the ``CancelledError``
-    the RPC task was stopped with — which is how a rejected ``basic.cancel`` reaches
-    ``__anext__``. ``__context__`` carries what was merely being handled when this
-    exception was raised, and that is the plain form: an error escaping the
-    ``except CancelledError`` block inside ``__anext__``. ``__suppress_context__`` is
-    what a ``raise ... from None`` sets, and code that writes it is saying the
-    cancellation it was handling is not the cause of what it raises —
-    :func:`call_with_timeout` converting an expired call into a ``TimeoutError`` says
-    precisely that.
-
-    The chain is all this function reads, so it cannot see where the exception was
-    raised: an ``aiormq`` failure carrying a ``CancelledError`` in ``__cause__`` looks
-    the same whether it came from ``__anext__`` or from a publish. Callers keep the
-    handling of a delivery away from here with :func:`_mark_delivery_fault` instead.
+    The chain says nothing about where the exception was raised, and an ``aiormq``
+    failure carrying a ``CancelledError`` in ``__cause__`` looks the same whether it came
+    from ``__anext__`` or from a publish made for a delivery. Each consumer loop keeps
+    the two apart by remembering, in the frame that runs the delivery, that this one came
+    from there.
     """
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -623,17 +593,15 @@ def _raised_while_cancelling(exc: BaseException) -> bool:
     return False
 
 
-def _ends_as_cancelled(exc: BaseException) -> bool:
-    """Whether a consumer loop ends as cancelled on ``exc`` instead of retrying on it.
+async def _pause_before_reattaching() -> None:
+    """Wait out :data:`_RECONNECT_DELAY` after a queue iterator returned on its own.
 
-    An exception the handling of a delivery raised is a transient fault, whatever chain
-    it carries: the mark says where it came from, and where it came from is the one
-    thing :func:`_raised_while_cancelling` cannot read. Everything else — that is,
-    whatever the queue iterator itself raised — is put to the heuristic.
+    A robust iterator returns without an exception on a connection closed on purpose, on
+    a channel loss it cannot wait out, and when its own wait for the channel to come back
+    runs out — states that repeat as readily as they arrive. Subscribing again the moment
+    one of them happens is what turns any of the three into a spinning consumer loop.
     """
-    if getattr(exc, _DELIVERY_FAULT, False):
-        return False
-    return _raised_while_cancelling(exc)
+    await asyncio.sleep(_RECONNECT_DELAY)
 
 
 async def _wait_cancelled(
@@ -1039,15 +1007,36 @@ class RMQConsumerManager:
 
         A write that does not land is logged and the pass carries on to the next writer,
         the same way a single stalled row does not cost the cycle the rest of them.
+
+        :data:`_DB_TIMEOUT` bounds the pass as a whole rather than each write in it. The
+        registry holds a writer for every subscription the process has ever written a
+        status for, so the number of rows to dun is not the number of subscriptions there
+        are now; a database that answers nothing would otherwise cost one full timeout
+        per pending writer, and the cycle budget covers only a handful of those. Each
+        write that outruns the bound also parks a worker of the cycle pool — the pool the
+        cycle's own steps read the database through — for as long as the database keeps
+        it, so one bound over the whole pass is also what keeps a single outage from
+        saturating that pool. Whatever the budget did not reach stays pending, and the
+        next cycle takes it.
         """
         with _status_writers_lock:
             writers = list(_status_writers.items())
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DB_TIMEOUT
         for sub_id, writer in writers:
             if not writer.has_pending:
                 continue
+            left = deadline - loop.time()
+            if left <= 0:
+                log.warning(
+                    "The pass over the status writers ran out of its %ss at subscription "
+                    "%s — the statuses it did not reach are stored by the next cycle",
+                    _DB_TIMEOUT, sub_id,
+                )
+                return
             try:
                 await call_with_timeout(
-                    self._cycle_executor.run(writer.store), timeout=_DB_TIMEOUT
+                    self._cycle_executor.run(writer.store), timeout=left
                 )
             except asyncio.CancelledError:
                 raise
@@ -2468,6 +2457,13 @@ class RMQConsumerManager:
                         )
                         incr("rmq_watcher.consumer_attached")
 
+                        # Handling a delivery reaches the broker on its own — a
+                        # publish, an ACK, a connection it has to rebuild — and a
+                        # connection torn down under any of those raises what a rejected
+                        # consumer cancellation raises. Which of the two this is comes
+                        # down to the frame it was raised in, so that is what is
+                        # remembered, for this attach alone.
+                        delivery_fault = False
                         try:
                             async for message in q_iter:
                                 try:
@@ -2483,18 +2479,11 @@ class RMQConsumerManager:
                                         await self._handle_immediate_delivery(
                                             sub, message, state, trigger_backoff
                                         )
-                                except Exception as delivery_exc:
-                                    # Handling a delivery reaches the broker on its own —
-                                    # a publish, an ACK, a connection it has to rebuild —
-                                    # and a connection torn down under any of those raises
-                                    # what a rejected consumer cancellation raises. The
-                                    # mark says which of the two this is, so the retry
-                                    # loop below keeps the subscription instead of ending
-                                    # it as cancelled.
-                                    _mark_delivery_fault(delivery_exc)
+                                except Exception:
+                                    delivery_fault = True
                                     raise
                         except Exception as exc:
-                            if not _ends_as_cancelled(exc):
+                            if delivery_fault or not _raised_while_cancelling(exc):
                                 raise
                             log.warning(
                                 "Cancelling consumer %s of subscription %d failed: %s — "
@@ -2508,10 +2497,7 @@ class RMQConsumerManager:
                         channel, f"the channel of subscription {sub_id}"
                     )
 
-                # The iterator finished without an exception — the broker cancelled the
-                # consumer. Pause before subscribing again so a broker that keeps ending
-                # it right away cannot spin this loop.
-                await asyncio.sleep(_RECONNECT_DELAY)
+                await _pause_before_reattaching()
 
             except asyncio.CancelledError:
                 return
@@ -2739,21 +2725,21 @@ class RMQConsumerManager:
                         )
                         incr("rmq_watcher.consumer_attached")
 
+                        # Same boundary the subscription loop draws: what the handling
+                        # of a fire event raises is judged as the transient fault it is,
+                        # not as a cancellation the chain happens to resemble.
+                        delivery_fault = False
                         try:
                             async for message in q_iter:
                                 try:
                                     await self._handle_fire_delivery(
                                         message, state, trigger_backoff
                                     )
-                                except Exception as delivery_exc:
-                                    # Same boundary the subscription loop draws: what the
-                                    # handling of a fire event raises is judged as the
-                                    # transient fault it is, not as a cancellation the
-                                    # chain happens to resemble.
-                                    _mark_delivery_fault(delivery_exc)
+                                except Exception:
+                                    delivery_fault = True
                                     raise
                         except Exception as exc:
-                            if not _ends_as_cancelled(exc):
+                            if delivery_fault or not _raised_while_cancelling(exc):
                                 raise
                             log.warning(
                                 "Cancelling the fire consumer %s of conn_id=%r failed: "
@@ -2767,12 +2753,7 @@ class RMQConsumerManager:
                         channel, f"the fire consumer channel of conn_id={conn_id!r}"
                     )
 
-                # The iterator returned without an exception. A robust iterator does that
-                # on a connection closed on purpose, on a channel loss it cannot wait out,
-                # and when its own wait for the channel to come back runs out — states
-                # that repeat as readily as they arrive. Pause before subscribing again so
-                # none of them can spin this loop.
-                await asyncio.sleep(_RECONNECT_DELAY)
+                await _pause_before_reattaching()
 
             except asyncio.CancelledError:
                 return

@@ -62,8 +62,14 @@ async def get_queue_consumers(
         ``https://mb.realcombi.mgcom.ru``.
     :param vhost: RabbitMQ vhost (as resolved from ``conn_info.schema or "/"``).
     :param auth: ``(login, password)`` tuple for HTTP basic auth.
-    :returns: ``{queue_name: {consumer_tag, ...}}`` for every consumer the broker
-        currently holds in ``vhost``; queues with no consumers are absent.
+    :returns: ``{queue_name: {consumer_tag, ...}}`` for every consumer the reply
+        carries; queues with no consumers in it are absent.
+
+        What the reply carries is shaped by the rights of the account in ``auth``: a
+        user tagged ``management`` is shown only the channels of its own connections,
+        while ``monitoring`` and ``administrator`` see the whole vhost. So an empty
+        answer for a queue means "none of ours", not "none at all", unless the account
+        is one of the latter two.
     :raises httpx.HTTPStatusError: If the Management API responds with an error status.
     :raises httpx.TimeoutException: If the request times out.
 

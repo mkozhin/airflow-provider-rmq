@@ -43,8 +43,6 @@ from airflow_provider_rmq.watcher.consumer import (
     _attach_nonce,
     _attached,
     _consumer_tag,
-    _ends_as_cancelled,
-    _mark_delivery_fault,
     _raised_while_cancelling,
     _build_run_id,
     _safe_run_id,
@@ -148,10 +146,16 @@ class _QueueIterFailingCancel:
     it. A broker that rejects the pending ``basic.cancel`` — which every connection torn
     down mid-call does — therefore leaves ``__anext__`` with its own error in place of
     the cancellation, carrying the CancelledError as context.
+
+    :param through_task_wrapper: Hand that failure over the way ``aiormq``'s RPC wrapper
+        does — ``raise self._exception from e``, with ``e`` the ``CancelledError`` the
+        RPC task was stopped with — so the error carries a cancellation in ``__cause__``
+        as well as in ``__context__``.
     """
 
-    def __init__(self, error: BaseException):
+    def __init__(self, error: BaseException, through_task_wrapper: bool = False):
         self._error = error
+        self._through_task_wrapper = through_task_wrapper
 
     async def __aenter__(self):
         return self
@@ -172,7 +176,12 @@ class _QueueIterFailingCancel:
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
-            raise self._error
+            if not self._through_task_wrapper:
+                raise self._error
+            try:
+                raise asyncio.CancelledError()  # the RPC task the teardown stopped
+            except asyncio.CancelledError as rpc_stopped:
+                raise self._error from rpc_stopped
 
 
 def _queue_failing_cancel(error: BaseException):
@@ -228,7 +237,7 @@ def _offloading_executor(outcome: str = _OUTCOME_TRIGGERED) -> _FakeExecutor:
         if fn is _sync_trigger:
             return outcome
         if isinstance(getattr(fn, "__self__", None), _StatusWriter):
-            return True   # the subscription's status writer; nothing to store here
+            return None   # the subscription's status writer; nothing to store here
         return fn(*args)
 
     return _FakeExecutor(handler)
@@ -239,11 +248,14 @@ _CONSUMER_MODULE = "airflow_provider_rmq.watcher.consumer"
 
 
 @contextlib.contextmanager
-def _record_consumer_sleeps(on_delay):
+def _record_consumer_sleeps(on_delay, block: bool = False):
     """Collect the pauses ``consumer.py`` takes, ignoring every other module's sleep.
 
     ``consumer.asyncio`` is the asyncio module itself, so patching its ``sleep``
     patches it process-wide; the caller's frame tells whose pause this is.
+
+    :param block: Leave ``consumer.py`` inside its pause instead of letting it out, so a
+        test can reach the loop while it is waiting.
     """
     real_sleep = asyncio.sleep
 
@@ -251,6 +263,8 @@ def _record_consumer_sleeps(on_delay):
         caller = inspect.currentframe().f_back
         if caller is not None and caller.f_globals.get("__name__") == _CONSUMER_MODULE:
             on_delay(delay)
+            if block:
+                await asyncio.Future()
         return await real_sleep(0)
 
     with patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new=fake_sleep):
@@ -1004,46 +1018,6 @@ class TestConsumeSubscription:
 # Telling a cancellation apart from a fault the handling of a delivery raised
 # ---------------------------------------------------------------------------
 
-class _QueueIterCancelFailingThroughTaskWrapper:
-    """Iterator whose ``basic.cancel`` is failed by ``aiormq``'s own RPC wrapper.
-
-    ``aiormq`` runs an RPC inside a task and hands a torn-down connection to whoever is
-    waiting on it as ``raise self._exception from e``, where ``e`` is the
-    ``CancelledError`` that task was stopped with. Reached through the ``close()``
-    ``QueueIterator.__anext__`` makes while it handles its own cancellation, that error
-    comes out of the iterator carrying a ``CancelledError`` in both ``__cause__`` and
-    ``__context__`` — and it is a genuine cancellation all the same.
-    """
-
-    def __init__(self, error: BaseException):
-        self._error = error
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        pass
-
-    async def consume(self):
-        self.consumed = True
-
-    def __aiter__(self):
-        return self
-
-    async def close(self):
-        try:
-            raise asyncio.CancelledError()  # the RPC task the teardown stopped
-        except asyncio.CancelledError as rpc_stopped:
-            raise self._error from rpc_stopped
-
-    async def __anext__(self):
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            await self.close()
-            raise
-
-
 async def _error_out_of_iterator(q_iter) -> BaseException:
     """The exception ``q_iter`` lets out when the cancellation of its consumer fails."""
     task = asyncio.create_task(q_iter.__anext__())
@@ -1089,7 +1063,7 @@ class TestTellingCancellationFromDeliveryFaults:
         assert exc.__cause__ is None
         assert isinstance(exc.__context__, asyncio.CancelledError)
         assert not exc.__suppress_context__
-        assert _ends_as_cancelled(exc)
+        assert _raised_while_cancelling(exc)
 
     def test_a_cancellederror_is_recognised_without_reading_the_chain(self):
         """Form 4 — a bare ``raise`` inside a cancellation handler re-raises that very
@@ -1114,7 +1088,7 @@ class TestTellingCancellationFromDeliveryFaults:
 
         assert isinstance(exc.__context__, asyncio.CancelledError)
         assert exc.__suppress_context__
-        assert not _ends_as_cancelled(exc)
+        assert not _raised_while_cancelling(exc)
 
     @pytest.mark.asyncio
     async def test_a_call_that_outran_its_bound_is_not_a_cancellation(self):
@@ -1124,7 +1098,7 @@ class TestTellingCancellationFromDeliveryFaults:
 
         assert isinstance(exc.__context__, asyncio.CancelledError)
         assert exc.__suppress_context__
-        assert not _ends_as_cancelled(exc)
+        assert not _raised_while_cancelling(exc)
 
     @pytest.mark.asyncio
     async def test_a_failed_cancel_reaching_the_iterator_through_aiormq_is_a_cancellation(self):
@@ -1132,19 +1106,21 @@ class TestTellingCancellationFromDeliveryFaults:
         ``aiormq``'s RPC wrapper instead of thrown directly, so it carries the
         ``CancelledError`` in ``__cause__``."""
         exc = await _error_out_of_iterator(
-            _QueueIterCancelFailingThroughTaskWrapper(
-                aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+            _QueueIterFailingCancel(
+                aio_pika.exceptions.AMQPConnectionError("connection reset by peer"),
+                through_task_wrapper=True,
             )
         )
 
         assert isinstance(exc.__cause__, asyncio.CancelledError)
         assert exc.__suppress_context__
-        assert _ends_as_cancelled(exc)
+        assert _raised_while_cancelling(exc)
 
-    def test_the_same_chain_raised_by_a_delivery_is_a_fault_to_retry(self):
+    def test_the_chain_of_a_delivery_fault_is_the_chain_of_a_cancellation(self):
         """Form 3 — what ``aiormq`` hands a publish whose connection was torn down
-        mid-RPC. Its chain is form 5's, so nothing in the chain tells the two apart;
-        what does is that this one was raised by the handling of a delivery."""
+        mid-RPC. Its chain is form 5's, so no reading of the chain can tell the two
+        apart; what does is the frame the exception was raised in, which each consumer
+        loop remembers for itself and the two classes below put to those loops."""
         try:
             try:
                 raise asyncio.CancelledError()
@@ -1157,10 +1133,6 @@ class TestTellingCancellationFromDeliveryFaults:
 
         assert _raised_while_cancelling(exc), "the chain alone cannot tell it from form 5"
 
-        _mark_delivery_fault(exc)
-
-        assert not _ends_as_cancelled(exc)
-
 
 class TestDeliveryFaultsKeepTheSubscription:
     """A cooldown subscription whose delivery handling failed reports it and retries.
@@ -1172,7 +1144,7 @@ class TestDeliveryFaultsKeepTheSubscription:
     ``listening`` with no consumer behind it until the next reconcile cycle.
     """
 
-    async def _run_until_resubscribed(self, manager, connection, queue, publish_channel):
+    async def _run_until_resubscribed(self, manager, queue, publish_channel):
         """Run the cooldown subscription until it attaches a second time.
 
         :returns: The statuses the subscription wrote, in order.
@@ -1209,7 +1181,7 @@ class TestDeliveryFaultsKeepTheSubscription:
 
         with patch.object(manager, "_get_or_create_connection", return_value=connection):
             writes = await self._run_until_resubscribed(
-                manager, connection, queue, timing_out_channel
+                manager, queue, timing_out_channel
             )
 
         assert _SUB_ERROR in [status for status, _ in writes]
@@ -1233,7 +1205,7 @@ class TestDeliveryFaultsKeepTheSubscription:
 
         with patch.object(manager, "_get_or_create_connection", return_value=connection):
             writes = await self._run_until_resubscribed(
-                manager, connection, queue, dropped_channel
+                manager, queue, dropped_channel
             )
 
         assert _SUB_ERROR in [status for status, _ in writes]
@@ -2504,17 +2476,9 @@ class TestConsumeFireQueue:
         )
 
         paused = asyncio.Event()
-        real_sleep = asyncio.sleep
-
-        async def hold(delay, *args, **kwargs):
-            caller = inspect.currentframe().f_back
-            if caller is not None and caller.f_globals.get("__name__") == _CONSUMER_MODULE:
-                paused.set()
-                await asyncio.Future()
-            return await real_sleep(delay)
 
         with patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
-             patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new=hold):
+             _record_consumer_sleeps(lambda delay: paused.set(), block=True):
             task = asyncio.create_task(
                 manager._consume_fire_queue(connection, "rmq_default")
             )
@@ -2592,6 +2556,45 @@ class TestConsumeFireQueue:
             await manager.reconcile([])
             assert fire_task.done()
             assert manager._fire_task is None
+
+    @pytest.mark.asyncio
+    async def test_a_fire_delivery_that_failed_reports_error_and_consumes_again(self):
+        """The handling of a fire event reaches the broker and the metadata database on
+        its own, and a connection torn down under it arrives in the shape of a rejected
+        consumer cancellation — ``aiormq`` hands every pending RPC its own error with the
+        ``CancelledError`` of the stopped RPC task as the cause. Read as a cancellation,
+        the fire task would return silently with no status written, and cooldown DAGs
+        would stop firing while the row still said ``listening``."""
+        manager = _make_manager()
+        queue = _make_push_queue([_make_fake_message(b"fire")])
+        connection = _make_live_connection(channel=_make_live_channel(queue=queue))
+        writes: list[tuple] = []
+
+        async def record_write(self, status, last_error=None):
+            writes.append((status, last_error))
+
+        async def dropped_mid_rpc(message, state, backoff):
+            try:
+                raise asyncio.CancelledError()  # the RPC task the teardown stopped
+            except asyncio.CancelledError as rpc_stopped:
+                raise aio_pika.exceptions.AMQPConnectionError(
+                    "connection reset by peer"
+                ) from rpc_stopped
+
+        with _record_consumer_sleeps(lambda delay: None), \
+             patch.object(manager, "_handle_fire_delivery", side_effect=dropped_mid_rpc), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write",
+                   new=record_write):
+            task = asyncio.create_task(
+                manager._consume_fire_queue(connection, "rmq_default")
+            )
+            try:
+                await _wait_for(lambda: queue.iterator.call_count >= 2)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        assert _SUB_ERROR in [status for status, _ in writes]
 
     @pytest.mark.asyncio
     async def test_a_failed_consumer_cancel_still_ends_the_fire_task(self):
@@ -7163,22 +7166,105 @@ class TestTheRowOfASubscriptionThatIsGone:
         """A subscription deleted from the table takes its status row with it.
 
         The write is an ``UPDATE ... WHERE id = ...``, so a row that is gone matches
-        nothing and costs the cycle a no-op rather than an error.
+        nothing (``tests/watcher/test_models.py`` puts that to a real session) and costs
+        the cycle one attempt that leaves nothing pending rather than an error.
         """
         _status_writer(7).record("disconnected", None)
-        matched = []
+        attempts = []
 
         def write(session, sub_id, status, last_error=None):
-            matched.append(0)   # the UPDATE reached no row
-            return 0
+            attempts.append(sub_id)
 
         with _patch_watcher_session(), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
                    side_effect=write):
             await manager._store_unwritten_statuses()
 
-        assert matched == [0]
+        assert attempts == [7]
         assert not _status_writer(7).has_pending
+
+    @pytest.mark.asyncio
+    async def test_a_write_that_fails_does_not_stop_the_writers_behind_it(self, manager):
+        """One row the database refuses costs the pass that row, not the rest of them."""
+        _status_writer(7).record("disconnected", None)
+        _status_writer(8).record("disconnected", None)
+        landed = []
+
+        def write(session, sub_id, status, last_error=None):
+            if sub_id == 7:
+                raise RuntimeError("metadata database is away")
+            landed.append(sub_id)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await manager._store_unwritten_statuses()
+
+        assert landed == [8]
+        assert _status_writer(7).has_pending
+
+    @pytest.mark.asyncio
+    async def test_the_whole_pass_shares_one_budget(self, manager):
+        """The registry holds a writer for every subscription the process has ever
+        written a status for, so a bound per writer is a cost that grows with the age of
+        the process: a database answering nothing would spend the cycle's whole budget
+        here and park a cycle-pool worker for each row it was asked about."""
+        for sub_id in (1, 2, 3, 4, 5, 6):
+            _status_writer(sub_id).record("disconnected", None)
+        attempts = []
+        release = threading.Event()
+
+        def write(session, sub_id, status, last_error=None):
+            attempts.append(sub_id)
+            release.wait(5)
+
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer._DB_TIMEOUT", 0.05), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                await asyncio.wait_for(
+                    manager._store_unwritten_statuses(), timeout=5
+                )
+        finally:
+            release.set()
+
+        assert attempts == [1], (
+            "the pass asked the stalled database about more than one row"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_registry_answers_other_callers_while_the_pass_waits(self, manager):
+        """The snapshot is taken under the registry lock and the lock is let go before
+        the first await. Holding it across the wait would shut every consumer task out of
+        :func:`_status_writer` for as long as the database stayed away, and reading the
+        live registry instead of a snapshot would end the pass on the first writer another
+        thread registers under it."""
+        _status_writer(7).record("disconnected", None)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def write(session, sub_id, status, last_error=None):
+            entered.set()
+            release.wait(5)
+
+        loop = asyncio.get_running_loop()
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                pass_task = asyncio.create_task(manager._store_unwritten_statuses())
+                assert await loop.run_in_executor(None, entered.wait, 5)
+
+                registered = await asyncio.wait_for(
+                    loop.run_in_executor(None, _status_writer, 8), timeout=2
+                )
+                assert registered is _status_writers[8]
+
+                release.set()
+                await asyncio.wait_for(pass_task, timeout=5)
+        finally:
+            release.set()
 
     @pytest.mark.asyncio
     async def test_a_writer_with_nothing_left_does_not_touch_the_database(self, manager):
@@ -7187,13 +7273,12 @@ class TestTheRowOfASubscriptionThatIsGone:
         _register_active(manager, _sub(id=7))
         _status_writer(7)
 
-        session = MagicMock()
-        with patch("airflow_provider_rmq.watcher.consumer.WatcherSession", session), \
-             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status") as stored:
+        with patch.object(
+            manager._cycle_executor, "run", new_callable=AsyncMock
+        ) as offloaded:
             await manager._store_unwritten_statuses()
 
-        stored.assert_not_called()
-        session.assert_not_called()
+        offloaded.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_the_pass_does_not_start_a_second_write_beside_a_running_one(
