@@ -68,11 +68,11 @@ def _read_number(
     try:
         value = cast(raw)
     except (TypeError, ValueError, OverflowError):
-        # OverflowError belongs here: ``extra_dejson`` parses 1e400 to ``inf`` and a
-        # 400-digit literal to an int no float can hold, and either one raises out of
-        # the cast rather than reaching the finiteness check below. Unhandled it leaves
+        # OverflowError belongs here: ``extra_dejson`` parses a 400-digit literal to an
+        # int no float can hold, and the cast raises on it. Unhandled it leaves
         # ``build_amqp_connection`` altogether, past the caller that would have written
-        # the reason into the connection row.
+        # the reason into the connection row. A literal written as 1e400 is read as
+        # ``inf``, which the cast takes and the finiteness check below turns down.
         log.warning("RMQ connection extra %r=%r is not a number, using %s", key, raw, default)
         return default
     if not math.isfinite(value):
