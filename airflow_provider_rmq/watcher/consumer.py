@@ -296,6 +296,10 @@ class _StatusWriter:
         self._lock = threading.Lock()
         self._pending: tuple[str, str | None] | None = None
         self._storing = False
+        #: The pair a running store took out and is committing, ``None`` while no store
+        #: runs. It is what the row is about to hold, and that is what a caller asking
+        #: "does the row already say this?" has to be told while a store is in flight.
+        self._storing_pair: tuple[str, str | None] | None = None
         self._stored: tuple[str, str | None] | None = None
 
     @property
@@ -325,28 +329,29 @@ class _StatusWriter:
         """Note ``(status, last_error)`` as the one to store next unless the row has settled on it.
 
         :returns: Whether a store is wanted. ``False`` — and nothing noted — only when
-            the row already holds this pair, no noted status is waiting to reach it and
-            no store is running.
+            nothing is waiting to reach the row and the pair the row is settling on is
+            the caller's own: what a running store is committing, or what the last one
+            committed when none runs.
 
         Asking and noting are one acquisition of the one lock, because a store in a
         worker moves both halves of the answer and moves them apart: it takes the noted
-        status out of the writer before it commits, so between those two moments the
-        writer says the row holds the previous pair and says nothing is on its way to
-        it. A caller reading those two answers separately would be told a status it is
-        about to be given the opposite of, and would skip the write that makes the row
-        true; the row would then contradict the subscription with nothing left to
-        correct it until the subscription next changes state.
+        status out of the writer before it commits, so between those two moments nothing
+        is noted while the last committed pair is still the previous one. A caller
+        reading those two answers separately would be told a status it is about to be
+        given the opposite of, and would skip the write that makes the row true; the row
+        would then contradict the subscription with nothing left to correct it until the
+        subscription next changes state.
 
-        A running store therefore counts as unsettled: what it will leave in the row is
-        not known yet, and the caller's status goes to it rather than being dropped.
+        What a running store is committing is therefore what the caller is compared
+        against. A store committing some other pair leaves the caller's status unsettled
+        and takes it on, so the row ends up saying what the subscription last reported.
+        A store committing the caller's own pair settles it, so a subscription whose
+        traffic reports ``listening`` after every message asks for one write of it, not
+        one per message that lands inside a commit.
         """
         with self._lock:
-            settled = (
-                not self._storing
-                and self._pending is None
-                and self._stored == (status, last_error)
-            )
-            if settled:
+            settling_on = self._storing_pair if self._storing else self._stored
+            if self._pending is None and settling_on == (status, last_error):
                 return False
             self._pending = (status, last_error)
             return True
@@ -368,6 +373,7 @@ class _StatusWriter:
                 with self._lock:
                     pending = self._pending
                     self._pending = None
+                    self._storing_pair = pending
                     if pending is None:
                         self._storing = False
                         return
@@ -387,6 +393,7 @@ class _StatusWriter:
                 if pending is not None and self._pending is None:
                     self._pending = pending
                 self._storing = False
+                self._storing_pair = None
             raise
 
 
@@ -950,9 +957,8 @@ class RMQConsumerManager:
         """Cancel every consumer, close what they ran on and finish their status rows.
 
         The whole call runs under one budget the caller sets, so each part of it is
-        bounded: the wait for the cancelled tasks, the closing that follows and the pass
-        that stores the final status of each subscription, which comes last because the
-        broker holds the consumers of a connection that is still open.
+        bounded: the wait for the cancelled tasks, the pass that stores the final status
+        of each subscription, and the closing of what they ran on.
         """
         tasks_to_cancel: list[asyncio.Task] = [
             entry.task for entry in self._active.values()
@@ -980,6 +986,20 @@ class RMQConsumerManager:
             self._fire_task = None
             self._fire_state = None
 
+            # The consumers were cancelled above, so these rows are already final and
+            # the pass runs before the closes rather than after them. A stop is often
+            # the last thing this process does: on a broker that has gone silent every
+            # close runs to its full timeout, and a pass placed behind them reaches a
+            # thread the scheduler has stopped waiting for, or no thread at all once the
+            # budget over the whole stop cancels what is left of it. Running here costs
+            # at most a moment in which the row says ``disconnected`` while the broker
+            # still holds a registration that is on its way out, and buys the rows their
+            # own share of the budget. What the pass does not reach stays noted, for the
+            # next manager's cycle.
+            await self._store_unwritten_statuses(
+                budget=_STOP_STATUS_TIMEOUT, first=set(self._active)
+            )
+
             for conn_id in list(self._conns):
                 await self._drop_connection(conn_id)
             self._active.clear()
@@ -990,13 +1010,6 @@ class RMQConsumerManager:
                     self._http_client, "the Management API client", "aclose"
                 )
                 self._http_client = None
-
-            # Last, on what is left of the budget, and only once the connections are
-            # closed: a stop is often the last thing this process does, and a status
-            # only noted would then stay noted — the row would go on showing a green
-            # subscription for a consumer that ended with the scheduler. What this pass
-            # does not reach stays noted, and the next manager's cycle stores it.
-            await self._store_unwritten_statuses(budget=_STOP_STATUS_TIMEOUT)
 
     async def reconcile(self, subscriptions: list[dict]) -> None:
         """Sync running tasks, connections and infrastructure with the subscription list.
@@ -1035,11 +1048,17 @@ class RMQConsumerManager:
 
         await self._store_unwritten_statuses()
 
-    async def _store_unwritten_statuses(self, budget: float | None = None) -> None:
+    async def _store_unwritten_statuses(
+        self, budget: float | None = None, first: set[int] | None = None
+    ) -> None:
         """Carry the statuses a database outage left unwritten into their rows.
 
         :param budget: Seconds the pass as a whole is given; :data:`_DB_TIMEOUT` when
             left out, which is what a reconcile cycle gives it.
+        :param first: Subscriptions to dun before the rest. A budget that runs out
+            decides nothing about which rows it reached, and the rows worth deciding
+            about are the ones this manager was consuming up to the moment it stopped:
+            those are the ones a reader would otherwise find still saying ``listening``.
 
         The consumer that writes a status has moved on by the time the database answers
         again, and one whose queue is quiet writes nothing further, so this pass — at the
@@ -1075,6 +1094,8 @@ class RMQConsumerManager:
         budget = _DB_TIMEOUT if budget is None else budget
         with _status_writers_lock:
             writers = list(_status_writers.items())
+        if first:
+            writers.sort(key=lambda item: item[0] not in first)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + budget
         for sub_id, writer in writers:

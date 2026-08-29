@@ -6929,6 +6929,110 @@ class TestStatusWriteOrder:
                 hung.result(timeout=2)
             pool.shutdown()
 
+    def test_a_status_the_running_write_is_already_committing_is_not_written_again(self):
+        """A subscription under traffic reports ``listening`` after every message it
+        triggers on, and those reports must cost the row nothing.
+
+        The pair the running write is committing is the pair the row is about to hold,
+        so a report of that same pair is already satisfied. Compared instead against the
+        pair the row held *before* that write, every report landing inside a commit is
+        noted afresh, the write loops and commits the identical pair again, and the next
+        report lands inside that commit: the writer keeps a worker of the pool the DAG
+        triggers run in for as long as the queue stays busy, and the row is updated once
+        per message.
+        """
+        pool = BoundedExecutor("test-status-hot", 2)
+        writer = _StatusWriter(7)
+        entered = threading.Event()
+        release = threading.Event()
+        commits = []
+
+        def write(session, sub_id, status, last_error=None):
+            commits.append((status, last_error))
+            entered.set()
+            release.wait(5)
+
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                writer.record_if_needed("listening", None)
+                running = pool.submit(writer.store)
+                assert entered.wait(2)
+
+                asked = [writer.record_if_needed("listening", None) for _ in range(20)]
+                assert asked == [False] * 20, "a report of the pair being committed"
+
+                release.set()
+                running.result(timeout=5)
+        finally:
+            release.set()
+            pool.shutdown()
+
+        assert commits == [("listening", None)]
+        assert not writer.has_pending, "the writer would keep its worker"
+        assert writer.record_if_needed("listening", None) is False
+
+    def test_a_different_status_landing_inside_the_running_write_still_lands(self):
+        """The pair a running write is committing settles only callers asking for that
+        pair. A subscription that fails while its ``listening`` is in flight reports the
+        failure into the write that is running, and the row ends up naming the fault."""
+        pool = BoundedExecutor("test-status-differs", 2)
+        writer = _StatusWriter(7)
+        entered = threading.Event()
+        release = threading.Event()
+        commits = []
+
+        def write(session, sub_id, status, last_error=None):
+            commits.append((status, last_error))
+            if status == "listening":
+                entered.set()
+                release.wait(5)
+
+        try:
+            with _patch_watcher_session(), \
+                 patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                       side_effect=write):
+                writer.record_if_needed("listening", None)
+                running = pool.submit(writer.store)
+                assert entered.wait(2)
+
+                assert writer.record_if_needed("error", "gone") is True
+                release.set()
+                running.result(timeout=5)
+        finally:
+            release.set()
+            pool.shutdown()
+
+        assert commits == [("listening", None), ("error", "gone")]
+        assert writer.stored == ("error", "gone")
+
+    def test_a_write_that_raises_leaves_no_pair_claiming_to_be_on_its_way(self):
+        """A failed write settles nothing: the status it took on goes back to being the
+        one to store next, and the caller that asks again is told to store.
+
+        The pair in flight is read whenever a write is running, and the next write is
+        running from the moment it claims the writer until it takes that pair out. A
+        pair left over from a write that raised would answer for it in between, and
+        would answer with a pair the database never took — the caller would skip the
+        write, and the row would keep whatever it held before the outage. Hence the
+        assertion on the attribute itself: the state it must not be in is a state no
+        single call can be made to show.
+        """
+        writer = _StatusWriter(7)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=RuntimeError("metadata database is away")):
+            writer.record_if_needed("listening", None)
+            with pytest.raises(RuntimeError):
+                writer.store()
+
+        assert writer.has_pending
+        assert writer.stored is None
+        assert writer._storing_pair is None
+        assert writer.record_if_needed("listening", None) is True
+
     def test_writes_that_arrive_in_order_all_land(self):
         writer = _StatusWriter(7)
         landed = []
@@ -7394,6 +7498,95 @@ class TestTheRowsAStopLeavesBehind:
             await manager.stop()
 
         assert sorted(landed) == [(7, "disconnected"), (8, "disconnected")]
+
+    @pytest.mark.asyncio
+    async def test_the_rows_are_written_before_the_connections_are_closed(self, manager):
+        """The consumers are cancelled before either step, so the rows are already
+        final and nothing about them waits on a socket.
+
+        Closing comes second because the incident these rows exist for is a broker that
+        has stopped answering, and on that broker every close runs to its full timeout.
+        Writing behind them is writing on whatever the budget over the whole stop has
+        left, in a daemon thread the scheduler has already stopped waiting for.
+        """
+        order = []
+        _register_active(manager, _sub(id=7), real_task=True)
+
+        connection = MagicMock()
+        connection.is_closed = False
+
+        async def close():
+            order.append("connection closed")
+
+        connection.close = close
+        manager._conn("rmq_default").connections[_ROLE_CONSUME] = connection
+
+        def write(session, sub_id, status, last_error=None):
+            order.append((sub_id, status))
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await manager.stop()
+
+        assert order == [(7, "disconnected"), "connection closed"]
+
+    @pytest.mark.asyncio
+    async def test_a_close_that_never_answers_does_not_cost_the_rows_their_write(self):
+        """The one incident the stop-time pass exists for: a broker whose socket is
+        black-holed. Every close then burns its full timeout, the caller's budget over
+        the stop runs out and cancels what is left of the call, and the process goes
+        down with no next manager to store what a graceful stop left noted."""
+        mgr = _make_manager()
+        _register_active(mgr, _sub(id=7), real_task=True)
+        landed = []
+
+        connection = MagicMock()
+        connection.is_closed = False
+
+        async def never_answers():
+            await asyncio.Future()
+
+        connection.close = never_answers
+        mgr._conn("rmq_default").connections[_ROLE_CONSUME] = connection
+
+        def write(session, sub_id, status, last_error=None):
+            landed.append((sub_id, status))
+
+        # The bound the listener puts on the whole stop, scaled down: it expires while
+        # the close is still waiting for an answer that never comes.
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write), \
+             patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 5.0), \
+             pytest.raises(asyncio.TimeoutError):
+            await call_with_timeout(mgr.stop(), timeout=0.3)
+
+        assert landed == [(7, "disconnected")]
+
+    @pytest.mark.asyncio
+    async def test_the_subscriptions_the_stop_let_go_of_are_dunned_first(self):
+        """A budget that runs out mid-pass decides nothing about which rows it reached,
+        so the order does. The rows this manager was consuming up to the moment it
+        stopped are the ones a reader would otherwise find still saying ``listening``;
+        a writer left pending by an earlier outage describes a subscription this
+        manager no longer holds."""
+        mgr = _make_manager()
+        _status_writer(1).record_if_needed("error", "an outage some cycles ago")
+        _status_writer(2).record_if_needed("error", "an outage some cycles ago")
+        _register_active(mgr, _sub(id=7), real_task=True)
+        order = []
+
+        def write(session, sub_id, status, last_error=None):
+            order.append(sub_id)
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await mgr.stop()
+
+        assert order[0] == 7, "the row of the subscription this stop let go of"
+        assert sorted(order) == [1, 2, 7]
 
     @pytest.mark.asyncio
     async def test_a_status_the_stop_could_not_store_is_taken_by_the_next_manager(self):
