@@ -639,28 +639,37 @@ HTTP-запрос успешен. Пересоздание соединения 
 **Files:**
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] в `test_before_stopping_survives_a_loop_that_is_already_closed`
+- [x] в `test_before_stopping_survives_a_loop_that_is_already_closed`
       (`test_listener.py:2460`) собирать `listener._waker = (loop, wakeup)` и
       наблюдать сам вызов: подменить `loop.call_soon_threadsafe` на `MagicMock`
       и проверить, что он не вызван
-- [ ] в `test_before_stopping_survives_a_loop_closing_under_it`
+- [x] в `test_before_stopping_survives_a_loop_closing_under_it`
       (`test_listener.py:2473`) — **другое**: собрать `listener._waker`, оставить
       `loop.is_closed()` → `False` и
       `call_soon_threadsafe.side_effect = RuntimeError`, проверить
       `assert_called_once()` и что `before_stopping` не бросил. Это единственное
       покрытие `except RuntimeError`, и подмена на пустой мок его снимает
-- [ ] в `test_a_cycle_that_stopped_the_watcher_does_not_wait_at_all`
+- [x] в `test_a_cycle_that_stopped_the_watcher_does_not_wait_at_all`
       (`test_listener.py:2448`) дать живой loop и `asyncio.Event`, чтобы
       мгновенный возврат нельзя было объяснить отсутствием waker'а, и снизить
       `_reconcile_interval` до пары секунд — иначе снятие проверки `_stop_event`
       выявляется только через 30 с
-- [ ] снять из `_wake_loop` проверку `loop.is_closed()` (`listener.py:703`),
+- [x] снять из `_wake_loop` проверку `loop.is_closed()` (`listener.py:703`),
       убедиться, что тест краснеет, вернуть
-- [ ] снять `except RuntimeError` (`listener.py:707`), убедиться, что тест
+      - проверено: краснеет только
+        `test_before_stopping_survives_a_loop_that_is_already_closed`
+        (`call_soon_threadsafe` вызван), остальные четыре теста класса зелёные
+- [x] снять `except RuntimeError` (`listener.py:707`), убедиться, что тест
       краснеет, вернуть
-- [ ] снять из `_wait_for_next_cycle` проверку `_stop_event`
+      - проверено: краснеет только
+        `test_before_stopping_survives_a_loop_closing_under_it`
+        (`RuntimeError` выходит из `before_stopping` наружу)
+- [x] снять из `_wait_for_next_cycle` проверку `_stop_event`
       (`listener.py:792`), убедиться, что тест краснеет, вернуть
-- [ ] run tests - must pass before next task
+      - проверено: краснеет только
+        `test_a_cycle_that_stopped_the_watcher_does_not_wait_at_all`
+        (ожидание длится весь интервал в 2 с)
+- [x] run tests - must pass before next task
 
 ### Task 8: Привести документацию в соответствие с кодом
 

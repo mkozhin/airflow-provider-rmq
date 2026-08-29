@@ -2446,10 +2446,15 @@ class TestGracefulStop:
 
     @pytest.mark.asyncio
     async def test_a_cycle_that_stopped_the_watcher_does_not_wait_at_all(self):
-        """The stop event may be set while the cycle runs — the wait must see it."""
+        """The stop event may be set while the cycle runs — the wait must see it.
+
+        The waker is a live loop and a real event, so an instant return says the stop
+        event was read and not that there was nothing to wait on. The interval is short
+        enough that a wait would show up as a failure rather than as a hang.
+        """
         listener = _cycle_listener()
-        listener._reconcile_interval = 30
-        listener._wakeup = asyncio.Event()
+        listener._reconcile_interval = 2
+        listener._waker = (asyncio.get_running_loop(), asyncio.Event())
         listener._stop_event.set()
 
         started = time.monotonic()
@@ -2458,30 +2463,38 @@ class TestGracefulStop:
         assert time.monotonic() - started < 1.0
 
     def test_before_stopping_survives_a_loop_that_is_already_closed(self):
+        """A closed loop is left alone: the call itself is what the guard prevents.
+
+        The ``RuntimeError`` swallowed a couple of lines below would keep the event
+        untouched either way, so the observation is the call, not its effect.
+        """
         listener = RMQWatcherListener()
         listener._stop_event = threading.Event()
-        listener._wakeup = MagicMock()
         loop = asyncio.new_event_loop()
         loop.close()
-        listener._loop = loop
+        loop.call_soon_threadsafe = MagicMock()
+        listener._waker = (loop, MagicMock())
 
         listener.before_stopping(MagicMock())
 
         assert listener._stop_event.is_set()
-        listener._wakeup.set.assert_not_called()
+        loop.call_soon_threadsafe.assert_not_called()
 
     def test_before_stopping_survives_a_loop_closing_under_it(self):
-        """``is_closed`` can still say False when the loop closes a moment later."""
+        """``is_closed`` can still say False when the loop closes a moment later.
+
+        The nudge is made and it raises; stopping must go through all the same.
+        """
         listener = RMQWatcherListener()
         listener._stop_event = threading.Event()
-        listener._wakeup = MagicMock()
         loop = MagicMock()
         loop.is_closed.return_value = False
         loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
-        listener._loop = loop
+        listener._waker = (loop, MagicMock())
 
         listener.before_stopping(MagicMock())
 
+        loop.call_soon_threadsafe.assert_called_once()
         assert listener._stop_event.is_set()
 
     def test_before_stopping_joins_the_watcher_thread(self):
