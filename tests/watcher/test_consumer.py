@@ -5355,6 +5355,210 @@ class TestLivenessAmqpProbe:
         assert channel.declare_queue.await_count == 1
 
 
+def _attached_channel(consumer_tag: str):
+    """A live channel laid out the way ``aio_pika`` lays one out, holding ``consumer_tag``.
+
+    ``aio_pika``'s channel wraps an ``aiormq`` one, and that is where the map of
+    consumers the client believes it has registered lives.
+    """
+    channel = _make_live_channel(queue=MagicMock())
+    channel._channel = SimpleNamespace(
+        channel=SimpleNamespace(consumers={consumer_tag: object()})
+    )
+    return channel
+
+
+async def _server_cancels(channel, consumer_tag: str) -> None:
+    """Hand ``channel`` the ``basic.cancel`` a broker sends when it drops our consumer.
+
+    The frame goes to ``aiormq``'s own handler, which is what the client does with it:
+    the tag is dropped and nothing else happens — no exception, no callback, and the
+    connection and the channel stay open.
+    """
+    await aiormq.Channel._on_cancel_frame(
+        channel._channel.channel,
+        aiormq.spec.Basic.Cancel(consumer_tag=consumer_tag),
+    )
+
+
+class TestServerSideCancel:
+    """The broker cancels a consumer of ours and leaves everything else standing.
+
+    A deleted queue, a quorum-queue or stream leader change, the node hosting a classic
+    queue restarting under a client connected to another node: the broker sends
+    ``basic.cancel``, the connection and the channel stay open, and every probe of that
+    connection goes on succeeding while nothing consumes.
+    """
+
+    def _cancelled_sub(self, manager, http_client=None):
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        channel = _attached_channel(entry.state.consumer_tag)
+        entry.state.channel = channel
+        manager._http_client = http_client
+        _fast_timeouts(manager)
+        manager._conn("rmq_default").connections[_ROLE_CONSUME] = _make_live_connection(
+            channel=channel
+        )
+        return sub, entry, channel
+
+    @pytest.mark.asyncio
+    async def test_a_server_cancelled_consumer_is_condemned_on_the_passive_declare_tier(
+        self, manager
+    ):
+        """The passive declare keeps succeeding — it is the same open connection — so
+        without the client's own answer the subscription would read 'listening' with no
+        consumer behind it for as long as the process runs."""
+        sub, entry, channel = self._cancelled_sub(manager)
+        await _server_cancels(channel, entry.state.consumer_tag)
+
+        first = await manager._check_subscription_liveness([sub])
+        second = await manager._check_subscription_liveness([sub])
+
+        assert first == (set(), set())
+        assert manager._conn("rmq_default").liveness.status == "error"
+        assert second == ({7}, {"rmq_default"})
+        assert channel.declare_queue.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_registered_consumer_is_still_vouched_for(self, manager):
+        """The tier must keep vouching for healthy subscriptions: refusing to would
+        restart every one of them every second cycle for the life of the process."""
+        sub, entry, _channel = self._cancelled_sub(manager)
+
+        result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert entry.negative_checks == 0
+        assert manager._conn("rmq_default").liveness.status == "connected"
+
+    @pytest.mark.asyncio
+    async def test_a_server_cancelled_consumer_is_condemned_on_the_management_tier(
+        self, manager
+    ):
+        """The Management API is asked about the tag, but the answer can be stale; the
+        client's own channel is the one that cannot be."""
+        sub, entry, channel = self._cancelled_sub(
+            manager,
+            http_client=_mgmt_client(
+                [{"queue": {"name": "orders"}, "consumer_tag": _consumer_tag(7)}]
+            ),
+        )
+        await _server_cancels(channel, entry.state.consumer_tag)
+
+        with _patch_mgmt_connection():
+            first = await manager._check_subscription_liveness([sub])
+            second = await manager._check_subscription_liveness([sub])
+
+        assert first == (set(), set())
+        assert second == ({7}, {"rmq_default"})
+
+    @pytest.mark.asyncio
+    async def test_a_channel_that_cannot_be_read_leaves_the_verdict_to_the_probe(
+        self, manager
+    ):
+        """A channel not yet opened, one being restored, or one a later library version
+        lays out differently answers nothing, and nothing is what it must cost."""
+        sub, _entry, channel = self._cancelled_sub(manager)
+        channel._channel = None
+
+        result = await manager._check_subscription_liveness([sub])
+
+        assert result == (set(), set())
+        assert manager._conn("rmq_default").liveness.status == "connected"
+
+    @pytest.mark.asyncio
+    async def test_a_server_cancelled_fire_consumer_is_condemned(self, manager):
+        sub = _sub(id=7, queue_name="orders", cooldown=30)
+        _register_active(manager, sub)
+        fire = _register_fire(manager)
+        channel = _attached_channel(fire.state.consumer_tag)
+        fire.state.channel = channel
+        manager._http_client = None
+        _fast_timeouts(manager)
+        manager._conn("rmq_default").connections[_ROLE_CONSUME] = _make_live_connection(
+            channel=channel
+        )
+        await _server_cancels(channel, fire.state.consumer_tag)
+
+        await manager._check_subscription_liveness([sub])
+        await manager._check_subscription_liveness([sub])
+
+        assert manager._fire_needs_restart is True
+        assert manager._conn("rmq_default").liveness.status == "error"
+
+
+class TestUnreadableAirflowConnection:
+    """The liveness check cannot read the Airflow connection of a conn_id.
+
+    A connection renamed or deleted in the UI while subscriptions still name it, or a
+    secrets backend that keeps refusing: the check would otherwise produce no data for
+    every cycle there is, leaving the stored ``connected`` and the ``listening`` rows
+    standing behind it.
+    """
+
+    def _manager_with_unreadable_row(self, manager, connection):
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = _mgmt_client([])
+        _fast_timeouts(manager)
+        manager._conn("rmq_default").connections[_ROLE_CONSUME] = connection
+        return sub
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_row_falls_back_to_the_amqp_probe_and_condemns(
+        self, manager
+    ):
+        channel = _make_live_channel()
+        channel.declare_queue = AsyncMock(side_effect=ConnectionError("gone"))
+        sub = self._manager_with_unreadable_row(manager, _make_live_connection(channel=channel))
+
+        with patch(
+            "airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+            side_effect=RuntimeError("connection 'rmq_default' is not defined"),
+        ):
+            first = await manager._check_subscription_liveness([sub])
+            unknown = manager._conn("rmq_default").liveness.status
+            second = await manager._check_subscription_liveness([sub])
+            after_fallback = manager._conn("rmq_default").liveness.status
+            third = await manager._check_subscription_liveness([sub])
+
+        assert (first, unknown) == ((set(), set()), None)
+        assert (second, after_fallback) == ((set(), set()), "error")
+        assert third == ({7}, {"rmq_default"})
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_still_vouches_for_a_pooled_connection_that_answers(
+        self, manager
+    ):
+        """The AMQP probe needs no metadata row, so an unreadable one must not by itself
+        condemn subscriptions running on a connection that is perfectly healthy."""
+        channel = _make_live_channel(queue=MagicMock())
+        sub = self._manager_with_unreadable_row(manager, _make_live_connection(channel=channel))
+
+        with patch(
+            "airflow_provider_rmq.watcher.consumer.BaseHook.get_connection",
+            side_effect=RuntimeError("connection 'rmq_default' is not defined"),
+        ):
+            await manager._check_subscription_liveness([sub])
+            second = await manager._check_subscription_liveness([sub])
+
+        assert second == (set(), set())
+        assert manager._conn("rmq_default").liveness.status == "connected"
+
+    @pytest.mark.asyncio
+    async def test_a_row_that_can_be_read_again_clears_the_counter(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        _register_active(manager, sub)
+        manager._http_client = _mgmt_client([])
+        manager._conn("rmq_default").conn_read_failures = 1
+
+        with _patch_mgmt_connection():
+            await manager._check_subscription_liveness([sub])
+
+        assert manager._conn("rmq_default").conn_read_failures == 0
+
+
 # ---------------------------------------------------------------------------
 # Tests for recovery: rebuilding condemned consumers and writing honest statuses
 # ---------------------------------------------------------------------------

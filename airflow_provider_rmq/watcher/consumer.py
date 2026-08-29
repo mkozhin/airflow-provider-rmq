@@ -107,10 +107,11 @@ _PUBLISH_TIMEOUTS_BEFORE_DROP = 2
 #: Negative liveness checks that condemn a consumer.
 _NEGATIVE_CHECKS_BEFORE_RESTART = 2
 
-#: Management API failures after which the liveness check switches to the passive-declare
-#: probe: a wrong URL or credentials without the ``management`` tag must not disable the
-#: watchdog altogether.
-_MGMT_FAILURES_BEFORE_FALLBACK = 2
+#: Failures of what the liveness check reads before it asks the broker — the Airflow
+#: connection, the Management API — after which it switches to the passive-declare probe.
+#: A wrong URL, credentials without the ``management`` tag or a connection renamed out
+#: from under a subscription must not disable the watchdog altogether.
+_PROBE_FAILURES_BEFORE_FALLBACK = 2
 
 #: Cycles in which a ``conn_id`` has live tasks but not one of them reaches ``listening``.
 #: A healthy attach costs a connect and two RPCs, so a connection that never gets there
@@ -571,6 +572,35 @@ async def _attached(queue: Any, consumer_tag: str, timeout: float) -> AsyncItera
         await _close_quietly(q_iter, f"the consumer {consumer_tag!r}")
 
 
+def _cancelled_by_broker(state: _ConsumerState) -> bool:
+    """Whether the channel this consumer is attached to has lost its registration.
+
+    The broker cancels a consumer of ours without closing anything — a deleted queue, a
+    quorum-queue or stream leader change, the node hosting a classic queue restarting
+    under a client connected to another node — by sending ``basic.cancel``, which the
+    client advertises it accepts. aiormq drops the tag from the channel's consumer map
+    and raises nothing at all, so the queue iterator goes on waiting for a message that
+    can no longer come and the task keeps reporting ``listening`` for a registration the
+    broker no longer has. The tag missing from the channel we hold is therefore the same
+    answer the broker would give, reached locally and for free, and it is the only
+    answer available on the passive-declare tier, whose declare says nothing about
+    individual consumers.
+
+    Only a positive answer is given. A channel whose consumer map cannot be read — not
+    yet opened, being restored, or laid out differently by a later library version —
+    answers ``False`` and leaves the verdict to the probe, so that a healthy consumer is
+    never condemned on a reading the client could not actually take.
+    """
+    tag = state.consumer_tag
+    if tag is None or state.channel is None:
+        return False
+    underlay = getattr(state.channel, "_channel", None)
+    consumers = getattr(getattr(underlay, "channel", None), "consumers", None)
+    if not isinstance(consumers, dict):
+        return False
+    return tag not in consumers
+
+
 def _usable(connection: Any) -> bool:
     """Whether ``connection`` can carry a call right now.
 
@@ -695,6 +725,10 @@ class _ConsumerState:
         #: fails or the connection is recreated, and a registration goes down with the
         #: object it was made on, so the manager compares the two.
         self.connection: Any = None
+        #: The channel the tag above is registered on, ``None`` while the task is not
+        #: attached. The client's own record of which consumers that channel carries is
+        #: what :func:`_cancelled_by_broker` reads.
+        self.channel: Any = None
 
     @property
     def status(self) -> str | None:
@@ -864,6 +898,8 @@ class _ConnState:
     liveness: _ConnLiveness | None = None
     #: Consecutive Management API failures.
     mgmt_failures: int = 0
+    #: Consecutive failures to read this conn_id's Airflow connection.
+    conn_read_failures: int = 0
     #: Consecutive cycles with live tasks of which not one reaches ``listening``.
     stuck_cycles: int = 0
 
@@ -2215,6 +2251,11 @@ class RMQConsumerManager:
         """Put the attached consumers of one conn_id to the broker and judge the answer.
 
         :returns: ``(sub_ids to restart, whether to recreate the connection)``.
+
+        A tag the probe confirms is confirmed only if the channel it is registered on
+        still carries it (:func:`_cancelled_by_broker`): a consumer the broker cancelled
+        on its own leaves the connection and the channel open, so every probe of the
+        connection keeps succeeding while nothing consumes.
         """
         state = self._conn(conn_id)
         state.stuck_cycles = 0
@@ -2238,7 +2279,9 @@ class RMQConsumerManager:
         unseen: set[int] = set()
         dead_subs: set[int] = set()
         for sub, entry in subs:
-            seen = entry.state.consumer_tag in live_tags
+            seen = entry.state.consumer_tag in live_tags and not _cancelled_by_broker(
+                entry.state
+            )
             # The row of this subscription carries a verdict of an earlier cycle exactly
             # when the count is up, and that verdict is this check's to take back.
             reported_unseen = entry.negative_checks > 0
@@ -2267,7 +2310,9 @@ class RMQConsumerManager:
 
         fire_unseen = False
         if fire_here and fire is not None:
-            seen = fire.state.consumer_tag in live_tags
+            seen = fire.state.consumer_tag in live_tags and not _cancelled_by_broker(
+                fire.state
+            )
             if fire.record(seen):
                 self._fire_needs_restart = True
             if not seen:
@@ -2451,11 +2496,20 @@ class RMQConsumerManager:
         that log in as the same user: several of them often point at one broker, and
         asking it once per conn_id multiplies the same request. Without a
         ``management_url`` — and after
-        :data:`_MGMT_FAILURES_BEFORE_FALLBACK` failed Management API calls in a row, which
+        :data:`_PROBE_FAILURES_BEFORE_FALLBACK` failed Management API calls in a row, which
         is what a wrong URL or credentials without the ``management`` tag look like — the
         probe is a passive declare on a fresh channel: it says nothing about individual
         consumers, so its success vouches for every tag of this conn_id and its failure —
         a raised error or a call that never returns — condemns them all.
+
+        Reading the Airflow connection is bounded the same way and for the same reason.
+        A connection renamed or deleted while subscriptions still name it, or a secrets
+        backend that keeps refusing, would otherwise leave every cycle without data and
+        the stored ``connected`` in place for as long as the fault lasts. After
+        :data:`_PROBE_FAILURES_BEFORE_FALLBACK` unreadable cycles the check falls back to
+        the passive declare, which asks the pooled connection itself and needs no
+        metadata row; with nothing pooled that probe fails, which is a verdict rather
+        than another silence.
         """
         if self._http_client is None:
             return await self._probe_by_passive_declare(conn_id, queues, expected_tags)
@@ -2464,12 +2518,23 @@ class RMQConsumerManager:
             conn_info = await self._get_connection_info(conn_id, self._cycle_executor)
             management_url = get_management_url(conn_info)
         except Exception as exc:
+            failures = self._conn(conn_id).conn_read_failures + 1
+            self._conn(conn_id).conn_read_failures = failures
+            if failures < _PROBE_FAILURES_BEFORE_FALLBACK:
+                log.warning(
+                    "Cannot read the Airflow connection of conn_id=%r for the liveness "
+                    "check: %s — liveness unknown this cycle, counters unchanged",
+                    conn_id, exc,
+                )
+                return None, None, str(exc)
             log.warning(
-                "Cannot read the Airflow connection of conn_id=%r for the liveness "
-                "check: %s — liveness unknown this cycle, counters unchanged",
-                conn_id, exc,
+                "The Airflow connection of conn_id=%r has been unreadable %d times in a "
+                "row (%s) — falling back to the AMQP probe, which asks the pooled "
+                "connection itself and needs no metadata row",
+                conn_id, failures, exc,
             )
-            return None, None, str(exc)
+            return await self._probe_by_passive_declare(conn_id, queues, expected_tags)
+        self._conn(conn_id).conn_read_failures = 0
 
         if (
             management_url is not None
@@ -2490,7 +2555,7 @@ class RMQConsumerManager:
                 except Exception as exc:
                     failures = self._conn(conn_id).mgmt_failures + 1
                     self._conn(conn_id).mgmt_failures = failures
-                    if failures < _MGMT_FAILURES_BEFORE_FALLBACK:
+                    if failures < _PROBE_FAILURES_BEFORE_FALLBACK:
                         log.warning(
                             "Management API did not answer the consumer list for "
                             "conn_id=%r: %s — liveness unknown this cycle, counters "
@@ -2530,7 +2595,9 @@ class RMQConsumerManager:
         the one the probe started with says nothing about the tags of this conn_id: they
         belong to the object that was replaced, and the broker dropped them with it.
         Vouching for them there is what leaves a subscription reported as consuming while
-        the broker holds no consumer of ours at all.
+        the broker holds no consumer of ours at all. It vouches for a tag the broker
+        cancelled just as blindly, which is why :func:`_cancelled_by_broker` is asked
+        about each tag separately before this answer is believed.
         """
         before = self._pooled_consume_connection(conn_id)
         answers, reason = await self._probe_connection(conn_id, queues)
@@ -2622,6 +2689,7 @@ class RMQConsumerManager:
                     async with _attached(queue, consumer_tag, rpc_timeout) as q_iter:
                         state.consumer_tag = consumer_tag
                         state.connection = connection
+                        state.channel = channel
                         await state.write(_SUB_LISTENING, last_error=None)
                         log.info(
                             "Subscription %d (DAG %s) is consuming queue %r on conn_id=%r",
@@ -2666,6 +2734,7 @@ class RMQConsumerManager:
                 finally:
                     state.consumer_tag = None
                     state.connection = None
+                    state.channel = None
                     await _close_quietly(
                         channel, f"the channel of subscription {sub_id}"
                     )
@@ -2891,6 +2960,7 @@ class RMQConsumerManager:
                     fire_tag = _consumer_tag("fire", _attach_nonce())
                     async with _attached(queue, fire_tag, rpc_timeout) as q_iter:
                         state.consumer_tag = fire_tag
+                        state.channel = channel
                         await state.write(_SUB_LISTENING)
                         log.info(
                             "Cooldown fire consumer is consuming queue %r on conn_id=%r",
@@ -2922,6 +2992,7 @@ class RMQConsumerManager:
                             raise asyncio.CancelledError from exc
                 finally:
                     state.consumer_tag = None
+                    state.channel = None
                     await _close_quietly(
                         channel, f"the fire consumer channel of conn_id={conn_id!r}"
                     )
