@@ -2458,6 +2458,77 @@ class TestConsumeFireQueue:
         assert call_count >= 2
 
     @pytest.mark.asyncio
+    async def test_the_fire_iterator_ending_pauses_before_resubscribing(self):
+        """The fire iterator returns on its own when the connection was closed on
+        purpose, when the channel it lost cannot be waited out and when its own wait for
+        that channel runs out. Every one of those states repeats as readily as it
+        arrives, so without a pause the loop reattaches to ``rmq_watcher.fire`` as fast
+        as the broker can answer — the sibling subscription loop waits out the same
+        interval for the same reason."""
+        manager = _make_manager()
+        queue = _ending_queue()
+        connection = _make_live_connection(queue=queue)
+
+        delays: list = []
+        paused = asyncio.Event()
+
+        def note(delay):
+            delays.append(delay)
+            paused.set()
+
+        with patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
+             _record_consumer_sleeps(note):
+            task = asyncio.create_task(
+                manager._consume_fire_queue(connection, "rmq_default")
+            )
+            await asyncio.wait_for(paused.wait(), timeout=2.0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert delays[0] == _RECONNECT_DELAY
+        assert queue.iterator.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_fire_task_inside_a_pause_ends_it_quietly(self):
+        """Reconcile cancels the fire task whenever it drops the connection under it,
+        and so does ``stop()``. A cancellation that arrives while the loop is waiting
+        ends it where it stands: the task returns instead of letting the CancelledError
+        out as a consumer that died of its own accord."""
+        manager = _make_manager()
+        channel = _make_live_channel(queue=_ending_queue())
+        connection = _make_live_connection(channel=channel)
+        # The connection refuses a second attach, so the loop is waiting when the
+        # cancellation reaches it whichever pause it took.
+        connection.channel = AsyncMock(
+            side_effect=[channel, RuntimeError("connection reset by peer")]
+        )
+
+        paused = asyncio.Event()
+        real_sleep = asyncio.sleep
+
+        async def hold(delay, *args, **kwargs):
+            caller = inspect.currentframe().f_back
+            if caller is not None and caller.f_globals.get("__name__") == _CONSUMER_MODULE:
+                paused.set()
+                await asyncio.Future()
+            return await real_sleep(delay)
+
+        with patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
+             patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new=hold):
+            task = asyncio.create_task(
+                manager._consume_fire_queue(connection, "rmq_default")
+            )
+            await asyncio.wait_for(paused.wait(), timeout=2.0)
+            task.cancel()
+            outcome = await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), timeout=2.0
+            )
+
+        assert outcome[0] is None
+        assert task.done()
+        assert not task.cancelled()
+
+    @pytest.mark.asyncio
     async def test_reconcile_starts_fire_task_when_cooldown_sub_added(self):
         """reconcile starts _fire_task when first cooldown subscription appears."""
         manager = _make_manager()

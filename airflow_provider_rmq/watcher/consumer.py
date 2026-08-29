@@ -2764,6 +2764,13 @@ class RMQConsumerManager:
                         channel, f"the fire consumer channel of conn_id={conn_id!r}"
                     )
 
+                # The iterator returned without an exception. A robust iterator does that
+                # on a connection closed on purpose, on a channel loss it cannot wait out,
+                # and when its own wait for the channel to come back runs out — states
+                # that repeat as readily as they arrive. Pause before subscribing again so
+                # none of them can spin this loop.
+                await asyncio.sleep(_RECONNECT_DELAY)
+
             except asyncio.CancelledError:
                 return
 
