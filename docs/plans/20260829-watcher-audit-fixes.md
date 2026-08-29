@@ -617,13 +617,22 @@ HTTP-запрос успешен. Пересоздание соединения 
 **Files:**
 - Modify: `tests/test_amqp_utils.py`
 
-- [ ] тест: `{"heartbeat": 0.5}` даёт URL с `heartbeat=DEFAULT_HEARTBEAT` и
+- [x] тест: `{"heartbeat": 0.5}` даёт URL с `heartbeat=DEFAULT_HEARTBEAT` и
       WARNING про интервал короче секунды
-- [ ] тест: `{"heartbeat": <400-значное целое>}` даёт тот же fallback, а не
+      (`test_a_heartbeat_shorter_than_a_second_falls_back_to_default`)
+- [x] тест: `{"heartbeat": <400-значное целое>}` даёт тот же fallback, а не
       исключение из `build_amqp_connection`
-- [ ] снять `if 0 < value < 1` и `OverflowError` по очереди, убедиться, что
+      (`test_a_heartbeat_too_large_for_a_float_falls_back_to_default`)
+- [x] снять `if 0 < value < 1` и `OverflowError` по очереди, убедиться, что
       краснеет ровно соответствующий тест, вернуть
-- [ ] run tests - must pass before next task
+      - ⚠️ ссылки на строки в задаче устарели: тесты добавлены в класс
+        `TestHeartbeatInUrl` перед `test_ssl_url_keeps_query`
+      - проверено по очереди: со снятым `if 0 < value < 1` краснеет только
+        тест на 0.5 (URL приходит с `heartbeat=0`, то есть с опт-аутом), со
+        снятым `OverflowError` — только тест на 400-значное целое
+        (`OverflowError` выходит из `build_amqp_connection` наружу); второй тест
+        в каждом прогоне остаётся зелёным
+- [x] run tests - must pass before next task
 
 ### Task 7: Починить тесты graceful-stop, которые ничего не проверяют
 

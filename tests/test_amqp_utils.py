@@ -166,6 +166,24 @@ class TestHeartbeatInUrl:
         assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
         assert caplog.records
 
+    def test_a_heartbeat_shorter_than_a_second_falls_back_to_default(self, caplog):
+        """An interval too short to express as whole seconds is a mistake, and reading it
+        as the zero opt-out would turn off the detection the caller asked to tighten."""
+        conn = FakeAirflowConnection(extra='{"heartbeat": 0.5}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert any("shorter than a second" in r.getMessage() for r in caplog.records)
+
+    def test_a_heartbeat_too_large_for_a_float_falls_back_to_default(self, caplog):
+        """A JSON integer no float can hold raises OverflowError out of the cast; the
+        value is written as a bare literal because a quoted one reads as ``inf``."""
+        conn = FakeAirflowConnection(extra='{"heartbeat": %s}' % ("9" * 400))
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert any("is not a number" in r.getMessage() for r in caplog.records)
+
     def test_ssl_url_keeps_query(self):
         conn = FakeAirflowConnection(port=None, extra='{"ssl_enabled": true, "heartbeat": 15}')
         with patch("airflow_provider_rmq.utils.amqp.build_ssl_context") as mock_ssl:
