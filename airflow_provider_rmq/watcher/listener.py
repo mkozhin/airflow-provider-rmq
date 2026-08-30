@@ -35,18 +35,11 @@ from airflow_provider_rmq.watcher.tunables import (
     CYCLE_TIMEOUT_VAR,
     DEFAULT_RECONCILE_INTERVAL,
     RECONCILE_INTERVAL_VAR,
+    cycle_timeout,
     read_positive,
 )
 
 log = logging.getLogger(__name__)
-
-#: A cycle may take this many reconcile intervals, but never less than
-#: ``_MIN_CYCLE_TIMEOUT`` seconds. The budget is generous on purpose: hitting it
-#: cancels every consumer task and pauses consumption on every conn_id for the
-#: 30s loop-restart delay, while the per-call AMQP timeouts catch a stuck network
-#: operation far earlier and only for the subscription that owns it.
-_CYCLE_TIMEOUT_FACTOR = 3
-_MIN_CYCLE_TIMEOUT = 300
 
 #: Seconds allowed for reading the tunables out of the Airflow Variables table.
 _VARIABLE_TIMEOUT = 15.0
@@ -912,11 +905,7 @@ class RMQWatcherListener:
 
     def _cycle_timeout(self) -> float:
         """Seconds one cycle may take before the event loop is recreated."""
-        if self._cycle_timeout_override is not None:
-            return self._cycle_timeout_override
-        return float(
-            max(self._reconcile_interval * _CYCLE_TIMEOUT_FACTOR, _MIN_CYCLE_TIMEOUT)
-        )
+        return cycle_timeout(self._reconcile_interval, self._cycle_timeout_override)
 
     async def _refresh_settings(self) -> None:
         """Re-read the tunables, keeping the last known values on any failure.

@@ -18,9 +18,12 @@ from airflow_provider_rmq.watcher.models import (
 )
 from airflow_provider_rmq.watcher.subscription_form import parse_cooldown, parse_filter_data
 from airflow_provider_rmq.watcher.tunables import (
+    CYCLE_TIMEOUT_VAR,
     DEFAULT_RECONCILE_INTERVAL,
     RECONCILE_INTERVAL_VAR,
+    cycle_timeout,
     read_positive,
+    stale_after,
 )
 
 log = logging.getLogger(__name__)
@@ -102,10 +105,6 @@ def _group_subscriptions(subs: list[RMQSubscription]) -> list[Any]:
 # Connection status helpers
 # ------------------------------------------------------------------
 
-#: A conn_id whose last reconcile cycle is older than this many reconcile
-#: intervals is flagged as stale on the page.
-_STALE_INTERVAL_FACTOR = 2
-
 #: Shown instead of the Connections table when the status rows cannot be read.
 SCHEMA_OUTDATED_MESSAGE = (
     "Connection status is unavailable: the rmq_watcher_conn_status table does "
@@ -139,12 +138,17 @@ class ConnStatusRow:
         """Age of the last reconcile cycle, or an em dash when there is none."""
         if self.age_seconds is None:
             return "—"
-        seconds = int(self.age_seconds)
-        if seconds < 60:
-            return f"{seconds}s"
-        if seconds < 3600:
-            return f"{seconds // 60}m"
-        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+        return format_duration(self.age_seconds)
+
+
+def format_duration(seconds: float) -> str:
+    """Render a number of seconds the way the Connections block shows durations."""
+    whole = int(seconds)
+    if whole < 60:
+        return f"{whole}s"
+    if whole < 3600:
+        return f"{whole // 60}m"
+    return f"{whole // 3600}h {(whole % 3600) // 60}m"
 
 
 def _reconcile_interval() -> int:
@@ -170,7 +174,32 @@ def _reconcile_interval() -> int:
     return interval if interval is not None else DEFAULT_RECONCILE_INTERVAL
 
 
-def _build_conn_status_rows(conn_statuses: list[Any], interval: int) -> list[ConnStatusRow]:
+def _stale_after() -> float:
+    """Age of ``last_reconcile_at`` past which a conn_id is flagged, in seconds.
+
+    The page flags what the loop itself treats as late, and not a second earlier: a
+    stamp one interval plus one full cycle budget old belongs to a watcher that is
+    running exactly as configured. Both numbers come from the same Airflow Variables
+    the loop reads, through the same parser; an unreachable database or an unusable
+    Variable leaves the built-in defaults, which is what the loop falls back to as well.
+    """
+    interval = _reconcile_interval()
+    try:
+        override = read_positive(CYCLE_TIMEOUT_VAR, float)
+    except Exception:
+        log.warning(
+            "Failed to read Airflow Variable %s — assuming the built-in cycle "
+            "budget for the staleness check",
+            CYCLE_TIMEOUT_VAR,
+            exc_info=True,
+        )
+        override = None
+    return stale_after(interval, cycle_timeout(interval, override))
+
+
+def _build_conn_status_rows(
+    conn_statuses: list[Any], stale_seconds: float
+) -> list[ConnStatusRow]:
     """Wrap the status rows for display, computing the age of each cycle.
 
     ``last_reconcile_at`` is written by the Airflow process as naive UTC, so
@@ -190,7 +219,7 @@ def _build_conn_status_rows(conn_statuses: list[Any], interval: int) -> list[Con
             if last.tzinfo is not None:
                 last = last.astimezone(timezone.utc).replace(tzinfo=None)
             age_seconds = max((now - last).total_seconds(), 0.0)
-            is_stale = age_seconds > interval * _STALE_INTERVAL_FACTOR
+            is_stale = age_seconds > stale_seconds
         rows.append(
             ConnStatusRow(
                 conn_id=cs.conn_id,
@@ -239,12 +268,14 @@ class RMQWatcherView(BaseView):
 
         conn_status_error = None
         conn_status_rows: list[ConnStatusRow] = []
+        stale_seconds = 0.0
         if conn_statuses is None:
             conn_status_error = SCHEMA_OUTDATED_MESSAGE
         elif conn_statuses:
-            # reading the interval is a database round trip, so it happens only
-            # when there is a row whose age it could be measured against
-            conn_status_rows = _build_conn_status_rows(conn_statuses, _reconcile_interval())
+            # reading the tunables is a database round trip, so it happens only
+            # when there is a row whose age they could be measured against
+            stale_seconds = _stale_after()
+            conn_status_rows = _build_conn_status_rows(conn_statuses, stale_seconds)
 
         # Separate session, opened only after the one above has closed:
         # render_template() below reads `rows`/`subs` as detached objects, and
@@ -266,7 +297,7 @@ class RMQWatcherView(BaseView):
             subscriptions=rows,
             conn_statuses=conn_status_rows,
             conn_status_error=conn_status_error,
-            stale_interval_factor=_STALE_INTERVAL_FACTOR,
+            stale_after_display=format_duration(stale_seconds),
             active_dag_ids=active_dag_ids,
         )
 

@@ -45,6 +45,7 @@ from airflow_provider_rmq.watcher.views import (  # noqa: E402
     _build_conn_status_rows,
     _group_subscriptions,
     _reconcile_interval,
+    _stale_after,
 )
 
 _fab_sec_dec.has_access = _orig_has_access  # restore for the rest of the session
@@ -1119,33 +1120,84 @@ class TestReconcileIntervalFromVariable:
             assert _reconcile_interval() == DEFAULT_RECONCILE_INTERVAL
 
 
+class TestStaleThreshold:
+    """The page must flag exactly what the loop treats as late, and not earlier.
+
+    A stamp is written at the end of a cycle and the loop then waits one interval,
+    so the oldest stamp a correctly working watcher produces is one interval plus
+    one whole cycle budget.
+    """
+
+    @staticmethod
+    def _variables(**values):
+        """Patch Airflow Variables, answering by name."""
+        def get(name, default_var=None):
+            return values.get(name, default_var)
+        variable = MagicMock()
+        variable.get.side_effect = get
+        return patch("airflow.models.Variable", variable)
+
+    def test_defaults_allow_an_interval_plus_the_built_in_budget(self):
+        with self._variables():
+            assert _stale_after() == 60 + 300
+
+    def test_longer_interval_grows_both_terms(self):
+        """At 120s the budget is three intervals, not the 300s floor."""
+        with self._variables(rmq_watcher_reconcile_interval="120"):
+            assert _stale_after() == 120 + 360
+
+    def test_cycle_timeout_variable_is_honoured(self):
+        with self._variables(rmq_watcher_cycle_timeout="45"):
+            assert _stale_after() == 60 + 45
+
+    def test_healthy_cycle_within_budget_is_not_flagged(self):
+        """A cycle that takes 90s on a 60s interval is well inside the budget the
+        watchdog allows, so its stamp must not raise the warning badge."""
+        with self._variables():
+            threshold = _stale_after()
+        row = _build_conn_status_rows(
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(150))], threshold
+        )[0]
+        assert row.is_stale is False
+
+    def test_unreadable_cycle_timeout_falls_back_to_the_built_in_budget(self, caplog):
+        variable = MagicMock()
+        variable.get.side_effect = [None, RuntimeError("no database")]
+        with patch("airflow.models.Variable", variable), \
+             caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.views"):
+            assert _stale_after() == 60 + 300
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "rmq_watcher_cycle_timeout" in warnings[0].getMessage()
+
+
 class TestConnStatusRowBuilding:
     def test_fresh_reconcile_is_not_stale(self):
         row = _build_conn_status_rows(
-            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(10))], 60
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(10))], 360
         )[0]
         assert row.is_stale is False
         assert 5 <= row.age_seconds <= 30
         assert row.age_display.endswith("s")
 
-    def test_reconcile_older_than_two_intervals_is_stale(self):
+    def test_reconcile_older_than_threshold_is_stale(self):
         row = _build_conn_status_rows(
-            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(300))], 60
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(400))], 360
         )[0]
         assert row.is_stale is True
-        assert row.age_display == "5m"
+        assert row.age_display == "6m"
 
-    def test_just_under_two_intervals_is_not_stale(self):
-        """The threshold is 'older than two intervals' — a cycle that has only
-        just come due must not be flagged, or a healthy watcher would blink
-        into warning whenever a cycle ran a little late."""
+    def test_just_under_threshold_is_not_stale(self):
+        """A cycle that spent nearly its whole budget is doing what it is allowed
+        to do, and must not be flagged — otherwise a watcher the loop itself
+        considers healthy shows a warning on every row."""
         rows = _build_conn_status_rows(
-            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(110))], 60
+            [_make_conn_status_row(last_reconcile_at=_naive_utc_ago(350))], 360
         )
         assert rows[0].is_stale is False
 
     def test_null_reconcile_time_reads_as_no_data(self):
-        row = _build_conn_status_rows([_make_conn_status_row(last_reconcile_at=None)], 60)[0]
+        row = _build_conn_status_rows([_make_conn_status_row(last_reconcile_at=None)], 360)[0]
         assert row.age_seconds is None
         assert row.is_stale is False
         assert row.age_display == "—"

@@ -684,7 +684,13 @@ Both forms can be combined on the same call — the final routing key set is the
 }
 ```
 
-What the Management API replies is shaped by the rights of the account that asked: a user tagged `management` is shown only the channels of its own connections, while `monitoring` and `administrator` see the whole vhost. With the minimum-privilege account described above, the watcher therefore sees its own consumers and no one else's.
+The account needs the `management` tag on top of its AMQP permissions — the Management API answers a tagless user with 401/403 whatever its `set_permissions` say:
+
+```
+rabbitmqctl set_user_tags <user> management
+```
+
+What the Management API replies is shaped by the rights of the account that asked: a user tagged `management` is shown only the channels of its own connections, while `monitoring` and `administrator` see the whole vhost. On the minimum-privilege account above, the watcher therefore sees its own consumers and no one else's.
 
 The same `login`/`password` from the connection are reused for the Management API call. If `management_url` is not set, bind-diff is skipped on every cycle (logged as ERROR) — the queue is still declared and consumed normally, but bindings never get created/updated.
 
@@ -785,9 +791,11 @@ Both are re-read at the start of every cycle in a thread pool under a short time
 | Status | `connected` when the broker confirmed every one of our consumer tags on this `conn_id`; `error` on a negative verdict — a consumer the broker did not confirm, no running task of this `conn_id` at all, a failed connection attempt, or tasks that are alive while not one of them reaches `listening` and the connection still answers an RPC, which puts the fault downstream of the connection (the reason is in Last Error); `degraded` when a negative verdict was held back by the recreation rate limit and the connection was left in place instead of being recreated again so soon; `unknown` for a `conn_id` no liveness check has ever reached a verdict on. The status follows the verdict alone — a `conn_id` with no verdict keeps whatever is stored, and the number of tasks the watcher started never makes a row green |
 | Consumers | How many live consumer tasks the watcher holds for this `conn_id`, the cooldown fire task included when it runs there |
 | Broker consumers | How many consumers the broker reports on the queues of the subscriptions that were actually probed — those whose own status is `listening` — plus `rmq_watcher.fire` when the fire consumer runs on this `conn_id`. `—` means there is no number at all: the passive-declare fallback never returns one, so a connection without `management_url` keeps the em dash even when the verdict is positive. A number that differs from the previous column is highlighted — lower means a subscription that has not attached yet (still connecting, or backing off after an error) and is therefore not probed, higher means another scheduler replica using the same credentials or — on a `monitoring`/`administrator` account, which is what makes foreign channels visible at all — other clients on the same queues |
-| Last reconcile | Age of the last cycle for this `conn_id`, flagged when it is older than two reconcile intervals — the loop is stuck, restarting, or not running at all |
+| Last reconcile | Age of the last cycle for this `conn_id`, flagged when it is older than one reconcile interval plus one whole cycle budget (`60 + 300` seconds with both Variables unset) — the stamp is written at the end of a cycle and the loop then waits an interval, so that is the oldest age a watcher doing exactly what it is configured to do can reach. A flagged row means the loop is stuck, restarting or not running at all — or that no enabled subscription names this `conn_id` any more |
 
 A row is written for **every** `conn_id` that appears in the subscription list, including one whose tasks all died. The counts and `last_reconcile_at` move on every cycle, which is what proves the loop is alive; `status` keeps its last stored value whenever the check produced no data.
+
+Rows are never deleted. A `conn_id` no enabled subscription mentions any more stops being stamped and keeps the age it had at that moment, so its row grows permanently stale — including after the documented way to pause consumption, turning the last subscription of that `conn_id` off in the UI. Turning one back on resumes the stamps on the next cycle.
 
 The Status column of the Subscriptions table further down the page is a different one: it reports a single subscription's own task — `connecting`, `listening`, `error` or `disconnected` — while the Connections block above reports the `conn_id` those tasks share (a grouped row shows how many of the group's subscriptions are `listening`).
 
