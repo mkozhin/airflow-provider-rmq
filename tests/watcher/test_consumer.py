@@ -4777,6 +4777,18 @@ def _register_fire(
     return manager._fire_state
 
 
+def _pool_consume_connection(manager, connection, *attached, conn_id: str = "rmq_default"):
+    """Pool ``connection`` for ``conn_id`` and register the ``attached`` states on it.
+
+    A consumer registers its tag on the object the pool handed it, and the liveness
+    check compares the two before it lets a probe of that object vouch for the tag.
+    """
+    manager._conn(conn_id).connections[_ROLE_CONSUME] = connection
+    for state in attached:
+        state.connection = connection
+    return connection
+
+
 def _registered_task(real: bool):
     """Task object for a registered consumer — a real never-ending one, or a mock."""
     if real:
@@ -5422,7 +5434,9 @@ class TestLivenessAmqpProbe:
         manager._http_client = None
         _fast_timeouts(manager)
         channel = _make_live_channel(queue=MagicMock())
-        manager._conn("rmq_default").connections[_ROLE_CONSUME] = _make_live_connection(channel=channel)
+        _pool_consume_connection(
+            manager, _make_live_connection(channel=channel), entry.state
+        )
 
         result = await manager._check_liveness([sub])
 
@@ -5458,6 +5472,149 @@ class TestLivenessAmqpProbe:
 
         assert result == (set(), set())
         assert channel.declare_queue.await_count == 1
+
+
+class TestAnAnswerThatArrivesAfterAReattach:
+    """The registration a probe was asked about is replaced while the probe is pending.
+
+    A consumer task reattaches on its own, and every attach registers a tag of its own,
+    so the answer coming back is about a registration the task no longer holds. Read as
+    an answer about the current one it denies a healthy consumer — and one prior negative
+    check is all it takes for that to drop its connection.
+    """
+
+    def _probe_answering(self, tags, reattach=None):
+        """A passive-declare probe answering ``tags``, reattaching a consumer while it runs."""
+        async def probe(conn_id, queues, expected):
+            if reattach is not None:
+                reattach()
+            return set(tags(expected)), None, None
+
+        return probe
+
+    @pytest.mark.asyncio
+    async def test_an_answer_about_the_previous_tag_neither_confirms_nor_denies(self, manager):
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        entry.negative_checks = 1  # a denial here would condemn the subscription
+        manager._http_client = None
+        probe = self._probe_answering(
+            lambda expected: expected,
+            reattach=lambda: setattr(
+                entry.state, "consumer_tag", _consumer_tag(7, "reattached")
+            ),
+        )
+
+        with patch.object(manager, "_probe_by_passive_declare", side_effect=probe):
+            result = await manager._check_liveness([sub])
+
+        assert result == (set(), set())
+        assert entry.negative_checks == 1, "an answer that does not apply is no evidence"
+        assert entry.state.denied_tag is None, "the tag it holds now was never asked about"
+        assert manager._conn("rmq_default").liveness.status is None
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_answer_leaves_the_row_alone(self, manager):
+        """The verdict is not written either: a false 'error' suppresses every
+        'listening' the subscription reports until another probe confirms it."""
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        manager._http_client = None
+        probe = self._probe_answering(
+            lambda expected: expected,
+            reattach=lambda: setattr(
+                entry.state, "consumer_tag", _consumer_tag(7, "reattached")
+            ),
+        )
+        stored = []
+
+        def write(session, sub_id, status, last_error=None):
+            stored.append(status)
+
+        with patch.object(manager, "_probe_by_passive_declare", side_effect=probe), \
+             _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await manager._check_liveness([sub])
+            await entry.state.write(_SUB_LISTENING, last_error=None)
+            await manager._store_unwritten_statuses()
+
+        assert stored == [_SUB_LISTENING]
+
+    @pytest.mark.asyncio
+    async def test_an_answer_about_the_tag_it_still_holds_condemns_it(self, manager):
+        """Dropping an answer that does not apply must leave a dead consumer condemnable:
+        a registration the task still holds is judged exactly as it always was."""
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        entry.negative_checks = 1
+        manager._http_client = None
+        probe = self._probe_answering(lambda expected: set())
+
+        with patch.object(manager, "_probe_by_passive_declare", side_effect=probe):
+            result = await manager._check_liveness([sub])
+
+        assert result == ({7}, {"rmq_default"})
+        assert entry.state.denied_tag == entry.state.consumer_tag
+
+    @pytest.mark.asyncio
+    async def test_the_subscription_that_did_not_reattach_is_still_judged(self, manager):
+        """One dropped answer is one subscription's, not the cycle's."""
+        reattached = _sub(id=7, queue_name="orders")
+        held = _sub(id=8, queue_name="events")
+        entry_a = _register_active(manager, reattached)
+        entry_b = _register_active(manager, held)
+        entry_a.negative_checks = entry_b.negative_checks = 1
+        manager._http_client = None
+        probe = self._probe_answering(
+            lambda expected: set(),
+            reattach=lambda: setattr(
+                entry_a.state, "consumer_tag", _consumer_tag(7, "reattached")
+            ),
+        )
+
+        with patch.object(manager, "_probe_by_passive_declare", side_effect=probe):
+            result = await manager._check_liveness([reattached, held])
+
+        assert result == ({8}, {"rmq_default"})
+        assert entry_a.negative_checks == 1
+        assert entry_b.negative_checks == 2
+
+    @pytest.mark.asyncio
+    async def test_a_fire_consumer_that_reattached_keeps_its_counter(self, manager):
+        sub = _sub(id=7, queue_name="orders", cooldown=30)
+        entry = _register_active(manager, sub)
+        fire = _register_fire(manager)
+        fire.negative_checks = 1
+        manager._http_client = None
+        probe = self._probe_answering(
+            lambda expected: {entry.state.consumer_tag},
+            reattach=lambda: setattr(
+                fire.state, "consumer_tag", _consumer_tag("fire", "reattached")
+            ),
+        )
+
+        with patch.object(manager, "_probe_by_passive_declare", side_effect=probe):
+            result = await manager._check_liveness([sub])
+
+        assert result == (set(), set())
+        assert fire.negative_checks == 1
+        assert manager._fire_needs_restart is False
+
+    @pytest.mark.asyncio
+    async def test_a_fire_consumer_that_kept_its_tag_is_still_condemned(self, manager):
+        sub = _sub(id=7, queue_name="orders", cooldown=30)
+        entry = _register_active(manager, sub)
+        fire = _register_fire(manager)
+        fire.negative_checks = 1
+        manager._http_client = None
+        probe = self._probe_answering(lambda expected: {entry.state.consumer_tag})
+
+        with patch.object(manager, "_probe_by_passive_declare", side_effect=probe):
+            await manager._check_liveness([sub])
+
+        assert fire.negative_checks == 2
+        assert manager._fire_needs_restart is True
 
 
 def _attached_channel(consumer_tag: str):
@@ -5502,8 +5659,8 @@ class TestServerSideCancel:
         entry.state.channel = channel
         manager._http_client = http_client
         _fast_timeouts(manager)
-        manager._conn("rmq_default").connections[_ROLE_CONSUME] = _make_live_connection(
-            channel=channel
+        _pool_consume_connection(
+            manager, _make_live_connection(channel=channel), entry.state
         )
         return sub, entry, channel
 
@@ -5627,8 +5784,8 @@ class TestServerSideCancel:
         fire.state.channel = channel
         manager._http_client = None
         _fast_timeouts(manager)
-        manager._conn("rmq_default").connections[_ROLE_CONSUME] = _make_live_connection(
-            channel=channel
+        fire.connection = _pool_consume_connection(
+            manager, _make_live_connection(channel=channel), manager._active[7].state
         )
         await _server_cancels(channel, fire.state.consumer_tag)
 
@@ -5650,10 +5807,10 @@ class TestUnreadableAirflowConnection:
 
     def _manager_with_unreadable_row(self, manager, connection):
         sub = _sub(id=7, queue_name="orders")
-        _register_active(manager, sub)
+        entry = _register_active(manager, sub)
         manager._http_client = _mgmt_client([])
         _fast_timeouts(manager)
-        manager._conn("rmq_default").connections[_ROLE_CONSUME] = connection
+        _pool_consume_connection(manager, connection, entry.state)
         return sub
 
     @pytest.mark.asyncio
@@ -6029,6 +6186,53 @@ class TestConsumersOnAReplacedConnection:
             assert manager._conn("rmq_default").liveness.status == "error"
 
             await _drain(manager)
+
+    @pytest.mark.asyncio
+    async def test_a_probe_run_after_the_replacement_confirms_nothing_either(self, manager):
+        """The pool can be moved on before the check runs — a cooldown connection
+        provisioned earlier in the cycle rebuilds it — and the probe then starts and
+        finishes on the replacement. Nothing about it changed while it ran, and it still
+        holds none of the registrations it is being asked to vouch for."""
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)
+        entry.state.connection = _make_live_connection()  # the object the pool left behind
+        manager._http_client = None
+        _fast_timeouts(manager)
+        replacement = _pool_consume_connection(
+            manager, _make_live_connection(channel=_make_live_channel(queue=MagicMock()))
+        )
+
+        first = await manager._check_liveness([sub])
+        second = await manager._check_liveness([sub])
+
+        assert first == (set(), set())
+        assert entry.negative_checks == 2
+        assert second == ({7}, {"rmq_default"})
+        assert manager._conn("rmq_default").liveness.status == "error"
+        assert manager._conn("rmq_default").connections[_ROLE_CONSUME] is replacement
+
+    @pytest.mark.asyncio
+    async def test_a_fire_consumer_on_a_replaced_connection_is_not_vouched_for(self, manager):
+        """The fire consumer holds the object it was handed for its whole life, so it is
+        the object it holds that the declare has to have been answered by."""
+        sub = _sub(id=7, queue_name="orders", cooldown=30)
+        entry = _register_active(manager, sub)
+        manager._http_client = None
+        _fast_timeouts(manager)
+        _pool_consume_connection(
+            manager,
+            _make_live_connection(channel=_make_live_channel(queue=MagicMock())),
+            entry.state,
+        )
+        fire = _register_fire(manager)
+        fire.connection = _make_live_connection()  # the object the pool left behind
+
+        await manager._check_liveness([sub])
+        await manager._check_liveness([sub])
+
+        assert entry.negative_checks == 0, "this subscription is on the pooled connection"
+        assert fire.negative_checks == 2
+        assert manager._fire_needs_restart is True
 
     @pytest.mark.asyncio
     async def test_the_orphaned_subscription_is_restarted_on_the_pooled_connection(self, manager):
