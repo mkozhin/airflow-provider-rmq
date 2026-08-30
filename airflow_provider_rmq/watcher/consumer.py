@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -667,6 +668,31 @@ def _seen(state: _ConsumerState, live_tags: set[str]) -> bool:
     return state.consumer_tag in live_tags and not _cancelled_by_broker(state)
 
 
+def _answer_misses(state: _ConsumerState, tag: str | None, taken_at: float) -> str | None:
+    """Why an answer taken at ``taken_at`` says nothing about the registration ``state`` holds.
+
+    :param tag: Tag the state carried when the question was asked.
+    :param taken_at: Monotonic reading the answer speaks for.
+    :returns: What the answer misses, ``None`` when it speaks for the current
+        registration.
+
+    A task reattaches on its own, and every attach registers a tag of its own
+    (:func:`_attach_nonce`). Two ways that falls beside the answer being judged. The
+    reattach happens after the question was asked, and the answer is about the tag it
+    replaced. Or it happens before the question but after the answer was taken — the
+    Management API snapshot is taken once and judges every conn_id of the cycle that
+    logs in as the same user, so its moment can precede the question by the whole
+    judging of another conn_id — and the answer is about a broker that had not yet seen
+    this registration. Neither speaks for the tag registered now, in either direction:
+    no confirmation, no denial, and no counter moved.
+    """
+    if state.consumer_tag != tag:
+        return f"the registration asked about ({tag}) has since been replaced"
+    if state.tag_registered_at > taken_at:
+        return f"consumer {tag} was registered after the answer was taken"
+    return None
+
+
 def _usable(connection: Any) -> bool:
     """Whether ``connection`` can carry a call right now.
 
@@ -784,18 +810,16 @@ class _ConsumerState:
         self._sub_id = sub_id
         self._executor = executor
         self._status: str | None = None
-        #: Tag the task registered on its queue during its current attach, ``None``
-        #: while it is not attached. The liveness check asks the broker for this exact
-        #: tag rather than recomputing one.
-        self.consumer_tag: str | None = None
-        #: The connection object the tag above is registered on, ``None`` while the task
-        #: is not attached. The pool replaces that object whenever the connect behind it
-        #: fails or the connection is recreated, and a registration goes down with the
-        #: object it was made on, so the manager compares the two.
+        self._consumer_tag: str | None = None
+        self._tag_registered_at = 0.0
+        #: The connection object the consumer tag is registered on, ``None`` while the
+        #: task is not attached. The pool replaces that object whenever the connect
+        #: behind it fails or the connection is recreated, and a registration goes down
+        #: with the object it was made on, so the manager compares the two.
         self.connection: Any = None
-        #: The channel the tag above is registered on, ``None`` while the task is not
-        #: attached. The client's own record of which consumers that channel carries is
-        #: what :func:`_cancelled_by_broker` reads.
+        #: The channel the consumer tag is registered on, ``None`` while the task is
+        #: not attached. The client's own record of which consumers that channel
+        #: carries is what :func:`_cancelled_by_broker` reads.
         self.channel: Any = None
         #: The tag the liveness check last found the broker not holding, ``None`` while
         #: the broker's answer about the current registration is positive or not yet
@@ -808,6 +832,34 @@ class _ConsumerState:
     def status(self) -> str | None:
         """Status the task last reported, ``None`` before it reported anything."""
         return self._status
+
+    @property
+    def consumer_tag(self) -> str | None:
+        """Tag the task registered on its queue during its current attach.
+
+        ``None`` while it is not attached. The liveness check asks the broker for this
+        exact tag rather than recomputing one.
+        """
+        return self._consumer_tag
+
+    @consumer_tag.setter
+    def consumer_tag(self, tag: str | None) -> None:
+        self._consumer_tag = tag
+        self._tag_registered_at = time.monotonic()
+
+    @property
+    def tag_registered_at(self) -> float:
+        """Monotonic reading of when the tag above was recorded.
+
+        The broker's answer is a snapshot of a moment, and a probe of the Management API
+        answers several conn_ids of one cycle from the one snapshot it took. A
+        registration made after that snapshot is not in it and cannot be: the answer
+        speaks for the registrations that existed when it was taken, and this reading is
+        what tells the liveness check which those are. It is stamped by the assignment
+        that records the tag, so the two never disagree about which registration the
+        moment belongs to.
+        """
+        return self._tag_registered_at
 
     def note_broker_answer(self, seen: bool) -> None:
         """Record what the liveness check's probe answered about this registration.
@@ -1068,10 +1120,15 @@ class RMQConsumerManager:
         self._active: dict[int, _ActiveSub] = {}  # sub_id → _ActiveSub
         self._conns: dict[str, _ConnState] = {}  # conn_id → its connections and bookkeeping
         self._cycle_no = 0  # liveness checks performed, i.e. reconcile cycles
-        # (management_url, vhost, login) → queue → consumer tags, for the current cycle
-        # only. The login is part of the key because the reply is shaped by the rights of
-        # whoever asked: a user tagged ``management`` is shown only its own channels.
-        self._consumer_cache: dict[tuple[str, str, str], dict[str, set[str]]] = {}
+        # (management_url, vhost, login) → the monotonic reading the snapshot was
+        # taken at and queue → consumer tags, for the current cycle only. The login is
+        # part of the key because the reply is shaped by the rights of whoever asked: a
+        # user tagged ``management`` is shown only its own channels. The reading travels
+        # with the snapshot because a conn_id judged from it registers consumers of its
+        # own, and one registered after the snapshot is one the snapshot cannot hold.
+        self._consumer_cache: dict[
+            tuple[str, str, str], tuple[float, dict[str, set[str]]]
+        ] = {}
         self._fire_task: asyncio.Task | None = None
         self._fire_state: _FireSub | None = None  # state record of the running fire task
         self._fire_needs_restart = False  # last check found the fire consumer gone
@@ -2421,7 +2478,7 @@ class RMQConsumerManager:
             fire_tag = fire.state.consumer_tag
             expected[fire_tag] = fire.connection
 
-        live_tags, broker_count, reason = await self._probe_consumers(
+        live_tags, broker_count, reason, taken_at = await self._probe_consumers(
             conn_id, queues, expected
         )
         if live_tags is None:
@@ -2430,41 +2487,39 @@ class RMQConsumerManager:
             )
             return set(), False
 
-        # A task reattaches on its own while the probe is pending, and every attach
-        # registers a tag of its own (:func:`_attach_nonce`). An answer about the tag
-        # that attach replaced speaks neither for nor against the one registered now, so
-        # it is applied only where the two are still the same tag. Nothing below awaits,
-        # so what this comparison finds is what the rest of the check judges.
+        # The answer is judged only where it speaks for the registration held now
+        # (:func:`_answer_misses`). Nothing below awaits, so what this comparison finds
+        # is what the rest of the check judges.
         answering: list[tuple[dict, _ActiveSub]] = []
         for sub, entry, tag in asked:
-            if entry.state.consumer_tag == tag:
+            missed = _answer_misses(entry.state, tag, taken_at)
+            if missed is None:
                 answering.append((sub, entry))
                 continue
             log.info(
-                "Subscription %d reattached while the liveness check was asking about "
-                "consumer %s — the answer is about a registration it no longer holds "
-                "and is dropped; the new one is checked next cycle",
-                sub["id"], tag,
+                "The liveness answer is not applied to subscription %d: %s — the "
+                "registration it holds now is checked next cycle",
+                sub["id"], missed,
             )
         fire_answering = False
         if fire_here and fire is not None:
-            fire_answering = fire.state.consumer_tag == fire_tag
-            if not fire_answering:
+            missed = _answer_misses(fire.state, fire_tag, taken_at)
+            fire_answering = missed is None
+            if missed is not None:
                 log.info(
-                    "The fire consumer reattached while the liveness check was asking "
-                    "about consumer %s — the answer is about a registration it no longer "
-                    "holds and is dropped; the new one is checked next cycle",
-                    fire_tag,
+                    "The liveness answer is not applied to the fire consumer: %s — the "
+                    "registration it holds now is checked next cycle",
+                    missed,
                 )
         if expected and not answering and not fire_answering:
-            # Every registration this conn_id was asked about is gone, so the check
-            # produced no data about the ones it holds now: the counters stay untouched
-            # and the row keeps what it has rather than claiming a confirmation.
+            # The answer speaks for none of the registrations this conn_id holds, so the
+            # check produced no data about them: the counters stay untouched and the row
+            # keeps what it has rather than claiming a confirmation.
             state.liveness = _ConnLiveness(
                 status=None,
                 broker_consumer_count=broker_count,
                 reason=(
-                    "every consumer of this connection reattached while the probe ran"
+                    "the probe's answer speaks for no consumer this connection holds now"
                 ),
             )
             return set(), False
@@ -2682,15 +2737,16 @@ class RMQConsumerManager:
 
     async def _probe_consumers(
         self, conn_id: str, queues: set[str], expected: dict[str, Any]
-    ) -> tuple[set[str] | None, int | None, str | None]:
+    ) -> tuple[set[str] | None, int | None, str | None, float]:
         """Ask ``conn_id`` which of our consumers the broker currently holds.
 
         :param conn_id: Airflow connection whose consumers are being verified.
         :param queues: Queue names our consumers of this conn_id are subscribed to.
         :param expected: Per consumer tag those subscriptions registered, the connection
             object it is registered on.
-        :returns: ``(live tags, consumers the broker reports, reason)``, where live tags
-            of ``None`` means the check produced no data and the counters stay untouched.
+        :returns: ``(live tags, consumers the broker reports, reason, the monotonic
+            reading the answer speaks for)``, where live tags of ``None`` means the check
+            produced no data and the counters stay untouched.
 
         With a ``management_url`` the answer comes from ``GET /api/consumers/{vhost}``,
         whose reply is shaped by the rights of the account that asked — a user tagged
@@ -2730,7 +2786,7 @@ class RMQConsumerManager:
                     "check: %s — liveness unknown this cycle, counters unchanged",
                     conn_id, exc,
                 )
-                return None, None, str(exc)
+                return None, None, str(exc), time.monotonic()
             log.warning(
                 "The Airflow connection of conn_id=%r has been unreadable %d times in a "
                 "row (%s) — falling back to the AMQP probe, which asks the pooled "
@@ -2747,8 +2803,12 @@ class RMQConsumerManager:
         ):
             vhost = conn_info.schema or "/"
             cache_key = (management_url, vhost, conn_info.login)
-            by_queue = self._consumer_cache.get(cache_key)
-            if by_queue is None:
+            cached = self._consumer_cache.get(cache_key)
+            if cached is None:
+                # Read before the request goes out: the snapshot describes the broker at
+                # some instant of the call, and every registration this reading precedes
+                # is one the reply can be believed about.
+                taken_at = time.monotonic()
                 try:
                     by_queue = await get_queue_consumers(
                         self._http_client,
@@ -2766,7 +2826,7 @@ class RMQConsumerManager:
                             "unchanged",
                             conn_id, exc,
                         )
-                        return None, None, str(exc)
+                        return None, None, str(exc), time.monotonic()
                     log.warning(
                         "Management API has failed %d times in a row for conn_id=%r "
                         "(%s) — falling back to the AMQP probe so the watchdog keeps "
@@ -2774,7 +2834,9 @@ class RMQConsumerManager:
                         failures, conn_id, exc,
                     )
                     return await self._probe_by_passive_declare(conn_id, queues, expected)
-                self._consumer_cache[cache_key] = by_queue
+                self._consumer_cache[cache_key] = (taken_at, by_queue)
+            else:
+                taken_at, by_queue = cached
             self._conn(conn_id).mgmt_failures = 0
             live_tags: set[str] = set()
             broker_count = 0
@@ -2782,17 +2844,19 @@ class RMQConsumerManager:
                 queue_tags = by_queue.get(queue_name, set())
                 live_tags |= queue_tags
                 broker_count += len(queue_tags)
-            return live_tags, broker_count, None
+            return live_tags, broker_count, None, taken_at
 
         return await self._probe_by_passive_declare(conn_id, queues, expected)
 
     async def _probe_by_passive_declare(
         self, conn_id: str, queues: set[str], expected: dict[str, Any]
-    ) -> tuple[set[str], int | None, str | None]:
+    ) -> tuple[set[str], int | None, str | None, float]:
         """Verify ``conn_id`` by passive-declaring one of its queues on a fresh channel.
 
         :param expected: Per consumer tag of this conn_id, the connection object it is
             registered on.
+        :returns: ``(live tags, no consumer count, reason, the monotonic reading the
+            answer speaks for)``.
 
         The declare says nothing about individual consumers, so what it vouches for is
         every tag registered on the connection that answered it — and nothing else. A tag
@@ -2813,19 +2877,20 @@ class RMQConsumerManager:
         :func:`_cancelled_by_broker` is asked about each tag separately before this
         answer is believed.
         """
+        taken_at = time.monotonic()
         before = self._pooled_consume_connection(conn_id)
         answers, reason = await self._probe_connection(conn_id, queues)
         if not answers:
-            return set(), None, reason
+            return set(), None, reason, taken_at
         probed = self._pooled_consume_connection(conn_id)
         if probed is not before:
             return set(), None, (
                 "the connection answering the probe is not the one these consumers are "
                 "registered on: the pool replaced it while the probe ran"
-            )
+            ), taken_at
         return {
             tag for tag, connection in expected.items() if connection is probed
-        }, None, None
+        }, None, None, taken_at
 
     async def _probe_connection(
         self, conn_id: str, queues: set[str]

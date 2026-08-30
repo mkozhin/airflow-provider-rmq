@@ -40,6 +40,7 @@ from airflow_provider_rmq.watcher.consumer import (
     _RECONNECT_DELAY,
     _ROLE_CONSUME,
     _ROLE_PUBLISH,
+    _answer_misses,
     _attach_nonce,
     _attached,
     _cancelled_by_broker,
@@ -4966,7 +4967,9 @@ class TestSubscriptionLiveness:
         sub = _sub(id=7, queue_name="orders")
         entry = _register_active(manager, sub)
         manager._http_client = _mgmt_client({"error": "unauthorized"}, status_code=401)
-        probe = AsyncMock(return_value=({entry.state.consumer_tag}, None, None))
+        probe = AsyncMock(
+            return_value=({entry.state.consumer_tag}, None, None, time.monotonic())
+        )
 
         with _patch_mgmt_connection(), \
              patch.object(manager, "_probe_by_passive_declare", probe):
@@ -5486,9 +5489,10 @@ class TestAnAnswerThatArrivesAfterAReattach:
     def _probe_answering(self, tags, reattach=None):
         """A passive-declare probe answering ``tags``, reattaching a consumer while it runs."""
         async def probe(conn_id, queues, expected):
+            taken_at = time.monotonic()
             if reattach is not None:
                 reattach()
-            return set(tags(expected)), None, None
+            return set(tags(expected)), None, None, taken_at
 
         return probe
 
@@ -5615,6 +5619,79 @@ class TestAnAnswerThatArrivesAfterAReattach:
 
         assert fire.negative_checks == 2
         assert manager._fire_needs_restart is True
+
+
+class TestAnAnswerOlderThanTheRegistrationItJudges:
+    """The answer was taken before the registration it would be applied to existed.
+
+    One Management API snapshot serves every conn_id of the cycle that logs in as the
+    same account, so the moment it speaks for can precede the question about a later
+    conn_id by the whole judging of an earlier one. A consumer that reattached in that
+    gap holds a tag the snapshot was taken too early to hold — which is not evidence
+    against it.
+    """
+
+    def test_a_matching_tag_registered_after_the_answer_is_still_not_judged_by_it(self):
+        """The tag comparison passes here: the registration held now is the one the
+        question was asked about. What the answer misses is its moment."""
+        state = _state_with(_SUB_LISTENING, 7)
+        taken_at = time.monotonic()
+        state.consumer_tag = _consumer_tag(7, "reattached")
+
+        assert _answer_misses(state, state.consumer_tag, taken_at) is not None
+        assert _answer_misses(state, state.consumer_tag, time.monotonic()) is None
+
+    @pytest.mark.asyncio
+    async def test_a_snapshot_older_than_the_reattach_does_not_condemn(self, manager):
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        b = _sub(id=8, queue_name="events", conn_id="conn_b")
+        entry_a = _register_active(manager, a)
+        entry_b = _register_active(manager, b)
+        entry_b.negative_checks = 1  # a denial here would condemn the subscription
+        listed = [
+            _consumer_entry(entry_a.state.consumer_tag, "orders"),
+            _consumer_entry(entry_b.state.consumer_tag, "events"),
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            # The subscription of conn_b reattaches while the snapshot is being taken —
+            # long before conn_b is the one being judged.
+            entry_b.state.consumer_tag = _consumer_tag(8, "reattached")
+            return httpx.Response(200, json=listed)
+
+        manager._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        with _patch_mgmt_connection_per_login({"conn_a": "shared", "conn_b": "shared"}):
+            result = await manager._check_liveness([a, b])
+
+        assert result == (set(), set()), "the reattached consumer is healthy"
+        assert entry_b.negative_checks == 1, "an answer that does not apply is no evidence"
+        assert entry_b.state.denied_tag is None, "the tag it holds now is not in that snapshot"
+        assert manager._conn("conn_b").liveness.status is None
+        assert manager._conn("conn_a").liveness.status == "connected"
+
+    @pytest.mark.asyncio
+    async def test_a_registration_the_snapshot_covers_is_condemned_as_before(self, manager):
+        """Dropping an answer taken too early must leave a dead consumer condemnable: a
+        registration that existed when the snapshot was taken and is missing from it is
+        denied, and the second negative check drops its connection."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        b = _sub(id=8, queue_name="events", conn_id="conn_b")
+        entry_a = _register_active(manager, a)
+        entry_b = _register_active(manager, b)
+        entry_b.negative_checks = 1
+        manager._http_client = _mgmt_client(
+            [_consumer_entry(entry_a.state.consumer_tag, "orders")]
+        )
+
+        with _patch_mgmt_connection_per_login({"conn_a": "shared", "conn_b": "shared"}):
+            result = await manager._check_liveness([a, b])
+
+        assert result == ({8}, {"conn_b"})
+        assert entry_b.negative_checks == 2
+        assert entry_b.state.denied_tag == entry_b.state.consumer_tag
+        assert manager._conn("conn_a").liveness.status == "connected"
+        assert manager._conn("conn_b").liveness.status == "error"
 
 
 def _attached_channel(consumer_tag: str):
