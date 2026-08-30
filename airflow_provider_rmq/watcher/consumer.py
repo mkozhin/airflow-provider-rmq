@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import itertools
 import logging
 import os
 import re
@@ -412,36 +411,67 @@ def _status_writer(sub_id: int) -> _StatusWriter:
         return writer
 
 
-def _write_conn_error(conn_id: str, error: str) -> None:
-    """Store a failed connection attempt against ``conn_id``. Blocking."""
-    with WatcherSession() as session:
-        upsert_conn_status(
-            session, conn_id, _CONN_ERROR, consumer_count=0, last_error=error
-        )
-        session.commit()
-
-
-#: Serialises the writes of ``rmq_watcher_conn_status`` and the mark of how far they
-#: have got, so that an older snapshot cannot land on top of a newer one. Held for the
-#: length of a write, so nothing on the event loop may ever take it.
+#: Held for the length of one write of ``rmq_watcher_conn_status``. Every writer of
+#: those rows takes it through :func:`_conn_status_turn`, and never waits for it.
 _conn_status_lock = threading.Lock()
-#: Numbers the snapshots in the order they were taken; read on the loop thread only.
-_conn_status_snapshots = itertools.count(1)
-#: The newest snapshot that reached the rows.
-_conn_status_written = 0
 
 
-def _write_conn_status_rows(rows: list[tuple], now: datetime, snapshot: int) -> None:
+def _conn_status_turn(what: str) -> bool:
+    """Take the right to write ``rmq_watcher_conn_status``, or report it taken.
+
+    :param what: What the caller was about to write, named in the log of a dropped write.
+    :returns: Whether the caller may write, in which case it releases
+        :data:`_conn_status_lock` when it is done.
+
+    Two writers reach these rows — the cycle, which stamps every conn_id it knows, and a
+    failed connect, which stamps its own — and either can be left running by a caller
+    whose :data:`_DB_TIMEOUT` ran out. Committed in whatever order two transactions
+    happen to finish in, a ``connected`` taken before an outage lands on top of the
+    ``error`` that followed it and stays there, because the caller of that older write
+    is long gone and the manager counts the newer value as stored. So one write of these
+    rows runs at a time.
+
+    Waiting for the running one is what a caller must never do: it waits in a pool
+    worker, and :data:`_DB_TIMEOUT` buys back the coroutine, not the worker. A database
+    holding one write past that timeout would then take a worker per cycle, and after
+    ``max_workers`` cycles the pool that reads metadata and probes the broker would have
+    nothing left to run recovery on. The caller that cannot have its turn therefore
+    gives its worker straight back, and its rows go unwritten: a write that is dropped
+    while another is still in the database costs the report a cycle, which the next
+    write restates in full, whereas a queued one costs the watchdog its pool.
+    """
+    if _conn_status_lock.acquire(blocking=False):
+        return True
+    log.warning(
+        "A write of the connection status rows is already running — dropping %s", what
+    )
+    return False
+
+
+def _write_conn_error(conn_id: str, error: str) -> None:
+    """Store a failed connection attempt against ``conn_id``. Blocking.
+
+    The attempt is reported on the same rows the cycle writes and through the same turn
+    (:func:`_conn_status_turn`); the connect the row is about is logged by the caller
+    whatever the row ends up saying.
+    """
+    if not _conn_status_turn(f"the failed connect of conn_id={conn_id!r}"):
+        return
+    try:
+        with WatcherSession() as session:
+            upsert_conn_status(
+                session, conn_id, _CONN_ERROR, consumer_count=0, last_error=error
+            )
+            session.commit()
+    finally:
+        _conn_status_lock.release()
+
+
+def _write_conn_status_rows(rows: list[tuple], now: datetime) -> None:
     """Store one status row per conn_id. Blocking.
 
-    :param snapshot: Where these rows come in the order the cycles took them.
-
-    One write of these rows runs at a time and an older snapshot loses to a newer one.
-    The caller stops waiting after :data:`_DB_TIMEOUT` while the worker carries on, so
-    a write a slow database is still holding meets the write of the cycle behind it;
-    committed in that order, a ``connected`` taken before an outage would land on top of
-    the ``error`` that followed it and stay there, with the manager counting the newer
-    value as stored and nothing left to correct the row until the verdict changes again.
+    The rows are one cycle's whole view of every conn_id it knows, written under the
+    turn every writer of these rows takes (:func:`_conn_status_turn`).
 
     A row whose ``status`` is ``None`` carries no verdict — the check produced no data —
     and keeps whatever is already stored, so an unreachable Management API does not
@@ -453,15 +483,9 @@ def _write_conn_status_rows(rows: list[tuple], now: datetime, snapshot: int) -> 
     The stored statuses are read only when some row actually needs the fallback, so an
     all-verdict cycle costs one write and no extra full-table scan.
     """
-    global _conn_status_written
-    with _conn_status_lock:
-        if snapshot <= _conn_status_written:
-            log.warning(
-                "Connection status snapshot %d is older than snapshot %d, which is "
-                "already in the rows — dropping it",
-                snapshot, _conn_status_written,
-            )
-            return
+    if not _conn_status_turn(f"the status of {len(rows)} conn_id(s)"):
+        return
+    try:
         with WatcherSession() as session:
             stored: dict[str, str] | None = None
             for conn_id, count, status, reason, broker_count in rows:
@@ -481,7 +505,8 @@ def _write_conn_status_rows(rows: list[tuple], now: datetime, snapshot: int) -> 
                     last_reconcile_at=now,
                 )
             session.commit()
-        _conn_status_written = snapshot
+    finally:
+        _conn_status_lock.release()
 
 
 class _Backoff:
@@ -772,11 +797,38 @@ class _ConsumerState:
         #: attached. The client's own record of which consumers that channel carries is
         #: what :func:`_cancelled_by_broker` reads.
         self.channel: Any = None
+        #: The tag the liveness check last found the broker not holding, ``None`` while
+        #: the broker's answer about the current registration is positive or not yet
+        #: taken. It is a tag rather than a flag because it is one registration the
+        #: broker denied: the next attach registers a tag of its own
+        #: (:func:`_attach_nonce`), which no earlier answer can speak for.
+        self.denied_tag: str | None = None
 
     @property
     def status(self) -> str | None:
         """Status the task last reported, ``None`` before it reported anything."""
         return self._status
+
+    def note_broker_answer(self, seen: bool) -> None:
+        """Record what the liveness check's probe answered about this registration.
+
+        :param seen: Whether the broker holds the tag this state carries.
+        """
+        self.denied_tag = None if seen else self.consumer_tag
+
+    def denied_by_broker(self) -> bool:
+        """Whether the registration this state carries is one the broker does not have.
+
+        Two answers say so, and either of them is enough. The broker's own — what the
+        last probe of the liveness check reported about this exact tag — and the
+        client's, the tag gone from the channel it was registered on
+        (:func:`_cancelled_by_broker`), which is the only one available on the
+        passive-declare tier and needs no probe at all.
+        """
+        tag = self.consumer_tag
+        if tag is not None and self.denied_tag == tag:
+            return True
+        return _cancelled_by_broker(self)
 
     async def write(
         self,
@@ -809,8 +861,8 @@ class _ConsumerState:
         what it *asked* for would end up holding the opposite of what the row says, and
         the guard would then suppress every write that could correct it.
 
-        ``listening`` is the one status the row can refuse, and the channel the consumer
-        is registered on is what refuses it (:func:`_cancelled_by_broker`). A broker that
+        ``listening`` is the one status the row can refuse, and a registration the
+        broker does not hold is what refuses it (:meth:`denied_by_broker`). A broker that
         cancels a consumer of ours goes on handing over whatever it had already buffered
         for it, so a delivery can be triggered, acknowledged and reported on a
         registration that is already gone — landing on the row after the liveness check
@@ -823,7 +875,7 @@ class _ConsumerState:
         self._status = status
         if self._sub_id is None:
             return
-        if status == _SUB_LISTENING and _cancelled_by_broker(self):
+        if status == _SUB_LISTENING and self.denied_by_broker():
             return
         writer = _status_writer(self._sub_id)
         if not writer.record_if_needed(status, last_error):
@@ -1613,9 +1665,7 @@ class RMQConsumerManager:
 
         try:
             await call_with_timeout(
-                self._cycle_executor.run(
-                    _write_conn_status_rows, rows, now, next(_conn_status_snapshots)
-                ),
+                self._cycle_executor.run(_write_conn_status_rows, rows, now),
                 timeout=_DB_TIMEOUT,
             )
         except Exception as exc:
@@ -2379,6 +2429,10 @@ class RMQConsumerManager:
         dead_subs: set[int] = set()
         for sub, entry in subs:
             seen = _seen(entry.state, live_tags)
+            # The answer stays with the registration it is about, so that a delivery
+            # arriving on a consumer the broker has let go cannot report over the
+            # verdict this check is writing.
+            entry.state.note_broker_answer(seen)
             # The row of this subscription carries a verdict of an earlier cycle exactly
             # when the count is up, and that verdict is this check's to take back.
             reported_unseen = entry.negative_checks > 0
