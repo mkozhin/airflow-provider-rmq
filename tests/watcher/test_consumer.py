@@ -5694,6 +5694,217 @@ class TestAnAnswerOlderThanTheRegistrationItJudges:
         assert manager._conn("conn_b").liveness.status == "error"
 
 
+class TestASubscriptionBetweenTwoAttaches:
+    """The attach that made a subscription a candidate ends while the cycle runs.
+
+    A pass of a consumer task clears its tag, closes its channel and pauses before it
+    attaches again, and the status write that says so comes only once the pause is over
+    — so for those seconds the state reads ``listening`` while holding no tag at all.
+    The broker can be asked nothing about such a subscription, and a probe that names no
+    tag of ours is not the broker denying it.
+    """
+
+    @staticmethod
+    def _pool_for(manager, conn_id: str, entry) -> None:
+        """Pool a connection that answers a passive declare, with ``entry`` attached to it."""
+        manager._conn(conn_id).timeouts = AmqpTimeouts(connect=0.05, rpc=0.05)
+        _pool_consume_connection(
+            manager,
+            _make_live_connection(queue=MagicMock()),
+            entry.state,
+            conn_id=conn_id,
+        )
+
+    @staticmethod
+    def _detach(entry) -> None:
+        """End ``entry``'s attach the way the consumer task's ``finally`` ends it."""
+        entry.state.consumer_tag = None
+        entry.state.connection = None
+
+    @pytest.mark.asyncio
+    async def test_a_subscription_holding_no_tag_is_not_denied(self, manager):
+        """conn_a is probed first, and the subscription of conn_b ends its attach while
+        that probe runs — before conn_b is asked about at all."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        b = _sub(id=8, queue_name="events", conn_id="conn_b")
+        entry_a = _register_active(manager, a)
+        entry_b = _register_active(manager, b)
+        entry_b.negative_checks = 1  # a denial here would condemn the subscription
+        manager._http_client = None
+        self._pool_for(manager, "conn_a", entry_a)
+        self._pool_for(manager, "conn_b", entry_b)
+        pooled_a = manager._conn("conn_a").connections[_ROLE_CONSUME]
+        pooled_a.channel.return_value.declare_queue = AsyncMock(
+            side_effect=lambda *a, **kw: self._detach(entry_b) or MagicMock()
+        )
+
+        result = await manager._check_liveness([a, b])
+
+        assert result == (set(), set())
+        assert entry_b.negative_checks == 1, "a subscription holding no tag is asked nothing"
+        assert entry_b.state.denied_tag is None
+        assert manager._conn("conn_b").liveness.status is None
+        assert manager._conn("conn_a").liveness.status == "connected"
+
+    @pytest.mark.asyncio
+    async def test_the_row_of_a_subscription_holding_no_tag_is_left_alone(self, manager):
+        """A verdict naming consumer ``None`` is what an operator reads as a broker that
+        dropped the subscription, and it suppresses every ``listening`` reported after
+        it until a probe confirms the consumer again."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        b = _sub(id=8, queue_name="events", conn_id="conn_b")
+        entry_a = _register_active(manager, a)
+        entry_b = _register_active(manager, b)
+        manager._http_client = None
+        self._pool_for(manager, "conn_a", entry_a)
+        self._pool_for(manager, "conn_b", entry_b)
+        pooled_a = manager._conn("conn_a").connections[_ROLE_CONSUME]
+        pooled_a.channel.return_value.declare_queue = AsyncMock(
+            side_effect=lambda *args, **kw: self._detach(entry_b) or MagicMock()
+        )
+        stored = []
+
+        def write(session, sub_id, status, last_error=None):
+            stored.append((sub_id, status, last_error))
+
+        with _patch_watcher_session(), \
+             patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
+                   side_effect=write):
+            await manager._check_liveness([a, b])
+            await manager._store_unwritten_statuses()
+
+        assert stored == []
+
+    @pytest.mark.asyncio
+    async def test_a_snapshot_naming_no_tag_of_a_detached_subscription_is_not_a_denial(
+        self, manager
+    ):
+        """The Management API tier reaches the same subscription by another route: the
+        snapshot is taken after the attach ended, so its moment is no objection."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        b = _sub(id=8, queue_name="events", conn_id="conn_b")
+        entry_a = _register_active(manager, a)
+        entry_b = _register_active(manager, b)
+        entry_b.negative_checks = 1
+        listed = [
+            _consumer_entry(entry_a.state.consumer_tag, "orders"),
+            _consumer_entry(entry_b.state.consumer_tag, "events"),
+        ]
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:  # conn_a's snapshot; conn_b's is taken after it
+                self._detach(entry_b)
+            return httpx.Response(200, json=listed)
+
+        manager._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        with _patch_mgmt_connection_per_login({"conn_a": "a", "conn_b": "b"}):
+            result = await manager._check_liveness([a, b])
+
+        assert result == (set(), set())
+        assert entry_b.negative_checks == 1
+        assert entry_b.state.denied_tag is None
+        assert manager._conn("conn_b").liveness.status is None
+
+    @pytest.mark.asyncio
+    async def test_the_consumer_that_kept_its_tag_is_condemned_beside_it(self, manager):
+        """Skipping a subscription that holds no tag is one subscription's business: the
+        consumer sharing its connection and still holding a tag the broker does not have
+        reaches its second negative check and takes the connection down."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        gone = _sub(id=8, queue_name="events", conn_id="conn_b")
+        dead = _sub(id=9, queue_name="alerts", conn_id="conn_b")
+        entry_a = _register_active(manager, a)
+        entry_gone = _register_active(manager, gone)
+        entry_dead = _register_active(manager, dead)
+        entry_dead.negative_checks = 1
+        listed = [
+            _consumer_entry(entry_a.state.consumer_tag, "orders"),
+            _consumer_entry(entry_gone.state.consumer_tag, "events"),
+        ]
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                self._detach(entry_gone)
+            return httpx.Response(200, json=listed)
+
+        manager._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        with _patch_mgmt_connection_per_login({"conn_a": "a", "conn_b": "b"}):
+            result = await manager._check_liveness([a, gone, dead])
+
+        assert result == ({9}, {"conn_b"})
+        assert entry_dead.negative_checks == 2
+        assert entry_dead.state.denied_tag == entry_dead.state.consumer_tag
+        assert entry_gone.negative_checks == 0
+        assert manager._conn("conn_b").liveness.status == "error"
+
+    @pytest.mark.asyncio
+    async def test_a_conn_id_left_with_nothing_to_ask_is_not_reported_connected(self, manager):
+        """The fire consumer is the only candidate its conn_id has, and it detaches while
+        the other conn_id is judged. A probe with no queue to name is answered without
+        reaching the broker, so there is nothing for it to confirm."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        entry_a = _register_active(manager, a)
+        manager._http_client = None
+        self._pool_for(manager, "conn_a", entry_a)
+        manager._conn("conn_b").connections[_ROLE_CONSUME] = _make_live_connection(
+            queue=MagicMock()
+        )
+        fire = _register_fire(manager, conn_id="conn_b")
+        probed = []
+        pooled_a = manager._conn("conn_a").connections[_ROLE_CONSUME]
+        pooled_a.channel.return_value.declare_queue = AsyncMock(
+            side_effect=lambda name, **kw: probed.append(name)
+            or setattr(fire.state, "consumer_tag", None)
+            or MagicMock()
+        )
+        pooled_b = manager._conn("conn_b").connections[_ROLE_CONSUME]
+        pooled_b.channel.return_value.declare_queue = AsyncMock(
+            side_effect=lambda name, **kw: probed.append(name) or MagicMock()
+        )
+
+        result = await manager._check_liveness([a])
+
+        assert result == (set(), set())
+        assert probed == ["orders"], "conn_b has no queue left to name the probe with"
+        assert manager._conn("conn_b").liveness.status is None
+        assert manager._conn("conn_a").liveness.status == "connected"
+
+    @pytest.mark.asyncio
+    async def test_the_next_cycle_judges_the_conn_id_it_left_no_verdict_for(self, manager):
+        """A conn_id every consumer of which detached mid-cycle reaches a judge again:
+        the next partition sorts its task as stalled, and the stuck-cycle counter that
+        eventually condemns a connection nothing consumes on starts running."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        b = _sub(id=8, queue_name="events", conn_id="conn_b")
+        entry_a = _register_active(manager, a)
+        entry_b = _register_active(manager, b)
+        manager._http_client = None
+        self._pool_for(manager, "conn_a", entry_a)
+        self._pool_for(manager, "conn_b", entry_b)
+        pooled_a = manager._conn("conn_a").connections[_ROLE_CONSUME]
+        pooled_a.channel.return_value.declare_queue = AsyncMock(
+            side_effect=lambda *args, **kw: self._detach(entry_b) or MagicMock()
+        )
+
+        first = await manager._check_liveness([a, b])
+        assert first == (set(), set())
+        assert manager._conn("conn_b").liveness.status is None
+        assert manager._conn("conn_b").stuck_cycles == 0
+
+        second = await manager._check_liveness([a, b])
+
+        assert second == (set(), set())
+        assert manager._conn("conn_b").stuck_cycles == 1, (
+            "the subscription is stalled, and the judge for a stalled conn_id counts it"
+        )
+
+
 def _attached_channel(consumer_tag: str):
     """A live channel laid out the way ``aio_pika`` lays one out, holding ``consumer_tag``.
 

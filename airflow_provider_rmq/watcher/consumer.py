@@ -668,6 +668,23 @@ def _seen(state: _ConsumerState, live_tags: set[str]) -> bool:
     return state.consumer_tag in live_tags and not _cancelled_by_broker(state)
 
 
+def _still_attached(entry: _ActiveSub) -> bool:
+    """Whether ``entry`` holds a registration the broker can be asked about right now.
+
+    A pass of a consumer task ends by clearing its tag, closing its channel and pausing
+    before it attaches again, and the status write that says so comes only once that
+    pause is over — so for the length of the pause the state reads ``listening`` while
+    holding no tag at all. There is nothing to ask about such a subscription: an answer
+    that names no tag of ours would read as the broker denying a consumer, when what it
+    describes is a task between two attaches.
+    """
+    return (
+        not entry.task.done()
+        and entry.state.status == _SUB_LISTENING
+        and entry.state.consumer_tag is not None
+    )
+
+
 def _answer_misses(state: _ConsumerState, tag: str | None, taken_at: float) -> str | None:
     """Why an answer taken at ``taken_at`` says nothing about the registration ``state`` holds.
 
@@ -2419,7 +2436,7 @@ class RMQConsumerManager:
             if entry is None or entry.task.done():
                 continue
             live_tasks[conn_id] += 1
-            if entry.state.status != _SUB_LISTENING or entry.state.consumer_tag is None:
+            if not _still_attached(entry):
                 stalled.setdefault(conn_id, []).append(sub)
                 continue
             candidates.setdefault(conn_id, []).append((sub, entry))
@@ -2462,11 +2479,19 @@ class RMQConsumerManager:
         still carries it (:func:`_cancelled_by_broker`): a consumer the broker cancelled
         on its own leaves the connection and the channel open, so every probe of the
         connection keeps succeeding while nothing consumes.
+
+        Only what is attached when the question is put is judged by the answer, and a
+        conn_id left with nothing to ask about ends the cycle with no verdict: a probe
+        that was asked nothing confirms nothing.
         """
         state = self._conn(conn_id)
-        state.stuck_cycles = 0
         fire = self._fire_candidate()
         fire_here = fire is not None and fire.conn_id == conn_id
+        # Candidacy is settled again here, where the question is put, rather than taken
+        # from the sorting that ran before the cycle's first await: an attach that ended
+        # in between holds no tag any more (:func:`_still_attached`), and the broker can
+        # be asked nothing about it.
+        subs = [(sub, entry) for sub, entry in subs if _still_attached(entry)]
         queues = {sub["queue_name"] for sub, _ in subs}
         # The tag each registration carries at the moment the question is asked, and the
         # connection object it is registered on. Both are what the answer will be about.
@@ -2478,6 +2503,21 @@ class RMQConsumerManager:
             fire_tag = fire.state.consumer_tag
             expected[fire_tag] = fire.connection
 
+        if not expected:
+            # Every attach that made this conn_id a candidate has ended, so the probe
+            # carries no question: it would be answered without reaching the broker at
+            # all, and reading that as a confirmation is the green row this check exists
+            # to remove. The cycle leaves no verdict and no counter moves; the next
+            # partition sorts these subscriptions as stalled and
+            # :meth:`_judge_without_candidates` takes them from there.
+            state.liveness = _ConnLiveness(
+                status=None,
+                broker_consumer_count=None,
+                reason="no consumer of this connection was attached when the probe ran",
+            )
+            return set(), False
+
+        state.stuck_cycles = 0
         live_tags, broker_count, reason, taken_at = await self._probe_consumers(
             conn_id, queues, expected
         )
