@@ -2984,8 +2984,9 @@ class RMQConsumerManager:
         to the queue and hands every delivery on to the handler the subscription's mode
         calls for. A pass that ends without a fatal error pauses and attaches again, so
         one broken connection costs a reconnect delay rather than the subscription; a
-        queue that does not exist is fatal, and the reconcile cycle is what starts the
-        task again once the row changes.
+        queue that does not exist ends the task, and the next reconcile cycle starts a
+        fresh one — a subscription pointing at a queue nobody declares therefore keeps
+        writing ``error`` once per cycle for as long as it stays enabled.
         """
         sub_id: int = sub["id"]
         dag_id: str = sub["dag_id"]
@@ -3177,12 +3178,15 @@ class RMQConsumerManager:
         publishers under a resource alarm leaves the consuming connection — and with it
         every ``basic.ack`` — untouched.
 
-        A broker that *rejects* the publish has done its job: the pending queue is
-        declared ``x-max-length=1`` with ``x-overflow=reject-publish``, so a rejection
-        means the cooldown for this dag_id is already counting down and a second
-        placeholder would add nothing. That is the ordinary case while a cooldown window
-        is open, and the delivery is acknowledged — requeueing it would redeliver the
-        same message for the whole window and burn the quorum-queue delivery limit on it.
+        A broker that *rejects* the publish is read as one that has done its job: the
+        pending queue is declared ``x-max-length=1`` with ``x-overflow=reject-publish``,
+        so a rejection means the cooldown for this dag_id is already counting down and a
+        second placeholder would add nothing. That is the ordinary case while a cooldown
+        window is open, and the delivery is acknowledged — requeueing it would redeliver
+        the same message for the whole window and burn the quorum-queue delivery limit on
+        it. The rejection frame carries no reason, so a queue whose own process failed
+        rejects the publish in exactly the same words and costs this one event; the log
+        line names both readings, at a level that survives the default configuration.
 
         A broker that *returns* the publish says the opposite: the pending queue is
         missing, so nothing is counting down and nothing will ever fire this window. The
@@ -3202,7 +3206,10 @@ class RMQConsumerManager:
                 channel.default_exchange.publish(
                     aio_pika.Message(
                         b"",
-                        expiration=str(cooldown * 1000),
+                        # aio_pika encodes the expiration itself: seconds as a number in,
+                        # milliseconds as a string on the wire. A string here reaches no
+                        # encoder and raises ValueError when the properties are read.
+                        expiration=cooldown,
                         message_id=str(uuid.uuid4()),
                     ),
                     routing_key=pending_queue,
@@ -3223,9 +3230,10 @@ class RMQConsumerManager:
             await self._handle_publish_failure(conn_id, message, exc)
             raise
         except aio_pika.exceptions.DeliveryError:
-            log.debug(
+            log.info(
                 "Cooldown placeholder for DAG %s was rejected by %s — a cooldown window "
-                "is already open, acknowledging the delivery",
+                "is already open, or the queue itself refused the publish; either way "
+                "the delivery is acknowledged and this event is dropped",
                 dag_id, pending_queue,
             )
             self._conn(conn_id).publish_timeouts = 0

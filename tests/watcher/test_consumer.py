@@ -1934,7 +1934,7 @@ class TestCooldownConsume:
 
     @pytest.mark.asyncio
     async def test_cooldown_pending_message_has_expiration(self, manager):
-        """cooldown>0: published Message must have expiration = str(cooldown * 1000)."""
+        """cooldown>0: the placeholder must carry a TTL the broker actually receives."""
         msg = _make_fake_message(b"order")
         channel, connection = self._make_channel_with_queue([msg])
 
@@ -1960,8 +1960,10 @@ class TestCooldownConsume:
             except asyncio.CancelledError:
                 pass
 
-        # aio_pika.Message stores expiration as string
-        assert published_msg["msg"].expiration == "300000"
+        # ``properties`` is what aio_pika hands the broker, and the only place the
+        # expiration is encoded: reading it here is what makes the assertion about the
+        # wire and not about the attribute the constructor stored.
+        assert published_msg["msg"].properties.expiration == "300000"
 
     @pytest.mark.asyncio
     async def test_cooldown_nonmatching_message_nacked(self, manager):
