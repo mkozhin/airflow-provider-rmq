@@ -763,6 +763,28 @@ Exchange-mode subscriptions show up in the UI like any other `dag_file` subscrip
 
 Any subscription whose `dag_id` doesn't correspond to an active Airflow DAG is marked on the page with a `⚠ dag not found` badge. This is a **one-sided** signal: its presence means a real problem — a matching message will be ACKed without triggering anything — but its **absence guarantees nothing**. Three reasons the badge can miss a broken subscription: `is_paused` is not checked, so a paused DAG never gets the badge even though a matching message is still ACKed without triggering a run, exactly like a missing DAG (see [ADR 0006](docs/adr/0006-badge-dag-lookup-not-unified-with-sync-trigger.md)); a just-added DAG may be badged for a short while until the Scheduler parses it; and a just-deleted or renamed DAG conversely stays un-badged for a while until `DagModel.is_active` catches up. The last two are expected lag, not bugs.
 
+### Subscriptions Page Access
+
+The page and its menu entry belong to two roles: Admin and Op. Viewer and User see neither the entry nor the `RabbitMQ` category it hangs under, and a direct visit to `/rmq-watcher/subscriptions` is refused.
+
+Admin gets the page from Airflow itself, which hands that role every non-DAG permission on every role synchronisation. Op gets it from the provider: at each webserver start the plugin grants the role `can_read`, `can_create`, `can_edit` and `can_delete` on the resource `RMQ Subscriptions`, plus `menu_access` on `Subscriptions` and on `RabbitMQ`. The grant runs on every start, so upgrading the provider opens the page to Op by itself, with nothing to do by hand.
+
+> **Warning.** Those permissions include creating and deleting subscriptions, so access to the page is the right to make an arbitrary DAG run on a message from a queue. An installation where Op should not hold that right sets the Airflow Variable `rmq_watcher_grant_op_access` to `false`.
+
+The Variable governs the access, not merely the grant: a false value **removes** the same six permissions from the Op role at the next webserver start. Granting or revoking them by hand while the Variable is true or unset achieves nothing — the next start puts the provider's own answer back.
+
+`menu_access` is granted on the **displayed** names of the entry and of its category, and the FAB menu is flat. Another installed plugin that names its own entry `Subscriptions` or its own category `RabbitMQ` therefore shares those two permissions, and a revocation closes its menu to Op along with this one.
+
+Any other role opens the page through Airflow's CLI:
+
+```bash
+airflow roles add-perms MyRole -a can_read -r "RMQ Subscriptions"
+airflow roles add-perms MyRole -a menu_access -r "Subscriptions"
+airflow roles add-perms MyRole -a menu_access -r "RabbitMQ"
+```
+
+Without `menu_access` on the category the entry stays out of the menu even with the other two granted. Without `can_create`, `can_edit` and `can_delete` the page still draws all eight of its controls — the template checks no permission — and each of them answers with a refusal.
+
 ### Connection Resilience
 
 The watcher holds long-lived AMQP connections inside the Scheduler, so it treats a broker restart, a silently dropped TCP link, a resource alarm or an unavailable database as normal weather: once the external problem is gone, subscriptions come back on their own. The design is written up in [ADR 0007](docs/adr/0007-connection-liveness-two-tier-check.md); the short version is four layers.
@@ -781,8 +803,9 @@ The watcher holds long-lived AMQP connections inside the Scheduler, so it treats
 |---|---|---|
 | `rmq_watcher_reconcile_interval` | `60` | Seconds between reconcile cycles |
 | `rmq_watcher_cycle_timeout` | `max(interval × 3, 300)` | Seconds one cycle may take before the event loop is recreated |
+| `rmq_watcher_grant_op_access` | `true` | Whether the Op role holds the permissions of the [Subscriptions page](#subscriptions-page-access) |
 
-Both are re-read at the start of every cycle in a thread pool under a short timeout of their own, so a changed Variable takes effect on the next cycle; a read still stuck in a worker blocks the next one from starting, and an unreachable database leaves the last known values in place instead of stalling the loop.
+The first two are re-read at the start of every cycle in a thread pool under a short timeout of their own, so a changed Variable takes effect on the next cycle; a read still stuck in a worker blocks the next one from starting, and an unreachable database leaves the last known values in place instead of stalling the loop. The third is read once per webserver start, when the page's permissions are set; a database that cannot answer it leaves them as they are and logs a warning.
 
 **What the Subscriptions page shows.** The Connections block at `/rmq-watcher/subscriptions` lists one row per `conn_id`:
 
@@ -805,7 +828,8 @@ The Status column of the Subscriptions table further down the page is a differen
 
 For subscriptions with `cooldown=0` the watcher acknowledges a delivery only **after** `trigger_dag` has created the DAG run:
 
-- A failed trigger is NACKed with requeue, logged as a WARNING and retried with a growing backoff (1 s, doubling up to 60 s); the subscription status becomes `error` with the reason, so a subscription that stopped starting DAG runs is visible on the page.
+- A failed trigger is NACKed with requeue, logged as a WARNING and retried with a growing backoff (1 s, doubling up to 60 s); the subscription status becomes `error` with the reason, so a subscription that stopped starting DAG runs is visible on the page. One answer out of `trigger_dag` is exempt, and it is the next bullet.
+- **One trigger failure the status keeps quiet about:** a DAG Airflow holds no serialized version of yet — `DagNotFound` out of `trigger_dag`, which is the state a freshly started scheduler is in until its DAG processor has parsed the files. The connection, the channel and the consumer registration are all intact, and what the delivery waits for is the rest of Airflow, so nothing is written to the row: a subscription that was `listening` stays `listening`, and an `error` an earlier, unrelated failure left there stays until the first delivery that goes through. The delivery itself is requeued and paused for the same growing interval. The quiet is bounded: 25 such deliveries in a row are long enough to be a failure of their own, and the row then reads `error` with the reason. The streak counts one attach — a reconnect starts a fresh warmup — and every tenth not-yet-serialized delivery is logged as a WARNING, which on a quorum queue that spends its `delivery-limit` before the streak runs out is the only trace the warmup leaves. The cooldown fire consumer treats the same answer the same way, minus the counting: it holds no row of its own, so a cooldown DAG that never gets serialized shows up in the scheduler log alone.
 - Deduplication rests on the producer. When the message carries an AMQP `message_id`, the run id is deterministic (`rmq__{queue}__{message_id}`, sanitized and truncated with a digest when it does not fit), so a redelivery lands on the run it already produced and is acknowledged as a duplicate. Two *different* messages sharing one `message_id` therefore collapse into a single DAG run. Without `message_id` the run id carries a timestamp instead and a redelivery starts the DAG again.
 - **Boundary of the guarantee:** a DAG that is paused, inactive or missing ends in a terminal ACK — the event is dropped on purpose, with a WARNING in the log. NACKing it would turn a paused DAG into an accumulator of redeliveries.
 - Messages that do not match the filter are NACKed with requeue (see [ADR 0002](docs/adr/0002-four-consume-loops-not-unified.md)) and go back to the head of the queue.

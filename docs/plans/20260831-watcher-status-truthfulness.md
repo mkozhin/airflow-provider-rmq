@@ -694,10 +694,10 @@ def read_flag(name: str, default: bool) -> bool:
 - Modify: `docs/live-verification.md`
 - Delete: `docs/backlog/trigger-before-serialized-dag.md`
 
-- [ ] `readme.md:808` и `readme_ru.md:807` утверждают, что упавший триггер
+- [x] `readme.md:808` и `readme_ru.md:807` утверждают, что упавший триггер
       переводит подписку в `error` с причиной. После задач 2 и 3 это неверно для
       несериализованного DAG — переписать оба пункта, назвав исключение
-- [ ] новый раздел про права — в оба readme, после «Subscription Management» /
+- [x] новый раздел про права — в оба readme, после «Subscription Management» /
       «Управление подписками» (`readme.md:752-764`, `readme_ru.md:751`) и перед
       разделом про живучесть соединения. Содержание:
       - страницу и пункт меню видят Admin и Op; Viewer и User не видят ни пункта,
@@ -719,27 +719,33 @@ def read_flag(name: str, default: bool) -> bool:
         `Subscriptions` и `RabbitMQ`, с оговоркой, что без `menu_access` на
         категорию пункт не появится, а без `can_edit`/`can_create`/`can_delete`
         кнопки будут отвечать отказом
-- [ ] упомянуть `rmq_watcher_grant_op_access` там же, где перечислены остальные
+- [x] упомянуть `rmq_watcher_grant_op_access` там же, где перечислены остальные
       Airflow Variables провайдера, в обоих readme
-- [ ] прочитать `docs/adr/0007-connection-liveness-two-tier-check.md:73-74`
+- [x] прочитать `docs/adr/0007-connection-liveness-two-tier-check.md:73-74`
       («подписка остаётся в `error` до первого успешного триггера») и решить,
       требует ли формулировка правки или её пример с недоступной метабазой
-      остаётся верным
-- [ ] прочитать `CONTEXT.md` (словарь статусов, `:78`, `:84`) и убедиться, что
-      выбор слов не разошёлся с новым поведением
-- [ ] пункты в `CHANGELOG.md` в терминах поведения: несериализованный DAG больше
+      остаётся верным — правки не требует: пример там про недоступную метабазу
+      Airflow, а она по-прежнему пишет `error`; `DagNotFound` в этот пример не
+      входит, и вывод абзаца — соединение отвечает, а таски падают после него —
+      верен для обоих случаев
+- [x] прочитать `CONTEXT.md` (словарь статусов, `:78`, `:84`) и убедиться, что
+      выбор слов не разошёлся с новым поведением — не разошёлся: обе статьи
+      описывают статусы `conn_id` (`degraded`, `unknown`), а правка их вердиктов
+      не касается; `error` как «вердикт, по которому действие выполнено» остаётся
+      точным
+- [x] пункты в `CHANGELOG.md` в терминах поведения: несериализованный DAG больше
       не отчитывается как отказ подписки; роль Op получает доступ к странице
-- [ ] дополнить «Сценарий 12. Остановка и рестарт scheduler'а»
+- [x] дополнить «Сценарий 12. Остановка и рестарт scheduler'а»
       (`docs/live-verification.md:425`) проверкой прогрева: сообщение лежит в
       очереди на момент рестарта, строка остаётся `listening`, в логе видна
       строка про прогрев, DAG запускается после первого разбора файлов
-- [ ] `git rm docs/backlog/trigger-before-serialized-dag.md`
-- [ ] `docs/backlog/duplicated-consumer-loops.md` **остаётся**: тест закрывает
+- [x] `git rm docs/backlog/trigger-before-serialized-dag.md`
+- [x] `docs/backlog/duplicated-consumer-loops.md` **остаётся**: тест закрывает
       дыру в покрытии, но дубль двух петель никуда не девается
-- [ ] `docs/backlog/stop-event-replacement-revives-watcher.md` **остаётся**: его
+- [x] `docs/backlog/stop-event-replacement-revives-watcher.md` **остаётся**: его
       закрывает `docs/plans/20260831-listener-generation-ownership.md`, а не этот
       план
-- [ ] переместить этот план в `docs/plans/completed/`
+- [x] переместить этот план в `docs/plans/completed/` — перемещение делает обвязка после всех фаз
 
 ## Post-Completion
 
