@@ -3597,9 +3597,9 @@ class RMQConsumerManager:
         about, and nothing counts those deliveries either: one fire consumer serves every
         cooldown DAG, so a count kept on it would mix the warmups of unrelated DAGs and
         one DAG going through would clear the streak of the rest. Holding the status at
-        ``listening`` keeps the consumer a candidate of the liveness check, so a warmup
-        that lasts minutes no longer hides a consumer that died inside it. The log line
-        is where such a warmup shows.
+        ``listening`` keeps the consumer a candidate of the liveness check, so a
+        consumer that dies inside a warmup lasting minutes is noticed all the same. The
+        log line is where such a warmup shows.
         """
         dag_id = message.routing_key or ""
         if not dag_id:

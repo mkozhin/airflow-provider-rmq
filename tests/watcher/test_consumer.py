@@ -8092,7 +8092,7 @@ class TestADagWithoutASerializedVersion:
     @pytest.mark.asyncio
     async def test_any_other_trigger_failure_still_reaches_the_row_at_once(self, manager):
         """The silence belongs to the one exception that is not the subscription's
-        fault: everything else is reported on the first delivery, as before."""
+        fault: everything else is reported on the first delivery."""
         state = self._state(manager)
         with patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
             messages = await self._deliver(
