@@ -3592,6 +3592,14 @@ class RMQConsumerManager:
         The fire consumer reports the failure as its own status for the same reason a
         subscription does: the connection is fine and the iterator keeps running, so
         nothing else would say that expired cooldown windows stopped starting DAG runs.
+
+        A DAG Airflow has not serialized yet is the one trigger failure it says nothing
+        about, and nothing counts those deliveries either: one fire consumer serves every
+        cooldown DAG, so a count kept on it would mix the warmups of unrelated DAGs and
+        one DAG going through would clear the streak of the rest. Holding the status at
+        ``listening`` keeps the consumer a candidate of the liveness check, so a warmup
+        that lasts minutes no longer hides a consumer that died inside it. The log line
+        is where such a warmup shows.
         """
         dag_id = message.routing_key or ""
         if not dag_id:
@@ -3609,6 +3617,15 @@ class RMQConsumerManager:
             outcome = await self._trigger_fire_dag(dag_id, message)
         except asyncio.CancelledError:
             raise
+        except _DagNotReady as exc:
+            await message.nack(requeue=True)
+            log.info(
+                "DAG %s of an expired cooldown window is not serialized yet: %s — the "
+                "fire event is back on the queue, pausing %.1fs",
+                dag_id, exc, backoff.seconds,
+            )
+            await backoff.wait()
+            return
         except Exception as exc:
             log.warning(
                 "Triggering DAG %s for an expired cooldown window failed: %s — the fire "

@@ -584,32 +584,32 @@ def read_flag(name: str, default: bool) -> bool:
 - Modify: `tests/watcher/test_consumer.py`
 - Create: `docs/backlog/cooldown-dag-never-serialized-invisible.md`
 
-- [ ] ветка `except _DagNotReady` в `_handle_fire_delivery`, между
+- [x] ветка `except _DagNotReady` в `_handle_fire_delivery`, между
       `except asyncio.CancelledError` (`consumer.py:3550`) и `except Exception`:
       `nack(requeue=True)`, своя строка в логе вместо «Triggering DAG %s for an
       expired cooldown window failed» (`consumer.py:3553-3556`), пауза, `return`
-- [ ] **ни счётчика, ни записи статуса** в этой ветке: строки у fire-consumer'а
+- [x] **ни счётчика, ни записи статуса** в этой ветке: строки у fire-consumer'а
       нет, `write` выходит на `if self._sub_id is None: return`
       (`consumer.py:996-997`), красить нечего
-- [ ] запись `_SUB_ERROR` на `consumer.py:3559` оставить на месте для всех
+- [x] запись `_SUB_ERROR` на `consumer.py:3559` оставить на месте для всех
       прочих исключений — правка уводит из-под неё только `_DagNotReady`
-- [ ] переписать docstring `_handle_fire_delivery` (`consumer.py:3523-3534`):
+- [x] переписать docstring `_handle_fire_delivery` (`consumer.py:3523-3534`):
       сейчас он обещает, что fire-consumer отчитывается о любом отказе своим
       статусом — назвать `_DagNotReady` исключением, о котором он молчит
-- [ ] тест: `DagNotFound` из fire-триггера — доставка возвращена в очередь,
+- [x] тест: `DagNotFound` из fire-триггера — доставка возвращена в очередь,
       `state.write` не вызывался, в логе строка про прогрев
-- [ ] тест на изменение поведения: во время прогрева fire-consumer **остаётся**
+- [x] тест на изменение поведения: во время прогрева fire-consumer **остаётся**
       кандидатом `_fire_candidate` (`consumer.py:2469-2480`), тогда как сегодня
       запись `_SUB_ERROR` выводит его из кандидатов проверки живости
-- [ ] тест-страж: любое другое исключение fire-триггера по-прежнему пишет
+- [x] тест-страж: любое другое исключение fire-триггера по-прежнему пишет
       `_SUB_ERROR` немедленно и выводит consumer'а из кандидатов
-- [ ] проверка снятием: убрать ветку — краснеют тест на молчание и тест на
+- [x] проверка снятием: убрать ветку — краснеют тест на молчание и тест на
       кандидатство, тест-страж остаётся зелёным
-- [ ] записать в `docs/backlog/` отдельным пунктом: cooldown-DAG, который не
+- [x] записать в `docs/backlog/` отдельным пунктом: cooldown-DAG, который не
       сериализуется никогда, виден только в логе. Показ на странице требует
       вести прогрев по каждому `dag_id` и писать в строки затронутых подписок по
       их `sub_id` — отдельный дизайн, в этот план не входит
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 4: Роль Op видит и ведёт страницу подписок
 

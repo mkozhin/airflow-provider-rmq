@@ -9697,6 +9697,77 @@ class TestFireDeliveryFailure:
         assert state.status == _SUB_LISTENING
 
 
+class TestAFireDagWithoutASerializedVersion:
+    """A fire trigger answering ``DagNotFound`` says the DAG processor is warming up.
+
+    The fire consumer starts with the scheduler, minutes before ``serialized_dag`` is
+    filled, and for that stretch the connection, the channel and the registration are
+    all in place: the event waits for the rest of Airflow. Its reported status is what
+    the liveness check reads, so holding it at ``listening`` keeps a consumer that dies
+    inside a long warmup something the check can still notice.
+    """
+
+    @staticmethod
+    def _fire_message():
+        msg = _make_fake_message(b"", message_id="m1")
+        msg.routing_key = "my_dag"
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_the_event_goes_back_and_nothing_is_written(self, manager):
+        msg = self._fire_message()
+        state = _ConsumerState(sub_id=None, executor=manager._executor)
+        state.write = AsyncMock()
+        delays: list = []
+
+        with patch.object(
+            manager,
+            "_trigger_fire_dag",
+            side_effect=_DagNotReady("Dag id my_dag not found"),
+        ), patch(f"{_CONSUMER_MODULE}.log") as log, _record_consumer_sleeps(delays.append):
+            await manager._handle_fire_delivery(
+                msg, state, _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
+            )
+
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+        state.write.assert_not_awaited()
+        assert delays == [_TRIGGER_BACKOFF_START]
+        assert "not serialized yet" in log.info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error, candidate",
+        [
+            (_DagNotReady("Dag id my_dag not found"), True),
+            (RuntimeError("airflow metadata db is down"), False),
+        ],
+        ids=["warming-up", "trigger-failure"],
+    )
+    async def test_the_liveness_check_keeps_asking_about_a_warming_up_consumer(
+        self, manager, error, candidate
+    ):
+        """A status of ``listening`` is what keeps the fire consumer in the check.
+
+        The check asks the broker for the tag of every candidate; a fire consumer it
+        counts out is asked about no more, and one that stopped consuming while the
+        DAG processor was filling ``serialized_dag`` would go unnoticed.
+        """
+        fire = _register_fire(manager)
+        delays: list = []
+
+        with patch.object(manager, "_trigger_fire_dag", side_effect=error), \
+             _record_consumer_sleeps(delays.append):
+            await manager._handle_fire_delivery(
+                self._fire_message(),
+                fire.state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+            )
+
+        assert (manager._fire_candidate() is fire) is candidate
+        assert (fire.state.status == _SUB_ERROR) is not candidate
+
+
 class TestAbandonedTasks:
     """A cancelled task that never finished is kept, not forgotten.
 
