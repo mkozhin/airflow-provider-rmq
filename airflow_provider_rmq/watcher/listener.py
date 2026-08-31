@@ -619,7 +619,9 @@ class RMQWatcherListener:
         self._thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
         self._manager: RMQConsumerManager | None = None
-        # mtime-based incremental scan state (lives in the daemon thread only)
+        # mtime-based incremental scan state, written by whichever cycle-pool worker runs
+        # the "scan" step. One step of a name is in flight at a time (:class:`_StepInFlight`
+        # in _cycle_step), which is what keeps two workers out of these dicts at once.
         self._last_mtimes: dict[str, float] = {}   # filepath → mtime
         self._cached_subs: dict[str, list[dict]] = {}  # filepath → list[sub dict]
         # Both pools are built here, in whatever thread constructs the listener, and
