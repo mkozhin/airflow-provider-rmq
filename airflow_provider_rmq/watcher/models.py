@@ -66,8 +66,9 @@ class RMQConnStatus(WatcherBase):
 
 
 #: Marker for an argument the caller left out, which ``None`` cannot express here:
-#: ``None`` is itself a meaningful value for the nullable columns below.
-_UNSET: Any = object()
+#: ``None`` is itself a meaningful value for the nullable columns below. Callers pass
+#: it to say "keep what the row holds".
+KEEP: Any = object()
 
 
 def _make_session_factory():
@@ -218,14 +219,16 @@ def upsert_conn_status(
     status: str,
     consumer_count: int,
     last_error: str | None = None,
-    broker_consumer_count: int | None = _UNSET,
-    last_reconcile_at: datetime | None = _UNSET,
+    broker_consumer_count: int | None = KEEP,
+    last_reconcile_at: datetime | None = KEEP,
 ) -> RMQConnStatus:
     """Insert or update connection status. Caller must commit.
 
     ``broker_consumer_count`` and ``last_reconcile_at`` distinguish two cases:
     an omitted argument keeps whatever the row holds, while an explicit None
-    records "no data" — the broker could not be asked.
+    records "no data" — the broker could not be asked. ``last_error`` takes the same
+    sentinel, for the caller that keeps a stored status: the text belongs to that
+    status, and clearing it leaves a red row with nothing saying why.
     """
     row = session.query(RMQConnStatus).filter_by(conn_id=conn_id).first()
     if row is None:
@@ -233,10 +236,11 @@ def upsert_conn_status(
         session.add(row)
     row.status = status
     row.consumer_count = consumer_count
-    row.last_error = last_error
-    if broker_consumer_count is not _UNSET:
+    if last_error is not KEEP:
+        row.last_error = last_error
+    if broker_consumer_count is not KEEP:
         row.broker_consumer_count = broker_consumer_count
-    if last_reconcile_at is not _UNSET:
+    if last_reconcile_at is not KEEP:
         row.last_reconcile_at = last_reconcile_at
     return row
 

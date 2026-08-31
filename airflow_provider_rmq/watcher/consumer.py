@@ -43,6 +43,7 @@ from airflow_provider_rmq.utils.management import (
 )
 from airflow_provider_rmq.utils.metrics import incr
 from airflow_provider_rmq.watcher.models import (
+    KEEP,
     WatcherSession,
     get_conn_statuses,
     set_consumer_status,
@@ -476,10 +477,12 @@ def _write_conn_status_rows(rows: list[tuple], now: datetime) -> None:
 
     A row whose ``status`` is ``None`` carries no verdict — the check produced no data —
     and keeps whatever is already stored, so an unreachable Management API does not
-    paint every connection red. A conn_id with nothing stored yet starts at
-    :data:`_CONN_UNKNOWN`: the number of tasks the watcher started says nothing about
-    the broker, so a connection nobody has verified is reported as unverified rather
-    than as healthy.
+    paint every connection red. It keeps the stored ``last_error`` with it: the text
+    explains the status it was written beside, and a row reading ``error`` with nothing
+    in Last Error tells the operator less than the cycle before it did. A conn_id with
+    nothing stored yet starts at :data:`_CONN_UNKNOWN`: the number of tasks the watcher
+    started says nothing about the broker, so a connection nobody has verified is
+    reported as unverified rather than as healthy.
 
     The stored statuses are read only when some row actually needs the fallback, so an
     all-verdict cycle costs one write and no extra full-table scan.
@@ -490,18 +493,20 @@ def _write_conn_status_rows(rows: list[tuple], now: datetime) -> None:
         with WatcherSession() as session:
             stored: dict[str, str] | None = None
             for conn_id, count, status, reason, broker_count in rows:
+                error: Any = reason
                 if status is None:
                     if stored is None:
                         stored = {
                             row.conn_id: row.status for row in get_conn_statuses(session)
                         }
                     status = stored.get(conn_id, _CONN_UNKNOWN)
+                    error = KEEP
                 upsert_conn_status(
                     session,
                     conn_id,
                     status,
                     consumer_count=count,
-                    last_error=reason,
+                    last_error=error,
                     broker_consumer_count=broker_count,
                     last_reconcile_at=now,
                 )
@@ -1143,8 +1148,11 @@ class RMQConsumerManager:
         # user tagged ``management`` is shown only its own channels. The reading travels
         # with the snapshot because a conn_id judged from it registers consumers of its
         # own, and one registered after the snapshot is one the snapshot cannot hold.
+        # A request that did not answer is cached the same way, as a ``None`` snapshot
+        # beside the reason: every conn_id keyed alike would meet the same unanswering
+        # API, and each of those attempts costs the cycle another _MGMT_HTTP_TIMEOUT.
         self._consumer_cache: dict[
-            tuple[str, str, str], tuple[float, dict[str, set[str]]]
+            tuple[str, str, str], tuple[float, dict[str, set[str]] | None, str | None]
         ] = {}
         self._fire_task: asyncio.Task | None = None
         self._fire_state: _FireSub | None = None  # state record of the running fire task
@@ -1806,6 +1814,12 @@ class RMQConsumerManager:
         channel that pair resolves the publish successfully and hands the returned
         message back as its result, so a caller that only watches for exceptions would
         acknowledge the delivery behind an event that reached no queue at all.
+
+        Opening one takes two awaits, during which a cooldown delivery of another
+        subscription on this conn_id can open one too. The one that arrives second is
+        closed rather than pooled: ``Channel.__del__`` writes no ``channel.close`` frame,
+        so a channel dropped on the floor stays open on the broker until the publish
+        connection itself goes.
         """
         state = self._conn(conn_id)
         channel = state.publish_channel
@@ -1816,6 +1830,14 @@ class RMQConsumerManager:
             connection.channel(on_return_raises=True),
             timeout=self._rpc_timeout(conn_id),
         )
+        # Nothing awaits between the two lines below, so the channel this caller pools is
+        # the one every later caller reads.
+        pooled = state.publish_channel
+        if pooled is not None and not pooled.is_closed:
+            await _close_quietly(
+                channel, f"the second publish channel of conn_id={conn_id!r}"
+            )
+            return pooled
         state.publish_channel = channel
         return channel
 
@@ -2468,6 +2490,62 @@ class RMQConsumerManager:
         """
         _status_writer(sub_id).record_if_needed(status, last_error)
 
+    def _condemn_locally_cancelled(
+        self,
+        conn_id: str,
+        asked: list[tuple[dict, _ActiveSub, str | None]],
+        fire: _FireSub | None,
+    ) -> tuple[set[int], bool, int]:
+        """Count the registrations their own channel says the broker has cancelled.
+
+        A probe that brings back no data does not silence the channels the client holds:
+        a consumer the broker cancelled is gone from its own channel's consumer map
+        (:func:`_cancelled_by_broker`), and that is an answer about that registration —
+        one that costs no request and cannot be stale, being read here without awaiting.
+        Only the registrations neither the probe nor their own channel can answer for
+        keep their counters untouched.
+
+        :returns: ``(dead_subs, fire_condemned, gone)`` — the subscriptions whose count
+            reached the restart threshold, whether the fire consumer reached it, and how
+            many registrations were found cancelled.
+        """
+        dead_subs: set[int] = set()
+        gone = 0
+        for sub, entry, _ in asked:
+            if not _cancelled_by_broker(entry.state):
+                continue
+            gone += 1
+            tag = entry.state.consumer_tag
+            entry.state.note_broker_answer(False)
+            if entry.record(False):
+                dead_subs.add(sub["id"])
+            log.warning(
+                "The channel of subscription %d (queue %r, conn_id=%r) no longer holds "
+                "consumer %s — the broker cancelled it; negative check %d of %d",
+                sub["id"], sub["queue_name"], conn_id, tag,
+                entry.negative_checks, _NEGATIVE_CHECKS_BEFORE_RESTART,
+            )
+            self._note_verdict(
+                sub["id"],
+                _SUB_ERROR,
+                (
+                    f"the broker cancelled consumer {tag} of this subscription — "
+                    f"negative check {entry.negative_checks} of "
+                    f"{_NEGATIVE_CHECKS_BEFORE_RESTART}"
+                ),
+            )
+        fire_condemned = False
+        if fire is not None and _cancelled_by_broker(fire.state):
+            gone += 1
+            if fire.record(False):
+                self._fire_needs_restart = fire_condemned = True
+            log.warning(
+                "The channel of the fire consumer on conn_id=%r no longer holds its "
+                "consumer — the broker cancelled it; negative check %d of %d",
+                conn_id, fire.negative_checks, _NEGATIVE_CHECKS_BEFORE_RESTART,
+            )
+        return dead_subs, fire_condemned, gone
+
     async def _judge_candidates(
         self, conn_id: str, subs: list[tuple[dict, _ActiveSub]]
     ) -> tuple[set[int], bool]:
@@ -2522,10 +2600,25 @@ class RMQConsumerManager:
             conn_id, queues, expected
         )
         if live_tags is None:
-            state.liveness = _ConnLiveness(
-                status=None, broker_consumer_count=None, reason=reason
+            # No data from the probe is not "no data" about every registration: the ones
+            # their own channel says the broker cancelled are judged here, and only the
+            # rest keep their counters and leave the row as it stands. The connection is
+            # not dropped — a channel that could be read is a connection that answers,
+            # and a cancelled consumer is put right by attaching again on it.
+            dead_subs, fire_condemned, gone = self._condemn_locally_cancelled(
+                conn_id, asked, fire if fire_here else None
             )
-            return set(), False
+            state.liveness = _ConnLiveness(
+                status=_CONN_ERROR if gone else None,
+                broker_consumer_count=None,
+                reason=(
+                    f"{reason}; the broker has cancelled {gone} consumer(s) of this "
+                    f"connection, which their own channels report without being asked"
+                    if gone
+                    else reason
+                ),
+            )
+            return dead_subs, False
 
         # The answer is judged only where it speaks for the registration held now
         # (:func:`_answer_misses`). Nothing below awaits, so what this comparison finds
@@ -2850,33 +2943,25 @@ class RMQConsumerManager:
                 # is one the reply can be believed about.
                 taken_at = time.monotonic()
                 try:
-                    by_queue = await get_queue_consumers(
+                    snapshot: dict[str, set[str]] | None = await get_queue_consumers(
                         self._http_client,
                         management_url,
                         vhost,
                         (conn_info.login, conn_info.password),
                     )
                 except Exception as exc:
-                    failures = self._conn(conn_id).mgmt_failures + 1
-                    self._conn(conn_id).mgmt_failures = failures
-                    if failures < _PROBE_FAILURES_BEFORE_FALLBACK:
-                        log.warning(
-                            "Management API did not answer the consumer list for "
-                            "conn_id=%r: %s — liveness unknown this cycle, counters "
-                            "unchanged",
-                            conn_id, exc,
-                        )
-                        return None, None, str(exc), time.monotonic()
-                    log.warning(
-                        "Management API has failed %d times in a row for conn_id=%r "
-                        "(%s) — falling back to the AMQP probe so the watchdog keeps "
-                        "running while the API stays unusable",
-                        failures, conn_id, exc,
+                    self._consumer_cache[cache_key] = (taken_at, None, str(exc))
+                    return await self._judge_mgmt_failure(
+                        conn_id, queues, expected, str(exc)
                     )
-                    return await self._probe_by_passive_declare(conn_id, queues, expected)
-                self._consumer_cache[cache_key] = (taken_at, by_queue)
+                self._consumer_cache[cache_key] = (taken_at, snapshot, None)
             else:
-                taken_at, by_queue = cached
+                taken_at, snapshot, failure = cached
+                if snapshot is None:
+                    return await self._judge_mgmt_failure(
+                        conn_id, queues, expected, failure or "no answer"
+                    )
+            by_queue = snapshot
             self._conn(conn_id).mgmt_failures = 0
             live_tags: set[str] = set()
             broker_count = 0
@@ -2886,6 +2971,32 @@ class RMQConsumerManager:
                 broker_count += len(queue_tags)
             return live_tags, broker_count, None, taken_at
 
+        return await self._probe_by_passive_declare(conn_id, queues, expected)
+
+    async def _judge_mgmt_failure(
+        self, conn_id: str, queues: set[str], expected: dict[str, Any], reason: str
+    ) -> tuple[set[str] | None, int | None, str | None, float]:
+        """Answer for one conn_id whose Management API request did not come back.
+
+        The count is this conn_id's own, whether the request was made for it or for
+        another conn_id keyed the same way: it is what decides when this conn_id stops
+        waiting for the API and asks its own connection instead.
+        """
+        failures = self._conn(conn_id).mgmt_failures + 1
+        self._conn(conn_id).mgmt_failures = failures
+        if failures < _PROBE_FAILURES_BEFORE_FALLBACK:
+            log.warning(
+                "Management API did not answer the consumer list for conn_id=%r: %s — "
+                "liveness unknown this cycle, counters unchanged",
+                conn_id, reason,
+            )
+            return None, None, reason, time.monotonic()
+        log.warning(
+            "Management API has failed %d times in a row for conn_id=%r (%s) — falling "
+            "back to the AMQP probe so the watchdog keeps running while the API stays "
+            "unusable",
+            failures, conn_id, reason,
+        )
         return await self._probe_by_passive_declare(conn_id, queues, expected)
 
     async def _probe_by_passive_declare(
@@ -2946,6 +3057,13 @@ class RMQConsumerManager:
         a connection the broker has long forgotten while the client socket stays open —
         answers it with silence, which the per-call timeout turns into a failure. With
         no queue to name the probe cannot be asked and the connection is left alone.
+
+        A broker that closes the channel has answered: only a live connection carries a
+        ``channel.close`` frame back, and what it says — the named queue is gone (404),
+        or is declared differently (406) — is about that queue and not about the
+        connection. The verdict of this probe covers every consumer of the conn_id, so
+        reading a deleted queue as a dead connection would condemn the healthy
+        subscriptions beside it.
         """
         if not queues:
             return True, None
@@ -2962,6 +3080,13 @@ class RMQConsumerManager:
             )
         except asyncio.CancelledError:
             raise
+        except aio_pika.exceptions.ChannelClosed as exc:
+            log.info(
+                "The passive declare of %r on conn_id=%r was refused by the broker "
+                "(%s) — the connection answered, so it is left in place",
+                queue_name, conn_id, exc,
+            )
+            return True, None
         except Exception as exc:
             reason = f"passive declare of {queue_name!r} failed: {exc}"
             log.warning(

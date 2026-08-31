@@ -43,6 +43,7 @@ from airflow_provider_rmq.watcher.consumer import (
     _answer_misses,
     _attach_nonce,
     _attached,
+    KEEP,
     _cancelled_by_broker,
     _conn_status_lock,
     _consumer_tag,
@@ -1223,6 +1224,75 @@ class TestDeliveryFaultsKeepTheSubscription:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
         return writes
+
+    @pytest.mark.asyncio
+    async def test_a_fault_of_one_task_does_not_disarm_the_cancellation_of_another(self):
+        """The exception object two tasks of one connection are handed is the same one.
+
+        ``aiormq``'s ``FutureStore.reject_all`` gives every pending RPC of a torn-down
+        connection one instance, so whatever a task records on that object is read by
+        every other task of that connection. Here A's placeholder publish fails with it
+        while A is handling a delivery, and B is being cancelled at that moment with the
+        broker rejecting its ``basic.cancel``, which lets the same object out of B's
+        iterator. B must end cancelled: a B that reads it as a delivery fault of its own
+        attaches again and consumes with nothing holding it, writing status into the row
+        its replacement owns.
+        """
+        shared = aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+        manager = _make_manager()
+        queue_a = _make_push_queue([_make_fake_message(b"order")])
+        queue_b = _queue_failing_cancel(shared)
+        queues = {"orders": queue_a, "events": queue_b}
+        channel = _make_live_channel()
+        channel.declare_queue = AsyncMock(side_effect=lambda name, **kwargs: queues[name])
+        connection = _make_live_connection(channel=channel)
+
+        async def publish_channel_of_a_torn_down_connection(conn_id):
+            try:
+                raise asyncio.CancelledError()  # the RPC task the teardown stopped
+            except asyncio.CancelledError as rpc_stopped:
+                raise shared from rpc_stopped
+
+        writes: list[tuple] = []
+
+        async def record_write(self, status, last_error=None):
+            writes.append((status, last_error))
+
+        with _record_consumer_sleeps(lambda delay: None), \
+             patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch.object(manager, "_get_publish_channel",
+                          side_effect=publish_channel_of_a_torn_down_connection), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write",
+                   new=record_write):
+            a = asyncio.create_task(
+                manager._consume_subscription(
+                    _sub(id=1, queue_name="orders", cooldown=300)
+                )
+            )
+            b = asyncio.create_task(
+                manager._consume_subscription(_sub(id=2, queue_name="events"))
+            )
+            try:
+                # A meets the fault and answers it as one: it reports and attaches again
+                await _wait_for(lambda: queue_a.iterator.call_count >= 2)
+                await _wait_for(lambda: queue_b.iterator.return_value.consumed)
+                b.cancel()
+                # The loop ends quietly on its own cancellation, so what says B took it
+                # as one is that it stopped — a B that read the object as a fault of its
+                # own goes on running, and no exception says so anywhere
+                done, _ = await asyncio.wait({b}, timeout=2.0)
+                assert done, "B kept running after its own cancellation"
+            finally:
+                a.cancel()
+                b.cancel()
+                await asyncio.wait({a, b}, timeout=2.0)
+
+        assert _SUB_ERROR in [status for status, _ in writes], (
+            "A read the object as the fault of the delivery it was handling"
+        )
+        assert queue_b.iterator.call_count == 1, (
+            "B was cancelled, so it must not attach again"
+        )
 
     @pytest.mark.asyncio
     async def test_a_publish_that_outran_its_bound_reports_error_and_retries(self):
@@ -4237,6 +4307,38 @@ class TestPublishConnection:
         msg.ack.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test_two_deliveries_opening_a_publish_channel_at_once_keep_one(self):
+        """Opening one takes two awaits, so a cooldown delivery of another subscription
+        on this conn_id can open one in between. ``Channel.__del__`` writes no
+        ``channel.close`` frame, so the one that is not pooled stays open on the broker
+        until the publish connection itself goes."""
+        manager = _make_manager()
+        opened: list = []
+        opening = asyncio.Event()
+
+        async def channel(**kwargs):
+            opening.set()
+            # Both callers are past the cache read before either has a channel
+            await asyncio.sleep(0)
+            new = _make_live_channel()
+            opened.append(new)
+            return new
+
+        connection = _make_live_connection()
+        connection.channel = channel
+        with patch.object(manager, "_get_or_create_connection", return_value=connection):
+            first, second = await asyncio.gather(
+                manager._get_publish_channel("rmq_default"),
+                manager._get_publish_channel("rmq_default"),
+            )
+
+        assert len(opened) == 2, "both callers found the cache empty"
+        assert first is second, "the pooled channel is the one every later caller reads"
+        loser = next(c for c in opened if c is not first)
+        loser.close.assert_awaited()
+        assert manager._conn("rmq_default").publish_channel is first
+
+    @pytest.mark.asyncio
     async def test_publish_failure_requeues_the_delivery(self):
         publish_channel = _make_live_channel()
         publish_channel.default_exchange.publish = AsyncMock(
@@ -5010,6 +5112,33 @@ class TestSubscriptionLiveness:
         assert manager._conn("conn_b").liveness.status == "connected"
 
     @pytest.mark.asyncio
+    async def test_an_api_that_does_not_answer_is_asked_once_per_cycle(self, manager):
+        """A request that failed is an answer about the API, and every conn_id keyed
+        the same way would meet the same one. Asking again per conn_id spends another
+        _MGMT_HTTP_TIMEOUT of the cycle on a call already known not to come back."""
+        a = _sub(id=7, queue_name="orders", conn_id="conn_a")
+        b = _sub(id=8, queue_name="events", conn_id="conn_b")
+        _register_active(manager, a)
+        _register_active(manager, b)
+        requested: list[str] = []
+        manager._http_client = _mgmt_client(
+            {"error": "unauthorized"}, requested=requested, status_code=401
+        )
+
+        with _patch_mgmt_connection_per_login({"conn_a": "shared", "conn_b": "shared"}):
+            result = await manager._check_liveness([a, b])
+
+        assert result == (set(), set())
+        assert len(requested) == 1, requested
+        assert manager._conn("conn_a").liveness.status is None
+        assert manager._conn("conn_b").liveness.status is None
+        assert manager._conn("conn_a").mgmt_failures == 1, (
+            "the count is each conn_id's own — it decides when this conn_id stops "
+            "waiting for the API and asks its own connection instead"
+        )
+        assert manager._conn("conn_b").mgmt_failures == 1
+
+    @pytest.mark.asyncio
     async def test_two_logins_on_one_vhost_each_get_their_own_answer(self, manager):
         """``GET /api/consumers/{vhost}`` is answered according to the rights of the
         account that asked: a user tagged ``management`` is shown only its own channels.
@@ -5430,6 +5559,33 @@ class TestLivenessAmqpProbe:
         result = await manager._check_liveness([sub])
 
         assert result == ({7}, {"rmq_default"})
+
+    @pytest.mark.asyncio
+    async def test_a_refused_passive_declare_leaves_the_connection_alone(self, manager):
+        """A broker that closes the channel has answered — only a live connection
+        carries a close frame back — and what it says is about the queue it names. The
+        verdict covers every consumer of the conn_id, so reading a deleted queue as a
+        dead connection condemns the healthy subscriptions beside it."""
+        gone = _sub(id=7, queue_name="deleted")
+        alive = _sub(id=8, queue_name="orders")
+        entry_gone = _register_active(manager, gone)
+        entry_alive = _register_active(manager, alive)
+        manager._http_client = None
+        _fast_timeouts(manager)
+        channel = _make_live_channel()
+        channel.declare_queue = AsyncMock(
+            side_effect=aio_pika.exceptions.ChannelNotFoundEntity("404 NOT_FOUND")
+        )
+        _pool_consume_connection(
+            manager, _make_live_connection(channel=channel), entry_gone.state,
+            entry_alive.state,
+        )
+
+        result = await manager._check_liveness([gone, alive])
+
+        assert result == (set(), set())
+        assert entry_alive.negative_checks == 0
+        assert manager._conn("rmq_default").liveness.status == "connected"
 
     @pytest.mark.asyncio
     async def test_successful_passive_declare_keeps_the_subscription(self, manager):
@@ -5971,6 +6127,48 @@ class TestServerSideCancel:
         assert manager._conn("rmq_default").liveness.status == "error"
         assert second == ({7}, {"rmq_default"})
         assert channel.declare_queue.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_consumer_is_condemned_while_the_api_says_nothing(
+        self, manager
+    ):
+        """A probe that brings no data does not silence the channel the client holds.
+        The tag is gone from that channel's own consumer map, which is an answer about
+        this registration and needs no request — reading it as 'no data' leaves a green
+        row over a consumer the broker has already dropped."""
+        sub, entry, channel = self._cancelled_sub(
+            manager,
+            http_client=_mgmt_client({"error": "unauthorized"}, status_code=401),
+        )
+        await _server_cancels(channel, entry.state.consumer_tag)
+
+        with _patch_mgmt_connection():
+            result = await manager._check_liveness([sub])
+
+        assert result == (set(), set()), "one negative check restarts nothing"
+        assert entry.negative_checks == 1
+        verdict = manager._conn("rmq_default").liveness
+        assert verdict.status == "error"
+        assert "cancelled" in verdict.reason
+
+    @pytest.mark.asyncio
+    async def test_a_registered_consumer_keeps_its_counters_while_the_api_says_nothing(
+        self, manager
+    ):
+        """The channel answers only for the registrations it has lost. One it still
+        carries is a registration nothing could ask about this cycle, and its counters
+        must stay where they were."""
+        sub, entry, _channel = self._cancelled_sub(
+            manager,
+            http_client=_mgmt_client({"error": "unauthorized"}, status_code=401),
+        )
+
+        with _patch_mgmt_connection():
+            result = await manager._check_liveness([sub])
+
+        assert result == (set(), set())
+        assert entry.negative_checks == 0
+        assert manager._conn("rmq_default").liveness.status is None
 
     @pytest.mark.asyncio
     async def test_a_registered_consumer_is_still_vouched_for(self, manager):
@@ -7099,6 +7297,37 @@ class TestConnStatusRows:
         assert upsert.call_args.args[2] == "connected"
         assert upsert.call_args.kwargs["broker_consumer_count"] is None
         assert upsert.call_args.kwargs["last_reconcile_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_no_data_keeps_the_text_that_explains_the_stored_status(self, manager):
+        """The row keeps a status the cycle could not verify, so it must keep the
+        reason with it: an 'error' row whose Last Error is blank tells the operator
+        less than the cycle before it did, and the two are written together."""
+        sub = _sub(id=7)
+        _register_active(manager, sub)
+        manager._conn("rmq_default").liveness = _ConnLiveness(
+            status=None, broker_consumer_count=None, reason=None,
+        )
+
+        upsert = await _write_statuses(manager, [sub], stored={"rmq_default": "error"})
+
+        assert upsert.call_args.args[2] == "error"
+        assert upsert.call_args.kwargs["last_error"] is KEEP
+
+    @pytest.mark.asyncio
+    async def test_a_positive_verdict_clears_the_text_of_the_one_before_it(self, manager):
+        """``connected`` carries no reason, and leaving the previous one in place would
+        keep an old failure on a green row for the life of the process."""
+        sub = _sub(id=7)
+        _register_active(manager, sub)
+        manager._conn("rmq_default").liveness = _ConnLiveness(
+            status="connected", broker_consumer_count=1,
+        )
+
+        upsert = await _write_statuses(manager, [sub], stored={"rmq_default": "error"})
+
+        assert upsert.call_args.args[2] == "connected"
+        assert upsert.call_args.kwargs["last_error"] is None
 
     @pytest.mark.asyncio
     async def test_conn_id_without_a_single_live_task_is_still_written(self, manager):
