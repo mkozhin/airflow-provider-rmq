@@ -21,6 +21,11 @@ DEFAULT_RECONCILE_INTERVAL = 60
 #: Airflow Variables holding the watcher tunables.
 RECONCILE_INTERVAL_VAR = "rmq_watcher_reconcile_interval"
 CYCLE_TIMEOUT_VAR = "rmq_watcher_cycle_timeout"
+GRANT_OP_ACCESS_VAR = "rmq_watcher_grant_op_access"
+
+#: Spellings :func:`read_flag` accepts, compared case-insensitively.
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
 
 #: A cycle may take this many reconcile intervals, but never less than
 #: ``MIN_CYCLE_TIMEOUT`` seconds. The budget is generous on purpose: hitting it
@@ -91,3 +96,45 @@ def read_positive(name: str, cast: Callable[[str], Any]) -> Any:
         log.warning("RMQ Watcher: Variable %s=%r must be positive — ignoring", name, raw)
         return None
     return value
+
+
+def read_flag(name: str, default: bool) -> bool:
+    """Read Airflow Variable ``name`` as a boolean.
+
+    ``1``, ``true``, ``yes`` and ``on`` read as true; ``0``, ``false``, ``no`` and
+    ``off`` read as false. Case and surrounding whitespace do not matter.
+
+    :param default: What an unset Variable, an unreadable one and a value spelled in
+        none of the words above all read as. Every case but the unset one is logged.
+
+    The caller is a webserver startup callback, so a metadata database that cannot
+    answer must not raise through it: the failure is a warning and the default.
+
+    Blocking — it queries the metadata database.
+    """
+    try:
+        from airflow.models import Variable
+
+        raw = Variable.get(name, default_var=None)
+    except Exception:
+        log.warning(
+            "RMQ Watcher: Variable %s could not be read — reading it as %s",
+            name,
+            default,
+            exc_info=True,
+        )
+        return default
+    if raw is None:
+        return default
+    word = str(raw).strip().lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    log.warning(
+        "RMQ Watcher: Variable %s=%r is not a yes-or-no value — reading it as %s",
+        name,
+        raw,
+        default,
+    )
+    return default
