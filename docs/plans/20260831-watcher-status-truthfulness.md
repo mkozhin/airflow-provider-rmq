@@ -495,28 +495,33 @@ def read_flag(name: str, default: bool) -> bool:
 **Files:**
 - Modify: `tests/watcher/test_consumer.py`
 
-- [ ] написать `test_a_fault_of_one_task_does_not_disarm_the_cancellation_of_the_fire_consumer`
+- [x] написать `test_a_fault_of_one_task_does_not_disarm_the_cancellation_of_the_fire_consumer`
       по образцу `test_consumer.py:1242`: подписочная таска A и fire-таска B на
       одном соединении, `shared = aio_pika.exceptions.AMQPConnectionError(...)`,
       fire-очередь через `_queue_failing_cancel(shared)`
-- [ ] запускать B как `manager._consume_fire_queue(connection, conn_id)`
-- [ ] дождаться, что A прочла общий объект как собственный сбой доставки и
+- ⚠️ fire-очередь собрана в теле теста: первый итератор —
+      `_QueueIterFailingCancel(shared)`, второй — обычный `_QueueIterCtx([])`.
+      С одним лишь отвергающим итератором при возвращённом дефекте fire-таска
+      глотает и отмену из `finally`, живёт дальше и подвешивает завершение
+      прогона; со вторым итератором тест падает за секунды
+- [x] запускать B как `manager._consume_fire_queue(connection, conn_id)`
+- [x] дождаться, что A прочла общий объект как собственный сбой доставки и
       прицепилась заново, затем `b.cancel()` и
       `done, _ = await asyncio.wait({b}, timeout=2.0)`, `assert done`
-- [ ] проверить, что fire-очередь не открывала итератор второй раз
-- [ ] ограничить по времени каждое ожидание и отменить обе таски в `finally`
-- [ ] docstring теста объясняет только собственный механизм: без сравнений с
+- [x] проверить, что fire-очередь не открывала итератор второй раз
+- [x] ограничить по времени каждое ожидание и отменить обе таски в `finally`
+- [x] docstring теста объясняет только собственный механизм: без сравнений с
       подписочным тестом и без «в отличие от»
-- [ ] тест сторожит фрейм-локальность `delivery_fault`: сбой доставки
+- [x] тест сторожит фрейм-локальность `delivery_fault`: сбой доставки
       принадлежит подписочной таске A, и fire-таска B не должна прочесть его с
       общего объекта исключения как свой
-- [ ] проверка снятием: заменить условие на `consumer.py:3475` на безусловный
+- [x] проверка снятием: заменить условие на `consumer.py:3475` на безусловный
       `raise`. Покраснеет и существующий
       `test_a_failed_consumer_cancel_still_ends_the_fire_task`
       (`test_consumer.py:2741`) — он проверяет ту же границу, поэтому снятие
       говорит о ней, а не о новом сценарии. Снятие одного лишь `delivery_fault
       or` новый тест не покрасит: у его fire-таски этой половины условия нет
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 2: `DagNotFound` в обработчике immediate-доставки
 

@@ -2764,6 +2764,84 @@ class TestConsumeFireQueue:
         assert outcome[0] is None
         assert task.done()
         assert queue.iterator.call_count == 1
+    @pytest.mark.asyncio
+    async def test_a_fault_of_one_task_does_not_disarm_the_cancellation_of_the_fire_consumer(self):
+        """The exception object every task of one connection is handed is a single one.
+
+        ``aiormq``'s ``FutureStore.reject_all`` gives every pending RPC of a torn-down
+        connection one instance, so whatever a task records on that object is read by
+        every other task of that connection. Here a subscription's placeholder publish
+        fails with it while that subscription is handling a delivery, and the fire
+        consumer is cancelled at that moment with the broker rejecting its
+        ``basic.cancel``, which lets the very same object out of its iterator. The fire
+        consumer must end cancelled: whether the delivery it was handling failed is a
+        fact of its own frame, not of the object it is holding. Reading a neighbour's
+        fault as its own, it would attach to ``rmq_watcher.fire`` again with nothing
+        holding it, and an expired cooldown window would reach whichever of the two
+        consumers got there first.
+        """
+        shared = aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
+        manager = _make_manager()
+        sub_queue = _make_push_queue([_make_fake_message(b"order")])
+        # The broker rejects the cancellation of the first attach and takes the one of
+        # any attach after it, so a fire consumer that went around the loop again ends
+        # on the cancellation this test finishes with instead of running on.
+        cancel_rejected = _QueueIterFailingCancel(shared)
+        fire_queue = MagicMock()
+        fire_queue.iterator = MagicMock(side_effect=[cancel_rejected, _QueueIterCtx([])])
+        queues = {"orders": sub_queue, _FIRE_QUEUE: fire_queue}
+        channel = _make_live_channel()
+        channel.declare_queue = AsyncMock(side_effect=lambda name, **kwargs: queues[name])
+        connection = _make_live_connection(channel=channel)
+
+        async def publish_channel_of_a_torn_down_connection(conn_id):
+            try:
+                raise asyncio.CancelledError()  # the RPC task the teardown stopped
+            except asyncio.CancelledError as rpc_stopped:
+                raise shared from rpc_stopped
+
+        writes: list[tuple] = []
+
+        async def record_write(self, status, last_error=None):
+            writes.append((status, last_error))
+
+        with _record_consumer_sleeps(lambda delay: None), \
+             patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch.object(manager, "_get_publish_channel",
+                          side_effect=publish_channel_of_a_torn_down_connection), \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write",
+                   new=record_write):
+            subscription = asyncio.create_task(
+                manager._consume_subscription(
+                    _sub(id=1, queue_name="orders", cooldown=300)
+                )
+            )
+            fire = asyncio.create_task(
+                manager._consume_fire_queue(connection, "rmq_default")
+            )
+            try:
+                # The subscription meets the fault and answers it as one: it reports
+                # and attaches again, leaving its own reading on the shared object
+                await _wait_for(lambda: sub_queue.iterator.call_count >= 2)
+                assert _SUB_ERROR in [status for status, _ in writes], (
+                    "the subscription read the object as the fault of the delivery it "
+                    "was handling"
+                )
+                await _wait_for(lambda: cancel_rejected.consumed)
+                fire.cancel()
+                # The loop ends quietly on its own cancellation, so what says the fire
+                # consumer took it as one is that it stopped — a consumer that read the
+                # object as a fault of its own goes on running, and no exception says so
+                done, _ = await asyncio.wait({fire}, timeout=2.0)
+                assert done, "the fire consumer kept running after its own cancellation"
+            finally:
+                subscription.cancel()
+                fire.cancel()
+                await asyncio.wait({subscription, fire}, timeout=2.0)
+
+        assert fire_queue.iterator.call_count == 1, (
+            "the fire consumer was cancelled, so it must not attach again"
+        )
 
     @pytest.mark.asyncio
     async def test_reconcile_warns_when_fire_connection_unavailable_after_provisioning(self):
