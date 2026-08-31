@@ -15,7 +15,8 @@ from typing import Any
 
 from airflow.listeners import hookimpl
 
-from airflow_provider_rmq.utils.amqp import call_with_timeout, next_backoff
+from airflow_provider_rmq.utils.amqp import call_with_timeout
+from airflow_provider_rmq.utils.backoff import next_backoff
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.utils.metrics import incr
 from airflow_provider_rmq.watcher.consumer import RMQConsumerManager

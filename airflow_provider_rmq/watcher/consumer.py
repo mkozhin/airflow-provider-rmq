@@ -32,8 +32,8 @@ from airflow_provider_rmq.utils.amqp import (
     get_amqp_timeouts,
     match,
     nack_and_sleep,
-    next_backoff,
 )
+from airflow_provider_rmq.utils.backoff import next_backoff
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.utils.filters import MessageFilter
 from airflow_provider_rmq.utils.management import (
@@ -161,7 +161,11 @@ _OUTCOME_DUPLICATE = "duplicate"
 #: ``DagRun.run_id`` is a ``String(250)`` validated against this alphabet.
 _RUN_ID_MAX_LEN = 250
 _RUN_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.~:+-]")
-_RUN_ID_HASH_LEN = 8
+#: Hex characters of the digest a shortened run id carries. Long enough that the digest
+#: alone keeps two run ids apart: a queue name of some 234 characters — the column holds
+#: 250 — leaves nothing of the message id in the prefix, and every distinction there is
+#: then the digest's to make.
+_RUN_ID_HASH_LEN = 32
 
 #: Backoff for a delivery whose trigger failed: doubling from the first second up to a
 #: minute, reset by the next success. The 0.1 s of ``nack_and_sleep`` guards against a
@@ -713,6 +717,48 @@ def _answer_misses(state: _ConsumerState, tag: str | None, taken_at: float) -> s
     if state.tag_registered_at > taken_at:
         return f"consumer {tag} was registered after the answer was taken"
     return None
+
+
+def _answering(
+    asked: list[tuple[dict, _ActiveSub]],
+    fire: _FireSub | None,
+    fire_tag: str | None,
+    taken_at: float,
+) -> tuple[list[tuple[dict, _ActiveSub]], bool]:
+    """Sort the registrations put to the broker by whether the answer speaks for them.
+
+    :param asked: Per subscription, its entry and the tag it carried when the question
+        was asked.
+    :param fire: The fire consumer, when it was part of the question.
+    :param taken_at: Monotonic reading the answer speaks for.
+    :returns: ``(the subscriptions the answer is about, whether it is about the fire
+        consumer)``.
+
+    The rule is :func:`_answer_misses`, applied to each registration in turn and logged
+    where it holds. Nothing here awaits, so the sorting this returns is the state the
+    verdicts are drawn from.
+    """
+    answering: list[tuple[dict, _ActiveSub]] = []
+    for sub, entry, tag in asked:
+        missed = _answer_misses(entry.state, tag, taken_at)
+        if missed is None:
+            answering.append((sub, entry))
+            continue
+        log.info(
+            "The liveness answer is not applied to subscription %d: %s — the "
+            "registration it holds now is checked next cycle",
+            sub["id"], missed,
+        )
+    if fire is None:
+        return answering, False
+    missed = _answer_misses(fire.state, fire_tag, taken_at)
+    if missed is not None:
+        log.info(
+            "The liveness answer is not applied to the fire consumer: %s — the "
+            "registration it holds now is checked next cycle",
+            missed,
+        )
+    return answering, missed is None
 
 
 def _usable(connection: Any) -> bool:
@@ -2620,32 +2666,12 @@ class RMQConsumerManager:
             )
             return dead_subs, False
 
-        # The answer is judged only where it speaks for the registration held now
-        # (:func:`_answer_misses`). Nothing below awaits, so what this comparison finds
-        # is what the rest of the check judges.
-        answering: list[tuple[dict, _ActiveSub]] = []
-        for sub, entry, tag in asked:
-            missed = _answer_misses(entry.state, tag, taken_at)
-            if missed is None:
-                answering.append((sub, entry))
-                continue
-            log.info(
-                "The liveness answer is not applied to subscription %d: %s — the "
-                "registration it holds now is checked next cycle",
-                sub["id"], missed,
-            )
-        fire_answering = False
-        if fire_here and fire is not None:
-            missed = _answer_misses(fire.state, fire_tag, taken_at)
-            fire_answering = missed is None
-            if missed is not None:
-                log.info(
-                    "The liveness answer is not applied to the fire consumer: %s — the "
-                    "registration it holds now is checked next cycle",
-                    missed,
-                )
-        if expected and not answering and not fire_answering:
-            # The answer speaks for none of the registrations this conn_id holds, so the
+        answering, fire_answering = _answering(
+            asked, fire if fire_here else None, fire_tag, taken_at
+        )
+        if not answering and not fire_answering:
+            # Every registration this conn_id holds was put to the broker (an empty
+            # ``expected`` returns above), and the answer speaks for none of them, so the
             # check produced no data about them: the counters stay untouched and the row
             # keeps what it has rather than claiming a confirmation.
             state.liveness = _ConnLiveness(

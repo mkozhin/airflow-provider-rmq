@@ -273,14 +273,6 @@ def match(message: Any, msg_filter: MessageFilter) -> bool:
 
 
 
-def next_backoff(current: float, maximum: float, minimum: float = 0.0) -> float:
-    """The pause that follows ``current``: twice as long, and never past ``maximum``.
-
-    :param minimum: Floor for the result, for a backoff that starts counting from zero.
-    """
-    return min(max(current * 2, minimum), maximum)
-
-
 async def nack_and_sleep(message: Any) -> None:
     """NACK a message with requeue=True and sleep 0.1 s to prevent a hot redelivery loop.
 

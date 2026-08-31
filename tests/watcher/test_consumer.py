@@ -540,6 +540,19 @@ class TestBuildRunId:
         assert _RUN_ID_UNSAFE.search(first) is None
         assert first != second
 
+    def test_the_digest_of_a_shortened_run_id_is_wide_enough(self):
+        """A queue name long enough to fill the prefix leaves nothing of the message id
+        in it, so the digest is the only thing telling two deliveries apart. Eight hex
+        characters are 32 bits, whose birthday threshold is about 77 000 runs — and two
+        deliveries sharing a run id collapse into one DAG run that is acknowledged as a
+        duplicate, which loses the second event without a word."""
+        run_id = _build_run_id("q" * 300, "x" * 200)
+
+        assert len(run_id) == _RUN_ID_MAX_LEN
+        digest = run_id.rsplit("_", 1)[1]
+        assert len(digest) >= 32, "the digest carries at least 128 bits"
+        int(digest, 16)  # it is a digest, not the tail of the queue name
+
     def test_cooldown_run_id_of_a_long_dag_id_fits_the_column(self):
         dag_id = "very_long_dag_" + "n" * 240
         run_id = _safe_run_id(f"rmq_cooldown__{dag_id}__{uuid4()}")
