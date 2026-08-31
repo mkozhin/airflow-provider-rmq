@@ -98,6 +98,28 @@ The hook also provides custom form widgets for SSL fields (`ssl_enabled`, `ca_ce
 
 Set `"cert_reqs": "CERT_NONE"` to disable certificate verification (not recommended for production).
 
+### Connection Timing
+
+Three optional **Extra** keys control AMQP timing. All of them are plain JSON values next to the SSL settings:
+
+```json
+{
+  "heartbeat": 30,
+  "connect_timeout": 15,
+  "rpc_timeout": 30
+}
+```
+
+| Key | Default | Used by | Meaning |
+|---|---|---|---|
+| `heartbeat` | `30` on the async path, `600` in `RMQHook` | every AMQP connection | Seconds between AMQP heartbeat frames. `aiormq` allows three missed intervals and checks every half-interval, so a broken connection becomes an exception in roughly `3 × heartbeat` seconds — about 90 s at the default — and `connect_robust` reconnects |
+| `connect_timeout` | `15` | RMQ Watcher | Seconds allowed for establishing an async connection |
+| `rpc_timeout` | `30` | RMQ Watcher | Seconds allowed for a single async AMQP call — `channel()`, declare, bind, publish |
+
+`heartbeat` is the same key the synchronous hook reads; the two paths differ only in default, because `RMQHook` lives in short sessions inside a task while the watcher holds a connection for days. Setting `"heartbeat": 0` is accepted as a deliberate opt-out and logged as a WARNING: with heartbeats off, a link that dies silently (a broker restart behind a proxy that keeps the client half open) stays undetected.
+
+`connect_timeout` and `rpc_timeout` have no counterpart in `RMQHook` — pika is driven by its own retry logic there. A value that is not a positive number falls back to the default with a WARNING.
+
 ---
 
 ## Components
@@ -532,7 +554,7 @@ The **RMQ Watcher Plugin** inverts the usual sensor pattern: instead of a DAG wa
 
 ### How it works
 
-The Scheduler process runs a background asyncio loop (via Airflow Listener API) that subscribes to queues via AMQP `basic_consume`. When a matching message arrives, `trigger_dag()` is called directly inside the process. One `connect_robust` connection per `conn_id` is shared across all subscriptions to that cluster.
+The Scheduler process runs a background asyncio loop (via Airflow Listener API) that subscribes to queues via AMQP `basic_consume`. When a matching message arrives, `trigger_dag()` is called directly inside the process. One `RobustConnection` per `conn_id` is shared across all subscriptions to that cluster, with cooldown publishing on a second connection of its own (see [Connection Resilience](#connection-resilience)).
 
 Every 60 seconds (configurable via Airflow Variable `rmq_watcher_reconcile_interval`) a reconciliation loop re-scans DAG files for `@rmq_trigger` decorators (mtime-based — only changed files are re-parsed) and syncs subscriptions to the database.
 
@@ -654,7 +676,7 @@ Both forms can be combined on the same call — the final routing key set is the
 - Bindings between that queue and the exchange, kept in sync with the routing keys currently declared in the decorator (diffed against RabbitMQ's actual binding state via the Management HTTP API — not against anything stored in the Airflow DB)
 - Safety nets: unroutable messages land in `{exchange}.unrouted` (TTL 8h); every routed message is mirrored into `{exchange}.log` (catch-all `#` binding, TTL 8h) for downstream logging/auditing
 
-**Connection extra — `management_url`:** exchange-mode requires a Management HTTP API endpoint to read current bindings (AMQP 0-9-1 has no "show my bindings" operation). Add it to the same Airflow Connection used for AMQP:
+**Connection extra — `management_url`:** the broker's Management HTTP API endpoint. Exchange-mode needs it to read current bindings (AMQP 0-9-1 has no "show my bindings" operation), and the liveness watchdog uses it for subscriptions of every type. Add it to the same Airflow Connection used for AMQP:
 
 ```json
 {
@@ -662,7 +684,17 @@ Both forms can be combined on the same call — the final routing key set is the
 }
 ```
 
+The account needs the `management` tag on top of its AMQP permissions — the Management API answers a tagless user with 401/403 whatever its `set_permissions` say:
+
+```
+rabbitmqctl set_user_tags <user> management
+```
+
+What the Management API replies is shaped by the rights of the account that asked: a user tagged `management` is shown only the channels of its own connections, while `monitoring` and `administrator` see the whole vhost. On the minimum-privilege account above, the watcher therefore sees its own consumers and no one else's.
+
 The same `login`/`password` from the connection are reused for the Management API call. If `management_url` is not set, bind-diff is skipped on every cycle (logged as ERROR) — the queue is still declared and consumed normally, but bindings never get created/updated.
+
+`management_url` also selects the liveness probe for **every** subscription, `queue=` and `exchange=` alike. With it, the check reads `GET /api/consumers/{vhost}`, can name individual consumer tags and reports the Broker consumers number. Without it, the check falls back to a passive queue declare: that vouches for — or condemns — all consumers of the `conn_id` at once and returns no count, so the Broker consumers column stays `—` even when the verdict is positive. After two consecutive Management API failures on one `conn_id` (wrong URL, credentials without the `management` tag, 404, timeout) the check switches to that same passive declare rather than staying blind. The same two-cycle bound covers a `conn_id` whose Airflow connection cannot be read at all — renamed, deleted while subscriptions still name it, or a secrets backend that keeps refusing: the check then asks the pooled connection itself, which needs no metadata row.
 
 **No stacking — one DAG, one exchange.** Multiple `@rmq_trigger(exchange=...)` decorators on the same DAG raise `ValueError` — they would all resolve to the same `rmq_watcher.sub.{dag_id}` queue, and the last one parsed would silently win. The error fires as soon as the DAG object actually exists: immediately at decoration time for a direct `DAG` instance, or when the `@dag(...)` factory is called (e.g. `jetstat_succeeded_dag()` at the end of the file, as in the example above) for TaskFlow style — either way, always during import, before the DAG is registered. Use a single decorator call with the union of routing keys, or subscribe to multiple exchanges across multiple DAGs. To consume from several exchanges on the same DAG, fall back to `queue=`/`queues=` with manually created and bound queues.
 
@@ -708,6 +740,7 @@ conf = context["dag_run"].conf
 # Cooldown trigger (fired after TTL expires in rmq_watcher.fire):
 # {
 #     "source":          "cooldown",
+#     "dag_id":          "<dag_id>",
 #     "body":            "",        # empty — original message body not preserved
 #     "headers":         {},        # empty — original headers not preserved
 #     "routing_key":     "<dag_id>",
@@ -730,11 +763,60 @@ Exchange-mode subscriptions show up in the UI like any other `dag_file` subscrip
 
 Any subscription whose `dag_id` doesn't correspond to an active Airflow DAG is marked on the page with a `⚠ dag not found` badge. This is a **one-sided** signal: its presence means a real problem — a matching message will be ACKed without triggering anything — but its **absence guarantees nothing**. Three reasons the badge can miss a broken subscription: `is_paused` is not checked, so a paused DAG never gets the badge even though a matching message is still ACKed without triggering a run, exactly like a missing DAG (see [ADR 0006](docs/adr/0006-badge-dag-lookup-not-unified-with-sync-trigger.md)); a just-added DAG may be badged for a short while until the Scheduler parses it; and a just-deleted or renamed DAG conversely stays un-badged for a while until `DagModel.is_active` catches up. The last two are expected lag, not bugs.
 
+### Connection Resilience
+
+The watcher holds long-lived AMQP connections inside the Scheduler, so it treats a broker restart, a silently dropped TCP link, a resource alarm or an unavailable database as normal weather: once the external problem is gone, subscriptions come back on their own. The design is written up in [ADR 0007](docs/adr/0007-connection-liveness-two-tier-check.md); the short version is four layers.
+
+**1 — Heartbeats and per-call timeouts.** Every async connection carries a `heartbeat` (30 s by default), and every AMQP call — connect, `channel()`, declare, bind, publish — runs under `connect_timeout`/`rpc_timeout` (see [Connection Timing](#connection-timing)). A link that dies turns into an exception instead of a call that waits forever. The connect carries the watcher's own bound rather than the library's: `connect_robust(timeout=…)` covers the TCP connect and the AMQP handshake and stops there, while the wait that follows it — for the broker to declare the connection unblocked — is outside it, and under a resource alarm that wait lasts as long as the alarm does. A connect that runs out of time is not cancelled but left in flight, and its connection stays in the pool: cancelling it would poison the connection object for good, and dropping it would leave an open connection to the broker that nothing can close. Each `conn_id` builds its connections under a lock of its own, and that lock covers starting a connect rather than waiting for one: however many callers want the connection, the broker is asked for a single attempt, and they wait for it side by side rather than one behind another. A broker that stopped answering therefore costs each caller one `connect_timeout`, and holds up the `conn_id`s that use it and no others. A pooled connection is handed out only while it is usable — not merely unclosed: a reconnect that never finished leaves an object with no transport under it, which reports itself open and fails every call made through it, so it is replaced rather than handed to the next caller.
+
+**2 — Liveness watchdog.** Every reconcile cycle the watcher asks the broker whether its consumers are still registered. Each subscription attaches under its own consumer tag `rmq_watcher.{hostname}.{pid}.{sub_id}.{nonce}` (the cooldown fire consumer uses `fire` in place of `{sub_id}`), and the check looks for that exact tag — a foreign consumer on the same queue, a second DAG subscribed to it, or another scheduler replica in HA cannot vouch for ours, and the `{nonce}`, fresh for every attach, keeps a ghost consumer left on the broker by a `close()` that never returned from vouching for the task that replaced it. The tag is claimed — and the subscription reported as `listening` — only once the broker has confirmed the registration, which itself runs under `rpc_timeout`: a `basic.consume` that never comes back would otherwise leave the check looking for a tag the broker never held. With `management_url` configured the tag is looked up in `GET /api/consumers/{vhost}`; without it, the watcher falls back to a passive `queue_declare` probe on a separate channel, whose verdict covers every consumer of that `conn_id` at once. Either way the tag is also checked against the channel the client holds it on: RabbitMQ cancels a consumer of ours — a deleted queue, a quorum-queue or stream leader change, the node hosting a classic queue restarting under a client connected to another node — with a `basic.cancel` that closes neither the connection nor the channel, so every probe of that connection keeps succeeding while nothing consumes; the tag missing from our own channel is what condemns it. Two negative checks in a row (never less than two reconcile intervals) cancel exactly those subscriptions whose own tag the broker did not confirm and drop the connection they share — restarting a task alone would hand it the same zombie connection out of the pool. The status row does not wait for the second check: a `conn_id` whose consumers the broker denies reads `error` with the reason and the check number straight away. The confirmed subscriptions of that `conn_id` are neither cancelled nor restarted: the shared connection is dropped underneath them, they reconnect through their own retry loop and surface the drop as a transient consumer error (a WARNING names them). The fire consumer goes down with the connection it runs on, because it holds the connection object it was handed at startup for its whole life; the reconcile cycle starts it again — on the connection the pool holds now — when that object was replaced under it, and moves it when the cooldown `conn_id` moves. A `conn_id` whose only attached consumer is the fire consumer is recreated on that consumer's verdict alone: nothing else on it can be asked about — its subscriptions are in their own retry loop — and a restart would otherwise be handed the same pooled object every cycle. A `conn_id` whose tasks are alive but never reach `listening` for two cycles offers the check no candidate at all, so the connection itself is asked whether it still answers an RPC: silence recreates it, an answer leaves it in place and the row says the fault is downstream of the connection — a subscription stuck in `error` because its trigger keeps failing is attached to a healthy broker connection. A Management API failure is "no data", not a verdict: it logs a WARNING, leaves the counters alone and keeps the stored status — until the second failure in a row, on which the passive declare takes over; an unreadable Airflow connection is treated the same way. A hung AMQP probe, on the other hand, counts as dead. The same `conn_id` is never recreated more often than once every 5 cycles; a verdict held back by that limit is logged and stored as `degraded`.
+
+**3 — Cycle timeout.** The whole reconcile iteration runs under a budget of `max(reconcile_interval × 3, 300)` seconds. Exceeding it stops the manager and recreates the event loop after 30 s, with an ERROR naming the phase (`migrate` / `scan` / `sync` / `read subs` / `reconcile`) and how long it took. The budget is deliberately generous — hitting it pauses consumption on every `conn_id` — while the per-call timeouts of layer 1 catch a stuck network operation much earlier and only for the subscription that owns it. Each blocking step of the cycle (the DAG-file scan, the sync to the database, the subscription read) has a 60-second bound of its own and only ever one attempt in flight, so an unresponsive database ends a single cycle rather than costing the loop, and cannot fill the cycle's four-worker pool with stuck copies of the same call.
+
+**4 — Publishing on its own connection.** Cooldown publishing uses a separate, lazily opened connection per `conn_id`. Under a memory or disk alarm RabbitMQ blocks publishing connections by stopping to read from the socket, which would otherwise take the acknowledgements of every consumer on the same connection down with it — and a connection the broker has flagged as blocked stops writing on the client side too (`aiormq` holds its own writer until `connection.unblocked` arrives), so the split is what keeps `basic.ack` moving: the consuming connection publishes nothing and is never flagged. What the split does not cover is a connection opened *during* an alarm, which does not become usable until the alarm clears — hence the client-side bound on connect in layer 1. A placeholder the broker returns as unroutable — the pending queue is missing, so nothing would ever fire the DAG after the window — puts the delivery back on the queue instead of acknowledging it. Two publish timeouts in a row recreate the publishing connection alone and leave consumption untouched, and a publish that keeps failing pauses that subscription for a growing interval (1 s, doubling up to 60 s) before reattaching, which stretches how long an alarm can last before it costs the message: every failed attempt requeues the delivery and spends one of the quorum queue's 20 redeliveries, and the pauses spread those 20 over roughly a quarter of an hour instead of seconds. An alarm outlasting that still ends with the broker dead-lettering or dropping the delivery. The cooldown fire consumer runs on the lowest `conn_id` among the cooldown subscriptions, which keeps it from being moved by the order rows happen to come back in; cooldown subscriptions spread over several `conn_id`s are logged as an ERROR, because the pending queues live on one broker only.
+
+**Airflow Variables:**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `rmq_watcher_reconcile_interval` | `60` | Seconds between reconcile cycles |
+| `rmq_watcher_cycle_timeout` | `max(interval × 3, 300)` | Seconds one cycle may take before the event loop is recreated |
+
+Both are re-read at the start of every cycle in a thread pool under a short timeout of their own, so a changed Variable takes effect on the next cycle; a read still stuck in a worker blocks the next one from starting, and an unreachable database leaves the last known values in place instead of stalling the loop.
+
+**What the Subscriptions page shows.** The Connections block at `/rmq-watcher/subscriptions` lists one row per `conn_id`:
+
+| Column | Meaning |
+|---|---|
+| Status | `connected` when the broker confirmed every one of our consumer tags on this `conn_id`; `error` on a negative verdict — a consumer the broker did not confirm, no running task of this `conn_id` at all, a failed connection attempt, or tasks that are alive while not one of them reaches `listening` and the connection still answers an RPC, which puts the fault downstream of the connection (the reason is in Last Error); `degraded` when a negative verdict was held back by the recreation rate limit and the connection was left in place instead of being recreated again so soon; `unknown` for a `conn_id` no liveness check has ever reached a verdict on. The status follows the verdict alone — a `conn_id` with no verdict keeps whatever is stored, and the number of tasks the watcher started never makes a row green |
+| Consumers | How many live consumer tasks the watcher holds for this `conn_id`, the cooldown fire task included when it runs there |
+| Broker consumers | How many consumers the broker reports on the queues of the subscriptions that were actually probed — those whose own status is `listening` — plus `rmq_watcher.fire` when the fire consumer runs on this `conn_id`. `—` means there is no number at all: the passive-declare fallback never returns one, so a connection without `management_url` keeps the em dash even when the verdict is positive. A number that differs from the previous column is highlighted — lower means a subscription that has not attached yet (still connecting, or backing off after an error) and is therefore not probed, higher means another scheduler replica using the same credentials or — on a `monitoring`/`administrator` account, which is what makes foreign channels visible at all — other clients on the same queues |
+| Last reconcile | Age of the last cycle for this `conn_id`, flagged when it is older than one reconcile interval plus one whole cycle budget (`60 + 300` seconds with both Variables unset) — the stamp is written at the end of a cycle and the loop then waits an interval, so that is the oldest age a watcher doing exactly what it is configured to do can reach. A flagged row means the loop is stuck, restarting or not running at all — or that no enabled subscription names this `conn_id` any more |
+
+A row is written for **every** `conn_id` that appears in the subscription list, including one whose tasks all died. The counts and `last_reconcile_at` move on every cycle, which is what proves the loop is alive; `status` keeps its last stored value whenever the check produced no data.
+
+Rows are never deleted. A `conn_id` no enabled subscription mentions any more stops being stamped and keeps the age it had at that moment, so its row grows permanently stale — including after the documented way to pause consumption, turning the last subscription of that `conn_id` off in the UI. Turning one back on resumes the stamps on the next cycle.
+
+The Status column of the Subscriptions table further down the page is a different one: it reports a single subscription's own task — `connecting`, `listening`, `error` or `disconnected` — while the Connections block above reports the `conn_id` those tasks share (a grouped row shows how many of the group's subscriptions are `listening`).
+
+**Schema migration.** The status table carries `broker_consumer_count` and `last_reconcile_at` alongside its other columns, and an idempotent migration adds whatever a given database lacks: it inspects the live table and issues `ALTER TABLE … ADD COLUMN` only for what is missing. The plugin runs it once at load, and the watcher loop retries it at the start of each cycle (one attempt in flight, with a growing backoff between failures) until it succeeds, so a database that was unreachable at load time does not leave the process running against an outdated table. While the table is behind, the Connections block shows a short notice instead of failing to render the page.
+
+### Delivery Guarantee (immediate mode)
+
+For subscriptions with `cooldown=0` the watcher acknowledges a delivery only **after** `trigger_dag` has created the DAG run:
+
+- A failed trigger is NACKed with requeue, logged as a WARNING and retried with a growing backoff (1 s, doubling up to 60 s); the subscription status becomes `error` with the reason, so a subscription that stopped starting DAG runs is visible on the page.
+- Deduplication rests on the producer. When the message carries an AMQP `message_id`, the run id is deterministic (`rmq__{queue}__{message_id}`, sanitized and truncated with a digest when it does not fit), so a redelivery lands on the run it already produced and is acknowledged as a duplicate. Two *different* messages sharing one `message_id` therefore collapse into a single DAG run. Without `message_id` the run id carries a timestamp instead and a redelivery starts the DAG again.
+- **Boundary of the guarantee:** a DAG that is paused, inactive or missing ends in a terminal ACK — the event is dropped on purpose, with a WARNING in the log. NACKing it would turn a paused DAG into an accumulator of redeliveries.
+- Messages that do not match the filter are NACKed with requeue (see [ADR 0002](docs/adr/0002-four-consume-loops-not-unified.md)) and go back to the head of the queue.
+
+**`prefetch` is deliberately not set.** Because filter misses are requeued and return to the head of the queue, any finite prefetch window would eventually fill up with them and consumption would stop for good — while the status still read `connected`. The cost is accepted explicitly: the number of unacknowledged deliveries is unbounded, so a queue with a large backlog is read into scheduler memory, and the oldest delivery can hit the broker's `consumer_timeout` (30 minutes by default), after which RabbitMQ closes the channel with `PRECONDITION_FAILED` and returns the whole window to the queue. If large backlogs are expected on a watched queue, raise `consumer_timeout` in the RabbitMQ configuration.
+
 ### Best Practices
 
 - Use a **dedicated queue** per DAG trigger (e.g. `orders.airflow-trigger` separate from `orders`). Avoids NACK hot-loops on quorum queues and interference with other consumers.
 - To pause message consumption without stopping the DAG: **toggle the subscription off** in the UI rather than pausing the DAG. Pausing the DAG acks messages silently.
-- In **multi-scheduler HA** deployments each active scheduler runs its own consumer, which may cause duplicate runs. Set `max_active_runs=1` as a lightweight mitigation. Exception: subscriptions with `cooldown > 0` are inherently idempotent — the deterministic `run_id` (`rmq_cooldown__{dag_id}__{message_id}`) prevents duplicate DAG runs even across multiple schedulers. Subscriptions with `cooldown=0` still need `max_active_runs=1`.
+- In **multi-scheduler HA** deployments each active scheduler runs its own consumer, which may cause duplicate runs. The protection is a deterministic `run_id`: subscriptions with `cooldown > 0` always have one (`rmq_cooldown__{dag_id}__{message_id}`), and immediate ones have it whenever the producer sets an AMQP `message_id` (`rmq__{queue}__{message_id}`) — in both cases the second replica's trigger lands on the DAG run the first one already created. Without a `message_id` an immediate run id carries a timestamp instead and both replicas start the DAG; set `max_active_runs=1` as a lightweight mitigation there.
 
 ---
 
@@ -774,21 +856,25 @@ airflow-provider-rmq/
 │   ├── triggers/
 │   │   └── rmq.py                   # RMQTrigger
 │   ├── utils/
-│   │   ├── amqp.py                  # build_amqp_connection(), match_and_ack()
+│   │   ├── amqp.py                  # build_amqp_connection(), get_amqp_timeouts(), call_with_timeout()
+│   │   ├── executor.py              # BoundedExecutor (thread pool for blocking calls)
 │   │   ├── filters.py               # MessageFilter
-│   │   ├── management.py            # Management HTTP API client (get_current_bindings)
+│   │   ├── management.py            # Management HTTP API client (bindings, queue consumers)
+│   │   ├── metrics.py               # Stats counters, no-op without statsd
 │   │   └── ssl.py                   # build_ssl_context()
 │   └── watcher/
 │       ├── decorators.py            # @rmq_trigger
 │       ├── subscription_builder.py  # build_subscriptions(), has_exchange_conflict()
 │       ├── subscription_form.py     # parse_cooldown(), parse_filter_data() (UI form parsing)
 │       ├── models.py                # RMQSubscription, RMQConnStatus, WatcherSession
+│       ├── tunables.py              # Airflow Variables tuning the watcher, with their defaults
 │       ├── consumer.py              # RMQConsumerManager
 │       ├── orphan_tracker.py        # OrphanTracker (cooldown + exchange-mode orphan detection)
 │       ├── listener.py              # RMQWatcherListener (Scheduler Listener)
 │       ├── views.py                 # RMQWatcherView (Flask-AppBuilder UI)
 │       └── plugin.py                # RMQWatcherPlugin (AirflowPlugin)
 ├── docs/
+│   ├── adr/                         # Architecture decision records
 │   └── example_dags/                # Example DAGs
 ├── tests/                           # Unit tests
 ├── CHANGELOG.md

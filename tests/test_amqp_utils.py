@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 import ssl
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -8,9 +12,14 @@ import pytest
 from airflow_provider_rmq.utils.amqp import (
     AMQP_PORT,
     AMQPS_PORT,
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_HEARTBEAT,
+    DEFAULT_RPC_TIMEOUT,
+    call_with_timeout,
     match as _match,
     nack_and_sleep as _nack_and_sleep,
     build_amqp_connection,
+    get_amqp_timeouts,
     match_and_ack,
 )
 from airflow_provider_rmq.utils.filters import MessageFilter
@@ -25,7 +34,7 @@ class TestBuildAmqpConnection:
     def test_plain_url(self):
         conn = FakeAirflowConnection(host="rmq.local", port=None, login="user", password="pass", schema="/")
         url, ssl_ctx = build_amqp_connection(conn)
-        assert url == "amqp://user:pass@rmq.local:5672/%2F"
+        assert url == f"amqp://user:pass@rmq.local:5672/%2F?heartbeat={DEFAULT_HEARTBEAT}"
         assert ssl_ctx is None
 
     def test_default_port_no_ssl(self):
@@ -73,7 +82,7 @@ class TestBuildAmqpConnection:
     def test_default_vhost_when_schema_empty(self):
         conn = FakeAirflowConnection(schema="")
         url, _ = build_amqp_connection(conn)
-        assert url.endswith("/%2F")
+        assert url.endswith(f"/%2F?heartbeat={DEFAULT_HEARTBEAT}")
 
     def test_returns_ssl_context_when_ssl_configured(self):
         conn = FakeAirflowConnection(extra='{"ssl_enabled": true}')
@@ -87,6 +96,171 @@ class TestBuildAmqpConnection:
         conn = FakeAirflowConnection()
         _, ssl_ctx = build_amqp_connection(conn)
         assert ssl_ctx is None
+
+
+# ---------------------------------------------------------------------------
+# heartbeat in the URL
+# ---------------------------------------------------------------------------
+
+class TestHeartbeatInUrl:
+    def test_default_heartbeat_present(self):
+        conn = FakeAirflowConnection()
+        url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+
+    def test_heartbeat_from_extra(self):
+        conn = FakeAirflowConnection(extra='{"heartbeat": 90}')
+        url, _ = build_amqp_connection(conn)
+        assert url.endswith("?heartbeat=90")
+
+    def test_heartbeat_from_extra_as_string(self):
+        conn = FakeAirflowConnection(extra='{"heartbeat": "45"}')
+        url, _ = build_amqp_connection(conn)
+        assert url.endswith("?heartbeat=45")
+
+    def test_scheme_credentials_port_and_vhost_unchanged(self):
+        conn = FakeAirflowConnection(
+            host="rmq.local", port=5700, login="user@domain", password="p@ss", schema="/app/v2",
+            extra='{"heartbeat": 90}',
+        )
+        url, _ = build_amqp_connection(conn)
+        assert url == "amqp://user%40domain:p%40ss@rmq.local:5700/%2Fapp%2Fv2?heartbeat=90"
+
+    def test_credentials_and_vhost_escaping_kept_with_query(self):
+        conn = FakeAirflowConnection(login="a b", password="p/w?x", schema="/v host")
+        url, _ = build_amqp_connection(conn)
+        assert "a%20b:p%2Fw%3Fx@" in url
+        assert "/%2Fv%20host?heartbeat=" in url
+        # the only "?" is the one starting the query string
+        assert url.count("?") == 1
+
+    def test_heartbeat_zero_kept_in_url(self):
+        conn = FakeAirflowConnection(extra='{"heartbeat": 0}')
+        url, _ = build_amqp_connection(conn)
+        assert url.endswith("?heartbeat=0")
+
+    def test_heartbeat_zero_logs_warning(self, caplog):
+        conn = FakeAirflowConnection(extra='{"heartbeat": 0}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            build_amqp_connection(conn)
+        assert any("heartbeat" in r.getMessage() for r in caplog.records)
+
+    def test_garbage_heartbeat_falls_back_to_default(self, caplog):
+        conn = FakeAirflowConnection(extra='{"heartbeat": "soon"}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert caplog.records
+
+    def test_negative_heartbeat_falls_back_to_default(self, caplog):
+        conn = FakeAirflowConnection(extra='{"heartbeat": -5}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert caplog.records
+
+    def test_null_heartbeat_falls_back_to_default(self, caplog):
+        conn = FakeAirflowConnection(extra='{"heartbeat": null}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert caplog.records
+
+    def test_a_heartbeat_shorter_than_a_second_falls_back_to_default(self, caplog):
+        """An interval too short to express as whole seconds is a mistake, and reading it
+        as the zero opt-out would turn off the detection the caller asked to tighten."""
+        conn = FakeAirflowConnection(extra='{"heartbeat": 0.5}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert any("shorter than a second" in r.getMessage() for r in caplog.records)
+
+    def test_a_heartbeat_too_large_for_a_float_falls_back_to_default(self, caplog):
+        """A JSON integer no float can hold raises OverflowError out of the cast; the
+        value is written as a bare literal because a quoted one reads as ``inf``."""
+        conn = FakeAirflowConnection(extra='{"heartbeat": %s}' % ("9" * 400))
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            url, _ = build_amqp_connection(conn)
+        assert url.endswith(f"?heartbeat={DEFAULT_HEARTBEAT}")
+        assert any("is not a number" in r.getMessage() for r in caplog.records)
+
+    def test_ssl_url_keeps_query(self):
+        conn = FakeAirflowConnection(port=None, extra='{"ssl_enabled": true, "heartbeat": 15}')
+        with patch("airflow_provider_rmq.utils.amqp.build_ssl_context") as mock_ssl:
+            mock_ssl.return_value = MagicMock(spec=ssl.SSLContext)
+            url, _ = build_amqp_connection(conn)
+        assert url.startswith("amqps://")
+        assert f":{AMQPS_PORT}/%2F?heartbeat=15" in url
+
+
+# ---------------------------------------------------------------------------
+# get_amqp_timeouts
+# ---------------------------------------------------------------------------
+
+class TestGetAmqpTimeouts:
+    def test_defaults_without_extra(self):
+        timeouts = get_amqp_timeouts(FakeAirflowConnection())
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert timeouts.rpc == DEFAULT_RPC_TIMEOUT
+
+    def test_override_from_extra(self):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": 5, "rpc_timeout": 7.5}')
+        timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == 5
+        assert timeouts.rpc == 7.5
+
+    def test_numeric_string_override(self):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": "5"}')
+        assert get_amqp_timeouts(conn).connect == 5
+
+    def test_non_numeric_string_falls_back(self, caplog):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": "fast"}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert caplog.records
+
+    def test_negative_value_falls_back(self, caplog):
+        conn = FakeAirflowConnection(extra='{"rpc_timeout": -1}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.rpc == DEFAULT_RPC_TIMEOUT
+        assert caplog.records
+
+    def test_zero_value_falls_back(self, caplog):
+        conn = FakeAirflowConnection(extra='{"rpc_timeout": 0}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.rpc == DEFAULT_RPC_TIMEOUT
+        assert caplog.records
+
+    def test_null_value_falls_back(self, caplog):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": null}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert caplog.records
+
+    @pytest.mark.parametrize("raw", ['"Infinity"', '"NaN"', "1e400"])
+    def test_a_value_that_is_not_finite_falls_back(self, caplog, raw):
+        """An infinite timeout is a call with no bound at all, which is what every bound
+        here exists to prevent, and NaN compares False against every minimum."""
+        conn = FakeAirflowConnection(extra=f'{{"connect_timeout": {raw}}}')
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert caplog.records
+
+    def test_missing_key_does_not_warn(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            get_amqp_timeouts(FakeAirflowConnection())
+        assert not caplog.records
+
+    def test_one_bad_value_does_not_affect_the_other(self):
+        conn = FakeAirflowConnection(extra='{"connect_timeout": "nope", "rpc_timeout": 3}')
+        timeouts = get_amqp_timeouts(conn)
+        assert timeouts.connect == DEFAULT_CONNECT_TIMEOUT
+        assert timeouts.rpc == 3
 
 
 # ---------------------------------------------------------------------------
@@ -220,3 +394,183 @@ class TestNackAndSleep:
         with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
             await _nack_and_sleep(msg)
         msg.ack.assert_not_called()
+
+
+class TestCallWithTimeout:
+    @pytest.mark.asyncio
+    async def test_returns_the_result_of_a_prompt_call(self):
+        async def quick():
+            return "done"
+
+        assert await call_with_timeout(quick(), 1.0) == "done"
+
+    @pytest.mark.asyncio
+    async def test_raises_timeout_and_cancels_the_call(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def hangs():
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with pytest.raises(asyncio.TimeoutError):
+            await call_with_timeout(hangs(), 0.05)
+
+        assert started.is_set()
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_a_call_slow_to_cancel_does_not_stretch_the_timeout(self):
+        """The bound holds even when the call takes its time answering the cancel.
+
+        An ``aiormq`` RPC answers a cancel by closing its channel, and the close writes
+        a frame to the very socket the call is stuck on. Waiting for that would hand the
+        bound back to the broker that stopped answering — the one case the timeout is
+        there for.
+        """
+        cleaning_up = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stubborn():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cleaning_up.set()
+                await release.wait()
+                raise
+
+        call = asyncio.create_task(stubborn())
+        bounded = asyncio.create_task(call_with_timeout(call, 0.05))
+        started = time.monotonic()
+        done, _ = await asyncio.wait({bounded}, timeout=1.0)
+        try:
+            assert bounded in done, "the caller is still waiting out the cancellation"
+            with pytest.raises(asyncio.TimeoutError):
+                bounded.result()
+
+            assert time.monotonic() - started < 0.5
+            assert cleaning_up.is_set(), "the call is cancelled, just not waited for"
+            assert not call.done(), "the call is still cleaning up in the background"
+        finally:
+            bounded.cancel()
+            release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_caller_does_not_wait_for_a_slow_cancel_either(self):
+        """stop() must reach the caller at once, whatever the call it is inside does."""
+        release = asyncio.Event()
+
+        async def stubborn():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+
+        call = asyncio.create_task(stubborn())
+        caller = asyncio.create_task(call_with_timeout(call, 3600.0))
+        await asyncio.sleep(0)
+        caller.cancel()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 0.5)
+            assert not call.done()
+        finally:
+            release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call
+
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_is_not_swallowed(self):
+        """The cancel must reach the caller even when the inner call has just finished.
+
+        ``asyncio.wait_for`` below Python 3.11 returns the inner result in that race and
+        the consumer task would keep running after stop() asked it to end.
+        """
+        finished = asyncio.Event()
+        resumed = False
+
+        async def inner():
+            finished.set()
+            return "value"
+
+        async def caller():
+            nonlocal resumed
+            await call_with_timeout(inner(), 10.0)
+            resumed = True
+
+        task = asyncio.create_task(caller())
+        await finished.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert resumed is False
+
+    @pytest.mark.asyncio
+    async def test_an_error_from_the_inner_call_reaches_the_caller_unchanged(self):
+        """The helper bounds the wait; it must not turn a real failure into a timeout."""
+        async def boom():
+            raise ValueError("passive declare refused")
+
+        with pytest.raises(ValueError, match="passive declare refused"):
+            await call_with_timeout(boom(), 10.0)
+
+    @pytest.mark.asyncio
+    async def test_the_timer_is_dropped_once_the_call_returns(self):
+        """The fast path leaves no timer behind: one per AMQP call, and every call of
+        a busy watcher would otherwise keep a callback scheduled for its full timeout."""
+        loop = asyncio.get_running_loop()
+        handles = []
+        real_call_later = loop.call_later
+
+        def recording_call_later(delay, callback, *args):
+            handle = real_call_later(delay, callback, *args)
+            handles.append(handle)
+            return handle
+
+        async def quick():
+            return "value"
+
+        with patch.object(loop, "call_later", recording_call_later):
+            assert await call_with_timeout(quick(), 3600.0) == "value"
+
+        assert handles, "the helper schedules a timer for the call it bounds"
+        assert all(handle.cancelled() for handle in handles), handles
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_in_the_same_tick_as_the_timeout_is_still_a_cancel(self):
+        """The timer fires and the caller is cancelled in the same tick.
+
+        The handler reads that as a cancel, not as its own timeout: read the other way
+        round, a consumer task would ignore stop() and keep consuming."""
+        survived = False
+
+        async def slow():
+            await asyncio.sleep(100)
+
+        async def caller():
+            nonlocal survived
+            try:
+                await call_with_timeout(slow(), 0.05)
+            except asyncio.TimeoutError:
+                pass
+            survived = True
+            await asyncio.sleep(0.2)
+
+        task = asyncio.create_task(caller())
+        await asyncio.sleep(0.05)   # the timer fires in this tick
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert survived is False

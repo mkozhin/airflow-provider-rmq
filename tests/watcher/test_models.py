@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import logging
+from datetime import datetime
+from unittest.mock import patch
+
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
+from airflow_provider_rmq.watcher import models
 from airflow_provider_rmq.watcher.models import (
     RMQConnStatus,
     RMQSubscription,
     WatcherBase,
     delete_subscriptions_for_dag,
+    ensure_table_exists,
     get_active_dag_ids,
     get_conn_statuses,
     get_enabled_subscriptions,
@@ -17,6 +23,24 @@ from airflow_provider_rmq.watcher.models import (
     upsert_conn_status,
     upsert_subscription,
 )
+
+
+def _naive(stamp: str) -> datetime:
+    """Naive UTC timestamp, in the shape the watcher writes it."""
+    return datetime.fromisoformat(stamp)
+
+
+#: Table the migration has to bring up to date: rmq_watcher_conn_status without the
+#: two diagnostic columns.
+_conn_status_ddl_without_diagnostics = """
+CREATE TABLE rmq_watcher_conn_status (
+    conn_id VARCHAR(250) NOT NULL PRIMARY KEY,
+    status VARCHAR(20) NOT NULL,
+    consumer_count INTEGER NOT NULL,
+    last_error TEXT,
+    updated_at DATETIME NOT NULL
+)
+"""
 
 
 @pytest.fixture(scope="function")
@@ -29,6 +53,16 @@ def session():
     yield s
     s.close()
     WatcherBase.metadata.drop_all(engine)
+
+
+@pytest.fixture(scope="function")
+def schema_engine(monkeypatch):
+    """Engine standing in for Airflow's, with the migration flag reset."""
+    engine = create_engine("sqlite:///:memory:")
+    monkeypatch.setattr("airflow.settings.engine", engine, raising=False)
+    monkeypatch.setattr(models, "_schema_ready", False)
+    yield engine
+    engine.dispose()
 
 
 @pytest.fixture(scope="function")
@@ -183,6 +217,16 @@ class TestConsumerStatus:
         assert refreshed.consumer_status == "error"
         assert refreshed.last_error == "queue not found"
 
+    def test_set_consumer_status_of_a_subscription_that_is_gone_is_a_no_op(self, session):
+        """The write is an ``UPDATE ... WHERE id = ...``, so the row a deleted
+        subscription took with it matches nothing. The reconcile cycle finishes the row
+        of a subscription it has already let go of, and a deleted one has to cost it a
+        no-op rather than an error."""
+        set_consumer_status(session, 4242, "disconnected")
+        session.commit()
+
+        assert session.query(RMQSubscription).filter_by(id=4242).one_or_none() is None
+
 
 class TestConnStatus:
     def test_upsert_conn_status_creates_and_updates(self, session):
@@ -200,6 +244,76 @@ class TestConnStatus:
         row = session.query(RMQConnStatus).filter_by(conn_id="rmq_default").one()
         assert row.status == "disconnected"
         assert row.last_error == "timeout"
+
+    def test_writes_and_updates_diagnostic_columns(self, session):
+        upsert_conn_status(
+            session, "rmq_default", "connected", consumer_count=3,
+            broker_consumer_count=2, last_reconcile_at=_naive("2026-08-27T10:00:00"),
+        )
+        session.commit()
+
+        row = session.query(RMQConnStatus).filter_by(conn_id="rmq_default").one()
+        assert row.broker_consumer_count == 2
+        assert row.last_reconcile_at == _naive("2026-08-27T10:00:00")
+
+        upsert_conn_status(
+            session, "rmq_default", "connected", consumer_count=3,
+            broker_consumer_count=3, last_reconcile_at=_naive("2026-08-27T10:05:00"),
+        )
+        session.commit()
+
+        row = session.query(RMQConnStatus).filter_by(conn_id="rmq_default").one()
+        assert row.broker_consumer_count == 3
+        assert row.last_reconcile_at == _naive("2026-08-27T10:05:00")
+
+    def test_omitted_diagnostic_args_keep_stored_values(self, session):
+        upsert_conn_status(
+            session, "c", "connected", consumer_count=1,
+            broker_consumer_count=1, last_reconcile_at=_naive("2026-08-27T10:00:00"),
+        )
+        session.commit()
+
+        upsert_conn_status(session, "c", "connected", consumer_count=1)
+        session.commit()
+
+        row = session.query(RMQConnStatus).filter_by(conn_id="c").one()
+        assert row.broker_consumer_count == 1
+        assert row.last_reconcile_at == _naive("2026-08-27T10:00:00")
+
+    def test_explicit_none_records_absence_of_data(self, session):
+        upsert_conn_status(
+            session, "c", "connected", consumer_count=1,
+            broker_consumer_count=1, last_reconcile_at=_naive("2026-08-27T10:00:00"),
+        )
+        session.commit()
+
+        upsert_conn_status(
+            session, "c", "connected", consumer_count=1,
+            broker_consumer_count=None, last_reconcile_at=None,
+        )
+        session.commit()
+
+        row = session.query(RMQConnStatus).filter_by(conn_id="c").one()
+        assert row.broker_consumer_count is None
+        assert row.last_reconcile_at is None
+
+    def test_unchanged_status_still_moves_last_reconcile_at(self, session):
+        """A steady-state cycle changes nothing else — the timestamp must still move."""
+        first = _naive("2026-08-27T10:00:00")
+        second = _naive("2026-08-27T10:00:30")
+        upsert_conn_status(
+            session, "c", "connected", consumer_count=2, last_reconcile_at=first,
+        )
+        session.commit()
+
+        upsert_conn_status(
+            session, "c", "connected", consumer_count=2, last_reconcile_at=second,
+        )
+        session.commit()
+        session.expire_all()
+
+        row = session.query(RMQConnStatus).filter_by(conn_id="c").one()
+        assert row.last_reconcile_at == second
 
     def test_get_conn_statuses_returns_all(self, session):
         upsert_conn_status(session, "conn_a", "connected", consumer_count=1)
@@ -260,3 +374,175 @@ class TestGetActiveDagIds:
 
         result = get_active_dag_ids(session)
         assert result == {"paused_dag"}
+
+
+class TestSchemaMigration:
+    def test_adds_columns_missing_from_legacy_table(self, schema_engine):
+        with schema_engine.begin() as conn:
+            conn.execute(text(_conn_status_ddl_without_diagnostics))
+
+        ensure_table_exists()
+
+        columns = {c["name"] for c in inspect(schema_engine).get_columns("rmq_watcher_conn_status")}
+        assert "broker_consumer_count" in columns
+        assert "last_reconcile_at" in columns
+        assert models.is_schema_ready() is True
+
+    def test_migrated_table_accepts_diagnostic_writes(self, schema_engine):
+        with schema_engine.begin() as conn:
+            conn.execute(text(_conn_status_ddl_without_diagnostics))
+        ensure_table_exists()
+
+        session = sessionmaker(bind=schema_engine)()
+        try:
+            upsert_conn_status(
+                session, "c", "connected", consumer_count=1,
+                broker_consumer_count=1, last_reconcile_at=_naive("2026-08-27T10:00:00"),
+            )
+            session.commit()
+            row = session.query(RMQConnStatus).filter_by(conn_id="c").one()
+            assert row.broker_consumer_count == 1
+        finally:
+            session.close()
+
+    @pytest.mark.parametrize("dialect_name", ["postgresql", "mysql", "sqlite"])
+    def test_the_ddl_is_built_from_the_target_dialect(self, dialect_name):
+        """The migration claims to be dialect-independent because it compiles each
+        column with the engine's own dialect rather than hard-coding a type name; a
+        literal ``DATETIME`` would be wrong on PostgreSQL."""
+        from sqlalchemy.dialects import registry
+
+        dialect = registry.load(dialect_name)()
+        table = models.RMQConnStatus.__table__
+        rendered = {
+            column.name: column.type.compile(dialect) for column in table.columns
+        }
+
+        assert rendered["broker_consumer_count"].upper().startswith("INTEGER")
+        assert "CHAR" not in rendered["last_reconcile_at"].upper()
+        if dialect_name == "postgresql":
+            assert rendered["last_reconcile_at"].upper() == "TIMESTAMP WITHOUT TIME ZONE"
+        assert all(value for value in rendered.values())
+
+    @pytest.mark.parametrize("dialect_name", ["postgresql", "sqlite"])
+    def test_the_migration_renders_its_ddl_with_the_engine_dialect(self, dialect_name):
+        """The claim above is about the migration, so put the migration to it. A DDL
+        built from a hard-coded type name or ``str(column.type)`` would render
+        ``DATETIME`` on PostgreSQL, where ``ALTER TABLE ... ADD COLUMN x DATETIME``
+        fails with `type "datetime" does not exist` — the migration then never completes
+        and the Subscriptions page keeps showing the not-migrated notice."""
+        from sqlalchemy.dialects import registry
+
+        statements: list[str] = []
+
+        class _Conn:
+            def execute(self, clause):
+                statements.append(str(clause))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class _Engine:
+            dialect = registry.load(dialect_name)()
+
+            def begin(self):
+                return _Conn()
+
+        class _Inspector:
+            def get_columns(self, table_name):
+                # Every column reads as missing, so each one is rendered into DDL.
+                return []
+
+        engine = _Engine()
+        # ``inspect`` is imported inside the function, so the patch goes to its source.
+        with patch("sqlalchemy.inspect", return_value=_Inspector()):
+            complete = models._add_missing_columns(engine)
+
+        assert complete is True
+        ddl = "\n".join(statements)
+        assert "last_reconcile_at" in ddl
+        if dialect_name == "postgresql":
+            assert "TIMESTAMP WITHOUT TIME ZONE" in ddl
+            assert "DATETIME" not in ddl.upper()
+        else:
+            assert "DATETIME" in ddl.upper()
+
+    def test_repeated_call_on_current_schema_is_safe(self, schema_engine):
+        ensure_table_exists()
+        assert models.is_schema_ready() is True
+
+        # a fresh process would re-run the whole thing against the same database
+        models._schema_ready = False
+        ensure_table_exists()
+        assert models.is_schema_ready() is True
+
+    def test_ready_schema_short_circuits(self, schema_engine, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            models, "_add_missing_columns", lambda engine: calls.append(engine) or True
+        )
+
+        ensure_table_exists()
+        ensure_table_exists()
+
+        assert len(calls) == 1
+
+    def test_failed_migration_is_retried_until_it_succeeds(self, schema_engine, monkeypatch):
+        attempts = []
+
+        def flaky(engine):
+            attempts.append(engine)
+            return len(attempts) > 1
+
+        monkeypatch.setattr(models, "_add_missing_columns", flaky)
+
+        ensure_table_exists()
+        assert models.is_schema_ready() is False
+
+        ensure_table_exists()
+        assert models.is_schema_ready() is True
+        assert len(attempts) == 2
+
+        ensure_table_exists()
+        assert len(attempts) == 2
+
+    def test_failing_alter_warns_and_leaves_schema_not_ready(self, schema_engine, monkeypatch, caplog):
+        class _BlindInspector:
+            """Reports every column as missing, so each ALTER hits a duplicate."""
+
+            def get_columns(self, table_name):
+                return []
+
+        monkeypatch.setattr("sqlalchemy.inspect", lambda engine: _BlindInspector())
+
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.models"):
+            ensure_table_exists()
+
+        assert models.is_schema_ready() is False
+        assert any("failed to add column" in r.message for r in caplog.records)
+
+    def test_unreadable_table_warns_and_leaves_schema_not_ready(self, schema_engine, monkeypatch, caplog):
+        class _BrokenInspector:
+            def get_columns(self, table_name):
+                raise OperationalError("SELECT 1", {}, Exception("no such table"))
+
+        monkeypatch.setattr("sqlalchemy.inspect", lambda engine: _BrokenInspector())
+
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.models"):
+            ensure_table_exists()
+
+        assert models.is_schema_ready() is False
+        assert any("cannot inspect" in r.message for r in caplog.records)
+
+    def test_database_failure_propagates_and_leaves_schema_not_ready(self, monkeypatch):
+        engine = create_engine("sqlite:////nonexistent-dir/rmq.db")
+        monkeypatch.setattr("airflow.settings.engine", engine, raising=False)
+        monkeypatch.setattr(models, "_schema_ready", False)
+
+        with pytest.raises(OperationalError):
+            ensure_table_exists()
+
+        assert models.is_schema_ready() is False

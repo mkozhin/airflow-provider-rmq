@@ -17,10 +17,19 @@
   <div class="panel panel-default">
     <div class="panel-heading"><h4>Connections</h4></div>
     <div class="panel-body">
-      {% if conn_statuses %}
+      {% if conn_status_error %}
+      <p class="text-warning">⚠ {{ conn_status_error }}</p>
+      {% elif conn_statuses %}
       <table class="table table-condensed table-bordered">
         <thead>
-          <tr><th>conn_id</th><th>Status</th><th>Consumers</th><th>Last Error</th></tr>
+          <tr>
+            <th>conn_id</th>
+            <th>Status</th>
+            <th>Consumers</th>
+            <th>Broker consumers</th>
+            <th>Last reconcile</th>
+            <th>Last Error</th>
+          </tr>
         </thead>
         <tbody>
         {% for cs in conn_statuses %}
@@ -31,13 +40,37 @@
               <span class="label label-success">● connected</span>
             {% elif cs.status == 'error' %}
               <span class="label label-danger">✕ error</span>
-            {% elif cs.status == 'connecting' %}
-              <span class="label label-warning">○ connecting</span>
+            {% elif cs.status == 'degraded' %}
+              <span class="label label-warning" title="The broker did not confirm a consumer of this connection, but the connection was recreated too recently to be torn down again — the watcher is holding off rather than looping through recreations.">○ degraded</span>
             {% else %}
               <span class="label label-default">○ {{ cs.status }}</span>
             {% endif %}
           </td>
           <td>{{ cs.consumer_count }}</td>
+          <td>
+            {% if cs.broker_consumer_count is none %}
+              —
+            {% elif cs.counts_mismatch %}
+              <span class="label label-warning"
+                    title="The broker reports a different number of consumers than the watcher has started for this conn_id. A lower number means a subscription that has not attached yet — still connecting, or backing off after an error — and is therefore not probed; a higher number means another scheduler replica using the same credentials, or — on a monitoring/administrator account, which is what makes foreign channels visible at all — other clients consuming the same queues. A consumer the broker is asked about and does not confirm is restarted by the watchdog, and says so in the status of its own subscription.">
+                ⚠ {{ cs.broker_consumer_count }}
+              </span>
+            {% else %}
+              {{ cs.broker_consumer_count }}
+            {% endif %}
+          </td>
+          <td>
+            {% if cs.age_seconds is none %}
+              —
+            {% elif cs.is_stale %}
+              <span class="label label-warning"
+                    title="The last reconcile cycle for this conn_id is older than {{ stale_after_display }} — one reconcile interval plus the whole budget a cycle is given. Either the watcher loop is stuck, restarting or not running at all, or no enabled subscription names this conn_id any more, which leaves its row behind with the timestamp it had when the last one was turned off.">
+                ⚠ {{ cs.age_display }} ago
+              </span>
+            {% else %}
+              {{ cs.age_display }} ago
+            {% endif %}
+          </td>
           <td>{{ cs.last_error or '—' }}</td>
         </tr>
         {% endfor %}
@@ -171,6 +204,9 @@
                 <span class="label label-warning">connecting</span>
               {% elif item.consumer_status == 'error' %}
                 <span class="label label-danger">error</span>
+              {% elif item.consumer_status == 'disconnected' %}
+                <span class="label label-default"
+                      title="No consumer task is running for this subscription — the watcher let it go and the next reconcile cycle starts it again. Unlike 'disabled', the subscription is still on.">○ disconnected</span>
               {% else %}
                 <span class="label label-default">{{ item.consumer_status }}</span>
               {% endif %}
