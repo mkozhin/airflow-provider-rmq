@@ -35,6 +35,8 @@ from airflow_provider_rmq.watcher.consumer import (
     _ConnLiveness,
     _ConsumerState,
     _CYCLES_BEFORE_REDROP,
+    _DagNotReady,
+    _NOT_READY_LIMIT,
     _StatusWriter,
     _FireSub,
     _RECONNECT_DELAY,
@@ -497,6 +499,24 @@ class TestSyncTrigger:
             mock_td.side_effect = MultipleResultsFound("two rows")
             with pytest.raises(MultipleResultsFound):
                 _sync_trigger("dag", {}, "run_id")
+
+    @pytest.mark.parametrize(
+        "text", ["Dag id dag not found", "Dag id dag not found in DagModel"]
+    )
+    def test_a_dag_with_no_serialized_version_is_told_apart(self, text):
+        """Airflow raises DagNotFound while its DAG processor has yet to fill
+        serialized_dag, in either of the two wordings it has for it. The delivery
+        handler acts on that differently from a trigger that failed, so it arrives
+        as an exception of its own."""
+        from airflow.exceptions import DagNotFound
+
+        fake_dag = MagicMock()
+        ws_patch, td_patch = _patch_sync_trigger_deps(dag_model=fake_dag)
+        with ws_patch, td_patch as mock_td:
+            mock_td.side_effect = DagNotFound(text)
+            with pytest.raises(_DagNotReady) as raised:
+                _sync_trigger("dag", {}, "run_id")
+        assert str(raised.value) == text
 
     def test_microseconds_are_kept(self):
         """find_duplicate() also matches on execution_date: truncating it to whole
@@ -7959,6 +7979,236 @@ class TestImmediateDeliveryAcknowledgement:
         await _consume_until(manager, _sub(queue_name="orders"), [msg], done)
 
         assert captured["run_id"] == "rmq__orders__msg-42"
+
+
+class TestADagWithoutASerializedVersion:
+    """A trigger answering ``DagNotFound`` says the DAG processor is still warming up.
+
+    The listener starts with the scheduler, minutes before ``serialized_dag`` is
+    filled, and for that stretch the connection, the channel and the registration are
+    all in place: the delivery waits for the rest of Airflow. The row keeps saying
+    ``listening`` until the wait outlasts the bound the handler holds it to.
+    """
+
+    @staticmethod
+    def _state(manager) -> _ConsumerState:
+        """State whose row writes are recorded instead of reaching a database."""
+        state = _ConsumerState(1, manager._executor)
+        state.write = AsyncMock()
+        return state
+
+    @staticmethod
+    async def _deliver(manager, state, backoff, error, count: int = 1) -> list:
+        """Hand the handler ``count`` deliveries whose trigger raises ``error``."""
+        async def handler(fn, *args):
+            if error is None:
+                return _OUTCOME_TRIGGERED
+            raise error
+
+        manager._executor = _FakeExecutor(handler)
+        messages = [_make_fake_message(b"order", message_id=f"m{i}") for i in range(count)]
+        for message in messages:
+            await manager._handle_immediate_delivery(_sub(), message, state, backoff)
+        return messages
+
+    @staticmethod
+    def _statuses(write) -> list:
+        return [c.args[0] for c in write.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_the_delivery_goes_back_and_the_row_is_left_alone(self, manager):
+        state = self._state(manager)
+        with patch(f"{_CONSUMER_MODULE}.log") as log, \
+             patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            messages = await self._deliver(
+                manager,
+                state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+                _DagNotReady("Dag id test_dag not found"),
+            )
+
+        messages[0].nack.assert_awaited_once_with(requeue=True)
+        messages[0].ack.assert_not_awaited()
+        state.write.assert_not_awaited()
+        assert "not serialized yet" in log.info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_the_tenth_delivery_in_a_row_is_a_warning(self, manager):
+        """A quorum queue can spend the delivery-limit of the message before the
+        streak reaches its bound, and the log line is then the only trace left."""
+        state = self._state(manager)
+        with patch(f"{_CONSUMER_MODULE}.log") as log, \
+             patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await self._deliver(
+                manager,
+                state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+                _DagNotReady("Dag id test_dag not found"),
+                count=10,
+            )
+
+        assert log.info.call_count == 9
+        assert log.warning.call_count == 1
+        assert state.not_ready_streak == 10
+        state.write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_warmup_longer_than_the_bound_reaches_the_row(self, manager):
+        state = self._state(manager)
+        with patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await self._deliver(
+                manager,
+                state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+                _DagNotReady("Dag id test_dag not found"),
+                count=_NOT_READY_LIMIT,
+            )
+            assert _SUB_ERROR not in self._statuses(state.write)
+
+            await self._deliver(
+                manager,
+                state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+                _DagNotReady("Dag id test_dag not found"),
+            )
+
+        assert state.write.await_args.args[0] == _SUB_ERROR
+        assert "not found" in state.write.await_args.kwargs["last_error"]
+
+    @pytest.mark.asyncio
+    async def test_a_delivery_that_went_through_starts_the_count_again(self, manager):
+        state = self._state(manager)
+        state.not_ready_streak = _NOT_READY_LIMIT
+        backoff = _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
+        with patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await self._deliver(manager, state, backoff, None)
+            await self._deliver(
+                manager, state, backoff, _DagNotReady("Dag id test_dag not found")
+            )
+
+        assert state.not_ready_streak == 1
+        assert _SUB_ERROR not in self._statuses(state.write)
+
+    @pytest.mark.asyncio
+    async def test_any_other_trigger_failure_still_reaches_the_row_at_once(self, manager):
+        """The silence belongs to the one exception that is not the subscription's
+        fault: everything else is reported on the first delivery, as before."""
+        state = self._state(manager)
+        with patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            messages = await self._deliver(
+                manager,
+                state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+                RuntimeError("airflow metadata db is down"),
+            )
+
+        messages[0].nack.assert_awaited_once_with(requeue=True)
+        assert state.write.await_args.args[0] == _SUB_ERROR
+        assert state.not_ready_streak == 0
+
+    @pytest.mark.asyncio
+    async def test_a_reattach_starts_the_count_again(self, manager):
+        """The count measures the deliveries of one attach.
+
+        A state lives as long as the task and outlives every reconnect inside it, so a
+        streak carried across a reattach would report the first delivery of the next
+        warmup as the failure of the one before it.
+        """
+        first = [
+            _make_fake_message(b"order", message_id=f"m{i}")
+            for i in range(_NOT_READY_LIMIT)
+        ]
+        last = _make_fake_message(b"order", message_id="last")
+        nacked = asyncio.Event()
+        last.nack = AsyncMock(side_effect=lambda requeue=False: nacked.set())
+
+        queue = MagicMock()
+        queue.iterator.side_effect = [
+            _QueueIterCtx(first, ends=True),
+            _QueueIterCtx([last]),
+        ]
+        connection = _make_live_connection(queue=queue)
+
+        async def handler(fn, *args):
+            raise _DagNotReady("Dag id test_dag not found")
+
+        manager._executor = _FakeExecutor(handler)
+        statuses = []
+
+        async def record(self, status, last_error=None, executor=None):
+            statuses.append(status)
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch.object(_ConsumerState, "write", record), \
+             patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            task = asyncio.create_task(manager._consume_subscription(_sub()))
+            # The task reports into the state record the manager holds for it, the way
+            # reconcile hands it one before the loop takes its first turn.
+            entry = _ActiveSub(
+                task=task, sub=_sub(), state=_ConsumerState(1, manager._executor)
+            )
+            manager._active[1] = entry
+            try:
+                await asyncio.wait_for(nacked.wait(), timeout=3.0)
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        assert _SUB_ERROR not in statuses
+        assert entry.state.not_ready_streak == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error, candidate",
+        [
+            (_DagNotReady("Dag id test_dag not found"), True),
+            (RuntimeError("airflow metadata db is down"), False),
+        ],
+        ids=["warming-up", "trigger-failure"],
+    )
+    async def test_the_liveness_check_keeps_asking_about_a_warming_up_subscription(
+        self, manager, error, candidate
+    ):
+        """A row that says ``listening`` is what keeps the subscription in the check.
+
+        The check asks the broker for the tag of every candidate; a subscription it
+        counts as stalled is asked about no more, and a whole connection whose
+        subscriptions are all stalled is reported as stuck.
+        """
+        sub = _sub(id=1)
+        message = _make_fake_message(b"order", message_id="m1")
+        nacked = asyncio.Event()
+        message.nack = AsyncMock(side_effect=lambda requeue=False: nacked.set())
+        connection = _make_live_connection(queue=_make_push_queue([message]))
+
+        def trigger(dag_id, conf, run_id):
+            raise error
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch(f"{_CONSUMER_MODULE}._sync_trigger", trigger), \
+             patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock), \
+             _patch_watcher_session(), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch.object(manager, "_provision_cooldown"):
+            await manager.reconcile([sub])
+            entry = manager._active[1]
+            try:
+                await asyncio.wait_for(nacked.wait(), timeout=3.0)
+                await _wait_for(
+                    lambda: (entry.state.status == _SUB_ERROR) is not candidate
+                )
+                candidates, stalled, _ = manager._partition_candidates([sub])
+            finally:
+                entry.task.cancel()
+                await asyncio.gather(entry.task, return_exceptions=True)
+
+        assert [s["id"] for s, _ in candidates.get("rmq_default", [])] == (
+            [1] if candidate else []
+        )
+        assert [s["id"] for s in stalled.get("rmq_default", [])] == (
+            [] if candidate else [1]
+        )
 
 
 class TestReconnectDiagnostics:

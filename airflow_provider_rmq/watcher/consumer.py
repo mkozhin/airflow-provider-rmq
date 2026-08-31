@@ -19,7 +19,7 @@ import aio_pika
 import aio_pika.exceptions
 import httpx
 from aio_pika.connection import make_url
-from airflow.exceptions import DagRunAlreadyExists
+from airflow.exceptions import DagNotFound, DagRunAlreadyExists
 from airflow.hooks.base import BaseHook
 from airflow.models import DagModel
 from sqlalchemy.exc import IntegrityError
@@ -158,6 +158,19 @@ _OUTCOME_TRIGGERED = "triggered"
 _OUTCOME_SKIPPED = "skipped"
 _OUTCOME_DUPLICATE = "duplicate"
 
+
+class _DagNotReady(Exception):
+    """The DAG has no serialized version to run yet.
+
+    Raised for both texts Airflow uses — with and without "in DagModel".
+    """
+
+
+#: Consecutive deliveries answered with "not serialized yet" before the warmup
+#: reading is given up and the subscription reports the failure. With the trigger
+#: backoff capped at 60s this spans roughly twenty minutes.
+_NOT_READY_LIMIT = 25
+
 #: ``DagRun.run_id`` is a ``String(250)`` validated against this alphabet.
 _RUN_ID_MAX_LEN = 250
 _RUN_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.~:+-]")
@@ -246,6 +259,11 @@ def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> str:
     :returns: :data:`_OUTCOME_TRIGGERED` when a DAG run was created,
         :data:`_OUTCOME_DUPLICATE` when this delivery already has one, and
         :data:`_OUTCOME_SKIPPED` when the DAG cannot run.
+    :raises _DagNotReady: When Airflow holds no serialized version of the DAG. The
+        DAG processor fills ``serialized_dag`` minutes after a scheduler start, so
+        this says the rest of Airflow is still warming up rather than that the
+        subscription failed — the same reading the check above gives a DAG that is
+        missing, inactive or paused.
 
     Uses a short-lived WatcherSession to avoid polluting Airflow's thread-local
     scoped session. Every other exception propagates, so the caller requeues the
@@ -271,6 +289,8 @@ def _sync_trigger(dag_id: str, conf: dict, run_id: str) -> str:
         # on execution_date as well as run_id, so a truncated one makes two distinct
         # messages of the same second look like a redelivery of each other.
         trigger_dag(dag_id=dag_id, run_id=run_id, conf=conf, replace_microseconds=False)
+    except DagNotFound as exc:
+        raise _DagNotReady(str(exc)) from exc
     except DagRunAlreadyExists:
         log.info("DAG run %s already exists — redelivery of a handled message", run_id)
         return _OUTCOME_DUPLICATE
@@ -895,6 +915,10 @@ class _ConsumerState:
         #: broker denied: the next attach registers a tag of its own
         #: (:func:`_attach_nonce`), which no earlier answer can speak for.
         self.denied_tag: str | None = None
+        #: Deliveries answered in a row with the DAG not being serialized yet. Reset
+        #: wherever this subscription's row is written as listening, so it measures one
+        #: attach rather than every warmup the task has lived through.
+        self.not_ready_streak = 0
 
     @property
     def status(self) -> str | None:
@@ -3173,6 +3197,7 @@ class RMQConsumerManager:
                         state.consumer_tag = consumer_tag
                         state.connection = connection
                         state.channel = channel
+                        state.not_ready_streak = 0
                         await state.write(_SUB_LISTENING, last_error=None)
                         log.info(
                             "Subscription %d (DAG %s) is consuming queue %r on conn_id=%r",
@@ -3295,6 +3320,13 @@ class RMQConsumerManager:
         next one. The subscription reports the failure as its own status: the connection
         is fine and the iterator keeps running, so nothing else would ever say that this
         subscription stopped starting DAG runs.
+
+        A DAG Airflow has not serialized yet is the one trigger failure the row stays
+        silent about. The connection, the channel and the registration are all intact,
+        and what the delivery is waiting for is the DAG processor: an ``error`` there
+        would report the rest of Airflow starting up as this subscription breaking. The
+        silence is bounded — :data:`_NOT_READY_LIMIT` deliveries answered that way in a
+        row are long enough to be a failure of their own, and the row says so.
         """
         dag_id: str = sub["dag_id"]
         sub_id: int = sub["id"]
@@ -3304,6 +3336,33 @@ class RMQConsumerManager:
             )
         except asyncio.CancelledError:
             raise
+        except _DagNotReady as exc:
+            state.not_ready_streak += 1
+            await message.nack(requeue=True)
+            if state.not_ready_streak > _NOT_READY_LIMIT:
+                log.warning(
+                    "DAG %s of subscription %d has had no serialized version for %d "
+                    "deliveries in a row: %s — reporting it on the subscription",
+                    dag_id, sub_id, state.not_ready_streak, exc,
+                )
+                await state.write(_SUB_ERROR, last_error=_error_text(exc))
+            elif state.not_ready_streak % 10 == 0:
+                # A quorum queue drops the delivery once its delivery-limit is spent,
+                # which can happen before the streak reaches the limit above. This line
+                # is then the only trace the warmup leaves.
+                log.warning(
+                    "DAG %s of subscription %d is not serialized yet, %d deliveries in "
+                    "a row: %s — the delivery is back on the queue, pausing %.1fs",
+                    dag_id, sub_id, state.not_ready_streak, exc, backoff.seconds,
+                )
+            else:
+                log.info(
+                    "DAG %s of subscription %d is not serialized yet: %s — the delivery "
+                    "is back on the queue, pausing %.1fs",
+                    dag_id, sub_id, exc, backoff.seconds,
+                )
+            await backoff.wait()
+            return
         except Exception as exc:
             log.warning(
                 "Triggering DAG %s for subscription %d failed: %s "
@@ -3315,6 +3374,7 @@ class RMQConsumerManager:
             await backoff.wait()
             return
         backoff.reset()
+        state.not_ready_streak = 0
         await state.write(_SUB_LISTENING, last_error=None)
         await message.ack()
         if outcome == _OUTCOME_TRIGGERED:

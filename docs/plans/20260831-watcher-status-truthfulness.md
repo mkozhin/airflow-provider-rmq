@@ -530,52 +530,52 @@ def read_flag(name: str, default: bool) -> bool:
 - Modify: `tests/watcher/test_consumer.py`
 - Create: `docs/backlog/warmup-loses-the-message-invisibly.md`
 
-- [ ] добавить `DagNotFound` в импорт `airflow.exceptions` (`consumer.py:22`)
-- [ ] объявить `_DagNotReady` и `_NOT_READY_LIMIT` рядом с `_OUTCOME_*`
+- [x] добавить `DagNotFound` в импорт `airflow.exceptions` (`consumer.py:22`)
+- [x] объявить `_DagNotReady` и `_NOT_READY_LIMIT` рядом с `_OUTCOME_*`
       (`consumer.py:157-159`)
-- [ ] поднять `_DagNotReady` из `DagNotFound` в `_sync_trigger`
+- [x] поднять `_DagNotReady` из `DagNotFound` в `_sync_trigger`
       (`consumer.py:269-280`) и дополнить docstring метода тем, что это
       исключение — не отказ подписки
-- [ ] добавить `not_ready_streak` в `_ConsumerState.__init__` (`consumer.py:877`)
-- [ ] ветка `except _DagNotReady` в `_handle_immediate_delivery`, между
+- [x] добавить `not_ready_streak` в `_ConsumerState.__init__` (`consumer.py:877`)
+- [x] ветка `except _DagNotReady` в `_handle_immediate_delivery`, между
       `except asyncio.CancelledError` (`consumer.py:3305`) и `except Exception`;
       вытесняемая строка лога — «Triggering DAG %s for subscription %d failed»
       (`consumer.py:3308-3311`)
-- [ ] обнулять счётчик у обеих записей `_SUB_LISTENING` подписочного пути —
+- [x] обнулять счётчик у обеих записей `_SUB_LISTENING` подписочного пути —
       `consumer.py:3176` (прицепление) и `3318` (удачная доставка)
-- [ ] переписать docstring `_handle_immediate_delivery` (`consumer.py:3291-3297`):
+- [x] переписать docstring `_handle_immediate_delivery` (`consumer.py:3291-3297`):
       сейчас он обещает, что подписка отчитывается о любом отказе триггера своим
       статусом — после правки это неверно для `_DagNotReady`
-- [ ] тест: `DagNotFound` из триггера — доставка возвращена в очередь, в статус
+- [x] тест: `DagNotFound` из триггера — доставка возвращена в очередь, в статус
       не записано ничего, в логе строка про прогрев
-- [ ] лог не-готовой доставки — INFO, но каждая десятая идёт WARNING'ом: на
+- [x] лог не-готовой доставки — INFO, но каждая десятая идёт WARNING'ом: на
       quorum-очереди сообщение может исчезнуть раньше порога, и лог остаётся
       единственным следом
-- [ ] тест: `_NOT_READY_LIMIT + 1` подряд идущих `DagNotFound` — пишется `error`
-- [ ] тест на обнуление: выставить `state.not_ready_streak = _NOT_READY_LIMIT`,
+- [x] тест: `_NOT_READY_LIMIT + 1` подряд идущих `DagNotFound` — пишется `error`
+- [x] тест на обнуление: выставить `state.not_ready_streak = _NOT_READY_LIMIT`,
       провести удачную доставку, затем одну `DagNotFound` — `error` не пишется.
       Последовательность «успех между двумя отказами» различающей не будет:
       при пороге 25 обе ветки молчат одинаково
-- [ ] тест на кандидатство: подписка, чей триггер отвечает `DagNotFound`,
+- [x] тест на кандидатство: подписка, чей триггер отвечает `DagNotFound`,
       остаётся в `candidates` у `_partition_candidates`
       (`consumer.py:2507-2510`), тогда как при любом другом исключении уходит в
       `stalled`
-- [ ] тест: **переприцепление** обнуляет счётчик — таска с уже накопленным
+- [x] тест: **переприцепление** обнуляет счётчик — таска с уже накопленным
       счётчиком переподключается, и первая доставка нового прогрева не даёт
       `error`
-- [ ] тест на уровень записи: первая не-готовая доставка логируется INFO,
+- [x] тест на уровень записи: первая не-готовая доставка логируется INFO,
       десятая — WARNING. Без него требование про единственный след остаётся
       без сторожа
-- [ ] тест-страж: любое другое исключение триггера по-прежнему пишет `error`
+- [x] тест-страж: любое другое исключение триггера по-прежнему пишет `error`
       немедленно
-- [ ] проверка снятием: убрать ветку `except _DagNotReady` — краснеют тесты на
+- [x] проверка снятием: убрать ветку `except _DagNotReady` — краснеют тесты на
       молчание статуса и на кандидатство, тест-страж остаётся зелёным; убрать
       обнуление на `3176` — краснеет тест на переприцепление; убрать обнуление
       на `3318` — краснеет тест на обнуление
-- [ ] записать в `docs/backlog/` отдельным пунктом: сообщение, исчезнувшее по
+- [x] записать в `docs/backlog/` отдельным пунктом: сообщение, исчезнувшее по
       `delivery-limit` во время прогрева, на странице не видно вовсе — тот же
       класс невидимости, что у промахов фильтра
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 3: `DagNotFound` в обработчике fire-доставки
 
