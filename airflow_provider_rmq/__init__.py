@@ -71,7 +71,10 @@ def get_provider_info():
                             "can_delete on the resource RMQ Subscriptions plus "
                             "menu_access on Subscriptions and on RabbitMQ. The webserver "
                             "gives the role those permissions at every start while this "
-                            "is true, and takes the same six back while it is false.\n"
+                            "is true, and takes the same six back while it is false. "
+                            "Every spelling of no an ini file is written in closes the "
+                            "page - false, off, no, n, 0 - and so does a value in no "
+                            "spelling the option knows.\n"
                         ),
                         "version_added": "2.4.0",
                         "type": "boolean",

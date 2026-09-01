@@ -17,6 +17,7 @@ that is the property the switch needs.
 """
 from __future__ import annotations
 
+import configparser
 import logging
 import math
 from collections.abc import Callable
@@ -44,6 +45,12 @@ GRANT_OP_ACCESS_OPTION = "grant_op_access"
 #: operation far earlier and only for the subscription that owns it.
 CYCLE_TIMEOUT_FACTOR = 3
 MIN_CYCLE_TIMEOUT = 300
+
+#: The spellings :func:`read_flag` reads as an answer, lower-cased and stripped. They
+#: are the words ini files are written in, and an administrator writing one of them
+#: means it: ``off`` closes the page as surely as ``false`` does.
+_TRUE_SPELLINGS = frozenset({"1", "t", "true", "y", "yes", "on"})
+_FALSE_SPELLINGS = frozenset({"0", "f", "false", "n", "no", "off"})
 
 
 def cycle_timeout(interval: float, override: float | None = None) -> float:
@@ -114,16 +121,21 @@ def read_positive(name: str, cast: Callable[[str], Any]) -> Any:
 def read_flag(section: str, option: str, default: bool) -> bool:
     """Read Airflow configuration option ``[section] option`` as a yes-or-no answer.
 
-    ``1``, ``t`` and ``true`` read as true; ``0``, ``f`` and ``false`` read as false.
-    Case, surrounding whitespace and a trailing ``#`` comment do not matter. These are
-    Airflow's own spellings for every boolean option it has, and the option is read
-    through Airflow's own parser so that it answers to exactly them.
+    ``1``, ``t``, ``true``, ``y``, ``yes`` and ``on`` read as true; ``0``, ``f``,
+    ``false``, ``n``, ``no`` and ``off`` read as false. Case, surrounding whitespace and
+    a trailing ``#`` comment do not matter. The vocabulary is the one ini files are
+    written in, so a switch spelled the way the rest of ``airflow.cfg`` is spelled says
+    what the administrator who wrote it meant.
 
     :param default: What an option nobody set reads as.
-    :raises AirflowConfigException: The option holds a value in none of the spellings
-        above. A switch whose value cannot be read is not an instruction, and the caller
-        is told so rather than handed ``default`` in its place, because it is the caller
-        that knows what the answer decides.
+    :returns: The answer the option holds, or ``False`` when it holds one in none of the
+        spellings above — a typo, an empty value, or a configuration that cannot even
+        produce the raw string. The one switch read through here withdraws a permission
+        when it is false, and a value nobody can read is answered in the direction that
+        withholds the privilege rather than the one that hands it out: an administrator
+        who wrote something unreadable in place of ``false`` gets the page closed, which
+        is what he was reaching for, and a warning naming the value he wrote. Only an
+        option nobody set at all reads as ``default``.
 
     The value comes from the environment and from ``airflow.cfg``, and from nowhere
     else: the ``_cmd`` and ``_secret`` indirections that would reach a shell command or
@@ -133,5 +145,27 @@ def read_flag(section: str, option: str, default: bool) -> bool:
     its application — there is nothing here that can hang.
     """
     from airflow.configuration import conf
+    from airflow.exceptions import AirflowConfigException
 
-    return conf.getboolean(section, option, fallback=default)
+    try:
+        raw = conf.get(section, option, fallback=None)
+    except (AirflowConfigException, configparser.Error):
+        log.warning(
+            "RMQ Watcher: configuration option [%s] %s could not be read — reading it "
+            "as false",
+            section, option, exc_info=True,
+        )
+        return False
+    if raw is None:
+        return default
+    value = str(raw).split("#")[0].strip().lower()
+    if value in _TRUE_SPELLINGS:
+        return True
+    if value in _FALSE_SPELLINGS:
+        return False
+    log.warning(
+        "RMQ Watcher: configuration option [%s] %s=%r is in no known spelling — "
+        "reading it as false",
+        section, option, raw,
+    )
+    return False

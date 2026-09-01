@@ -313,13 +313,14 @@ class TestOpAccessGrant:
             r.getMessage() for r in caplog.records
         ]
 
-    def test_a_switch_that_cannot_be_read_leaves_the_role_as_it_is(self, caplog):
-        """An unanswerable switch grants nothing and revokes nothing.
+    def test_a_read_that_breaks_outright_leaves_the_role_as_it_is(self, caplog):
+        """A reader that raises grants nothing and revokes nothing.
 
-        The read and the permission writes go through different sessions, so one can
-        fail while the others work. Reading the failure as the default would hand six
-        permissions back to a role an administrator has taken them from, and a
-        permission switch that cannot be read has to leave the door where it stands.
+        Every value the reader can be handed has an answer — a yes, a no, or the no it
+        gives whatever it cannot read — so a raise coming out of it is the reader
+        itself breaking, and the callback then has no answer of any kind to act on. It
+        touches nothing and says so in the log, which is where the six permissions the
+        role holds or does not hold stay exactly as the last start left them.
         """
         sm = _FakeSecurityManager(permissions=_OP_PERMISSIONS)
 
@@ -478,19 +479,30 @@ class _AlwaysTrueBackend:
 
 
 class TestReadFlag:
-    """The yes-or-no reader: both spellings, the default and a value it cannot read.
+    """The yes-or-no reader: every spelling, the default, and a value it cannot read.
 
-    Its answer decides whether a role keeps a permission, so the one thing it must never
-    do is turn something that is not an answer into one.
+    Its answer decides whether a role keeps a permission it can start DAG runs with, so
+    the one thing it must never do is read something that is not an answer as a yes.
     """
 
-    @pytest.mark.parametrize("raw", ["1", "t", "true", "TRUE", " True "])
+    @pytest.mark.parametrize(
+        "raw", ["1", "t", "true", "TRUE", " True ", "y", "yes", "on", "ON", "Yes # open"]
+    )
     def test_a_value_spelled_as_yes_reads_as_true(self, raw):
         with _option(raw):
             assert _read_switch(False) is True
 
-    @pytest.mark.parametrize("raw", ["0", "f", "false", "FALSE", " False "])
+    @pytest.mark.parametrize(
+        "raw",
+        ["0", "f", "false", "FALSE", " False ", "n", "no", "off", "OFF", "No # closed"],
+    )
     def test_a_value_spelled_as_no_reads_as_false(self, raw):
+        """Every spelling of no an ini file is written in closes the page.
+
+        ``off`` and ``no`` are what an administrator reaches for first, and a reader
+        that knew only ``false`` would answer the switch he wrote to close the page by
+        leaving it open.
+        """
         with _option(raw):
             assert _read_switch(True) is False
 
@@ -499,17 +511,46 @@ class TestReadFlag:
             assert _read_switch(True) is True
             assert _read_switch(False) is False
 
-    @pytest.mark.parametrize("raw", ["", "maybe", "2", "yes"])
-    def test_a_value_in_no_known_spelling_raises(self, raw):
+    @pytest.mark.parametrize("raw", ["", "   ", "maybe", "2", "ture", "# no"])
+    def test_a_value_in_no_known_spelling_reads_as_false(self, raw, caplog):
         """A switch holding something unreadable is not an instruction to grant.
 
-        Reading it as the default would open the page on a typo, and the caller can only
-        leave the role alone if it is told that no answer was had.
+        The switch has one job, and it is to take a permission away; the granting answer
+        is the one that needs a value saying so. An administrator who wrote a typo over
+        the default was reaching for the closed page, and the value he wrote is named in
+        the log so that he can find it.
         """
-        from airflow.exceptions import AirflowConfigException
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.tunables"
+        ), _option(raw):
+            assert _read_switch(True) is False
 
-        with _option(raw), pytest.raises(AirflowConfigException):
-            _read_switch(True)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(GRANT_OP_ACCESS_OPTION in m and repr(raw) in m for m in messages), (
+            messages
+        )
+
+    def test_a_configuration_that_cannot_answer_reads_as_false(self, caplog):
+        """A raw string the parser refuses to build is as unreadable as a typo.
+
+        A value like ``%(missing)s`` in ``airflow.cfg`` fails interpolation, and the
+        answer is the same one every unreadable value gets: the privilege is withheld.
+        """
+        import configparser
+
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.tunables"
+        ), _option("false"), patch(
+            "airflow.configuration.conf.get",
+            side_effect=configparser.InterpolationMissingOptionError(
+                GRANT_OP_ACCESS_OPTION, GRANT_OP_ACCESS_SECTION, "%(missing)s", "missing"
+            ),
+        ):
+            assert _read_switch(True) is False
+
+        assert any(
+            GRANT_OP_ACCESS_OPTION in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
     def test_the_option_is_read_from_the_configuration_alone(self):
         """The switch answers to the configuration and to nothing else.
@@ -526,6 +567,44 @@ class TestReadFlag:
             "airflow.configuration.ensure_secrets_loaded", side_effect=refuse
         ), patch("airflow.models.Variable.get", side_effect=refuse):
             assert _read_switch(True) is False
+
+
+class TestTheSwitchClosesThePageInEverySpellingOfNo:
+    """What an administrator writes to close the page closes it, however he spells it.
+
+    The callback runs here over the real reader and the real configuration, because the
+    property at stake is the one an administrator sees: the option in his ``airflow.cfg``
+    and what the Op role holds after the restart he made for it.
+    """
+
+    @pytest.mark.parametrize("raw", ["off", "OFF", "no", "n", "false", "0", "ture"])
+    def test_the_role_ends_without_the_page(self, raw):
+        sm = _FakeSecurityManager(permissions=_OP_PERMISSIONS)
+
+        with _option(raw):
+            _grant_op_access(_state(sm))
+
+        assert sm.roles["Op"].permissions == set()
+        assert set(sm.removed) == set(_OP_PERMISSIONS)
+
+    def test_a_page_opened_by_the_default_is_closed_by_the_next_start(self):
+        """The timeline an installation actually goes through.
+
+        The provider ships with the page open, so the first webserver start hands the
+        Op role all six permissions and the metadata database keeps them. The
+        administrator then writes the switch and restarts, and that restart is the only
+        thing standing between the role and the right to start a DAG run from a queue
+        message — it has to take all six back.
+        """
+        sm = _FakeSecurityManager()
+
+        with _option(None):
+            _grant_op_access(_state(sm))
+        assert sm.roles["Op"].permissions == set(_OP_PERMISSIONS)
+
+        with _option("off"):
+            _grant_op_access(_state(sm))
+        assert sm.roles["Op"].permissions == set()
 
 
 class TestTheSwitchIsBeyondTheRoleItGoverns:

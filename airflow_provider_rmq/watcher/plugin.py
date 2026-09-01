@@ -112,9 +112,11 @@ def _grant_op_access(state) -> None:
     Op role create, edit and delete on Variables: a switch that role can write is one it
     can use to hand itself back the page an administrator closed to it, and a switch
     that withdraws a privilege must be out of reach of the role it withdraws it from.
-    The switch is read first and on its own: an answer that cannot be had leaves the
-    role exactly as it is, so a value in no known spelling never re-grants what an
-    administrator took away.
+    The switch is read first and on its own, and it is read towards withholding: every
+    spelling of no an ini file knows — ``false``, ``off``, ``no``, ``n``, ``0`` — closes
+    the page, and so does a value in no spelling at all, because an administrator who
+    wrote something over the granting default was reaching for the closed page and gets
+    it, with the value he wrote named in the log.
 
     Runs as a deferred blueprint callback, by which point ``app.appbuilder`` exists and
     an application context is up. Nothing it does may keep the webserver from starting,
@@ -122,10 +124,10 @@ def _grant_op_access(state) -> None:
     """
     grant: bool | None = None
     try:
-        # The switch is read before anything is touched, and one holding a value that
-        # is not a yes-or-no answer raises: what the role holds then stays exactly as it
-        # is, and ``grant`` still being None is what tells the two failures apart down
-        # below.
+        # The switch is read before anything is touched, and it answers false to
+        # everything that is not a yes, so nothing below can hand the page back on a
+        # value nobody could read. ``grant`` still being None in the handler is what
+        # tells a read that failed outright from a write that did.
         grant = read_flag(GRANT_OP_ACCESS_SECTION, GRANT_OP_ACCESS_OPTION, True)
         sm = state.app.appbuilder.sm
         role = sm.find_role(_OP_ROLE)
