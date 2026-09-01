@@ -79,14 +79,18 @@ class _FakeSecurityManager:
         knows: a role cannot hold one that does not exist.
     :param refuses: Pairs whose creation answers ``None``, as FAB's does on a database
         that refuses the insert.
+    :param rolls_back: Pairs whose add and remove leave the role exactly as it was and
+        say nothing about it, the way FAB's do when the commit inside them fails: both
+        methods log the error, roll the session back and return.
     """
 
-    def __init__(self, roles=("Op",), permissions=(), refuses=()):
+    def __init__(self, roles=("Op",), permissions=(), refuses=(), rolls_back=()):
         self.roles = {name: _FakeRole(name) for name in roles}
         for role in self.roles.values():
             role.permissions.update(permissions)
         self.known: set = set(permissions)
         self.refuses: set = set(refuses)
+        self.rolls_back: set = set(rolls_back)
         self.created: list = []
         self.added: list = []
         self.removed: list = []
@@ -108,10 +112,14 @@ class _FakeSecurityManager:
         if permission in role.permissions:
             return
         self.added.append(permission)
+        if permission in self.rolls_back:
+            return
         role.permissions.add(permission)
 
     def remove_permission_from_role(self, role, permission):
         self.removed.append(permission)
+        if permission in self.rolls_back:
+            return
         role.permissions.discard(permission)
 
 
@@ -303,6 +311,51 @@ class TestOpAccessGrant:
             "RabbitMQ" in r.getMessage() for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
 
+    def test_a_grant_the_database_rolled_back_is_not_reported_as_done(self, caplog):
+        """FAB's role-permission calls answer nothing and raise nothing.
+
+        A commit they could not make is logged inside them, rolled back and returned
+        from exactly as a successful one is, so a callback counting its own calls would
+        report a page opened to a role that holds nothing of it. What the role holds
+        when the call comes back is the only account of the write there is.
+        """
+        stuck = ("can_delete", "RMQ Subscriptions")
+        sm = _FakeSecurityManager(rolls_back=[stuck])
+
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.plugin"
+        ), patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
+            _grant_op_access(_state(sm))
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert sm.roles["Op"].permissions == set(_OP_PERMISSIONS) - {stuck}
+        assert any(
+            "can_delete" in m and "was not given to" in m for m in messages
+        ), messages
+        assert any("holds 5 of the 6" in m for m in messages), messages
+
+    def test_a_revocation_the_database_rolled_back_is_not_reported_as_done(self, caplog):
+        """The log line is all an administrator has to go on when he withdraws access.
+
+        He sets the switch to false to take create, edit and delete on subscriptions
+        away from the role, and a summary counting calls would tell him it happened
+        while the role still held every one of them.
+        """
+        stuck = ("can_edit", "RMQ Subscriptions")
+        sm = _FakeSecurityManager(permissions=_OP_PERMISSIONS, rolls_back=[stuck])
+
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.plugin"
+        ), patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=False):
+            _grant_op_access(_state(sm))
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert sm.roles["Op"].permissions == {stuck}
+        assert any(
+            "can_edit" in m and "was not taken from" in m for m in messages
+        ), messages
+        assert any("is without 5 of the 6" in m for m in messages), messages
+
 
 class _FakeBackend:
     """A secrets backend holding ``values``, or failing every read with ``raises``."""
@@ -366,6 +419,41 @@ class TestReadFlag:
         assert any(
             GRANT_OP_ACCESS_VAR in r.getMessage() for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
+
+    def test_a_failing_backend_does_not_hide_a_value_the_next_one_holds(self, caplog):
+        """Airflow puts a custom backend in front of the metadata database.
+
+        A Vault or SSM outage would otherwise swallow the value the database holds, and
+        the switch would read as unreadable at every webserver start for as long as that
+        backend is flaky — leaving the role holding a page the administrator set the
+        Variable to close.
+        """
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.tunables"
+        ), _backends(
+            _FakeBackend({}, raises=RuntimeError("vault is down")),
+            _FakeBackend({GRANT_OP_ACCESS_VAR: "false"}),
+        ):
+            assert read_flag(GRANT_OP_ACCESS_VAR, True) is False
+
+        assert any(
+            "vault is down" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_a_read_no_backend_answered_raises_the_first_failure(self):
+        """A refusal in front of backends that hold nothing is not an unset Variable.
+
+        The failure is what the caller is told about, because it is the one thing that
+        stands between it and an answer.
+        """
+        first = RuntimeError("vault is down")
+
+        with _backends(
+            _FakeBackend({}, raises=first), _FakeBackend({})
+        ), pytest.raises(RuntimeError) as caught:
+            read_flag(GRANT_OP_ACCESS_VAR, True)
+
+        assert caught.value is first
 
     def test_a_database_that_cannot_answer_raises(self):
         """The caller is told, instead of being handed the default as an answer.

@@ -94,20 +94,36 @@ def _grant_op_access(state) -> None:
                     )
                     continue
                 sm.add_permission_to_role(role, permission)
+                landed = permission in role.permissions
             else:
                 # A pair FAB does not hold is a pair no role holds either, so the
                 # revocation asks for the existing one instead of making it first.
                 permission = sm.get_permission(action, resource)
                 if permission is None:
+                    # A pair FAB never made is one the role cannot be holding, so it is
+                    # already off the role and counts towards the summary below.
+                    done += 1
                     continue
                 sm.remove_permission_from_role(role, permission)
+                landed = permission not in role.permissions
+            # Both FAB calls answer nothing and raise nothing: a commit they could not
+            # make is logged by FAB, rolled back and returned from as if it had worked.
+            # What the role holds afterwards is therefore the only account of the write
+            # this callback can give, and the summary below counts nothing else.
+            if not landed:
+                log.warning(
+                    "RMQ Watcher: permission %s on %r was not %s role %s — the write "
+                    "did not reach the database",
+                    action, resource, "given to" if grant else "taken from", _OP_ROLE,
+                )
+                continue
             done += 1
         log.info(
-            "RMQ Watcher: %d of the %d permissions of the Subscriptions page %s role %s",
+            "RMQ Watcher: role %s %s %d of the %d permissions of the Subscriptions page",
+            _OP_ROLE,
+            "holds" if grant else "is without",
             done,
             len(_OP_PERMISSIONS),
-            "given to" if grant else "taken from",
-            _OP_ROLE,
         )
     except Exception:
         if grant is None:

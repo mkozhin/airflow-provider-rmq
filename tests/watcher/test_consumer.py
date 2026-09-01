@@ -8102,7 +8102,13 @@ class TestADagWithoutASerializedVersion:
             )
 
         assert state.write.await_args.args[0] == _SUB_ERROR
-        assert "not found" in state.write.await_args.kwargs["last_error"]
+        last_error = state.write.await_args.kwargs["last_error"]
+        # The row names the condition an operator can act on. Airflow's own "Dag id X
+        # not found" is true of an unparsed DAG and of a deleted one alike, and a row
+        # carrying it alone sends whoever reads it looking for a DAG that is there.
+        assert "no serialized version" in last_error
+        assert "DAG processor has not parsed it" in last_error
+        assert "Dag id test_dag not found" in last_error
 
     @pytest.mark.asyncio
     async def test_a_delivery_that_went_through_starts_the_count_again(self, manager):
@@ -9835,7 +9841,7 @@ class TestAFireDagWithoutASerializedVersion:
         return [(c.args[0], c.args[1] % c.args[2:]) for c in log.log.call_args_list]
 
     @pytest.mark.asyncio
-    async def test_the_event_goes_back_and_nothing_is_written(self, manager):
+    async def test_the_event_goes_back_and_the_status_is_held_at_listening(self, manager):
         msg = self._fire_message()
         state = _ConsumerState(sub_id=None, executor=manager._executor)
         state.write = AsyncMock()
@@ -9850,7 +9856,7 @@ class TestAFireDagWithoutASerializedVersion:
 
         msg.nack.assert_awaited_once_with(requeue=True)
         msg.ack.assert_not_awaited()
-        state.write.assert_not_awaited()
+        state.write.assert_awaited_once_with(_SUB_LISTENING, last_error=None)
         assert delays == [_TRIGGER_BACKOFF_START]
         [(level, text)] = self._warmup_lines(log)
         assert level == logging.INFO
@@ -9879,7 +9885,7 @@ class TestAFireDagWithoutASerializedVersion:
                 msg.nack.assert_awaited_once_with(requeue=True)
                 msg.ack.assert_not_awaited()
 
-        state.write.assert_not_awaited()
+        assert {c.args[0] for c in state.write.await_args_list} == {_SUB_LISTENING}
         lines = self._warmup_lines(log)
         assert len(lines) == count
         assert [
@@ -9947,6 +9953,29 @@ class TestAFireDagWithoutASerializedVersion:
 
         assert (manager._fire_candidate() is fire) is candidate
         assert (fire.state.status == _SUB_ERROR) is not candidate
+
+    @pytest.mark.asyncio
+    async def test_a_warmup_takes_the_consumer_back_into_the_check(self, manager):
+        """An ``error`` left by an unrelated failure does not outlast the next event.
+
+        One trigger that timed out against a loaded metadata database is enough to have
+        the consumer reporting ``error``, and a warmup that only declined to touch the
+        status would leave it there for every event of the whole warmup — a fire
+        consumer whose connection died in that window would be asked about by nobody.
+        """
+        fire = _register_fire(manager, status=_SUB_ERROR)
+        assert manager._fire_candidate() is None
+        self._warming_up(manager)
+
+        with _record_consumer_sleeps(lambda delay: None):
+            await manager._handle_fire_delivery(
+                self._fire_message(),
+                fire.state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+            )
+
+        assert fire.state.status == _SUB_LISTENING
+        assert manager._fire_candidate() is fire
 
 
 class TestAbandonedTasks:

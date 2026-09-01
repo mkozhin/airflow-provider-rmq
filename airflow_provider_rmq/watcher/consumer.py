@@ -574,6 +574,21 @@ def _error_text(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
+def _not_ready_text(exc: BaseException) -> str:
+    """What the row says of a DAG Airflow holds no serialized version of.
+
+    Airflow words this one "Dag id X not found", and of a DAG that exists, is active and
+    unpaused — which is what the check before the trigger has just established — that
+    reads as a hunt for a missing DAG. What is missing is the parsed version the DAG
+    processor writes, so the row names that condition and keeps Airflow's own wording
+    behind it, where it still matches the scheduler log.
+    """
+    return (
+        "the DAG has no serialized version yet — the DAG processor has not parsed it "
+        f"({_error_text(exc)})"
+    )
+
+
 def _new_connection(url: str, ssl_context: Any) -> Any:
     """Build the robust connection to ``url``, before anything is awaited on it.
 
@@ -3353,7 +3368,7 @@ class RMQConsumerManager:
                     "deliveries in a row: %s — reporting it on the subscription",
                     dag_id, sub_id, state.not_ready_streak, exc,
                 )
-                await state.write(_SUB_ERROR, last_error=_error_text(exc))
+                await state.write(_SUB_ERROR, last_error=_not_ready_text(exc))
             else:
                 # A quorum queue drops the delivery once its delivery-limit is spent,
                 # which can happen before the streak reaches the limit above, so every
@@ -3600,11 +3615,12 @@ class RMQConsumerManager:
         subscription does: the connection is fine and the iterator keeps running, so
         nothing else would say that expired cooldown windows stopped starting DAG runs.
 
-        A DAG Airflow has not serialized yet is the one trigger failure it writes no
-        status for: one fire consumer serves every cooldown DAG, so an ``error`` on it
-        would report the warmup of one DAG as the failure of all of them. Holding the
-        status at ``listening`` keeps the consumer a candidate of the liveness check, so
-        a consumer that dies inside a warmup lasting minutes is noticed all the same.
+        A DAG Airflow has not serialized yet is the one trigger failure it reports no
+        ``error`` for: one fire consumer serves every cooldown DAG, so an ``error`` on it
+        would report the warmup of one DAG as the failure of all of them. The status is
+        held at ``listening``, which keeps the consumer a candidate of the liveness
+        check, so a consumer that dies inside a warmup lasting minutes is noticed all
+        the same.
         The log line is where such a warmup shows, and every tenth event of the same DAG
         is raised to WARNING — the events of one dag_id are counted for that and for
         nothing else, since the DAG that never becomes serializable circles here for as
@@ -3628,6 +3644,12 @@ class RMQConsumerManager:
             raise
         except _DagNotReady as exc:
             await message.nack(requeue=True)
+            # The reported status is what the liveness check reads, so a warmup event
+            # puts it back to ``listening`` the way a delivery that went through does.
+            # A failure of another kind one event earlier has the consumer reporting
+            # ``error``, and holding that through the warmup keeps a live consumer out
+            # of the check for as long as the DAG stays unparsed.
+            await state.write(_SUB_LISTENING, last_error=None)
             seen = self._fire_not_ready[dag_id] = self._fire_not_ready.get(dag_id, 0) + 1
             log.log(
                 logging.WARNING if seen % 10 == 0 else logging.INFO,

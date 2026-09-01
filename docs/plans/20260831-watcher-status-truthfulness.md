@@ -290,6 +290,17 @@ cooldown-DAG'и, поэтому единственный счётчик на е�
 долгого прогрева, будет замечен. Изменение поведения названо здесь и покрыто
 собственным тестом.
 
+⚠️ Ветка пишет `_SUB_LISTENING`, а не молчит. `_ConsumerState.write`
+присваивает `_status` до выхода по `if self._sub_id is None`
+(`consumer.py:1024`), поэтому в памяти статус fire-consumer'а живёт и при
+отсутствующей строке. Отказ другого рода одной доставкой раньше — например
+`asyncio.TimeoutError` от `_TRIGGER_TIMEOUT` по нагруженной метабазе — оставляет
+`_SUB_ERROR`, и ветка, которая ничего не пишет, не может его снять: каждый
+следующий прогревающийся event держал бы живого consumer'а вне проверки живости
+весь прогрев, а для несериализуемого cooldown-DAG'а — навсегда. Запись
+`listening` делает обещание «прогрев оставляет consumer'а кандидатом» верным в
+обе стороны.
+
 Остаётся видимость: своя строка в логе вместо «Triggering DAG %s for an expired
 cooldown window failed» (`consumer.py:3553-3556`). Cooldown-DAG, не
 сериализуемый никогда, по-прежнему будет виден только в логе — ровно как
@@ -430,12 +441,15 @@ except _DagNotReady as exc:
 (`3454`, `3564`) счётчика не касаются: его там нет.
 
 Ветка в `_handle_fire_delivery` (после `except asyncio.CancelledError` на
-`consumer.py:3550`) короче — ни счётчика, ни записи статуса:
+`consumer.py:3550`) порога не знает: считаются события по `dag_id` — только ради
+уровня записи в логе, — а статус держится в `listening`:
 
 ```python
 except _DagNotReady as exc:
     await message.nack(requeue=True)
-    log.info(...)
+    await state.write(_SUB_LISTENING, last_error=None)
+    seen = self._fire_not_ready[dag_id] = self._fire_not_ready.get(dag_id, 0) + 1
+    log.log(logging.WARNING if seen % 10 == 0 else logging.INFO, ...)
     await backoff.wait()
     return
 ```
@@ -478,8 +492,15 @@ def read_flag(name: str, default: bool) -> bool:
 ```
 
 Истинными читаются `1`, `true`, `yes`, `on` в любом регистре; ложными — `0`,
-`false`, `no`, `off`; всё прочее и недоступная база дают `default`, о чём
+`false`, `no`, `off`; всё прочее и незаданная Variable дают `default`, о чём
 пишется предупреждение.
+
+⚠️ Backend'ы опрашиваются в порядке самого Airflow, и отказ одного не
+прекращает опрос: сбойный Vault не прячет значение, лежащее в метабазе за ним.
+Если не ответил ни один и хотя бы один отказал, `read_flag` бросает первое
+исключение, а не возвращает `default`: недоступная база иначе была бы
+неотличима от админа, не задавшего ничего, и умолчание решало бы за него.
+Значение прогоняется через `mask_secret`, как это делает `Variable.get`.
 
 ## What Goes Where
 
@@ -588,16 +609,23 @@ def read_flag(name: str, default: bool) -> bool:
       `except asyncio.CancelledError` (`consumer.py:3550`) и `except Exception`:
       `nack(requeue=True)`, своя строка в логе вместо «Triggering DAG %s for an
       expired cooldown window failed» (`consumer.py:3553-3556`), пауза, `return`
-- [x] **ни счётчика, ни записи статуса** в этой ветке: строки у fire-consumer'а
-      нет, `write` выходит на `if self._sub_id is None: return`
-      (`consumer.py:996-997`), красить нечего
+- [x] порога в этой ветке нет: строки у fire-consumer'а нет, `write` выходит на
+      `if self._sub_id is None: return`, красить нечего
+- ⚠️ статус ветка всё же пишет — `_SUB_LISTENING`: `write` присваивает `_status`
+      до этого выхода, и от него зависит `_fire_candidate`. Молчащая ветка не
+      сняла бы `_SUB_ERROR`, оставленный отказом другого рода, и держала бы
+      живого consumer'а вне проверки живости весь прогрев
+- ➕ события считаются по `dag_id` (`_fire_not_ready`) — только ради уровня
+      записи в логе: каждое десятое идёт WARNING'ом
 - [x] запись `_SUB_ERROR` на `consumer.py:3559` оставить на месте для всех
       прочих исключений — правка уводит из-под неё только `_DagNotReady`
 - [x] переписать docstring `_handle_fire_delivery` (`consumer.py:3523-3534`):
       сейчас он обещает, что fire-consumer отчитывается о любом отказе своим
       статусом — назвать `_DagNotReady` исключением, о котором он молчит
 - [x] тест: `DagNotFound` из fire-триггера — доставка возвращена в очередь,
-      `state.write` не вызывался, в логе строка про прогрев
+      статус держится в `listening`, в логе строка про прогрев
+- ➕ тест: `_SUB_ERROR`, оставленный отказом другого рода, снимается первым же
+      прогревающимся event'ом, и consumer снова кандидат `_fire_candidate`
 - [x] тест на изменение поведения: во время прогрева fire-consumer **остаётся**
       кандидатом `_fire_candidate` (`consumer.py:2469-2480`), тогда как сегодня
       запись `_SUB_ERROR` выводит его из кандидатов проверки живости
@@ -636,6 +664,11 @@ def read_flag(name: str, default: bool) -> bool:
 - [x] выход с предупреждением, когда роль `Op` не найдена
 - [x] весь колбэк под `try/except Exception` с `log.warning`: веб-сервер обязан
       подняться, что бы ни случилось
+- ➕ обе FAB-функции (`add_permission_to_role`, `remove_permission_from_role`)
+      не возвращают ничего и не бросают: несостоявшийся commit они логируют,
+      откатывают и выходят как из удачного. Поэтому после каждого вызова
+      проверяется `permission in role.permissions`, итоговая строка лога
+      считает только это, а не собственные вызовы
 - [x] зарегистрировать колбэк как `_bp.record_once(_grant_op_access)`
 - [x] тест **на подключение колбэка**: поднять `flask.Flask`, положить на него
       подставной `appbuilder` с `sm`, вызвать `app.register_blueprint(_bp)` и

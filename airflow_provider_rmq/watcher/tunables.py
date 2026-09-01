@@ -108,24 +108,48 @@ def read_flag(name: str, default: bool) -> bool:
 
     :param default: What an unset Variable and a value spelled in none of the words
         above read as. The latter is logged.
-    :raises: Whatever a secrets backend raises. The backends are asked in Airflow's own
-        order rather than through :meth:`Variable.get`, which logs a backend that failed
-        and hands back the very ``None`` an unset Variable gives: a caller acting on the
-        answer would then take an unreachable database for an administrator who set
-        nothing, and the default would decide in his place. Raising leaves that decision
-        where it belongs — with the caller, which knows what it is about to do.
+    :raises: The first exception a secrets backend raised, and only when no backend
+        answered at all. The backends are asked in Airflow's own order — one that failed
+        is logged and the next is asked, so a value the metadata database holds is
+        reached across an outage of the custom backend in front of it — but a read every
+        backend refused raises rather than returning ``default``, which is where this
+        parting from :meth:`Variable.get` lies: that one hands back the very ``None`` an
+        unset Variable gives, so a caller acting on the answer would take an unreachable
+        database for an administrator who set nothing and let the default decide in his
+        place. Raising leaves that decision with the caller, which knows what it is
+        about to do.
 
     Blocking — it queries the secrets backends, the metadata database among them.
     """
     from airflow.configuration import ensure_secrets_loaded
+    from airflow.utils.log.secrets_masker import mask_secret
 
     raw = None
+    failure: Exception | None = None
     for backend in ensure_secrets_loaded():
-        raw = backend.get_variable(key=name)
+        try:
+            raw = backend.get_variable(key=name)
+        except Exception as exc:  # noqa: BLE001 - carried, and raised when no one answers
+            if failure is None:
+                failure = exc
+            log.warning(
+                "RMQ Watcher: secrets backend %s could not be asked for Variable %s: "
+                "%s — asking the next backend",
+                type(backend).__name__,
+                name,
+                exc,
+            )
+            continue
         if raw is not None:
             break
     if raw is None:
+        if failure is not None:
+            raise failure
         return default
+    # The value is put through the masker the way ``Variable.get`` puts it, so a name
+    # Airflow counts as sensitive is redacted in the warning below as it is everywhere
+    # else.
+    mask_secret(raw, name)
     word = raw.strip().lower()
     if word in _TRUE_WORDS:
         return True
