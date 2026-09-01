@@ -8032,7 +8032,10 @@ class TestADagWithoutASerializedVersion:
         return [c.args[0] for c in write.await_args_list]
 
     @pytest.mark.asyncio
-    async def test_the_delivery_goes_back_and_the_row_is_left_alone(self, manager):
+    async def test_the_delivery_goes_back_and_the_row_reads_listening(self, manager):
+        """The row says what the consumer is doing: holding its registration and taking
+        every delivery offered. Nothing about the warmup is a fault of the subscription,
+        and ``listening`` is also what keeps it a candidate of the liveness check."""
         state = self._state(manager)
         with patch(f"{_CONSUMER_MODULE}.log") as log, \
              patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
@@ -8045,7 +8048,8 @@ class TestADagWithoutASerializedVersion:
 
         messages[0].nack.assert_awaited_once_with(requeue=True)
         messages[0].ack.assert_not_awaited()
-        state.write.assert_not_awaited()
+        assert self._statuses(state.write) == [_SUB_LISTENING]
+        assert state.write.await_args.kwargs["last_error"] is None
         [(level, text)] = _warmup_lines(log)
         assert level == logging.INFO
         assert "not serialized yet" in text
@@ -8079,7 +8083,7 @@ class TestADagWithoutASerializedVersion:
         assert "10 deliveries in a row" in text
         assert "back on the queue" in text
         assert state.not_ready_streak == count
-        state.write.assert_not_awaited()
+        assert set(self._statuses(state.write)) == {_SUB_LISTENING}
 
     @pytest.mark.asyncio
     async def test_a_warmup_longer_than_the_bound_reaches_the_row(self, manager):
@@ -8244,6 +8248,30 @@ class TestADagWithoutASerializedVersion:
         assert state.write.await_args.args[0] == _SUB_ERROR
         silence = sum(delays[:-1])   # the pauses before the delivery that reports
         assert 15 * 60 < silence < 25 * 60, silence
+
+    @pytest.mark.asyncio
+    async def test_a_warmup_takes_the_subscription_back_into_the_check(self, manager):
+        """An ``error`` left by an unrelated failure does not outlast the next delivery.
+
+        A scheduler that has just come up is where both halves meet: one trigger that
+        failed against a metadata database still under load leaves the row reading
+        ``error``, and the deliveries after it go through the warmup. Carrying that
+        ``error`` on would report a fault of a subscription that has none, and would
+        leave it out of :func:`_still_attached` for the length of the warmup — nobody
+        would ask the broker about a registration that had meanwhile died.
+        """
+        state = self._state(manager)
+        state._status = _SUB_ERROR
+
+        with patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await self._deliver(
+                manager,
+                state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+                _DagNotReady("Dag id test_dag not found"),
+            )
+
+        assert self._statuses(state.write) == [_SUB_LISTENING]
 
     @pytest.mark.asyncio
     async def test_the_conn_id_row_stays_green_through_the_warmup(self, manager):

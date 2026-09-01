@@ -27,6 +27,13 @@ _MENU_CATEGORY = "RabbitMQ"
 #: hands that role every non-DAG permission on every role synchronisation.
 _OP_ROLE = "Op"
 
+#: An endpoint of Airflow's own web UI. The webserver registers the core views before it
+#: registers plugin blueprints, so this is present by the time the grant below runs;
+#: every other application that builds an appbuilder — the FAB CLI commands do, for
+#: ``airflow users``, ``airflow roles`` and ``airflow sync-perm`` — registers plugin
+#: blueprints without it.
+_WEB_UI_ENDPOINT = "Airflow.index"
+
 _bp = Blueprint(
     "rmq_watcher",
     __name__,
@@ -96,6 +103,22 @@ def _apply_pair(sm, role, action: str, resource: str, grant: bool) -> bool:
     return landed
 
 
+def _serves_the_web_ui(app) -> bool:
+    """Answer whether this application is the one that serves the Subscriptions page.
+
+    A blueprint callback runs wherever the blueprint is registered, and the webserver is
+    not the only application that registers plugin blueprints: the FAB CLI commands
+    behind ``airflow users``, ``airflow roles`` and ``airflow sync-perm`` assemble an
+    appbuilder of their own the same way. The permissions of a page belong to the
+    application that serves the page, so the grant asks for Airflow's own web UI and
+    stands aside where there is none.
+
+    ``view_functions`` is a plain dictionary Flask fills in at construction, so the
+    question can be asked of any application without a context and without a database.
+    """
+    return _WEB_UI_ENDPOINT in app.view_functions
+
+
 def _grant_op_access(state) -> None:
     """Give the Op role every permission of the Subscriptions page, or take them back.
 
@@ -118,10 +141,18 @@ def _grant_op_access(state) -> None:
     wrote something over the granting default was reaching for the closed page and gets
     it, with the value he wrote named in the log.
 
-    Runs as a deferred blueprint callback, by which point ``app.appbuilder`` exists and
-    an application context is up. Nothing it does may keep the webserver from starting,
-    so every failure ends as a warning over a session handed back rolled back.
+    Runs as a deferred blueprint callback in the application that serves the page, by
+    which point ``app.appbuilder`` exists and an application context is up. Nothing it
+    does may keep the webserver from starting, so every failure ends as a warning over a
+    session handed back rolled back.
     """
+    if not _serves_the_web_ui(state.app):
+        log.debug(
+            "RMQ Watcher: this application serves no web UI — leaving the Subscriptions "
+            "page permissions of role %s to the webserver",
+            _OP_ROLE,
+        )
+        return
     grant: bool | None = None
     try:
         # The switch is read before anything is touched, and it answers false to

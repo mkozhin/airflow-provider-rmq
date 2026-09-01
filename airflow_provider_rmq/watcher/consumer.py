@@ -3384,6 +3384,17 @@ class RMQConsumerManager:
                     "a row: %s — the delivery is back on the queue, pausing %.1fs",
                     dag_id, sub_id, state.not_ready_streak, exc, backoff.seconds,
                 )
+                # The row is moved back to ``listening`` because that is what the
+                # consumer is doing: it holds its registration and takes every delivery
+                # the broker offers. A failure of another kind one delivery earlier has
+                # the row reading ``error``, and carrying that through the warmup would
+                # keep saying something untrue of a working consumer and, worse, keep it
+                # out of the liveness check — :func:`_still_attached` asks only about a
+                # subscription reporting ``listening``. Its ``conn_id`` would then run
+                # out of candidates and be judged without any, colouring a row whose
+                # connection answers every probe. Repeating the same status costs
+                # nothing: the writer drops a write the row already holds.
+                await state.write(_SUB_LISTENING, last_error=None)
             await backoff.wait()
             return
         except Exception as exc:

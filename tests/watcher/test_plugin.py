@@ -15,6 +15,7 @@ import pytest
 from airflow_provider_rmq.watcher import tunables
 from airflow_provider_rmq.watcher.plugin import (
     _OP_PERMISSIONS,
+    _WEB_UI_ENDPOINT,
     RMQWatcherPlugin,
     _bp,
     _grant_op_access,
@@ -166,9 +167,26 @@ class _FakeSecurityManager:
         role.permissions.discard(permission)
 
 
+def _web_ui_app():
+    """A Flask application shaped like the webserver's: it serves Airflow's own UI.
+
+    The webserver registers the core views before it registers plugin blueprints, so the
+    endpoint is there by the time the grant runs. An application without it is one of the
+    others that build an appbuilder — the FAB CLI commands — and the grant stands aside.
+    """
+    app = flask.Flask(__name__)
+    app.add_url_rule("/home", endpoint="Airflow.index", view_func=lambda: "")
+    return app
+
+
 def _state(sm):
     """A stand-in for the blueprint setup state the callback is handed."""
-    return SimpleNamespace(app=SimpleNamespace(appbuilder=SimpleNamespace(sm=sm)))
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            appbuilder=SimpleNamespace(sm=sm),
+            view_functions={"Airflow.index": lambda: ""},
+        )
+    )
 
 
 class TestOpAccessGrant:
@@ -183,7 +201,7 @@ class TestOpAccessGrant:
         an operator is told to set, and no other test reads that name off the call.
         """
         sm = _FakeSecurityManager()
-        app = flask.Flask(__name__)
+        app = _web_ui_app()
         app.appbuilder = SimpleNamespace(sm=sm)
         reads: list = []
 
@@ -478,6 +496,91 @@ class _AlwaysTrueBackend:
         return "true"
 
 
+class TestTheGrantBelongsToTheWebserver:
+    """The permissions of a page are set by the application that serves the page.
+
+    A blueprint callback runs wherever the blueprint is registered, and the webserver is
+    not the only application that registers plugin blueprints. Every FAB CLI command
+    behind ``airflow users``, ``airflow roles`` and ``airflow sync-perm`` assembles an
+    appbuilder the same way, in a process whose environment is the operator's shell — so
+    a grant that ran there would answer to a switch nobody set in that shell and write
+    the role's permissions on a command that only reads.
+    """
+
+    def test_an_application_without_the_web_ui_is_left_alone(self):
+        sm = _FakeSecurityManager()
+        app = flask.Flask(__name__)
+        app.appbuilder = SimpleNamespace(sm=sm)
+        reads: list = []
+
+        def record(section, option, default):
+            reads.append((section, option, default))
+            return True
+
+        with patch("airflow_provider_rmq.watcher.plugin.read_flag", record):
+            app.register_blueprint(_bp)
+
+        assert reads == []
+        assert sm.roles["Op"].permissions == set()
+        assert sm.created == []
+        assert sm.added == []
+        assert sm.removed == []
+
+    def test_a_closed_switch_takes_nothing_back_outside_the_webserver(self):
+        """The stand-aside holds in the revoking direction too.
+
+        A grant that only skipped the granting half would still strip the role on every
+        CLI command run in a shell that happens to carry the switch.
+        """
+        sm = _FakeSecurityManager(permissions=_OP_PERMISSIONS)
+        app = flask.Flask(__name__)
+        app.appbuilder = SimpleNamespace(sm=sm)
+
+        with patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=False):
+            app.register_blueprint(_bp)
+
+        assert sm.roles["Op"].permissions == set(_OP_PERMISSIONS)
+        assert sm.removed == []
+
+    def test_the_endpoint_is_one_airflow_registers_for_its_own_ui(self):
+        """The constant names a view Airflow really has, under the name FAB gives it.
+
+        FAB takes an endpoint from the view class name unless the class overrides it, so
+        a rename upstream would leave the grant standing aside in the webserver too —
+        silently, since standing aside is the quiet outcome.
+        """
+        views = pytest.importorskip("airflow.www.views")
+
+        assert _WEB_UI_ENDPOINT == f"{views.Airflow.__name__}.index"
+        assert callable(views.Airflow.index)
+        assert getattr(views.Airflow, "endpoint", None) is None
+
+    def test_the_fab_cli_assembles_an_application_without_the_web_ui(self):
+        """The premise of the whole stand-aside, read off the installed Airflow.
+
+        ``_return_appbuilder`` registers plugin blueprints and never the core views, so
+        the endpoint the grant asks for is exactly what tells the two applications apart.
+        """
+        import inspect
+
+        utils = pytest.importorskip(
+            "airflow.providers.fab.auth_manager.cli_commands.utils"
+        )
+        source = inspect.getsource(utils._return_appbuilder)
+
+        assert "init_plugins" in source
+        assert "init_appbuilder_views" not in source
+
+    def test_the_webserver_registers_the_core_views_before_the_plugins(self):
+        """And the order is what puts the endpoint there in time for the callback."""
+        import inspect
+
+        app_module = pytest.importorskip("airflow.www.app")
+        source = inspect.getsource(app_module.create_app)
+
+        assert source.index("init_appbuilder_views") < source.index("init_plugins")
+
+
 class TestReadFlag:
     """The yes-or-no reader: every spelling, the default, and a value it cannot read.
 
@@ -739,7 +842,7 @@ class TestGrantOpAccessIsDeclared:
         )
 
         sm = _FakeSecurityManager()
-        app = flask.Flask(__name__)
+        app = _web_ui_app()
         app.appbuilder = SimpleNamespace(sm=sm)
         fallbacks: list = []
 
