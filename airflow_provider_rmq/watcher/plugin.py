@@ -10,7 +10,11 @@ log = logging.getLogger(__name__)
 
 from airflow_provider_rmq.watcher.listener import RMQWatcherListener
 from airflow_provider_rmq.watcher.models import ensure_table_exists
-from airflow_provider_rmq.watcher.tunables import GRANT_OP_ACCESS_VAR, read_flag
+from airflow_provider_rmq.watcher.tunables import (
+    GRANT_OP_ACCESS_OPTION,
+    GRANT_OP_ACCESS_SECTION,
+    read_flag,
+)
 from airflow_provider_rmq.watcher.views import RMQWatcherView
 
 #: The menu entry and the category it hangs under. FAB grants menu access by the
@@ -100,13 +104,17 @@ def _grant_op_access(state) -> None:
     configures the instance the subscriptions listen on, and this hands it the page at
     every webserver start, which makes the grant retroactive over an upgrade.
 
-    Airflow Variable :data:`GRANT_OP_ACCESS_VAR` governs the access, not merely the
-    grant: a false value **removes** the same permissions, because FAB deletes no valid
-    role-permission pair of its own accord and a switch that only fell silent would
-    leave the role holding full access after the administrator declined it. The switch
-    is read first and on its own: an answer that cannot be had leaves the role exactly
-    as it is, so a database that refuses the read never re-grants what an administrator
-    took away.
+    Airflow configuration option ``[rmq_watcher] grant_op_access`` governs the access,
+    not merely the grant: a false value **removes** the same permissions, because FAB
+    deletes no valid role-permission pair of its own accord and a switch that only fell
+    silent would leave the role holding full access after the administrator declined it.
+    It is a configuration option and not an Airflow Variable because Airflow gives the
+    Op role create, edit and delete on Variables: a switch that role can write is one it
+    can use to hand itself back the page an administrator closed to it, and a switch
+    that withdraws a privilege must be out of reach of the role it withdraws it from.
+    The switch is read first and on its own: an answer that cannot be had leaves the
+    role exactly as it is, so a value in no known spelling never re-grants what an
+    administrator took away.
 
     Runs as a deferred blueprint callback, by which point ``app.appbuilder`` exists and
     an application context is up. Nothing it does may keep the webserver from starting,
@@ -114,10 +122,11 @@ def _grant_op_access(state) -> None:
     """
     grant: bool | None = None
     try:
-        # The switch is read before anything is touched, and an unreadable one raises:
-        # what the role holds then stays exactly as it is, and ``grant`` still being
-        # None is what tells the two failures apart down below.
-        grant = read_flag(GRANT_OP_ACCESS_VAR, True)
+        # The switch is read before anything is touched, and one holding a value that
+        # is not a yes-or-no answer raises: what the role holds then stays exactly as it
+        # is, and ``grant`` still being None is what tells the two failures apart down
+        # below.
+        grant = read_flag(GRANT_OP_ACCESS_SECTION, GRANT_OP_ACCESS_OPTION, True)
         sm = state.app.appbuilder.sm
         role = sm.find_role(_OP_ROLE)
         if role is None:
@@ -156,9 +165,10 @@ def _grant_op_access(state) -> None:
             )
         if grant is None:
             log.warning(
-                "RMQ Watcher: Variable %s could not be read — the Subscriptions page "
-                "permissions of role %s are left as they are",
-                GRANT_OP_ACCESS_VAR,
+                "RMQ Watcher: configuration option [%s] %s could not be read — the "
+                "Subscriptions page permissions of role %s are left as they are",
+                GRANT_OP_ACCESS_SECTION,
+                GRANT_OP_ACCESS_OPTION,
                 _OP_ROLE,
                 exc_info=True,
             )

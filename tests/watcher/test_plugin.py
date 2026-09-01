@@ -5,19 +5,25 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import flask
 import pytest
 
+from airflow_provider_rmq.watcher import tunables
 from airflow_provider_rmq.watcher.plugin import (
     _OP_PERMISSIONS,
     RMQWatcherPlugin,
     _bp,
     _grant_op_access,
 )
-from airflow_provider_rmq.watcher.tunables import GRANT_OP_ACCESS_VAR, read_flag
+from airflow_provider_rmq.watcher.tunables import (
+    GRANT_OP_ACCESS_OPTION,
+    GRANT_OP_ACCESS_SECTION,
+    read_flag,
+)
 
 
 def test_plugin_name():
@@ -173,22 +179,22 @@ class TestOpAccessGrant:
 
         Every other test here calls the function itself and would stay green with the
         registration gone, leaving the grant to never happen on a live webserver. The
-        arguments of the read are recorded here too: they name the Variable an operator
-        is told to set, and no other test reads that name off the call.
+        arguments of the read are recorded here too: they name the configuration option
+        an operator is told to set, and no other test reads that name off the call.
         """
         sm = _FakeSecurityManager()
         app = flask.Flask(__name__)
         app.appbuilder = SimpleNamespace(sm=sm)
         reads: list = []
 
-        def record(name, default):
-            reads.append((name, default))
+        def record(section, option, default):
+            reads.append((section, option, default))
             return True
 
         with patch("airflow_provider_rmq.watcher.plugin.read_flag", record):
             app.register_blueprint(_bp)
 
-        assert reads == [("rmq_watcher_grant_op_access", True)]
+        assert reads == [("rmq_watcher", "grant_op_access", True)]
         assert sm.roles["Op"].permissions == set(_OP_PERMISSIONS)
 
     def test_the_six_expected_pairs_are_granted(self):
@@ -330,7 +336,7 @@ class TestOpAccessGrant:
         assert not sm.added
         assert not sm.removed
         assert any(
-            GRANT_OP_ACCESS_VAR in r.getMessage() for r in caplog.records
+            GRANT_OP_ACCESS_OPTION in r.getMessage() for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
 
     def test_a_permission_the_database_refuses_is_named_and_the_rest_go_on(self, caplog):
@@ -443,112 +449,147 @@ class TestOpAccessGrant:
         assert any("rolled back" in m for m in messages), messages
 
 
-class _FakeBackend:
-    """A secrets backend holding ``values``, or failing every read with ``raises``."""
-
-    def __init__(self, values: dict, raises: Exception | None = None):
-        self._values = values
-        self._raises = raises
-
-    def get_variable(self, key: str):
-        if self._raises is not None:
-            raise self._raises
-        return self._values.get(key)
-
-
 @contextlib.contextmanager
-def _backends(*backends):
-    with patch("airflow.configuration.ensure_secrets_loaded", return_value=list(backends)):
+def _option(value: str | None):
+    """Run the block with the switch set to ``value`` in the process environment.
+
+    ``conf`` reads an environment variable before it reads ``airflow.cfg``, so this is
+    the same channel an operator uses who configures Airflow through its environment.
+    ``None`` runs the block with the option set nowhere.
+    """
+    name = f"AIRFLOW__{GRANT_OP_ACCESS_SECTION.upper()}__{GRANT_OP_ACCESS_OPTION.upper()}"
+    with patch.dict(os.environ, {}, clear=False):
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
         yield
 
 
+def _read_switch(default: bool) -> bool:
+    return read_flag(GRANT_OP_ACCESS_SECTION, GRANT_OP_ACCESS_OPTION, default)
+
+
+class _AlwaysTrueBackend:
+    """A secrets backend answering every Variable with a value that means yes."""
+
+    def get_variable(self, key: str) -> str:
+        return "true"
+
+
 class TestReadFlag:
-    """The yes-or-no reader: both spellings, the default and the unreadable database.
+    """The yes-or-no reader: both spellings, the default and a value it cannot read.
 
     Its answer decides whether a role keeps a permission, so the one thing it must never
-    do is turn a database that could not answer into an answer.
+    do is turn something that is not an answer into one.
     """
 
-    @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "Yes", " on "])
+    @pytest.mark.parametrize("raw", ["1", "t", "true", "TRUE", " True "])
     def test_a_value_spelled_as_yes_reads_as_true(self, raw):
-        with _backends(_FakeBackend({GRANT_OP_ACCESS_VAR: raw})):
-            assert read_flag(GRANT_OP_ACCESS_VAR, False) is True
+        with _option(raw):
+            assert _read_switch(False) is True
 
-    @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "No", " off "])
+    @pytest.mark.parametrize("raw", ["0", "f", "false", "FALSE", " False "])
     def test_a_value_spelled_as_no_reads_as_false(self, raw):
-        with _backends(_FakeBackend({GRANT_OP_ACCESS_VAR: raw})):
-            assert read_flag(GRANT_OP_ACCESS_VAR, True) is False
+        with _option(raw):
+            assert _read_switch(True) is False
 
-    def test_an_unset_variable_reads_as_the_default(self):
-        with _backends(_FakeBackend({})):
-            assert read_flag(GRANT_OP_ACCESS_VAR, True) is True
-            assert read_flag(GRANT_OP_ACCESS_VAR, False) is False
+    def test_an_unset_option_reads_as_the_default(self):
+        with _option(None):
+            assert _read_switch(True) is True
+            assert _read_switch(False) is False
 
-    def test_the_backends_are_asked_in_turn(self):
-        """Airflow reads a Variable from the first backend that holds it.
+    @pytest.mark.parametrize("raw", ["", "maybe", "2", "yes"])
+    def test_a_value_in_no_known_spelling_raises(self, raw):
+        """A switch holding something unreadable is not an instruction to grant.
 
-        An environment variable overrides the metadata database, and a reader that asked
-        the database alone would answer with a value the rest of Airflow ignores.
+        Reading it as the default would open the page on a typo, and the caller can only
+        leave the role alone if it is told that no answer was had.
         """
-        with _backends(
-            _FakeBackend({}), _FakeBackend({GRANT_OP_ACCESS_VAR: "false"})
+        from airflow.exceptions import AirflowConfigException
+
+        with _option(raw), pytest.raises(AirflowConfigException):
+            _read_switch(True)
+
+    def test_the_option_is_read_from_the_configuration_alone(self):
+        """The switch answers to the configuration and to nothing else.
+
+        A read reaching the metadata database — directly, or through the secrets
+        backends Airflow puts in front of it — is a read that can hang while the
+        webserver is building its application, and one that a role holding write access
+        to Variables can answer in the administrator's place.
+        """
+        def refuse(*args, **kwargs):
+            raise AssertionError("the switch was read outside the configuration")
+
+        with _option("false"), patch(
+            "airflow.configuration.ensure_secrets_loaded", side_effect=refuse
+        ), patch("airflow.models.Variable.get", side_effect=refuse):
+            assert _read_switch(True) is False
+
+
+class TestTheSwitchIsBeyondTheRoleItGoverns:
+    """The switch withdraws a privilege from Op, so Op must not be able to set it.
+
+    Airflow hands the Op role full write access to Variables and read-only access to the
+    configuration, and that is what decides where a switch over that role's permissions
+    can live: one kept in a Variable is one the role turns back on for itself at the
+    next webserver start.
+    """
+
+    @staticmethod
+    def _op_permissions():
+        override = pytest.importorskip(
+            "airflow.providers.fab.auth_manager.security_manager.override"
+        )
+        for config in override.FabAirflowSecurityManagerOverride.ROLE_CONFIGS:
+            if config["role"] == "Op":
+                return set(config["perms"])
+        raise AssertionError("the FAB security manager declares no Op role")
+
+    def test_the_op_role_writes_variables(self):
+        from airflow.security import permissions
+
+        held = self._op_permissions()
+        for action in (
+            permissions.ACTION_CAN_CREATE,
+            permissions.ACTION_CAN_EDIT,
+            permissions.ACTION_CAN_DELETE,
         ):
-            assert read_flag(GRANT_OP_ACCESS_VAR, True) is False
+            assert (action, permissions.RESOURCE_VARIABLE) in held
 
-    @pytest.mark.parametrize("raw", ["", "maybe", "2"])
-    def test_a_value_in_no_known_spelling_reads_as_the_default(self, caplog, raw):
-        with caplog.at_level(
-            logging.WARNING, logger="airflow_provider_rmq.watcher.tunables"
-        ), _backends(_FakeBackend({GRANT_OP_ACCESS_VAR: raw})):
-            assert read_flag(GRANT_OP_ACCESS_VAR, True) is True
+    def test_the_op_role_does_not_write_the_configuration(self):
+        from airflow.security import permissions
 
-        assert any(
-            GRANT_OP_ACCESS_VAR in r.getMessage() for r in caplog.records
-        ), [r.getMessage() for r in caplog.records]
-
-    def test_a_failing_backend_does_not_hide_a_value_the_next_one_holds(self, caplog):
-        """Airflow puts a custom backend in front of the metadata database.
-
-        A Vault or SSM outage would otherwise swallow the value the database holds, and
-        the switch would read as unreadable at every webserver start for as long as that
-        backend is flaky — leaving the role holding a page the administrator set the
-        Variable to close.
-        """
-        with caplog.at_level(
-            logging.WARNING, logger="airflow_provider_rmq.watcher.tunables"
-        ), _backends(
-            _FakeBackend({}, raises=RuntimeError("vault is down")),
-            _FakeBackend({GRANT_OP_ACCESS_VAR: "false"}),
+        held = self._op_permissions()
+        for action in (
+            permissions.ACTION_CAN_CREATE,
+            permissions.ACTION_CAN_EDIT,
+            permissions.ACTION_CAN_DELETE,
         ):
-            assert read_flag(GRANT_OP_ACCESS_VAR, True) is False
+            assert (action, permissions.RESOURCE_CONFIG) not in held
 
-        assert any(
-            "vault is down" in r.getMessage() for r in caplog.records
-        ), [r.getMessage() for r in caplog.records]
+    def test_the_switch_is_named_as_a_configuration_option(self):
+        """What the plugin reads is a section and an option, and no Variable name."""
+        assert (GRANT_OP_ACCESS_SECTION, GRANT_OP_ACCESS_OPTION) == (
+            "rmq_watcher", "grant_op_access",
+        )
+        assert not hasattr(tunables, "GRANT_OP_ACCESS_VAR")
 
-    def test_a_read_no_backend_answered_raises_the_first_failure(self):
-        """A refusal in front of backends that hold nothing is not an unset Variable.
+    def test_a_metastore_value_does_not_reopen_the_page(self):
+        """The switch says no while everything the Op role can write says yes.
 
-        The failure is what the caller is told about, because it is the one thing that
-        stands between it and an answer.
+        This is what the option buys: a role the page was taken from writes an Airflow
+        Variable of whatever name it likes and gets nowhere, because the grant asks the
+        configuration and never the metadata database.
         """
-        first = RuntimeError("vault is down")
+        sm = _FakeSecurityManager(permissions=_OP_PERMISSIONS)
 
-        with _backends(
-            _FakeBackend({}, raises=first), _FakeBackend({})
-        ), pytest.raises(RuntimeError) as caught:
-            read_flag(GRANT_OP_ACCESS_VAR, True)
+        with _option("false"), patch(
+            "airflow.configuration.ensure_secrets_loaded",
+            return_value=[_AlwaysTrueBackend()],
+        ), patch("airflow.models.Variable.get", return_value="true"):
+            _grant_op_access(_state(sm))
 
-        assert caught.value is first
-
-    def test_a_database_that_cannot_answer_raises(self):
-        """The caller is told, instead of being handed the default as an answer.
-
-        Airflow's own reader logs a failed backend and returns the ``None`` an unset
-        Variable returns, which would make an outage indistinguishable from an
-        administrator who set nothing.
-        """
-        with _backends(
-            _FakeBackend({}, raises=RuntimeError("no database"))
-        ), pytest.raises(RuntimeError):
-            read_flag(GRANT_OP_ACCESS_VAR, False)
+        assert sm.roles["Op"].permissions == set()
+        assert set(sm.removed) == set(_OP_PERMISSIONS)

@@ -772,9 +772,11 @@ Admin gets the page from Airflow itself, which hands that role every non-DAG per
 
 Two starts are needed on a virgin metadata database: Airflow creates the `Op` role after the plugin's callback has run, so the first start finds no role, logs a warning and leaves the grant to the start after it. The grant also needs the FAB auth manager, which is the default one — under another `auth_manager` there is no role to grant to and the callback logs a warning instead.
 
-> **Warning.** Those permissions include creating and deleting subscriptions, so access to the page is the right to make an arbitrary DAG run on a message from a queue. An installation where Op should not hold that right sets the Airflow Variable `rmq_watcher_grant_op_access` to `false`.
+> **Warning.** Those permissions include creating and deleting subscriptions, so access to the page is the right to make an arbitrary DAG run on a message from a queue. An installation where Op should not hold that right puts `grant_op_access = false` in the `[rmq_watcher]` section of `airflow.cfg` — or sets `AIRFLOW__RMQ_WATCHER__GRANT_OP_ACCESS=false` in the webserver's environment — and restarts the webserver.
 
-The Variable governs the access, not merely the grant: a false value **removes** the same six permissions from the Op role at the next webserver start. Granting or revoking them by hand while the Variable is true or unset achieves nothing — the next start puts the provider's own answer back.
+The switch governs the access, not merely the grant: a false value **removes** the same six permissions from the Op role at the next webserver start. Granting or revoking them by hand while the switch is true or unset achieves nothing — the next start puts the provider's own answer back.
+
+It is an Airflow configuration option and not an Airflow Variable because Airflow gives the `Op` role create, edit and delete on Variables. A switch kept there is one the very role it restricts can set back to `true` for itself, taking the page back at the next webserver restart; `airflow.cfg` and the process environment are outside the reach of every role the web UI has, which is what a switch that withdraws a privilege has to be.
 
 `menu_access` is granted on the **displayed** names of the entry and of its category, and the FAB menu is flat. Another installed plugin that names its own entry `Subscriptions` or its own category `RabbitMQ` therefore shares those two permissions, and a revocation closes its menu to Op along with this one.
 
@@ -806,9 +808,16 @@ The watcher holds long-lived AMQP connections inside the Scheduler, so it treats
 |---|---|---|
 | `rmq_watcher_reconcile_interval` | `60` | Seconds between reconcile cycles |
 | `rmq_watcher_cycle_timeout` | `max(interval × 3, 300)` | Seconds one cycle may take before the event loop is recreated |
-| `rmq_watcher_grant_op_access` | `true` | Whether the Op role holds the permissions of the [Subscriptions page](#subscriptions-page-access) |
 
-The first two are re-read at the start of every cycle in a thread pool under a short timeout of their own, so a changed Variable takes effect on the next cycle; a read still stuck in a worker blocks the next one from starting, and the loop gives up on it at its own timeout and keeps the values it already has instead of stalling; a database that refuses the read outright is not told apart from an unset Variable — it reads as no value at all, and the built-in defaults take effect until a later cycle reads a real one. The third is read once per webserver start, when the page's permissions are set. It is read before anything is touched, and a database that cannot answer it leaves the permissions exactly as they are — granting nothing, revoking nothing — with a warning in the log: an unreadable switch must not decide a question of access.
+Both are re-read at the start of every cycle in a thread pool under a short timeout of their own, so a changed Variable takes effect on the next cycle; a read still stuck in a worker blocks the next one from starting, and the loop gives up on it at its own timeout and keeps the values it already has instead of stalling; a database that refuses the read outright is not told apart from an unset Variable — it reads as no value at all, and the built-in defaults take effect until a later cycle reads a real one.
+
+**Airflow configuration:**
+
+| Option | Default | Meaning |
+|---|---|---|
+| `[rmq_watcher] grant_op_access` | `true` | Whether the Op role holds the permissions of the [Subscriptions page](#subscriptions-page-access) |
+
+It is read once per webserver start, when the page's permissions are set, and it is read from `airflow.cfg` and the webserver's environment and from nowhere else: the `_cmd` and `_secret` indirections that would reach a shell command or a secrets backend are honoured only for the options Airflow lists as sensitive, and this one is not among them. The read therefore touches neither the network nor the database, and nothing in it can hang while the webserver is still building its application. It happens before anything is touched, and a value spelled as neither `true` nor `false` leaves the permissions exactly as they are — granting nothing, revoking nothing — with a warning in the log: a switch that cannot be read must not decide a question of access.
 
 **What the Subscriptions page shows.** The Connections block at `/rmq-watcher/subscriptions` lists one row per `conn_id`:
 
@@ -895,7 +904,7 @@ airflow-provider-rmq/
 │       ├── subscription_builder.py  # build_subscriptions(), has_exchange_conflict()
 │       ├── subscription_form.py     # parse_cooldown(), parse_filter_data() (UI form parsing)
 │       ├── models.py                # RMQSubscription, RMQConnStatus, WatcherSession
-│       ├── tunables.py              # Airflow Variables tuning the watcher, with their defaults
+│       ├── tunables.py              # settings tuning the watcher, with their defaults
 │       ├── consumer.py              # RMQConsumerManager
 │       ├── orphan_tracker.py        # OrphanTracker (cooldown + exchange-mode orphan detection)
 │       ├── listener.py              # RMQWatcherListener (Scheduler Listener)

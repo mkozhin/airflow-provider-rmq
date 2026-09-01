@@ -1,4 +1,4 @@
-"""Names, defaults and timing rules of the Airflow Variables that tune the watcher.
+"""Names, defaults and timing rules of the settings that tune the watcher.
 
 The reconcile interval and the cycle budget are read by two processes that share
 nothing else: the scheduler runs the loop, and the webserver renders the Subscriptions
@@ -6,7 +6,14 @@ page and needs the same numbers to tell a fresh status row from a late one. The 
 their defaults and the arithmetic over them therefore have one home that both read, and
 the view does not reach into the listener for them. The yes-or-no switch of the page's
 access is read by the webserver alone and lives here for the same reason: the name of a
-watcher Variable and the rules for reading it belong together.
+watcher setting and the rules for reading it belong together.
+
+That switch is the one setting here that is not an Airflow Variable. It governs a
+permission of the Op role, and Airflow gives that role create, edit and delete on
+Variables, so a switch kept in the metadata database is one the restricted role can
+turn back on for itself. Airflow configuration is written in ``airflow.cfg`` or in the
+environment of the webserver process, which no role reaches through the web UI, and
+that is the property the switch needs.
 """
 from __future__ import annotations
 
@@ -23,11 +30,12 @@ DEFAULT_RECONCILE_INTERVAL = 60
 #: Airflow Variables holding the watcher tunables.
 RECONCILE_INTERVAL_VAR = "rmq_watcher_reconcile_interval"
 CYCLE_TIMEOUT_VAR = "rmq_watcher_cycle_timeout"
-GRANT_OP_ACCESS_VAR = "rmq_watcher_grant_op_access"
 
-#: Spellings :func:`read_flag` accepts, compared case-insensitively.
-_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
-_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+#: The Airflow configuration option governing the Subscriptions page access of the Op
+#: role — ``[rmq_watcher] grant_op_access`` in ``airflow.cfg``, or the environment
+#: variable ``AIRFLOW__RMQ_WATCHER__GRANT_OP_ACCESS``.
+GRANT_OP_ACCESS_SECTION = "rmq_watcher"
+GRANT_OP_ACCESS_OPTION = "grant_op_access"
 
 #: A cycle may take this many reconcile intervals, but never less than
 #: ``MIN_CYCLE_TIMEOUT`` seconds. The budget is generous on purpose: hitting it
@@ -103,65 +111,27 @@ def read_positive(name: str, cast: Callable[[str], Any]) -> Any:
     return value
 
 
-def read_flag(name: str, default: bool) -> bool:
-    """Read Airflow Variable ``name`` as a yes-or-no answer.
+def read_flag(section: str, option: str, default: bool) -> bool:
+    """Read Airflow configuration option ``[section] option`` as a yes-or-no answer.
 
-    ``1``, ``true``, ``yes`` and ``on`` read as true; ``0``, ``false``, ``no`` and
-    ``off`` read as false. Case and surrounding whitespace do not matter.
+    ``1``, ``t`` and ``true`` read as true; ``0``, ``f`` and ``false`` read as false.
+    Case, surrounding whitespace and a trailing ``#`` comment do not matter. These are
+    Airflow's own spellings for every boolean option it has, and the option is read
+    through Airflow's own parser so that it answers to exactly them.
 
-    :param default: What an unset Variable and a value spelled in none of the words
-        above read as. The latter is logged.
-    :raises Exception: The first exception a secrets backend raised, and only when no
-        backend answered at all. The backends are asked in Airflow's own order — one that
-        failed is logged and the next is asked, so a value the metadata database holds
-        is reached across an outage of the custom backend in front of it — but a read
-        every backend refused raises rather than returning ``default``, which is where this
-        parting from :meth:`Variable.get` lies: that one hands back the very ``None`` an
-        unset Variable gives, so a caller acting on the answer would take an unreachable
-        database for an administrator who set nothing and let the default decide in his
-        place. Raising leaves that decision with the caller, which knows what it is
-        about to do.
+    :param default: What an option nobody set reads as.
+    :raises AirflowConfigException: The option holds a value in none of the spellings
+        above. A switch whose value cannot be read is not an instruction, and the caller
+        is told so rather than handed ``default`` in its place, because it is the caller
+        that knows what the answer decides.
 
-    Blocking — it queries the secrets backends, the metadata database among them.
+    The value comes from the environment and from ``airflow.cfg``, and from nowhere
+    else: the ``_cmd`` and ``_secret`` indirections that would reach a shell command or
+    a secrets backend are honoured only for the options Airflow lists as sensitive, and
+    the watcher's is not one of them. The read therefore touches no network and no
+    database, which is what makes it safe to run while the webserver is still building
+    its application — there is nothing here that can hang.
     """
-    from airflow.configuration import ensure_secrets_loaded
-    from airflow.utils.log.secrets_masker import mask_secret
+    from airflow.configuration import conf
 
-    raw = None
-    failure: Exception | None = None
-    for backend in ensure_secrets_loaded():
-        try:
-            raw = backend.get_variable(key=name)
-        except Exception as exc:  # noqa: BLE001 - carried, and raised when no one answers
-            if failure is None:
-                failure = exc
-            log.warning(
-                "RMQ Watcher: secrets backend %s could not be asked for Variable %s: "
-                "%s — asking the next backend",
-                type(backend).__name__,
-                name,
-                exc,
-            )
-            continue
-        if raw is not None:
-            break
-    if raw is None:
-        if failure is not None:
-            raise failure
-        return default
-    # The value is put through the masker the way ``Variable.get`` puts it, so a name
-    # Airflow counts as sensitive is redacted in the warning below as it is everywhere
-    # else.
-    mask_secret(raw, name)
-    word = raw.strip().lower()
-    if word in _TRUE_WORDS:
-        return True
-    if word in _FALSE_WORDS:
-        return False
-    log.warning(
-        "RMQ Watcher: Variable %s=%r is not a yes-or-no value — reading it as %s",
-        name,
-        raw,
-        default,
-    )
-    return default
+    return conf.getboolean(section, option, fallback=default)

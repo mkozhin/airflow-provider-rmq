@@ -364,8 +364,9 @@ Admin отдельно не упоминается: `update_admin_permission` о
 Выдача идёт при каждом старте веб-сервера и потому ретроактивна — на первом же
 подъёме после обновления провайдера. Идемпотентность обеспечивает сам FAB.
 
-Отказаться можно через Airflow Variable `rmq_watcher_grant_op_access`, и её
-значение **управляет доступом, а не только выдачей**: истинное или пустое —
+Отказаться можно через опцию конфигурации Airflow `[rmq_watcher] grant_op_access`
+(она же `AIRFLOW__RMQ_WATCHER__GRANT_OP_ACCESS`), и её значение **управляет
+доступом, а не только выдачей**: истинное или пустое —
 шесть прав выдаются, ложное — те же шесть **снимаются** с роли Op. Просто
 пропустить выдачу недостаточно: после первого же старта с умолчанием права уже
 лежат в базе, а FAB валидные связки роль-право не удаляет ни в
@@ -498,26 +499,30 @@ _bp.record_once(_grant_op_access)
 | `menu_access` | `Subscriptions` |
 | `menu_access` | `RabbitMQ` |
 
-**Новое в `tunables.py`** — имена всех Airflow Variables провайдера живут в одном
-месте, туда же уходит и эта:
+**Новое в `tunables.py`** — имена всех настроек провайдера живут в одном месте,
+туда же уходит и эта:
 
 ```python
-GRANT_OP_ACCESS_VAR = "rmq_watcher_grant_op_access"
+GRANT_OP_ACCESS_SECTION = "rmq_watcher"
+GRANT_OP_ACCESS_OPTION = "grant_op_access"
 
-def read_flag(name: str, default: bool) -> bool:
-    """Read Airflow Variable ``name`` as a boolean."""
+def read_flag(section: str, option: str, default: bool) -> bool:
+    """Read Airflow configuration option ``[section] option`` as a boolean."""
 ```
 
-Истинными читаются `1`, `true`, `yes`, `on` в любом регистре; ложными — `0`,
-`false`, `no`, `off`; всё прочее и незаданная Variable дают `default`, о чём
-пишется предупреждение.
+Истинными читаются `1`, `t`, `true` в любом регистре; ложными — `0`, `f`,
+`false`; незаданная опция даёт `default`, а всё прочее бросает
+`AirflowConfigException`: переключатель, значение которого не прочиталось, —
+не указание что-либо выдавать, и колбэк на этом оставляет права как есть.
 
-⚠️ Backend'ы опрашиваются в порядке самого Airflow, и отказ одного не
-прекращает опрос: сбойный Vault не прячет значение, лежащее в метабазе за ним.
-Если не ответил ни один и хотя бы один отказал, `read_flag` бросает первое
-исключение, а не возвращает `default`: недоступная база иначе была бы
-неотличима от админа, не задавшего ничего, и умолчание решало бы за него.
-Значение прогоняется через `mask_secret`, как это делает `Variable.get`.
+⚠️ Переключатель — опция конфигурации, а не Airflow Variable: роли `Op`
+Airflow отдаёт `can_create`/`can_edit`/`can_delete` на Variables
+(`OP_PERMISSIONS` в `airflow/providers/fab/auth_manager/security_manager/override.py`),
+поэтому переключатель в метабазе роль вернула бы себе сама. Читается опция из
+окружения и `airflow.cfg` и больше ниоткуда: обходы `_cmd`/`_secret` Airflow
+чтит только для перечисленных им чувствительных опций. Значит, чтение не ходит
+ни в сеть, ни в базу — ему нечем зависнуть и нечему отказать, пока веб-сервер
+собирает приложение.
 
 ## What Goes Where
 
@@ -671,10 +676,26 @@ def read_flag(name: str, default: bool) -> bool:
 колбэка — единственного, кто этот флаг читает; `test_listener.py` задача не
 трогает.
 
+⚠️ **Отклонение от плана.** Переключатель задуман как Airflow Variable
+`rmq_watcher_grant_op_access`; landed он опцией конфигурации Airflow
+`[rmq_watcher] grant_op_access`. Внешнее ревью показало, что роль `Op` держит
+`can_create`/`can_edit`/`can_delete` на ресурс `Variables`
+(`OP_PERMISSIONS`, `airflow/providers/fab/auth_manager/security_manager/override.py:286`),
+то есть переключателем в метабазе ограничиваемая роль вернула бы себе права,
+отобранные администратором, на ближайшем рестарте веб-сервера. Опцию
+конфигурации из веб-интерфейса не правит ни одна роль. Требование плана — Op
+получает страницу по умолчанию, а у оператора есть выключатель — сохранено:
+умолчание `true`, выключение через `airflow.cfg` или
+`AIRFLOW__RMQ_WATCHER__GRANT_OP_ACCESS`. Тем же переездом закрыты ещё две
+находки того же ревью: чтение больше не спрашивает secrets-backend'ы, поэтому
+значение из backend'а более низкого приоритета не подменяет собой `false` из
+отказавшего старшего, и в чтении не остаётся сетевого вызова, который мог бы
+подвесить сборку Flask-приложения.
+
 - [x] вынести `_MENU_NAME` и `_MENU_CATEGORY` в константы `plugin.py` и
       использовать их в `appbuilder_views` (`plugin.py:26-32`)
-- [x] добавить `GRANT_OP_ACCESS_VAR` и `read_flag` в `tunables.py` рядом с
-      существующими именами Variables (`tunables.py:22-23`)
+- [x] добавить `GRANT_OP_ACCESS_SECTION`/`GRANT_OP_ACCESS_OPTION` и `read_flag`
+      в `tunables.py` рядом с существующими именами Variables (`tunables.py:22-23`)
 - [x] написать `_grant_op_access(state)`: берёт `state.app.appbuilder.sm`,
       находит роль `Op`, создаёт шесть прав через `create_permission` и выдаёт их
       через `add_permission_to_role`
@@ -689,7 +710,8 @@ def read_flag(name: str, default: bool) -> bool:
 - ➕ одну пару кладёт и снимает `_apply_pair(sm, role, action, resource, grant)`
       (`plugin.py:47`), возвращая, дошла ли запись до базы; колбэку остаются
       переключатель, роль и итоговая строка
-- [x] при ложной `read_flag(GRANT_OP_ACCESS_VAR, True)` — **снимать** те же
+- [x] при ложной `read_flag(GRANT_OP_ACCESS_SECTION, GRANT_OP_ACCESS_OPTION, True)`
+      — **снимать** те же
       шесть прав через `remove_permission_from_role`, а не просто выходить:
       после первого старта с умолчанием права уже в базе, и FAB их не удаляет ни
       в `bulk_sync_roles`, ни в `clean_perms`
@@ -709,19 +731,27 @@ def read_flag(name: str, default: bool) -> bool:
 - [x] тест: колбэк выдаёт роли ровно шесть ожидаемых пар «действие — ресурс»
 - [x] тест: повторный вызов на роли, у которой права уже есть, ничего не
       добавляет и не бросает
-- [x] тест **на переход**: роли, которой права уже выданы, при
-      `rmq_watcher_grant_op_access=false` они снимаются. Тест на чистой роли
+- [x] тест **на переход**: роли, которой права уже выданы, при ложном
+      `[rmq_watcher] grant_op_access` они снимаются. Тест на чистой роли
       этот дефект не поймает
-- [x] тест: `rmq_watcher_grant_op_access=false` на роли без прав — ничего не
+- [x] тест: ложный `[rmq_watcher] grant_op_access` на роли без прав — ничего не
       выдаётся и ничего не падает
 - [x] тест: отсутствующая роль `Op` — предупреждение, исключения нет
 - [x] тест: `sm`, бросающий из `find_role`, не поднимает исключение наружу
-- [x] тест: `read_flag` читает истинные и ложные написания, а на мусоре и на
-      незаданной переменной возвращает умолчание
-- ⚠️ недоступная база умолчания не даёт: когда не ответил ни один backend, а
-      хотя бы один отказал, `read_flag` бросает первое исключение —
-      `test_a_database_that_cannot_answer_raises`
-      (`tests/watcher/test_plugin.py:537`)
+- [x] тест: `read_flag` читает истинные и ложные написания, а на незаданной
+      опции возвращает умолчание
+- ⚠️ на мусоре умолчания нет: значение, написанное ни как `true`, ни как
+      `false`, бросает `AirflowConfigException` —
+      `test_a_value_in_no_known_spelling_raises`. Умолчание там открыло бы
+      страницу по опечатке в переключателе, который её закрывает
+- ⚠️ переключатель живёт в конфигурации Airflow, а не в Airflow Variable:
+      роль `Op` держит `can_create`/`can_edit`/`can_delete` на Variables, то
+      есть переключателем в метабазе вернула бы себе страницу, отобранную
+      администратором. Свойство закреплено классом
+      `TestTheSwitchIsBeyondTheRoleItGoverns`: он сверяет права роли `Op` с
+      `ROLE_CONFIGS` установленного FAB (пишет Variables, конфигурацию — только
+      читает) и прогоняет колбэк при ложной опции и `true` во всех backend'ах
+      и в `Variable.get` — права всё равно снимаются
 - [x] тест-страж на имена: сверять пары, которые фактически строит
       `_grant_op_access`, с литералами `RMQ Subscriptions`, `Subscriptions`,
       `RabbitMQ`. Сравнение константы с той же константой зелено при любом
@@ -744,7 +774,7 @@ def read_flag(name: str, default: bool) -> bool:
 - [x] `.venv/bin/pytest tests/ -q` — весь набор зелёный
 - [x] колбэк выдаёт роли Op ровно шесть пар: `menu_access` на `Subscriptions` и
       на `RabbitMQ`, четыре действия на `RMQ Subscriptions`
-- [x] ложное значение `rmq_watcher_grant_op_access` снимает эти шесть прав с
+- [x] ложное значение `[rmq_watcher] grant_op_access` снимает эти шесть прав с
       роли, которой они были выданы
 - [x] fire-consumer во время прогрева остаётся кандидатом проверки живости
 - [x] `ruff check` — 135 замечаний, не больше
@@ -777,8 +807,8 @@ def read_flag(name: str, default: bool) -> bool:
         без ручных действий
       - **предупреждение**: права включают создание и удаление подписок, то есть
         доступ к странице есть право заставить произвольный DAG запускаться по
-        сообщению из очереди. Кому этого не надо — Variable
-        `rmq_watcher_grant_op_access` в `false`
+        сообщению из очереди. Кому этого не надо — `grant_op_access = false` в
+        секции `[rmq_watcher]` файла `airflow.cfg`
       - смысл переключателя: доступом роли Op управляет провайдер. Ложное
         значение не просто прекращает выдачу, а **снимает** права на следующем
         старте веб-сервера; выдавать или отбирать их руками при истинном
@@ -788,8 +818,8 @@ def read_flag(name: str, default: bool) -> bool:
         `Subscriptions` и `RabbitMQ`, с оговоркой, что без `menu_access` на
         категорию пункт не появится, а без `can_edit`/`can_create`/`can_delete`
         кнопки будут отвечать отказом
-- [x] упомянуть `rmq_watcher_grant_op_access` там же, где перечислены остальные
-      Airflow Variables провайдера, в обоих readme
+- [x] упомянуть `[rmq_watcher] grant_op_access` рядом с таблицей Airflow
+      Variables провайдера, отдельной таблицей конфигурации, в обоих readme
 - [x] прочитать `docs/adr/0007-connection-liveness-two-tier-check.md:73-74`
       («подписка остаётся в `error` до первого успешного триггера») и решить,
       требует ли формулировка правки или её пример с недоступной метабазой
@@ -828,8 +858,11 @@ def read_flag(name: str, default: bool) -> bool:
 работающий Airflow с синхронизированными ролями FAB и сессия пользователя Op:
 - роль Op видит категорию `RabbitMQ` и пункт `Subscriptions`, открывает страницу
   и пользуется всеми восемью кнопками
-- после перевода `rmq_watcher_grant_op_access` в `false` и рестарта веб-сервера
+- после перевода `[rmq_watcher] grant_op_access` в `false` и рестарта веб-сервера
   Op не видит ни пункта, ни категории, а прямой заход даёт отказ
+- при ложной опции пользователь Op ставит Airflow Variable
+  `rmq_watcher_grant_op_access` в `true`, веб-сервер перезапускается — страница
+  роли не возвращается
 
 **Проверка на живом брокере:**
 - прогон `docs/live-verification.md`, включая сценарии 13 и 14
