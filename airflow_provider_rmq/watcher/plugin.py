@@ -10,7 +10,29 @@ log = logging.getLogger(__name__)
 
 from airflow_provider_rmq.watcher.listener import RMQWatcherListener
 from airflow_provider_rmq.watcher.models import ensure_table_exists
+from airflow_provider_rmq.watcher.tunables import (
+    GRANT_OP_ACCESS_OPTION,
+    GRANT_OP_ACCESS_SECTION,
+    read_flag,
+)
 from airflow_provider_rmq.watcher.views import RMQWatcherView
+
+#: The menu entry and the category it hangs under. FAB grants menu access by the
+#: displayed names, so the registration below and the grant further down read the same
+#: two strings.
+_MENU_NAME = "Subscriptions"
+_MENU_CATEGORY = "RabbitMQ"
+
+#: The role the provider opens the page for. Admin gets it from Airflow itself, which
+#: hands that role every non-DAG permission on every role synchronisation.
+_OP_ROLE = "Op"
+
+#: An endpoint of Airflow's own web UI. The webserver registers the core views before it
+#: registers plugin blueprints, so this is present by the time the grant below runs;
+#: every other application that builds an appbuilder — the FAB CLI commands do, for
+#: ``airflow users``, ``airflow roles`` and ``airflow sync-perm`` — registers plugin
+#: blueprints without it.
+_WEB_UI_ENDPOINT = "Airflow.index"
 
 _bp = Blueprint(
     "rmq_watcher",
@@ -19,14 +41,189 @@ _bp = Blueprint(
 )
 
 
+#: The action-resource pairs that make the Subscriptions page usable. The actions on the
+#: page are the ones the view declares for itself, so the grant covers exactly what the
+#: page enforces and a view that gains or loses an action carries the grant with it. Read
+#: access alone would draw a page whose every button answers with a refusal: the template
+#: renders its controls for whoever got the page at all.
+_OP_PERMISSIONS = tuple(
+    (action, RMQWatcherView.class_permission_name)
+    for action in RMQWatcherView.base_permissions
+) + (
+    ("menu_access", _MENU_NAME),
+    ("menu_access", _MENU_CATEGORY),
+)
+
+
+def _apply_pair(sm, role, action: str, resource: str, grant: bool) -> bool:
+    """Put one action-resource pair on ``role`` or take it off, and say whether it landed.
+
+    Both FAB calls answer nothing and raise nothing: a commit they could not make is
+    logged by FAB, rolled back and returned from as if it had worked. What the role holds
+    afterwards is therefore the only account of the write there is, and it is what the
+    answer here reports — a caller counting its own calls would report a page opened to a
+    role holding nothing of it.
+
+    :returns: True when the role holds the pair afterwards and ``grant`` asked for it, or
+        holds it no longer and ``grant`` was false. A pair that did not land is named in
+        the log, since the summary the caller writes counts pairs and not reasons.
+    """
+    if grant:
+        # The permission is created rather than looked up: with ``[fab] update_fab_perms``
+        # off nobody else creates it by the time this runs, and FAB hands back the
+        # existing one when there is one. It answers None when the database refused the
+        # insert, and handing that to ``add_permission_to_role`` would raise and cost the
+        # pairs behind it.
+        permission = sm.create_permission(action, resource)
+        if permission is None:
+            log.warning(
+                "RMQ Watcher: permission %s on %r could not be created — role %s does "
+                "not get it",
+                action, resource, _OP_ROLE,
+            )
+            return False
+        sm.add_permission_to_role(role, permission)
+        landed = permission in role.permissions
+    else:
+        # A pair FAB does not hold is a pair no role holds either, so the revocation asks
+        # for the existing one instead of making it first.
+        permission = sm.get_permission(action, resource)
+        if permission is None:
+            # A pair FAB never made is one the role cannot be holding, so it is already
+            # off the role and counts towards the summary.
+            return True
+        sm.remove_permission_from_role(role, permission)
+        landed = permission not in role.permissions
+    if not landed:
+        log.warning(
+            "RMQ Watcher: permission %s on %r was not %s role %s — the write did not "
+            "reach the database",
+            action, resource, "given to" if grant else "taken from", _OP_ROLE,
+        )
+    return landed
+
+
+def _serves_the_web_ui(app) -> bool:
+    """Answer whether this application is the one that serves the Subscriptions page.
+
+    A blueprint callback runs wherever the blueprint is registered, and the webserver is
+    not the only application that registers plugin blueprints: the FAB CLI commands
+    behind ``airflow users``, ``airflow roles`` and ``airflow sync-perm`` assemble an
+    appbuilder of their own the same way. The permissions of a page belong to the
+    application that serves the page, so the grant asks for Airflow's own web UI and
+    stands aside where there is none.
+
+    ``view_functions`` is a plain dictionary Flask fills in at construction, so the
+    question can be asked of any application without a context and without a database.
+    """
+    return _WEB_UI_ENDPOINT in app.view_functions
+
+
+def _grant_op_access(state) -> None:
+    """Give the Op role every permission of the Subscriptions page, or take them back.
+
+    The fixed role lists of Airflow's ``sync_roles`` hold no resource belonging to a
+    third-party plugin, so the page otherwise belongs to Admin alone. The Op role
+    configures the instance the subscriptions listen on, and this hands it the page at
+    every webserver start, which makes the grant retroactive over an upgrade.
+
+    Airflow configuration option ``[rmq_watcher] grant_op_access`` governs the access,
+    not merely the grant: a false value **removes** the same permissions, because FAB
+    deletes no valid role-permission pair of its own accord and a switch that only fell
+    silent would leave the role holding full access after the administrator declined it.
+    It is a configuration option and not an Airflow Variable because Airflow gives the
+    Op role create, edit and delete on Variables: a switch that role can write is one it
+    can use to hand itself back the page an administrator closed to it, and a switch
+    that withdraws a privilege must be out of reach of the role it withdraws it from.
+    The switch is read first and on its own, and it is read towards withholding: every
+    spelling of no an ini file knows — ``false``, ``off``, ``no``, ``n``, ``0`` — closes
+    the page, and so does a value in no spelling at all, because an administrator who
+    wrote something over the granting default was reaching for the closed page and gets
+    it, with the value he wrote named in the log.
+
+    Runs as a deferred blueprint callback in the application that serves the page, by
+    which point ``app.appbuilder`` exists and an application context is up. Nothing it
+    does may keep the webserver from starting, so every failure ends as a warning over a
+    session handed back rolled back.
+    """
+    if not _serves_the_web_ui(state.app):
+        log.debug(
+            "RMQ Watcher: this application serves no web UI — leaving the Subscriptions "
+            "page permissions of role %s to the webserver",
+            _OP_ROLE,
+        )
+        return
+    grant: bool | None = None
+    try:
+        # The switch is read before anything is touched, and it answers false to
+        # everything that is not a yes, so nothing below can hand the page back on a
+        # value nobody could read. ``grant`` still being None in the handler is what
+        # tells a read that failed outright from a write that did.
+        grant = read_flag(GRANT_OP_ACCESS_SECTION, GRANT_OP_ACCESS_OPTION, True)
+        sm = state.app.appbuilder.sm
+        role = sm.find_role(_OP_ROLE)
+        if role is None:
+            log.warning(
+                "RMQ Watcher: role %s does not exist yet — the Subscriptions page will "
+                "be opened to it at the next webserver start",
+                _OP_ROLE,
+            )
+            return
+        done = sum(
+            _apply_pair(sm, role, action, resource, grant)
+            for action, resource in _OP_PERMISSIONS
+        )
+        log.info(
+            "RMQ Watcher: role %s %s %d of the %d permissions of the Subscriptions page",
+            _OP_ROLE,
+            "holds" if grant else "is without",
+            done,
+            len(_OP_PERMISSIONS),
+        )
+    except Exception:
+        # Every statement above runs on FAB's session, and Airflow reuses that same
+        # session right after this callback to synchronise its own roles. A statement
+        # that failed leaves the transaction aborted, and the synchronisation then
+        # raises on a database that has already recovered, taking the webserver start
+        # down with it — the outcome this handler exists to prevent. The rollback hands
+        # it a clean transaction, and can fail in turn, so it is guarded on its own.
+        try:
+            state.app.appbuilder.sm.get_session.rollback()
+        except Exception:
+            log.warning(
+                "RMQ Watcher: the session could not be rolled back after the "
+                "Subscriptions page access of role %s failed",
+                _OP_ROLE,
+                exc_info=True,
+            )
+        if grant is None:
+            log.warning(
+                "RMQ Watcher: configuration option [%s] %s could not be read — the "
+                "Subscriptions page permissions of role %s are left as they are",
+                GRANT_OP_ACCESS_SECTION,
+                GRANT_OP_ACCESS_OPTION,
+                _OP_ROLE,
+                exc_info=True,
+            )
+        else:
+            log.warning(
+                "RMQ Watcher: failed to set the Subscriptions page access of role %s",
+                _OP_ROLE,
+                exc_info=True,
+            )
+
+
+_bp.record_once(_grant_op_access)
+
+
 class RMQWatcherPlugin(AirflowPlugin):
     name = "rmq_watcher"
     listeners = [RMQWatcherListener()]
     flask_blueprints = [_bp]
     appbuilder_views = [
         {
-            "name": "Subscriptions",
-            "category": "RabbitMQ",
+            "name": _MENU_NAME,
+            "category": _MENU_CATEGORY,
             "view": RMQWatcherView(),
         }
     ]

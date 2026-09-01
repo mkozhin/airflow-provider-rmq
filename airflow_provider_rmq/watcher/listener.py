@@ -560,8 +560,9 @@ def _read_settings() -> tuple[int | None, float | None]:
     """Read the watcher tunables from Airflow Variables. Blocking: hits the database.
 
     Returns ``(reconcile_interval, cycle_timeout)``; either is ``None`` when the
-    Variable is unset or holds something that is not a positive number, which the
-    caller reads as "keep the built-in default".
+    Variable is unset, holds something that is not a positive number, or sits in a
+    database that answers the read with a refusal — Airflow reports all three the same
+    way. The caller reads ``None`` as "keep the built-in default".
     """
     return (
         read_positive(RECONCILE_INTERVAL_VAR, int),
@@ -911,7 +912,8 @@ class RMQWatcherListener:
         return cycle_timeout(self._reconcile_interval, self._cycle_timeout_override)
 
     async def _refresh_settings(self) -> None:
-        """Re-read the tunables, keeping the last known values on any failure.
+        """Re-read the tunables, keeping the last known values on a read that did not
+        answer.
 
         ``Variable.get`` talks to the database and the result decides the cycle
         budget, so it has to be read *before* the budget starts counting — outside
@@ -919,6 +921,13 @@ class RMQWatcherListener:
         under a short timeout of its own. A read still stuck in a worker blocks the
         next one from starting, so an unresponsive database costs one worker rather
         than one per cycle, and a changed Variable takes effect on the next cycle.
+
+        The values are held on a read that timed out or threw. A database that answers
+        with a refusal is a different case: Airflow swallows a failing secrets backend
+        and hands back the very ``None`` an unset Variable gives, so the refusal is
+        indistinguishable from nobody having set anything and the built-in defaults take
+        effect — an operator's interval is dropped for the duration. That is recorded in
+        ``docs/backlog/refusing-database-resets-tunables.md``.
         """
         try:
             interval, cycle_timeout = await self._cycle_step(

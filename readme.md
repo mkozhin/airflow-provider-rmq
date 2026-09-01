@@ -625,6 +625,7 @@ my_dag()
 - All cooldown DAGs must use the same `conn_id` / vhost.
 - `conf["body"]` and `conf["headers"]` in the DAG run conf are empty when triggered via cooldown — original message data is lost in the DLX chain.
 - Changing `cooldown` in a DAG file takes effect on the next reconcile cycle (default 60 s); already-running timers in RMQ are not affected.
+- A cooldown DAG Airflow never serializes — removed from the folder, broken by an import error, present on another instance only — leaves its fire event circling `rmq_watcher.fire` for as long as the process runs, while every subscription row of that DAG keeps saying `listening`. The fire consumer holds no row of its own, so the scheduler log is the only place it shows: an INFO line per event and a WARNING on every tenth.
 
 **RabbitMQ Permissions (cooldown only):**
 
@@ -763,6 +764,34 @@ Exchange-mode subscriptions show up in the UI like any other `dag_file` subscrip
 
 Any subscription whose `dag_id` doesn't correspond to an active Airflow DAG is marked on the page with a `⚠ dag not found` badge. This is a **one-sided** signal: its presence means a real problem — a matching message will be ACKed without triggering anything — but its **absence guarantees nothing**. Three reasons the badge can miss a broken subscription: `is_paused` is not checked, so a paused DAG never gets the badge even though a matching message is still ACKed without triggering a run, exactly like a missing DAG (see [ADR 0006](docs/adr/0006-badge-dag-lookup-not-unified-with-sync-trigger.md)); a just-added DAG may be badged for a short while until the Scheduler parses it; and a just-deleted or renamed DAG conversely stays un-badged for a while until `DagModel.is_active` catches up. The last two are expected lag, not bugs.
 
+### Subscriptions Page Access
+
+The page and its menu entry belong to two roles: Admin and Op. Viewer and User see neither the entry nor the `RabbitMQ` category it hangs under, and a direct visit to `/rmq-watcher/subscriptions` is refused.
+
+Admin gets the page from Airflow itself, which hands that role every non-DAG permission on every role synchronisation. Op gets it from the provider: at each webserver start the plugin grants the role `can_read`, `can_create`, `can_edit` and `can_delete` on the resource `RMQ Subscriptions`, plus `menu_access` on `Subscriptions` and on `RabbitMQ`. The grant runs on every start, so upgrading the provider opens the page to Op by itself, with nothing to do by hand.
+
+Two starts are needed on a virgin metadata database: Airflow creates the `Op` role after the plugin's callback has run, so the first start finds no role, logs a warning and leaves the grant to the start after it. The grant also needs the FAB auth manager, which is the default one — under another `auth_manager` there is no role to grant to and the callback logs a warning instead.
+
+> **Warning.** Those permissions include creating and deleting subscriptions, so access to the page is the right to make an arbitrary DAG run on a message from a queue. An installation where Op should not hold that right puts `grant_op_access = false` in the `[rmq_watcher]` section of `airflow.cfg` — or sets `AIRFLOW__RMQ_WATCHER__GRANT_OP_ACCESS=false` in the webserver's environment — and restarts the webserver.
+
+The webserver is the only process that acts on the switch. A plugin blueprint is registered by every application that builds an appbuilder — the FAB commands behind `airflow users`, `airflow roles` and `airflow sync-perm` build one too — and the permissions of a page belong to the application that serves the page, so the grant asks for Airflow's own web UI and stands aside where there is none. A command run in a shell that does not carry the switch therefore leaves the role alone instead of answering to a value the operator never set there.
+
+The switch governs the access, not merely the grant: a false value **removes** the same six permissions from the Op role at the next webserver start. `false`, `off`, `no`, `n` and `0` all say it, and so does a value in no spelling the switch knows: an unreadable answer closes the page rather than holding it open. Granting or revoking them by hand while the switch is true or unset achieves nothing — the next start puts the provider's own answer back.
+
+It is an Airflow configuration option and not an Airflow Variable because Airflow gives the `Op` role create, edit and delete on Variables. A switch kept there is one the very role it restricts can set back to `true` for itself, taking the page back at the next webserver restart; `airflow.cfg` and the process environment are outside the reach of every role the web UI has, which is what a switch that withdraws a privilege has to be.
+
+`menu_access` is granted on the **displayed** names of the entry and of its category, and the FAB menu is flat. Another installed plugin that names its own entry `Subscriptions` or its own category `RabbitMQ` therefore shares those two permissions, and a revocation closes its menu to Op along with this one.
+
+Any other role opens the page through Airflow's CLI:
+
+```bash
+airflow roles add-perms MyRole -a can_read -r "RMQ Subscriptions"
+airflow roles add-perms MyRole -a menu_access -r "Subscriptions"
+airflow roles add-perms MyRole -a menu_access -r "RabbitMQ"
+```
+
+Without `menu_access` on the category the entry stays out of the menu even with the other two granted. Without `can_create`, `can_edit` and `can_delete` the page still draws all eight of its controls — the template checks no permission — and each of them answers with a refusal.
+
 ### Connection Resilience
 
 The watcher holds long-lived AMQP connections inside the Scheduler, so it treats a broker restart, a silently dropped TCP link, a resource alarm or an unavailable database as normal weather: once the external problem is gone, subscriptions come back on their own. The design is written up in [ADR 0007](docs/adr/0007-connection-liveness-two-tier-check.md); the short version is four layers.
@@ -782,7 +811,15 @@ The watcher holds long-lived AMQP connections inside the Scheduler, so it treats
 | `rmq_watcher_reconcile_interval` | `60` | Seconds between reconcile cycles |
 | `rmq_watcher_cycle_timeout` | `max(interval × 3, 300)` | Seconds one cycle may take before the event loop is recreated |
 
-Both are re-read at the start of every cycle in a thread pool under a short timeout of their own, so a changed Variable takes effect on the next cycle; a read still stuck in a worker blocks the next one from starting, and an unreachable database leaves the last known values in place instead of stalling the loop.
+Both are re-read at the start of every cycle in a thread pool under a short timeout of their own, so a changed Variable takes effect on the next cycle; a read still stuck in a worker blocks the next one from starting, and the loop gives up on it at its own timeout and keeps the values it already has instead of stalling; a database that refuses the read outright is not told apart from an unset Variable — it reads as no value at all, and the built-in defaults take effect until a later cycle reads a real one.
+
+**Airflow configuration:**
+
+| Option | Default | Meaning |
+|---|---|---|
+| `[rmq_watcher] grant_op_access` | `true` | Whether the Op role holds the permissions of the [Subscriptions page](#subscriptions-page-access) |
+
+It is read once per webserver start, when the page's permissions are set, and it is read from `airflow.cfg` and the webserver's environment and from nowhere else: the `_cmd` and `_secret` indirections that would reach a shell command or a secrets backend are honoured only for the options Airflow lists as sensitive, and this one is not among them. The read therefore touches neither the network nor the database, and nothing in it can hang while the webserver is still building its application. It happens before anything is touched, and the answer is read towards withholding. `1`, `t`, `true`, `y`, `yes` and `on` hold the page open; `0`, `f`, `false`, `n`, `no` and `off` close it — case, surrounding whitespace and a trailing `#` comment do not matter. A value in none of those spellings closes the page as well, with the value named in a warning in the log: the switch has one job, and it is taking a privilege away, so what nobody can read is answered in the direction that withholds the privilege rather than the one that hands it out. Only an option nobody set at all is read as the default `true`. The provider declares the option in its configuration metadata, so Airflow's Configuration page, `airflow config list` and `airflow config get-value rmq_watcher grant_op_access` show it with its default on an installation where nobody has set it.
 
 **What the Subscriptions page shows.** The Connections block at `/rmq-watcher/subscriptions` lists one row per `conn_id`:
 
@@ -805,9 +842,11 @@ The Status column of the Subscriptions table further down the page is a differen
 
 For subscriptions with `cooldown=0` the watcher acknowledges a delivery only **after** `trigger_dag` has created the DAG run:
 
-- A failed trigger is NACKed with requeue, logged as a WARNING and retried with a growing backoff (1 s, doubling up to 60 s); the subscription status becomes `error` with the reason, so a subscription that stopped starting DAG runs is visible on the page.
+- A failed trigger is NACKed with requeue, logged as a WARNING and retried with a growing backoff (1 s, doubling up to 60 s); the subscription status becomes `error` with the reason, so a subscription that stopped starting DAG runs is visible on the page. One answer out of `trigger_dag` is exempt, and it is the next bullet.
+- **One trigger failure the status keeps quiet about:** a DAG Airflow holds no serialized version of yet — `DagNotFound` out of `trigger_dag`, which is the state a freshly started scheduler is in until its DAG processor has parsed the files. The connection, the channel and the consumer registration are all intact, and what the delivery waits for is the rest of Airflow, so the row is held at `listening` — which is what the consumer is doing, and what keeps the subscription a candidate of the liveness check. An `error` an earlier, unrelated failure left there is cleared by the first not-yet-serialized delivery rather than carried through the whole warmup, so a `conn_id` whose subscriptions are all warming up keeps its own row green as well. The delivery itself is requeued and paused for the same growing interval. The quiet is bounded: 25 such deliveries in a row are long enough to be a failure of their own, and the row then reads `error` naming the missing serialized version, with Airflow's own `Dag id ... not found` kept behind it. The streak counts one uninterrupted warmup — a reconnect starts it over, and so does any delivery that goes through or fails for another reason — and every tenth not-yet-serialized delivery is logged as a WARNING, which on a quorum queue that spends its `delivery-limit` before the streak runs out is the only trace the warmup leaves. The cooldown fire consumer treats the same answer the same way and holds its reported status at `listening`: it has no row of its own, but that status is what keeps it a candidate of the liveness check, so a fire consumer that stops consuming during a warmup is noticed all the same. One such consumer serves every cooldown DAG, so its events are counted per `dag_id` to pick the log level and for nothing else — every tenth is a WARNING. A cooldown DAG that never gets serialized therefore shows up in the scheduler log alone.
 - Deduplication rests on the producer. When the message carries an AMQP `message_id`, the run id is deterministic (`rmq__{queue}__{message_id}`, sanitized and truncated with a digest when it does not fit), so a redelivery lands on the run it already produced and is acknowledged as a duplicate. Two *different* messages sharing one `message_id` therefore collapse into a single DAG run. Without `message_id` the run id carries a timestamp instead and a redelivery starts the DAG again.
 - **Boundary of the guarantee:** a DAG that is paused, inactive or missing ends in a terminal ACK — the event is dropped on purpose, with a WARNING in the log. NACKing it would turn a paused DAG into an accumulator of redeliveries.
+- **Boundary of the silence:** each not-yet-serialized delivery spends one unit of the queue's `delivery-limit` — 20 by default on a quorum queue — so an event waiting out a long warmup can be dead-lettered or dropped by the broker before the streak reaches 25. The row goes on saying `listening`, nothing records that the event existed, and the WARNING on every tenth delivery is the only trace left (`docs/backlog/warmup-loses-the-message-invisibly.md`).
 - Messages that do not match the filter are NACKed with requeue (see [ADR 0002](docs/adr/0002-four-consume-loops-not-unified.md)) and go back to the head of the queue.
 
 **`prefetch` is deliberately not set.** Because filter misses are requeued and return to the head of the queue, any finite prefetch window would eventually fill up with them and consumption would stop for good — while the status still read `connected`. The cost is accepted explicitly: the number of unacknowledged deliveries is unbounded, so a queue with a large backlog is read into scheduler memory, and the oldest delivery can hit the broker's `consumer_timeout` (30 minutes by default), after which RabbitMQ closes the channel with `PRECONDITION_FAILED` and returns the whole window to the queue. If large backlogs are expected on a watched queue, raise `consumer_timeout` in the RabbitMQ configuration.
@@ -867,7 +906,7 @@ airflow-provider-rmq/
 │       ├── subscription_builder.py  # build_subscriptions(), has_exchange_conflict()
 │       ├── subscription_form.py     # parse_cooldown(), parse_filter_data() (UI form parsing)
 │       ├── models.py                # RMQSubscription, RMQConnStatus, WatcherSession
-│       ├── tunables.py              # Airflow Variables tuning the watcher, with their defaults
+│       ├── tunables.py              # settings tuning the watcher, with their defaults
 │       ├── consumer.py              # RMQConsumerManager
 │       ├── orphan_tracker.py        # OrphanTracker (cooldown + exchange-mode orphan detection)
 │       ├── listener.py              # RMQWatcherListener (Scheduler Listener)
