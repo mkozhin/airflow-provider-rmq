@@ -56,7 +56,7 @@
 - `airflow_provider_rmq/watcher/consumer.py` — задачи 2, 3
 - `airflow_provider_rmq/watcher/plugin.py`, `tunables.py` — задача 4
 - `tests/watcher/test_consumer.py` — задачи 1, 2, 3;
-  `tests/watcher/test_listener.py` и `test_plugin.py` — задача 4
+  `tests/watcher/test_plugin.py` — задача 4
 - `readme.md`, `readme_ru.md`, `CHANGELOG.md`, `docs/live-verification.md`
 - `docs/backlog/` — новый формат, один пункт на файл
 
@@ -232,18 +232,25 @@ Flask-AppBuilder.
 - `backoff.wait()` — та же растущая пауза.
 
 Граница у молчания. `_ConsumerState` считает подряд идущие `_DagNotReady`, и
-когда счётчик переваливает `_NOT_READY_LIMIT`, пишется `error` обычным путём.
-Счётчик обнуляется у обеих записей `_SUB_LISTENING` подписочного пути —
-`consumer.py:3176` (прицепление) и `3318` (удачная доставка), — а не только на
-исходе триггера: `_ConsumerState` создаётся один раз на запуск таски
-(`consumer.py:1470`) и переживает переподключения внутри неё, так что отметка,
-снятая лишь исходом триггера, дожила бы до следующего прогрева и покрасила бы
-его первую доставку. Обнуление на прицеплении означает, что счётчик меряет
-подряд идущие не-готовые доставки **одного прицепления**: переподключение
-внутри окна прогрева отодвигает порог на новый круг. Это принимается — чистый
-реаттач без исключения внутри прогрева редок, а сбой соединения или канала сам
-пишет `_SUB_ERROR` (`consumer.py:3232`, `3241`, `3253`), так что безмятежно
-зелёной строки в этом случае и не будет.
+когда счётчик доходит до `_NOT_READY_LIMIT`, пишется `error` обычным путём.
+Счётчик обнуляется в трёх местах подписочного пути — при прицеплении
+(`consumer.py:3223`), при удачной доставке (`3399`) и при отказе другого рода
+(`3388`), — а не только на исходе триггера: `_ConsumerState` создаётся один
+раз на запуск таски (`consumer.py:1470`) и переживает переподключения внутри
+неё, так что отметка, снятая лишь исходом триггера, дожила бы до следующего
+прогрева и покрасила бы его первую доставку. Обнуление на прицеплении означает,
+что счётчик меряет подряд идущие не-готовые доставки **одного прицепления**:
+переподключение внутри окна прогрева отодвигает порог на новый круг. Это
+принимается — чистый реаттач без исключения внутри прогрева редок, а сбой
+соединения или канала сам пишет `_SUB_ERROR` (`consumer.py:3232`, `3241`,
+`3253`), так что безмятежно зелёной строки в этом случае и не будет.
+
+⚠️ Сравнение с порогом — `>=` (`consumer.py:3365`): отчитывается сама
+двадцать пятая не-готовая доставка, а не следующая за ней. Так число в коде
+совпадает с «25 подряд» в readme, CHANGELOG и сценарии живой проверки.
+Обнуление тоже шире задуманного: помимо прицепления и удачной доставки счётчик
+снимает отказ другого рода (`consumer.py:3388`) — счётчик меряет подряд идущие
+не-готовые доставки, а эта была отвечена не прогревом.
 
 **Immediate-путь тоже меняет проверку живости.** `_still_attached`
 (`consumer.py:690-693`) требует `status == _SUB_LISTENING` и непустой тег, а
@@ -259,7 +266,7 @@ fire-пути, и покрывается своим тестом.
 
 **Чего порог не достаёт.** Escalation срабатывает только на доставке. У
 quorum-очереди с `delivery-limit` по умолчанию (20) сообщение исчезает раньше,
-чем счётчик дойдёт до 26, — и если следующего сообщения нет, строка так и
+чем счётчик дойдёт до 25, — и если следующего сообщения нет, строка так и
 останется `listening`. Понизить порог нельзя: по фактическому `_Backoff`
 (`consumer.py:539-542`) накопленное время идёт 1, 3, 7, 15, 31, 63 секунды на
 первых шести доставках и дальше по 60, так что наблюдавшийся прогрев в 13.5
@@ -413,8 +420,9 @@ except DagNotFound as exc:
 
 ```python
 #: Deliveries answered in a row with the DAG not being serialized yet. Reset
-#: wherever this subscription's row is written as listening, so it measures one
-#: attach rather than every warmup the task has lived through.
+#: when the task attaches, when a delivery goes through and when one fails for
+#: another reason, so it measures one uninterrupted warmup rather than every
+#: warmup the task has lived through.
 self.not_ready_streak = 0
 ```
 
@@ -425,20 +433,29 @@ self.not_ready_streak = 0
 except _DagNotReady as exc:
     state.not_ready_streak += 1
     await message.nack(requeue=True)
-    if state.not_ready_streak > _NOT_READY_LIMIT:
+    if state.not_ready_streak >= _NOT_READY_LIMIT:
         log.warning(...)
-        await state.write(_SUB_ERROR, last_error=_error_text(exc))
-    elif state.not_ready_streak % 10 == 0:
-        log.warning(...)          # единственный след на quorum-очереди
+        await state.write(_SUB_ERROR, last_error=_not_ready_text(exc))
     else:
-        log.info(...)
+        # каждая десятая — WARNING'ом: единственный след на quorum-очереди
+        log.log(
+            logging.WARNING if state.not_ready_streak % 10 == 0 else logging.INFO,
+            ...,
+        )
     await backoff.wait()
     return
 ```
 
-Обнуление — рядом с обеими записями `_SUB_LISTENING` подписочного пути:
-`consumer.py:3176` (прицепление) и `3318` (удачная доставка). Записи fire-пути
-(`3454`, `3564`) счётчика не касаются: его там нет.
+Обнуление — в трёх местах подписочного пути: при прицеплении
+(`consumer.py:3223`), при удачной доставке (`3399`) и при отказе другого рода
+(`3388`). Счётчика подписки fire-путь не касается; у него свой счётчик,
+`_fire_not_ready` (`consumer.py:1252`, `3653`, `3663`, `3674`), — по `dag_id` и
+только ради уровня записи в логе.
+
+⚠️ Ветка сравнивает `>=`, а не `>`, и пишет в строку `_not_ready_text(exc)`,
+называющий условие целиком, а не `_error_text(exc)`. Уровень записи выбирается
+выражением внутри одного `log.log`, а не двумя ветками. Отказ другого рода
+счётчик обнуляет — это третье место обнуления.
 
 Ветка в `_handle_fire_delivery` (после `except asyncio.CancelledError` на
 `consumer.py:3550`) порога не знает: считаются события по `dag_id` — только ради
@@ -563,7 +580,10 @@ def read_flag(name: str, default: bool) -> bool:
       вытесняемая строка лога — «Triggering DAG %s for subscription %d failed»
       (`consumer.py:3308-3311`)
 - [x] обнулять счётчик у обеих записей `_SUB_LISTENING` подписочного пути —
-      `consumer.py:3176` (прицепление) и `3318` (удачная доставка)
+      `consumer.py:3223` (прицепление) и `3399` (удачная доставка)
+- ➕ третье обнуление — на отказе другого рода (`consumer.py:3388`): счётчик
+      считает подряд идущие не-готовые доставки, а такую доставку ответил не
+      прогрев
 - [x] переписать docstring `_handle_immediate_delivery` (`consumer.py:3291-3297`):
       сейчас он обещает, что подписка отчитывается о любом отказе триггера своим
       статусом — после правки это неверно для `_DagNotReady`
@@ -572,7 +592,8 @@ def read_flag(name: str, default: bool) -> bool:
 - [x] лог не-готовой доставки — INFO, но каждая десятая идёт WARNING'ом: на
       quorum-очереди сообщение может исчезнуть раньше порога, и лог остаётся
       единственным следом
-- [x] тест: `_NOT_READY_LIMIT + 1` подряд идущих `DagNotFound` — пишется `error`
+- [x] тест: `_NOT_READY_LIMIT` подряд идущих `DagNotFound` — пишется `error`
+      (порог сравнивается через `>=`, отчитывается сама двадцать пятая)
 - [x] тест на обнуление: выставить `state.not_ready_streak = _NOT_READY_LIMIT`,
       провести удачную доставку, затем одну `DagNotFound` — `error` не пишется.
       Последовательность «успех между двумя отказами» различающей не будет:
@@ -591,8 +612,8 @@ def read_flag(name: str, default: bool) -> bool:
       немедленно
 - [x] проверка снятием: убрать ветку `except _DagNotReady` — краснеют тесты на
       молчание статуса и на кандидатство, тест-страж остаётся зелёным; убрать
-      обнуление на `3176` — краснеет тест на переприцепление; убрать обнуление
-      на `3318` — краснеет тест на обнуление
+      обнуление на `3223` — краснеет тест на переприцепление; убрать обнуление
+      на `3399` — краснеет тест на обнуление
 - [x] записать в `docs/backlog/` отдельным пунктом: сообщение, исчезнувшее по
       `delivery-limit` во время прогрева, на странице не видно вовсе — тот же
       класс невидимости, что у промахов фильтра
@@ -645,7 +666,10 @@ def read_flag(name: str, default: bool) -> bool:
 - Modify: `airflow_provider_rmq/watcher/plugin.py`
 - Modify: `airflow_provider_rmq/watcher/tunables.py`
 - Modify: `tests/watcher/test_plugin.py`
-- Modify: `tests/watcher/test_listener.py`
+
+⚠️ Тесты `read_flag` лежат в `tests/watcher/test_plugin.py`, рядом с тестами
+колбэка — единственного, кто этот флаг читает; `test_listener.py` задача не
+трогает.
 
 - [x] вынести `_MENU_NAME` и `_MENU_CATEGORY` в константы `plugin.py` и
       использовать их в `appbuilder_views` (`plugin.py:26-32`)
@@ -655,7 +679,7 @@ def read_flag(name: str, default: bool) -> bool:
       находит роль `Op`, создаёт шесть прав через `create_permission` и выдаёт их
       через `add_permission_to_role`
 - [x] ресурс брать из `RMQWatcherView.class_permission_name`, не строкой
-- ➕ шесть пар собирает `op_permissions()` — публичный помощник рядом с колбэком:
+- ➕ шесть пар держит модульная константа `_OP_PERMISSIONS` (`plugin.py:36`):
       тесту нужен ровно тот список, который колбэк обходит, а не его копия
 - [x] при ложной `read_flag(GRANT_OP_ACCESS_VAR, True)` — **снимать** те же
       шесть прав через `remove_permission_from_role`, а не просто выходить:
@@ -685,7 +709,11 @@ def read_flag(name: str, default: bool) -> bool:
 - [x] тест: отсутствующая роль `Op` — предупреждение, исключения нет
 - [x] тест: `sm`, бросающий из `find_role`, не поднимает исключение наружу
 - [x] тест: `read_flag` читает истинные и ложные написания, а на мусоре и на
-      недоступной базе возвращает умолчание
+      незаданной переменной возвращает умолчание
+- ⚠️ недоступная база умолчания не даёт: когда не ответил ни один backend, а
+      хотя бы один отказал, `read_flag` бросает первое исключение —
+      `test_a_database_that_cannot_answer_raises`
+      (`tests/watcher/test_plugin.py:537`)
 - [x] тест-страж на имена: сверять пары, которые фактически строит
       `_grant_op_access`, с литералами `RMQ Subscriptions`, `Subscriptions`,
       `RabbitMQ`. Сравнение константы с той же константой зелено при любом

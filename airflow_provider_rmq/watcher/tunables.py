@@ -73,8 +73,11 @@ def read_positive(name: str, cast: Callable[[str], Any]) -> Any:
         number at or below zero. Both readers take ``None`` as "keep the built-in
         default", and every unusable case is logged as it is found.
 
-    A database that cannot answer raises: the loop keeps the values it already has, the
-    view falls back to the default, and each says so in its own terms.
+    A database that cannot answer reads as an unset Variable: the value comes from
+    :meth:`Variable.get`, which swallows a secrets backend's failure and hands back
+    ``None``, so both readers take the built-in default. Only a read that hangs is told
+    apart — the caller that runs this one under a timeout of its own keeps the values it
+    already has.
 
     Blocking — it queries the metadata database.
     """
