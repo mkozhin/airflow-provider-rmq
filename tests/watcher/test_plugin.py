@@ -593,3 +593,82 @@ class TestTheSwitchIsBeyondTheRoleItGoverns:
 
         assert sm.roles["Op"].permissions == set()
         assert set(sm.removed) == set(_OP_PERMISSIONS)
+
+
+class TestGrantOpAccessIsDeclared:
+    """The switch is declared in the provider's configuration metadata.
+
+    A declared option is one Airflow's Configuration page, ``airflow config list`` and
+    ``airflow config get-value`` show together with its default, so an operator can see
+    the option that governs who reaches the page without reading the source.
+    """
+
+    @staticmethod
+    def _declared_option():
+        from airflow_provider_rmq import get_provider_info
+
+        config = get_provider_info()["config"]
+        assert GRANT_OP_ACCESS_SECTION in config, (
+            f"section [{GRANT_OP_ACCESS_SECTION}] is not described"
+        )
+        section = config[GRANT_OP_ACCESS_SECTION]
+        assert GRANT_OP_ACCESS_OPTION in section["options"], (
+            f"option {GRANT_OP_ACCESS_OPTION} is not described"
+        )
+        return section["options"][GRANT_OP_ACCESS_OPTION]
+
+    def test_the_option_is_described_as_a_boolean(self):
+        option = self._declared_option()
+        assert option["type"] == "boolean"
+        assert option["description"]
+
+    def test_the_declaration_validates_against_the_provider_info_schema(self):
+        """A declaration Airflow rejects makes it reject the whole provider.
+
+        The package would then install and import while its hooks, operators, plugin
+        and connection type were all absent from the running Airflow, which is a far
+        larger failure than the invisible option the declaration exists to fix.
+        """
+        import json
+        import os
+
+        import airflow
+        import jsonschema
+
+        from airflow_provider_rmq import get_provider_info
+
+        schema_path = os.path.join(
+            os.path.dirname(airflow.__file__), "provider_info.schema.json"
+        )
+        with open(schema_path) as fh:
+            schema = json.load(fh)
+
+        jsonschema.validate(instance=get_provider_info(), schema=schema)
+
+    def test_the_declared_default_is_the_fallback_the_plugin_reads_with(self):
+        """The two answers to "unset means what?" are held in different files.
+
+        The declaration is what an operator is shown; the fallback is what the grant
+        actually acts on. Left to drift apart they would say opposite things about a
+        page nobody configured, and the shown one would be the lie.
+        """
+        spellings = {"1": True, "t": True, "true": True,
+                     "0": False, "f": False, "false": False}
+        declared = self._declared_option()["default"]
+        assert declared.strip().lower() in spellings, (
+            f"declared default {declared!r} is in no spelling Airflow reads as a boolean"
+        )
+
+        sm = _FakeSecurityManager()
+        app = flask.Flask(__name__)
+        app.appbuilder = SimpleNamespace(sm=sm)
+        fallbacks: list = []
+
+        def record(section, option, default):
+            fallbacks.append(default)
+            return True
+
+        with patch("airflow_provider_rmq.watcher.plugin.read_flag", record):
+            app.register_blueprint(_bp)
+
+        assert fallbacks == [spellings[declared.strip().lower()]]

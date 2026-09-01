@@ -60,4 +60,25 @@ def get_provider_info():
                 "plugin-class": "airflow_provider_rmq.watcher.plugin.RMQWatcherPlugin",
             },
         ],
+        "config": {
+            "rmq_watcher": {
+                "description": "Options for the RMQ Watcher Plugin.",
+                "options": {
+                    "grant_op_access": {
+                        "description": (
+                            "Whether the Op role holds the permissions of the "
+                            "Subscriptions page: can_read, can_create, can_edit and "
+                            "can_delete on the resource RMQ Subscriptions plus "
+                            "menu_access on Subscriptions and on RabbitMQ. The webserver "
+                            "gives the role those permissions at every start while this "
+                            "is true, and takes the same six back while it is false.\n"
+                        ),
+                        "version_added": "2.4.0",
+                        "type": "boolean",
+                        "example": None,
+                        "default": "True",
+                    },
+                },
+            },
+        },
     }
