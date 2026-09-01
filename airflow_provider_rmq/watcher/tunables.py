@@ -4,7 +4,9 @@ The reconcile interval and the cycle budget are read by two processes that share
 nothing else: the scheduler runs the loop, and the webserver renders the Subscriptions
 page and needs the same numbers to tell a fresh status row from a late one. The names,
 their defaults and the arithmetic over them therefore have one home that both read, and
-the view does not reach into the listener for them.
+the view does not reach into the listener for them. The yes-or-no switch of the page's
+access is read by the webserver alone and lives here for the same reason: the name of a
+watcher Variable and the rules for reading it belong together.
 """
 from __future__ import annotations
 
@@ -99,34 +101,32 @@ def read_positive(name: str, cast: Callable[[str], Any]) -> Any:
 
 
 def read_flag(name: str, default: bool) -> bool:
-    """Read Airflow Variable ``name`` as a boolean.
+    """Read Airflow Variable ``name`` as a yes-or-no answer.
 
     ``1``, ``true``, ``yes`` and ``on`` read as true; ``0``, ``false``, ``no`` and
     ``off`` read as false. Case and surrounding whitespace do not matter.
 
-    :param default: What an unset Variable, an unreadable one and a value spelled in
-        none of the words above all read as. Every case but the unset one is logged.
+    :param default: What an unset Variable and a value spelled in none of the words
+        above read as. The latter is logged.
+    :raises: Whatever a secrets backend raises. The backends are asked in Airflow's own
+        order rather than through :meth:`Variable.get`, which logs a backend that failed
+        and hands back the very ``None`` an unset Variable gives: a caller acting on the
+        answer would then take an unreachable database for an administrator who set
+        nothing, and the default would decide in his place. Raising leaves that decision
+        where it belongs — with the caller, which knows what it is about to do.
 
-    The caller is a webserver startup callback, so a metadata database that cannot
-    answer must not raise through it: the failure is a warning and the default.
-
-    Blocking — it queries the metadata database.
+    Blocking — it queries the secrets backends, the metadata database among them.
     """
-    try:
-        from airflow.models import Variable
+    from airflow.configuration import ensure_secrets_loaded
 
-        raw = Variable.get(name, default_var=None)
-    except Exception:
-        log.warning(
-            "RMQ Watcher: Variable %s could not be read — reading it as %s",
-            name,
-            default,
-            exc_info=True,
-        )
-        return default
+    raw = None
+    for backend in ensure_secrets_loaded():
+        raw = backend.get_variable(key=name)
+        if raw is not None:
+            break
     if raw is None:
         return default
-    word = str(raw).strip().lower()
+    word = raw.strip().lower()
     if word in _TRUE_WORDS:
         return True
     if word in _FALSE_WORDS:

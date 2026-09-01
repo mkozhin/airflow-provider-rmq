@@ -1,18 +1,21 @@
 """Tests for RMQWatcherPlugin registration."""
 from __future__ import annotations
 
+import contextlib
 import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import flask
+import pytest
 
 from airflow_provider_rmq.watcher.plugin import (
+    _OP_PERMISSIONS,
     RMQWatcherPlugin,
     _bp,
     _grant_op_access,
-    op_permissions,
 )
+from airflow_provider_rmq.watcher.tunables import GRANT_OP_ACCESS_VAR, read_flag
 
 
 def test_plugin_name():
@@ -67,13 +70,23 @@ class _FakeSecurityManager:
     """Enough of the FAB security manager for the grant: roles, permissions, both edges.
 
     ``create_permission`` returns the pair itself, so a role's ``permissions`` set reads
-    as the action-resource pairs the callback actually handed it.
+    as the action-resource pairs the callback actually handed it, and it is the only way
+    a pair comes to exist — ``get_permission`` answers ``None`` for one nobody made.
+    ``add_permission_to_role`` skips a pair the role already holds, the way FAB's own
+    does, so a repeated grant is visible as an empty ``added`` list rather than assumed.
+
+    :param permissions: Pairs the role holds at the start, which are also pairs FAB
+        knows: a role cannot hold one that does not exist.
+    :param refuses: Pairs whose creation answers ``None``, as FAB's does on a database
+        that refuses the insert.
     """
 
-    def __init__(self, roles=("Op",), permissions=()):
+    def __init__(self, roles=("Op",), permissions=(), refuses=()):
         self.roles = {name: _FakeRole(name) for name in roles}
         for role in self.roles.values():
             role.permissions.update(permissions)
+        self.known: set = set(permissions)
+        self.refuses: set = set(refuses)
         self.created: list = []
         self.added: list = []
         self.removed: list = []
@@ -83,9 +96,17 @@ class _FakeSecurityManager:
 
     def create_permission(self, action, resource):
         self.created.append((action, resource))
+        if (action, resource) in self.refuses:
+            return None
+        self.known.add((action, resource))
         return (action, resource)
 
+    def get_permission(self, action, resource):
+        return (action, resource) if (action, resource) in self.known else None
+
     def add_permission_to_role(self, role, permission):
+        if permission in role.permissions:
+            return
         self.added.append(permission)
         role.permissions.add(permission)
 
@@ -106,16 +127,24 @@ class TestOpAccessGrant:
         """The callback is wired to the blueprint, not merely callable.
 
         Every other test here calls the function itself and would stay green with the
-        registration gone, leaving the grant to never happen on a live webserver.
+        registration gone, leaving the grant to never happen on a live webserver. The
+        arguments of the read are recorded here too: they name the Variable an operator
+        is told to set, and no other test reads that name off the call.
         """
         sm = _FakeSecurityManager()
         app = flask.Flask(__name__)
         app.appbuilder = SimpleNamespace(sm=sm)
+        reads: list = []
 
-        with patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
+        def record(name, default):
+            reads.append((name, default))
+            return True
+
+        with patch("airflow_provider_rmq.watcher.plugin.read_flag", record):
             app.register_blueprint(_bp)
 
-        assert sm.roles["Op"].permissions == set(op_permissions())
+        assert reads == [("rmq_watcher_grant_op_access", True)]
+        assert sm.roles["Op"].permissions == set(_OP_PERMISSIONS)
 
     def test_the_six_expected_pairs_are_granted(self):
         sm = _FakeSecurityManager()
@@ -144,7 +173,7 @@ class TestOpAccessGrant:
         assert view["category"] == "RabbitMQ"
         assert type(view["view"]).class_permission_name == "RMQ Subscriptions"
 
-        assert set(op_permissions()) == {
+        assert set(_OP_PERMISSIONS) == {
             ("can_read", "RMQ Subscriptions"),
             ("can_create", "RMQ Subscriptions"),
             ("can_edit", "RMQ Subscriptions"),
@@ -154,12 +183,18 @@ class TestOpAccessGrant:
         }
 
     def test_granting_again_over_the_same_role_adds_nothing_new(self):
-        sm = _FakeSecurityManager(permissions=op_permissions())
+        """A second start over a role that already holds them changes nothing.
+
+        The webserver starts as often as it is restarted, and every start walks the same
+        six pairs: an add that repeats itself would write six rows a start.
+        """
+        sm = _FakeSecurityManager(permissions=_OP_PERMISSIONS)
 
         with patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
             _grant_op_access(_state(sm))
 
-        assert sm.roles["Op"].permissions == set(op_permissions())
+        assert sm.added == []
+        assert sm.roles["Op"].permissions == set(_OP_PERMISSIONS)
 
     def test_a_false_flag_takes_the_permissions_back(self):
         """The switch governs the access, not just the grant.
@@ -169,22 +204,30 @@ class TestOpAccessGrant:
         ``clean_perms``. A role that already holds them is therefore the only state in
         which the revocation can be seen at all.
         """
-        sm = _FakeSecurityManager(permissions=op_permissions())
+        sm = _FakeSecurityManager(permissions=_OP_PERMISSIONS)
 
         with patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=False):
             _grant_op_access(_state(sm))
 
         assert sm.roles["Op"].permissions == set()
-        assert set(sm.removed) == set(op_permissions())
+        assert set(sm.removed) == set(_OP_PERMISSIONS)
         assert not sm.added
 
     def test_a_false_flag_over_a_role_without_them_is_quiet(self):
+        """Taking away what nobody holds creates nothing.
+
+        A pair FAB does not know is a pair no role holds, so the revocation asks for the
+        existing one instead of making it: an installation that has never granted the
+        access ends the start with as empty a permission table as it began.
+        """
         sm = _FakeSecurityManager()
 
         with patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=False):
             _grant_op_access(_state(sm))
 
         assert sm.roles["Op"].permissions == set()
+        assert not sm.created
+        assert not sm.removed
         assert not sm.added
 
     def test_a_missing_op_role_is_a_warning(self, caplog):
@@ -213,3 +256,125 @@ class TestOpAccessGrant:
         assert any("Op" in r.getMessage() for r in caplog.records), [
             r.getMessage() for r in caplog.records
         ]
+
+    def test_a_switch_that_cannot_be_read_leaves_the_role_as_it_is(self, caplog):
+        """An unanswerable switch grants nothing and revokes nothing.
+
+        The read and the permission writes go through different sessions, so one can
+        fail while the others work. Reading the failure as the default would hand six
+        permissions back to a role an administrator has taken them from, and a
+        permission switch that cannot be read has to leave the door where it stands.
+        """
+        sm = _FakeSecurityManager(permissions=_OP_PERMISSIONS)
+
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.plugin"
+        ), patch(
+            "airflow_provider_rmq.watcher.plugin.read_flag",
+            side_effect=RuntimeError("no database"),
+        ):
+            _grant_op_access(_state(sm))
+
+        assert sm.roles["Op"].permissions == set(_OP_PERMISSIONS)
+        assert not sm.created
+        assert not sm.added
+        assert not sm.removed
+        assert any(
+            GRANT_OP_ACCESS_VAR in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_a_permission_the_database_refuses_is_named_and_the_rest_go_on(self, caplog):
+        """FAB answers a refused insert with ``None`` rather than an exception.
+
+        Handing that to ``add_permission_to_role`` would raise and cost the pairs behind
+        it, and passing it over silently would leave the page half-open with a line in
+        the log saying it was opened.
+        """
+        refused = ("menu_access", "RabbitMQ")
+        sm = _FakeSecurityManager(refuses=[refused])
+
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.plugin"
+        ), patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
+            _grant_op_access(_state(sm))
+
+        assert set(sm.added) == set(_OP_PERMISSIONS) - {refused}
+        assert any(
+            "RabbitMQ" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+
+class _FakeBackend:
+    """A secrets backend holding ``values``, or failing every read with ``raises``."""
+
+    def __init__(self, values: dict, raises: Exception | None = None):
+        self._values = values
+        self._raises = raises
+
+    def get_variable(self, key: str):
+        if self._raises is not None:
+            raise self._raises
+        return self._values.get(key)
+
+
+@contextlib.contextmanager
+def _backends(*backends):
+    with patch("airflow.configuration.ensure_secrets_loaded", return_value=list(backends)):
+        yield
+
+
+class TestReadFlag:
+    """The yes-or-no reader: both spellings, the default and the unreadable database.
+
+    Its answer decides whether a role keeps a permission, so the one thing it must never
+    do is turn a database that could not answer into an answer.
+    """
+
+    @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "Yes", " on "])
+    def test_true_spellings(self, raw):
+        with _backends(_FakeBackend({GRANT_OP_ACCESS_VAR: raw})):
+            assert read_flag(GRANT_OP_ACCESS_VAR, False) is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "No", " off "])
+    def test_false_spellings(self, raw):
+        with _backends(_FakeBackend({GRANT_OP_ACCESS_VAR: raw})):
+            assert read_flag(GRANT_OP_ACCESS_VAR, True) is False
+
+    def test_an_unset_variable_reads_as_the_default(self):
+        with _backends(_FakeBackend({})):
+            assert read_flag(GRANT_OP_ACCESS_VAR, True) is True
+            assert read_flag(GRANT_OP_ACCESS_VAR, False) is False
+
+    def test_the_backends_are_asked_in_turn(self):
+        """Airflow reads a Variable from the first backend that holds it.
+
+        An environment variable overrides the metadata database, and a reader that asked
+        the database alone would answer with a value the rest of Airflow ignores.
+        """
+        with _backends(
+            _FakeBackend({}), _FakeBackend({GRANT_OP_ACCESS_VAR: "false"})
+        ):
+            assert read_flag(GRANT_OP_ACCESS_VAR, True) is False
+
+    @pytest.mark.parametrize("raw", ["", "maybe", "2"])
+    def test_a_value_in_no_known_spelling_reads_as_the_default(self, caplog, raw):
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.tunables"
+        ), _backends(_FakeBackend({GRANT_OP_ACCESS_VAR: raw})):
+            assert read_flag(GRANT_OP_ACCESS_VAR, True) is True
+
+        assert any(
+            GRANT_OP_ACCESS_VAR in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_a_database_that_cannot_answer_raises(self):
+        """The caller is told, instead of being handed the default as an answer.
+
+        Airflow's own reader logs a failed backend and returns the ``None`` an unset
+        Variable returns, which would make an outage indistinguishable from an
+        administrator who set nothing.
+        """
+        with _backends(
+            _FakeBackend({}, raises=RuntimeError("no database"))
+        ), pytest.raises(RuntimeError):
+            read_flag(GRANT_OP_ACCESS_VAR, False)

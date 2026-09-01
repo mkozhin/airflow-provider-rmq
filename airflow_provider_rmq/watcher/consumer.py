@@ -166,9 +166,11 @@ class _DagNotReady(Exception):
     """
 
 
-#: Consecutive deliveries answered with "not serialized yet" before the warmup
-#: reading is given up and the subscription reports the failure. With the trigger
-#: backoff capped at 60s this spans roughly twenty minutes.
+#: Deliveries answered "not serialized yet" in a row at which the warmup reading is
+#: given up and the subscription reports the failure. With the trigger backoff capped at
+#: 60s this spans roughly twenty minutes, which sits above the longest warmup observed
+#: on a production install — some 13.5 minutes, around twenty deliveries — and below the
+#: patience of an operator watching a red row that means nothing.
 _NOT_READY_LIMIT = 25
 
 #: ``DagRun.run_id`` is a ``String(250)`` validated against this alphabet.
@@ -916,8 +918,9 @@ class _ConsumerState:
         #: (:func:`_attach_nonce`), which no earlier answer can speak for.
         self.denied_tag: str | None = None
         #: Deliveries answered in a row with the DAG not being serialized yet. Reset
-        #: wherever this subscription's row is written as listening, so it measures one
-        #: attach rather than every warmup the task has lived through.
+        #: when the task attaches, when a delivery goes through and when one fails for
+        #: another reason, so it measures one uninterrupted warmup rather than every
+        #: warmup the task has lived through.
         self.not_ready_streak = 0
 
     @property
@@ -1227,6 +1230,11 @@ class RMQConsumerManager:
         self._fire_task: asyncio.Task | None = None
         self._fire_state: _FireSub | None = None  # state record of the running fire task
         self._fire_needs_restart = False  # last check found the fire consumer gone
+        #: dag_id → fire events answered in a row with the DAG not being serialized yet.
+        #: It picks the log level of those events and nothing else: one fire consumer
+        #: serves every cooldown DAG, so the count belongs to the DAG, not to the
+        #: consumer whose status it would otherwise colour.
+        self._fire_not_ready: dict[str, int] = {}
         self._cooldown_tracker = OrphanTracker()  # dag_ids for which pending queues were created
         self._exchange_tracker = OrphanTracker()  # dag_ids for which sub queues/bindings were created
         self._http_client: httpx.AsyncClient | None = None  # Management API client
@@ -3339,31 +3347,30 @@ class RMQConsumerManager:
         except _DagNotReady as exc:
             state.not_ready_streak += 1
             await message.nack(requeue=True)
-            if state.not_ready_streak > _NOT_READY_LIMIT:
+            if state.not_ready_streak >= _NOT_READY_LIMIT:
                 log.warning(
                     "DAG %s of subscription %d has had no serialized version for %d "
                     "deliveries in a row: %s — reporting it on the subscription",
                     dag_id, sub_id, state.not_ready_streak, exc,
                 )
                 await state.write(_SUB_ERROR, last_error=_error_text(exc))
-            elif state.not_ready_streak % 10 == 0:
+            else:
                 # A quorum queue drops the delivery once its delivery-limit is spent,
-                # which can happen before the streak reaches the limit above. This line
-                # is then the only trace the warmup leaves.
-                log.warning(
+                # which can happen before the streak reaches the limit above, so every
+                # tenth line is raised to WARNING: it is then the only trace the warmup
+                # leaves.
+                log.log(
+                    logging.WARNING if state.not_ready_streak % 10 == 0 else logging.INFO,
                     "DAG %s of subscription %d is not serialized yet, %d deliveries in "
                     "a row: %s — the delivery is back on the queue, pausing %.1fs",
                     dag_id, sub_id, state.not_ready_streak, exc, backoff.seconds,
                 )
-            else:
-                log.info(
-                    "DAG %s of subscription %d is not serialized yet: %s — the delivery "
-                    "is back on the queue, pausing %.1fs",
-                    dag_id, sub_id, exc, backoff.seconds,
-                )
             await backoff.wait()
             return
         except Exception as exc:
+            # The streak counts deliveries answered in a row, and this one was answered
+            # by something else.
+            state.not_ready_streak = 0
             log.warning(
                 "Triggering DAG %s for subscription %d failed: %s "
                 "— requeueing the delivery, pausing %.1fs",
@@ -3593,13 +3600,15 @@ class RMQConsumerManager:
         subscription does: the connection is fine and the iterator keeps running, so
         nothing else would say that expired cooldown windows stopped starting DAG runs.
 
-        A DAG Airflow has not serialized yet is the one trigger failure it says nothing
-        about, and nothing counts those deliveries either: one fire consumer serves every
-        cooldown DAG, so a count kept on it would mix the warmups of unrelated DAGs and
-        one DAG going through would clear the streak of the rest. Holding the status at
-        ``listening`` keeps the consumer a candidate of the liveness check, so a
-        consumer that dies inside a warmup lasting minutes is noticed all the same. The
-        log line is where such a warmup shows.
+        A DAG Airflow has not serialized yet is the one trigger failure it writes no
+        status for: one fire consumer serves every cooldown DAG, so an ``error`` on it
+        would report the warmup of one DAG as the failure of all of them. Holding the
+        status at ``listening`` keeps the consumer a candidate of the liveness check, so
+        a consumer that dies inside a warmup lasting minutes is noticed all the same.
+        The log line is where such a warmup shows, and every tenth event of the same DAG
+        is raised to WARNING — the events of one dag_id are counted for that and for
+        nothing else, since the DAG that never becomes serializable circles here for as
+        long as the process runs.
         """
         dag_id = message.routing_key or ""
         if not dag_id:
@@ -3619,14 +3628,17 @@ class RMQConsumerManager:
             raise
         except _DagNotReady as exc:
             await message.nack(requeue=True)
-            log.info(
-                "DAG %s of an expired cooldown window is not serialized yet: %s — the "
-                "fire event is back on the queue, pausing %.1fs",
-                dag_id, exc, backoff.seconds,
+            seen = self._fire_not_ready[dag_id] = self._fire_not_ready.get(dag_id, 0) + 1
+            log.log(
+                logging.WARNING if seen % 10 == 0 else logging.INFO,
+                "DAG %s of an expired cooldown window is not serialized yet, %d events "
+                "in a row: %s — the fire event is back on the queue, pausing %.1fs",
+                dag_id, seen, exc, backoff.seconds,
             )
             await backoff.wait()
             return
         except Exception as exc:
+            self._fire_not_ready.pop(dag_id, None)
             log.warning(
                 "Triggering DAG %s for an expired cooldown window failed: %s — the fire "
                 "event is back on the queue, pausing %.1fs",
@@ -3637,6 +3649,7 @@ class RMQConsumerManager:
             await backoff.wait()
             return
 
+        self._fire_not_ready.pop(dag_id, None)
         backoff.reset()
         await state.write(_SUB_LISTENING, last_error=None)
         if outcome == _OUTCOME_TRIGGERED:

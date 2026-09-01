@@ -25,7 +25,6 @@ from airflow_provider_rmq.watcher.listener import (
     _parse_rmq_trigger_decorator,
     _read_settings,
 )
-from airflow_provider_rmq.watcher.tunables import GRANT_OP_ACCESS_VAR, read_flag
 
 
 # ---------------------------------------------------------------------------
@@ -2321,65 +2320,6 @@ class TestReadSettings:
             CYCLE_TIMEOUT_VAR: "900",
         }):
             assert _read_settings() == (None, 900.0)
-
-
-class TestReadFlag:
-    """The yes-or-no reader: both spellings, the fallbacks and the unreadable database.
-
-    Its only caller runs while the webserver is coming up, so every answer it can give
-    has to be a value rather than an exception.
-    """
-
-    @contextlib.contextmanager
-    def _variables(self, values: dict, raises: Exception | None = None):
-        variable = MagicMock()
-        if raises is not None:
-            variable.get.side_effect = raises
-        else:
-            variable.get.side_effect = lambda name, default_var=None: values.get(
-                name, default_var
-            )
-        module = MagicMock()
-        module.Variable = variable
-        with patch.dict(sys.modules, {"airflow.models": module}):
-            yield variable
-
-    @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "Yes", " on "])
-    def test_true_spellings(self, raw):
-        with self._variables({GRANT_OP_ACCESS_VAR: raw}):
-            assert read_flag(GRANT_OP_ACCESS_VAR, False) is True
-
-    @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "No", " off "])
-    def test_false_spellings(self, raw):
-        with self._variables({GRANT_OP_ACCESS_VAR: raw}):
-            assert read_flag(GRANT_OP_ACCESS_VAR, True) is False
-
-    def test_an_unset_variable_reads_as_the_default(self):
-        with self._variables({}) as variable:
-            assert read_flag(GRANT_OP_ACCESS_VAR, True) is True
-            assert read_flag(GRANT_OP_ACCESS_VAR, False) is False
-        assert {c.args[0] for c in variable.get.call_args_list} == {GRANT_OP_ACCESS_VAR}
-
-    @pytest.mark.parametrize("raw", ["", "maybe", "2"])
-    def test_a_value_in_no_known_spelling_reads_as_the_default(self, caplog, raw):
-        with caplog.at_level(
-            logging.WARNING, logger="airflow_provider_rmq.watcher.tunables"
-        ), self._variables({GRANT_OP_ACCESS_VAR: raw}):
-            assert read_flag(GRANT_OP_ACCESS_VAR, True) is True
-
-        assert any(
-            GRANT_OP_ACCESS_VAR in r.getMessage() for r in caplog.records
-        ), [r.getMessage() for r in caplog.records]
-
-    def test_a_database_that_cannot_answer_reads_as_the_default(self, caplog):
-        with caplog.at_level(
-            logging.WARNING, logger="airflow_provider_rmq.watcher.tunables"
-        ), self._variables({}, raises=RuntimeError("no database")):
-            assert read_flag(GRANT_OP_ACCESS_VAR, False) is False
-
-        assert any(
-            GRANT_OP_ACCESS_VAR in r.getMessage() for r in caplog.records
-        ), [r.getMessage() for r in caplog.records]
 
 
 class TestSchemaMigrationRetry:

@@ -40,6 +40,7 @@ from airflow_provider_rmq.watcher.consumer import (
     _StatusWriter,
     _FireSub,
     _RECONNECT_DELAY,
+    _STUCK_CYCLES_BEFORE_DROP,
     _ROLE_CONSUME,
     _ROLE_PUBLISH,
     _answer_misses,
@@ -2784,6 +2785,7 @@ class TestConsumeFireQueue:
         assert outcome[0] is None
         assert task.done()
         assert queue.iterator.call_count == 1
+
     @pytest.mark.asyncio
     async def test_a_fault_of_one_task_does_not_disarm_the_cancellation_of_the_fire_consumer(self):
         """The exception object every task of one connection is handed is a single one.
@@ -2802,7 +2804,12 @@ class TestConsumeFireQueue:
         """
         shared = aio_pika.exceptions.AMQPConnectionError("connection reset by peer")
         manager = _make_manager()
-        sub_queue = _make_push_queue([_make_fake_message(b"order")])
+        # The second attach of the subscription has no delivery and waits there, which
+        # holds the loop still while the test drives the fire consumer.
+        sub_queue = MagicMock()
+        sub_queue.iterator = MagicMock(side_effect=[
+            _QueueIterCtx([_make_fake_message(b"order")]), _QueueIterCtx([]),
+        ])
         # The broker rejects the cancellation of the first attach and takes the one of
         # any attach after it, so a fire consumer that went around the loop again ends
         # on the cancellation this test finishes with instead of running on.
@@ -2861,6 +2868,10 @@ class TestConsumeFireQueue:
 
         assert fire_queue.iterator.call_count == 1, (
             "the fire consumer was cancelled, so it must not attach again"
+        )
+        assert sub_queue.iterator.call_count == 2, (
+            "the subscription reported the fault and attached once more, and the attach "
+            "that found nothing to consume is where it waits"
         )
 
     @pytest.mark.asyncio
@@ -8015,6 +8026,11 @@ class TestADagWithoutASerializedVersion:
     def _statuses(write) -> list:
         return [c.args[0] for c in write.await_args_list]
 
+    @staticmethod
+    def _warmup_lines(log) -> list:
+        """``(level, rendered text)`` of every warmup line the handler wrote."""
+        return [(c.args[0], c.args[1] % c.args[2:]) for c in log.log.call_args_list]
+
     @pytest.mark.asyncio
     async def test_the_delivery_goes_back_and_the_row_is_left_alone(self, manager):
         state = self._state(manager)
@@ -8030,12 +8046,17 @@ class TestADagWithoutASerializedVersion:
         messages[0].nack.assert_awaited_once_with(requeue=True)
         messages[0].ack.assert_not_awaited()
         state.write.assert_not_awaited()
-        assert "not serialized yet" in log.info.call_args.args[0]
+        [(level, text)] = self._warmup_lines(log)
+        assert level == logging.INFO
+        assert "not serialized yet" in text
 
     @pytest.mark.asyncio
-    async def test_the_tenth_delivery_in_a_row_is_a_warning(self, manager):
+    @pytest.mark.parametrize("count", [10, 20])
+    async def test_every_tenth_delivery_in_a_row_is_a_warning(self, manager, count):
         """A quorum queue can spend the delivery-limit of the message before the
-        streak reaches its bound, and the log line is then the only trace left."""
+        streak reaches its bound, and the log line is then the only trace left — which
+        is why it says which DAG, how long it has been waiting and that the delivery
+        went back, and why it says it at a level a filtered log keeps."""
         state = self._state(manager)
         with patch(f"{_CONSUMER_MODULE}.log") as log, \
              patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
@@ -8044,12 +8065,20 @@ class TestADagWithoutASerializedVersion:
                 state,
                 _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
                 _DagNotReady("Dag id test_dag not found"),
-                count=10,
+                count=count,
             )
 
-        assert log.info.call_count == 9
-        assert log.warning.call_count == 1
-        assert state.not_ready_streak == 10
+        lines = self._warmup_lines(log)
+        assert [
+            n for n, (level, _) in enumerate(lines, start=1)
+            if level == logging.WARNING
+        ] == list(range(10, count + 1, 10))
+        text = lines[9][1]
+        assert "test_dag" in text
+        assert "not serialized yet" in text
+        assert "10 deliveries in a row" in text
+        assert "back on the queue" in text
+        assert state.not_ready_streak == count
         state.write.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -8061,7 +8090,7 @@ class TestADagWithoutASerializedVersion:
                 state,
                 _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
                 _DagNotReady("Dag id test_dag not found"),
-                count=_NOT_READY_LIMIT,
+                count=_NOT_READY_LIMIT - 1,
             )
             assert _SUB_ERROR not in self._statuses(state.write)
 
@@ -8116,7 +8145,7 @@ class TestADagWithoutASerializedVersion:
         """
         first = [
             _make_fake_message(b"order", message_id=f"m{i}")
-            for i in range(_NOT_READY_LIMIT)
+            for i in range(_NOT_READY_LIMIT - 1)
         ]
         last = _make_fake_message(b"order", message_id="last")
         nacked = asyncio.Event()
@@ -8159,6 +8188,80 @@ class TestADagWithoutASerializedVersion:
         assert entry.state.not_ready_streak == 1
 
     @pytest.mark.asyncio
+    async def test_a_failure_of_another_kind_starts_the_count_again(self, manager):
+        """The bound counts deliveries answered that way one after another.
+
+        A warmup broken in the middle by an unrelated failure — one trigger meeting a
+        metadata database that is down — is a fresh warmup afterwards. Counting the two
+        stretches together would report the subscription over a warmup shorter than the
+        bound, which is the very thing the bound is chosen to sit above.
+        """
+        state = self._state(manager)
+        backoff = _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
+        warming_up = _DagNotReady("Dag id test_dag not found")
+        with patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await self._deliver(manager, state, backoff, warming_up, count=5)
+            assert state.not_ready_streak == 5
+
+            await self._deliver(
+                manager, state, backoff, RuntimeError("airflow metadata db is down")
+            )
+            assert state.not_ready_streak == 0
+
+            await self._deliver(manager, state, backoff, warming_up)
+
+        assert state.not_ready_streak == 1
+
+    @pytest.mark.asyncio
+    async def test_the_bound_outlasts_the_warmup_it_is_meant_to_sit_out(self, manager):
+        """The number is the whole of the choice: it decides what the row can be trusted
+        to say.
+
+        A bound below the warmup of a healthy install reddens a subscription that is
+        merely waiting for the DAG processor — the failure this silence exists to stop.
+        Far above it the row keeps saying ``listening`` while a DAG that will never be
+        serialized takes the deliveries. The pauses the handler waits out are what turns
+        the count into time, and the observed warmup to sit out is 13.5 minutes.
+        """
+        assert _NOT_READY_LIMIT == 25
+        state = self._state(manager)
+        delays: list = []
+        with _record_consumer_sleeps(delays.append):
+            await self._deliver(
+                manager,
+                state,
+                _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX),
+                _DagNotReady("Dag id test_dag not found"),
+                count=_NOT_READY_LIMIT,
+            )
+
+        assert state.write.await_args.args[0] == _SUB_ERROR
+        silence = sum(delays[:-1])   # the pauses before the delivery that reports
+        assert 15 * 60 < silence < 25 * 60, silence
+
+    @pytest.mark.asyncio
+    async def test_the_conn_id_row_stays_green_through_the_warmup(self, manager):
+        """The silence keeps a whole connection from being reported as stuck.
+
+        A subscription outside ``listening`` is no candidate of the liveness check, and
+        a conn_id left without candidates is judged on its own terms: after
+        ``_STUCK_CYCLES_BEFORE_DROP`` cycles its row is coloured too. A warmup that
+        reddened the subscription would therefore redden the row every subscription of
+        that connection shares — the half of the fix an operator sees first.
+        """
+        sub = _sub(id=7, queue_name="orders")
+        entry = _register_active(manager, sub)   # listening, as the warmup leaves it
+        manager._http_client = _mgmt_client(
+            [_consumer_entry(entry.state.consumer_tag, "orders")]
+        )
+
+        with _patch_mgmt_connection():
+            for _ in range(_STUCK_CYCLES_BEFORE_DROP + 1):
+                assert await manager._check_liveness([sub]) == (set(), set())
+
+        assert manager._conn("rmq_default").liveness.status == "connected"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "error, candidate",
         [
@@ -8187,7 +8290,7 @@ class TestADagWithoutASerializedVersion:
 
         with patch.object(manager, "_get_or_create_connection", return_value=connection), \
              patch(f"{_CONSUMER_MODULE}._sync_trigger", trigger), \
-             patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock), \
+             _record_consumer_sleeps(lambda delay: None), \
              _patch_watcher_session(), \
              patch.object(manager, "_update_all_conn_counts"), \
              patch.object(manager, "_provision_cooldown"):
@@ -9708,10 +9811,28 @@ class TestAFireDagWithoutASerializedVersion:
     """
 
     @staticmethod
-    def _fire_message():
+    def _fire_message(dag_id: str = "my_dag"):
         msg = _make_fake_message(b"", message_id="m1")
-        msg.routing_key = "my_dag"
+        msg.routing_key = dag_id
         return msg
+
+    @staticmethod
+    def _warming_up(manager) -> None:
+        """Let the trigger answer that the DAG has no serialized version yet.
+
+        The answer is raised where the offloaded trigger runs, so it travels the whole
+        way the live one does — the executor, the timeout around it and
+        ``_trigger_fire_dag`` — instead of being handed to the handler ready-made.
+        """
+        async def handler(fn, *args):
+            raise _DagNotReady("Dag id my_dag not found")
+
+        manager._executor = _FakeExecutor(handler)
+
+    @staticmethod
+    def _warmup_lines(log) -> list:
+        """``(level, rendered text)`` of every warmup line the handler wrote."""
+        return [(c.args[0], c.args[1] % c.args[2:]) for c in log.log.call_args_list]
 
     @pytest.mark.asyncio
     async def test_the_event_goes_back_and_nothing_is_written(self, manager):
@@ -9719,12 +9840,10 @@ class TestAFireDagWithoutASerializedVersion:
         state = _ConsumerState(sub_id=None, executor=manager._executor)
         state.write = AsyncMock()
         delays: list = []
+        self._warming_up(manager)
 
-        with patch.object(
-            manager,
-            "_trigger_fire_dag",
-            side_effect=_DagNotReady("Dag id my_dag not found"),
-        ), patch(f"{_CONSUMER_MODULE}.log") as log, _record_consumer_sleeps(delays.append):
+        with patch(f"{_CONSUMER_MODULE}.log") as log, \
+             _record_consumer_sleeps(delays.append):
             await manager._handle_fire_delivery(
                 msg, state, _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
             )
@@ -9733,7 +9852,69 @@ class TestAFireDagWithoutASerializedVersion:
         msg.ack.assert_not_awaited()
         state.write.assert_not_awaited()
         assert delays == [_TRIGGER_BACKOFF_START]
-        assert "not serialized yet" in log.info.call_args.args[0]
+        [(level, text)] = self._warmup_lines(log)
+        assert level == logging.INFO
+        assert "not serialized yet" in text
+
+    @pytest.mark.asyncio
+    async def test_the_wait_has_no_bound_and_every_tenth_event_is_a_warning(self, manager):
+        """Nothing here ever ends the wait, and the log is the whole of what says so.
+
+        The immediate path gives up after a bound and colours its row; a fire consumer
+        has no row of its own and serves every cooldown DAG at once, so a DAG that never
+        becomes serializable circles here for as long as the process runs. Every tenth
+        event is raised to WARNING to keep that visible in a filtered log.
+        """
+        state = _ConsumerState(sub_id=None, executor=manager._executor)
+        state.write = AsyncMock()
+        backoff = _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
+        count = _NOT_READY_LIMIT + 5
+        self._warming_up(manager)
+
+        with patch(f"{_CONSUMER_MODULE}.log") as log, \
+             _record_consumer_sleeps(lambda delay: None):
+            for _ in range(count):
+                msg = self._fire_message()
+                await manager._handle_fire_delivery(msg, state, backoff)
+                msg.nack.assert_awaited_once_with(requeue=True)
+                msg.ack.assert_not_awaited()
+
+        state.write.assert_not_awaited()
+        lines = self._warmup_lines(log)
+        assert len(lines) == count
+        assert [
+            n for n, (level, _) in enumerate(lines, start=1)
+            if level == logging.WARNING
+        ] == list(range(10, count + 1, 10))
+        assert "my_dag" in lines[9][1]
+        assert "10 events in a row" in lines[9][1]
+
+    @pytest.mark.asyncio
+    async def test_the_count_belongs_to_the_dag_and_not_to_the_consumer(self, manager):
+        """One fire consumer serves every cooldown DAG.
+
+        A single count kept on it would mix the warmups of unrelated DAGs, and the log
+        line would say a DAG has been waiting through events that were never about it.
+        """
+        state = _ConsumerState(sub_id=None, executor=manager._executor)
+        state.write = AsyncMock()
+        backoff = _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
+        self._warming_up(manager)
+
+        with patch(f"{_CONSUMER_MODULE}.log") as log, \
+             _record_consumer_sleeps(lambda delay: None):
+            for _ in range(9):
+                await manager._handle_fire_delivery(
+                    self._fire_message(), state, backoff
+                )
+            await manager._handle_fire_delivery(
+                self._fire_message("other_dag"), state, backoff
+            )
+
+        level, text = self._warmup_lines(log)[-1]
+        assert level == logging.INFO
+        assert "other_dag" in text
+        assert "1 events in a row" in text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

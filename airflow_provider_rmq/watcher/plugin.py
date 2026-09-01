@@ -30,21 +30,17 @@ _bp = Blueprint(
 )
 
 
-def op_permissions() -> tuple[tuple[str, str], ...]:
-    """The action-resource pairs that make the Subscriptions page usable.
-
-    Read access alone would draw a page whose every button answers with a refusal: the
-    template renders its controls for whoever got the page at all.
-    """
-    resource = RMQWatcherView.class_permission_name
-    return (
-        ("can_read", resource),
-        ("can_create", resource),
-        ("can_edit", resource),
-        ("can_delete", resource),
-        ("menu_access", _MENU_NAME),
-        ("menu_access", _MENU_CATEGORY),
-    )
+#: The action-resource pairs that make the Subscriptions page usable. Read access alone
+#: would draw a page whose every button answers with a refusal: the template renders its
+#: controls for whoever got the page at all.
+_OP_PERMISSIONS = (
+    ("can_read", RMQWatcherView.class_permission_name),
+    ("can_create", RMQWatcherView.class_permission_name),
+    ("can_edit", RMQWatcherView.class_permission_name),
+    ("can_delete", RMQWatcherView.class_permission_name),
+    ("menu_access", _MENU_NAME),
+    ("menu_access", _MENU_CATEGORY),
+)
 
 
 def _grant_op_access(state) -> None:
@@ -58,13 +54,20 @@ def _grant_op_access(state) -> None:
     Airflow Variable :data:`GRANT_OP_ACCESS_VAR` governs the access, not merely the
     grant: a false value **removes** the same permissions, because FAB deletes no valid
     role-permission pair of its own accord and a switch that only fell silent would
-    leave the role holding full access after the administrator declined it.
+    leave the role holding full access after the administrator declined it. The switch
+    is read first and on its own: an answer that cannot be had leaves the role exactly
+    as it is, so a database that refuses the read never re-grants what an administrator
+    took away.
 
     Runs as a deferred blueprint callback, by which point ``app.appbuilder`` exists and
     an application context is up. Nothing it does may keep the webserver from starting,
     so every failure ends as a warning.
     """
+    grant: bool | None = None
     try:
+        # The switch is read before anything is touched, and an unreadable one raises:
+        # what the role holds then stays exactly as it is, and ``grant`` still being
+        # None is what tells the two failures apart down below.
         grant = read_flag(GRANT_OP_ACCESS_VAR, True)
         sm = state.app.appbuilder.sm
         role = sm.find_role(_OP_ROLE)
@@ -75,28 +78,52 @@ def _grant_op_access(state) -> None:
                 _OP_ROLE,
             )
             return
-        for action, resource in op_permissions():
-            # The permissions are created rather than looked up: with
-            # ``[fab] update_fab_perms`` off nobody else creates them by the time this
-            # runs, and FAB hands back the existing one when there is one.
-            permission = sm.create_permission(action, resource)
-            if permission is None:
-                continue
+        done = 0
+        for action, resource in _OP_PERMISSIONS:
             if grant:
+                # The permission is created rather than looked up: with
+                # ``[fab] update_fab_perms`` off nobody else creates it by the time this
+                # runs, and FAB hands back the existing one when there is one. It
+                # answers None when the database refused the insert.
+                permission = sm.create_permission(action, resource)
+                if permission is None:
+                    log.warning(
+                        "RMQ Watcher: permission %s on %r could not be created — role "
+                        "%s does not get it",
+                        action, resource, _OP_ROLE,
+                    )
+                    continue
                 sm.add_permission_to_role(role, permission)
             else:
+                # A pair FAB does not hold is a pair no role holds either, so the
+                # revocation asks for the existing one instead of making it first.
+                permission = sm.get_permission(action, resource)
+                if permission is None:
+                    continue
                 sm.remove_permission_from_role(role, permission)
+            done += 1
         log.info(
-            "RMQ Watcher: %s role %s the Subscriptions page",
-            "granted" if grant else "revoked from",
+            "RMQ Watcher: %d of the %d permissions of the Subscriptions page %s role %s",
+            done,
+            len(_OP_PERMISSIONS),
+            "given to" if grant else "taken from",
             _OP_ROLE,
         )
     except Exception:
-        log.warning(
-            "RMQ Watcher: failed to set the Subscriptions page access of role %s",
-            _OP_ROLE,
-            exc_info=True,
-        )
+        if grant is None:
+            log.warning(
+                "RMQ Watcher: Variable %s could not be read — the Subscriptions page "
+                "permissions of role %s are left as they are",
+                GRANT_OP_ACCESS_VAR,
+                _OP_ROLE,
+                exc_info=True,
+            )
+        else:
+            log.warning(
+                "RMQ Watcher: failed to set the Subscriptions page access of role %s",
+                _OP_ROLE,
+                exc_info=True,
+            )
 
 
 _bp.record_once(_grant_op_access)
