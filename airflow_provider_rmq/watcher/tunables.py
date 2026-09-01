@@ -111,11 +111,11 @@ def read_flag(name: str, default: bool) -> bool:
 
     :param default: What an unset Variable and a value spelled in none of the words
         above read as. The latter is logged.
-    :raises: The first exception a secrets backend raised, and only when no backend
-        answered at all. The backends are asked in Airflow's own order — one that failed
-        is logged and the next is asked, so a value the metadata database holds is
-        reached across an outage of the custom backend in front of it — but a read every
-        backend refused raises rather than returning ``default``, which is where this
+    :raises Exception: The first exception a secrets backend raised, and only when no
+        backend answered at all. The backends are asked in Airflow's own order — one that
+        failed is logged and the next is asked, so a value the metadata database holds
+        is reached across an outage of the custom backend in front of it — but a read
+        every backend refused raises rather than returning ``default``, which is where this
         parting from :meth:`Variable.get` lies: that one hands back the very ``None`` an
         unset Variable gives, so a caller acting on the answer would take an unreachable
         database for an administrator who set nothing and let the default decide in his

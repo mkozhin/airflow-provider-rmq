@@ -30,17 +30,66 @@ _bp = Blueprint(
 )
 
 
-#: The action-resource pairs that make the Subscriptions page usable. Read access alone
-#: would draw a page whose every button answers with a refusal: the template renders its
-#: controls for whoever got the page at all.
-_OP_PERMISSIONS = (
-    ("can_read", RMQWatcherView.class_permission_name),
-    ("can_create", RMQWatcherView.class_permission_name),
-    ("can_edit", RMQWatcherView.class_permission_name),
-    ("can_delete", RMQWatcherView.class_permission_name),
+#: The action-resource pairs that make the Subscriptions page usable. The actions on the
+#: page are the ones the view declares for itself, so the grant covers exactly what the
+#: page enforces and a view that gains or loses an action carries the grant with it. Read
+#: access alone would draw a page whose every button answers with a refusal: the template
+#: renders its controls for whoever got the page at all.
+_OP_PERMISSIONS = tuple(
+    (action, RMQWatcherView.class_permission_name)
+    for action in RMQWatcherView.base_permissions
+) + (
     ("menu_access", _MENU_NAME),
     ("menu_access", _MENU_CATEGORY),
 )
+
+
+def _apply_pair(sm, role, action: str, resource: str, grant: bool) -> bool:
+    """Put one action-resource pair on ``role`` or take it off, and say whether it landed.
+
+    Both FAB calls answer nothing and raise nothing: a commit they could not make is
+    logged by FAB, rolled back and returned from as if it had worked. What the role holds
+    afterwards is therefore the only account of the write there is, and it is what the
+    answer here reports — a caller counting its own calls would report a page opened to a
+    role holding nothing of it.
+
+    :returns: True when the role holds the pair afterwards and ``grant`` asked for it, or
+        holds it no longer and ``grant`` was false. A pair that did not land is named in
+        the log, since the summary the caller writes counts pairs and not reasons.
+    """
+    if grant:
+        # The permission is created rather than looked up: with ``[fab] update_fab_perms``
+        # off nobody else creates it by the time this runs, and FAB hands back the
+        # existing one when there is one. It answers None when the database refused the
+        # insert, and handing that to ``add_permission_to_role`` would raise and cost the
+        # pairs behind it.
+        permission = sm.create_permission(action, resource)
+        if permission is None:
+            log.warning(
+                "RMQ Watcher: permission %s on %r could not be created — role %s does "
+                "not get it",
+                action, resource, _OP_ROLE,
+            )
+            return False
+        sm.add_permission_to_role(role, permission)
+        landed = permission in role.permissions
+    else:
+        # A pair FAB does not hold is a pair no role holds either, so the revocation asks
+        # for the existing one instead of making it first.
+        permission = sm.get_permission(action, resource)
+        if permission is None:
+            # A pair FAB never made is one the role cannot be holding, so it is already
+            # off the role and counts towards the summary.
+            return True
+        sm.remove_permission_from_role(role, permission)
+        landed = permission not in role.permissions
+    if not landed:
+        log.warning(
+            "RMQ Watcher: permission %s on %r was not %s role %s — the write did not "
+            "reach the database",
+            action, resource, "given to" if grant else "taken from", _OP_ROLE,
+        )
+    return landed
 
 
 def _grant_op_access(state) -> None:
@@ -78,46 +127,10 @@ def _grant_op_access(state) -> None:
                 _OP_ROLE,
             )
             return
-        done = 0
-        for action, resource in _OP_PERMISSIONS:
-            if grant:
-                # The permission is created rather than looked up: with
-                # ``[fab] update_fab_perms`` off nobody else creates it by the time this
-                # runs, and FAB hands back the existing one when there is one. It
-                # answers None when the database refused the insert.
-                permission = sm.create_permission(action, resource)
-                if permission is None:
-                    log.warning(
-                        "RMQ Watcher: permission %s on %r could not be created — role "
-                        "%s does not get it",
-                        action, resource, _OP_ROLE,
-                    )
-                    continue
-                sm.add_permission_to_role(role, permission)
-                landed = permission in role.permissions
-            else:
-                # A pair FAB does not hold is a pair no role holds either, so the
-                # revocation asks for the existing one instead of making it first.
-                permission = sm.get_permission(action, resource)
-                if permission is None:
-                    # A pair FAB never made is one the role cannot be holding, so it is
-                    # already off the role and counts towards the summary below.
-                    done += 1
-                    continue
-                sm.remove_permission_from_role(role, permission)
-                landed = permission not in role.permissions
-            # Both FAB calls answer nothing and raise nothing: a commit they could not
-            # make is logged by FAB, rolled back and returned from as if it had worked.
-            # What the role holds afterwards is therefore the only account of the write
-            # this callback can give, and the summary below counts nothing else.
-            if not landed:
-                log.warning(
-                    "RMQ Watcher: permission %s on %r was not %s role %s — the write "
-                    "did not reach the database",
-                    action, resource, "given to" if grant else "taken from", _OP_ROLE,
-                )
-                continue
-            done += 1
+        done = sum(
+            _apply_pair(sm, role, action, resource, grant)
+            for action, resource in _OP_PERMISSIONS
+        )
         log.info(
             "RMQ Watcher: role %s %s %d of the %d permissions of the Subscriptions page",
             _OP_ROLE,

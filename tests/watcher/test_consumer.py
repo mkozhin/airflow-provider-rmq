@@ -279,6 +279,11 @@ def _record_consumer_sleeps(on_delay, block: bool = False):
         yield
 
 
+def _warmup_lines(log) -> list:
+    """``(level, rendered text)`` of every warmup line a delivery handler wrote."""
+    return [(c.args[0], c.args[1] % c.args[2:]) for c in log.log.call_args_list]
+
+
 def _pooled_connections(manager) -> list:
     """Every connection the manager holds, whatever conn_id or role it is pooled under."""
     return [
@@ -8026,11 +8031,6 @@ class TestADagWithoutASerializedVersion:
     def _statuses(write) -> list:
         return [c.args[0] for c in write.await_args_list]
 
-    @staticmethod
-    def _warmup_lines(log) -> list:
-        """``(level, rendered text)`` of every warmup line the handler wrote."""
-        return [(c.args[0], c.args[1] % c.args[2:]) for c in log.log.call_args_list]
-
     @pytest.mark.asyncio
     async def test_the_delivery_goes_back_and_the_row_is_left_alone(self, manager):
         state = self._state(manager)
@@ -8046,7 +8046,7 @@ class TestADagWithoutASerializedVersion:
         messages[0].nack.assert_awaited_once_with(requeue=True)
         messages[0].ack.assert_not_awaited()
         state.write.assert_not_awaited()
-        [(level, text)] = self._warmup_lines(log)
+        [(level, text)] = _warmup_lines(log)
         assert level == logging.INFO
         assert "not serialized yet" in text
 
@@ -8068,7 +8068,7 @@ class TestADagWithoutASerializedVersion:
                 count=count,
             )
 
-        lines = self._warmup_lines(log)
+        lines = _warmup_lines(log)
         assert [
             n for n, (level, _) in enumerate(lines, start=1)
             if level == logging.WARNING
@@ -9835,11 +9835,6 @@ class TestAFireDagWithoutASerializedVersion:
 
         manager._executor = _FakeExecutor(handler)
 
-    @staticmethod
-    def _warmup_lines(log) -> list:
-        """``(level, rendered text)`` of every warmup line the handler wrote."""
-        return [(c.args[0], c.args[1] % c.args[2:]) for c in log.log.call_args_list]
-
     @pytest.mark.asyncio
     async def test_the_event_goes_back_and_the_status_is_held_at_listening(self, manager):
         msg = self._fire_message()
@@ -9858,7 +9853,7 @@ class TestAFireDagWithoutASerializedVersion:
         msg.ack.assert_not_awaited()
         state.write.assert_awaited_once_with(_SUB_LISTENING, last_error=None)
         assert delays == [_TRIGGER_BACKOFF_START]
-        [(level, text)] = self._warmup_lines(log)
+        [(level, text)] = _warmup_lines(log)
         assert level == logging.INFO
         assert "not serialized yet" in text
 
@@ -9886,7 +9881,7 @@ class TestAFireDagWithoutASerializedVersion:
                 msg.ack.assert_not_awaited()
 
         assert {c.args[0] for c in state.write.await_args_list} == {_SUB_LISTENING}
-        lines = self._warmup_lines(log)
+        lines = _warmup_lines(log)
         assert len(lines) == count
         assert [
             n for n, (level, _) in enumerate(lines, start=1)
@@ -9917,7 +9912,7 @@ class TestAFireDagWithoutASerializedVersion:
                 self._fire_message("other_dag"), state, backoff
             )
 
-        level, text = self._warmup_lines(log)[-1]
+        level, text = _warmup_lines(log)[-1]
         assert level == logging.INFO
         assert "other_dag" in text
         assert "1 events in a row" in text

@@ -1248,7 +1248,11 @@ class RMQConsumerManager:
         #: dag_id → fire events answered in a row with the DAG not being serialized yet.
         #: It picks the log level of those events and nothing else: one fire consumer
         #: serves every cooldown DAG, so the count belongs to the DAG, not to the
-        #: consumer whose status it would otherwise colour.
+        #: consumer whose status it would otherwise colour. Belonging to the DAG is also
+        #: why it outlives a reattach of the fire consumer: what it measures is how long
+        #: the DAG processor has been leaving this dag_id unparsed, and a broker blip in
+        #: the middle of that neither ends the wait nor starts it over. An event of the
+        #: same dag_id that goes through, or fails another way, is what clears it.
         self._fire_not_ready: dict[str, int] = {}
         self._cooldown_tracker = OrphanTracker()  # dag_ids for which pending queues were created
         self._exchange_tracker = OrphanTracker()  # dag_ids for which sub queues/bindings were created
@@ -3621,6 +3625,7 @@ class RMQConsumerManager:
         held at ``listening``, which keeps the consumer a candidate of the liveness
         check, so a consumer that dies inside a warmup lasting minutes is noticed all
         the same.
+
         The log line is where such a warmup shows, and every tenth event of the same DAG
         is raised to WARNING — the events of one dag_id are counted for that and for
         nothing else, since the DAG that never becomes serializable circles here for as

@@ -1,4 +1,6 @@
-"""Tests for RMQWatcherPlugin registration."""
+"""Tests for the plugin module: what it registers with Airflow, the Subscriptions
+page access it gives the Op role at webserver start, and the switch that governs it.
+"""
 from __future__ import annotations
 
 import contextlib
@@ -256,22 +258,27 @@ class TestOpAccessGrant:
         assert set(sm.removed) == set(_OP_PERMISSIONS)
         assert not sm.added
 
-    def test_a_false_flag_over_a_role_without_them_is_quiet(self):
+    def test_a_false_flag_over_a_role_without_them_is_quiet(self, caplog):
         """Taking away what nobody holds creates nothing.
 
         A pair FAB does not know is a pair no role holds, so the revocation asks for the
         existing one instead of making it: an installation that has never granted the
-        access ends the start with as empty a permission table as it began.
+        access ends the start with as empty a permission table as it began. Such a pair
+        counts as one the role is without, which is what the summary line reports.
         """
         sm = _FakeSecurityManager()
 
-        with patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=False):
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.plugin"
+        ), patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=False):
             _grant_op_access(_state(sm))
 
+        messages = [r.getMessage() for r in caplog.records]
         assert sm.roles["Op"].permissions == set()
         assert not sm.created
         assert not sm.removed
         assert not sm.added
+        assert any("is without 6 of the 6" in m for m in messages), messages
 
     def test_a_missing_op_role_is_a_warning(self, caplog):
         """A virgin database has no Op role yet: it is created after this callback."""
@@ -337,14 +344,14 @@ class TestOpAccessGrant:
         sm = _FakeSecurityManager(refuses=[refused])
 
         with caplog.at_level(
-            logging.WARNING, logger="airflow_provider_rmq.watcher.plugin"
+            logging.INFO, logger="airflow_provider_rmq.watcher.plugin"
         ), patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
             _grant_op_access(_state(sm))
 
+        messages = [r.getMessage() for r in caplog.records]
         assert set(sm.added) == set(_OP_PERMISSIONS) - {refused}
-        assert any(
-            "RabbitMQ" in r.getMessage() for r in caplog.records
-        ), [r.getMessage() for r in caplog.records]
+        assert any("RabbitMQ" in m for m in messages), messages
+        assert any("holds 5 of the 6" in m for m in messages), messages
 
     def test_a_grant_the_database_rolled_back_is_not_reported_as_done(self, caplog):
         """FAB's role-permission calls answer nothing and raise nothing.
@@ -463,12 +470,12 @@ class TestReadFlag:
     """
 
     @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "Yes", " on "])
-    def test_true_spellings(self, raw):
+    def test_a_value_spelled_as_yes_reads_as_true(self, raw):
         with _backends(_FakeBackend({GRANT_OP_ACCESS_VAR: raw})):
             assert read_flag(GRANT_OP_ACCESS_VAR, False) is True
 
     @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "No", " off "])
-    def test_false_spellings(self, raw):
+    def test_a_value_spelled_as_no_reads_as_false(self, raw):
         with _backends(_FakeBackend({GRANT_OP_ACCESS_VAR: raw})):
             assert read_flag(GRANT_OP_ACCESS_VAR, True) is False
 
