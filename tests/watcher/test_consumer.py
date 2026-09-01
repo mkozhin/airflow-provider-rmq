@@ -2000,7 +2000,11 @@ class TestCooldownConsume:
             task = asyncio.create_task(
                 manager._consume_subscription(_sub(cooldown=300))
             )
-            await asyncio.wait_for(published.wait(), timeout=2.0)
+            # The acknowledgement is the last step of the cooldown path and the one
+            # asserted below, so it is what the wait is for: the publish event says
+            # only that the path reached the broker call, and the cancellation that
+            # follows would then race the rest of it.
+            await _wait_for(lambda: msg.ack.await_count > 0)
             task.cancel()
             try:
                 await task
@@ -4425,7 +4429,9 @@ class TestPublishConnection:
         with patch.object(manager, "_get_or_create_connection", side_effect=get_conn), \
              patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"):
             task = asyncio.create_task(manager._consume_subscription(_sub(cooldown=300)))
-            await asyncio.wait_for(published.wait(), timeout=2.0)
+            # Waiting for the acknowledgement, the last step of the cooldown path,
+            # keeps the cancellation below from racing the rest of that path.
+            await _wait_for(lambda: msg.ack.await_count > 0)
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
