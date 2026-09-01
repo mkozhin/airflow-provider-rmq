@@ -66,6 +66,35 @@ class _FakeRole:
         self.permissions: set = set()
 
 
+class _FakeSession:
+    """The session FAB shares with the role synchronisation that follows the callback.
+
+    :param raises: What ``rollback`` throws, for a database still gone by the time the
+        handler tries to clear the transaction.
+    """
+
+    def __init__(self, raises=None):
+        self.raises = raises
+        self.rollbacks = 0
+
+    def rollback(self):
+        self.rollbacks += 1
+        if self.raises is not None:
+            raise self.raises
+
+
+class _ExpiredPermissions:
+    """A role's permission collection as it reads once FAB rolled a failed commit back.
+
+    The rollback expires the role, so the membership test the callback runs next re-emits
+    a SELECT against the database that has just refused the commit — which is where this
+    raises.
+    """
+
+    def __contains__(self, item):
+        raise RuntimeError("current transaction is aborted")
+
+
 class _FakeSecurityManager:
     """Enough of the FAB security manager for the grant: roles, permissions, both edges.
 
@@ -82,9 +111,15 @@ class _FakeSecurityManager:
     :param rolls_back: Pairs whose add and remove leave the role exactly as it was and
         say nothing about it, the way FAB's do when the commit inside them fails: both
         methods log the error, roll the session back and return.
+    :param session_raises: What the session's ``rollback`` throws, ``None`` for one that
+        works. ``get_session`` is a plain attribute here and a property on FAB's manager;
+        the callback reads it the same way either way.
     """
 
-    def __init__(self, roles=("Op",), permissions=(), refuses=(), rolls_back=()):
+    def __init__(
+        self, roles=("Op",), permissions=(), refuses=(), rolls_back=(), session_raises=None
+    ):
+        self.get_session = _FakeSession(session_raises)
         self.roles = {name: _FakeRole(name) for name in roles}
         for role in self.roles.values():
             role.permissions.update(permissions)
@@ -355,6 +390,50 @@ class TestOpAccessGrant:
             "can_edit" in m and "was not taken from" in m for m in messages
         ), messages
         assert any("is without 5 of the 6" in m for m in messages), messages
+
+    def test_a_landed_check_that_raises_leaves_the_session_rolled_back(self, caplog):
+        """The callback shares FAB's session with the role synchronisation behind it.
+
+        A database fault inside the loop leaves that session's transaction aborted, and
+        Airflow's own ``sync_roles`` — which runs on it moments later, in the same
+        ``create_app`` — raises on the aborted transaction even once the database is
+        back, so a callback that only logged its fault would keep the webserver from
+        starting. That is the very thing this handler is here to prevent.
+        """
+        sm = _FakeSecurityManager()
+
+        def expire(role, permission):
+            role.permissions = _ExpiredPermissions()
+
+        sm.add_permission_to_role = expire
+
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.plugin"
+        ), patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
+            _grant_op_access(_state(sm))
+
+        assert sm.get_session.rollbacks == 1
+        assert any(
+            "Op" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_a_rollback_that_raises_in_turn_is_still_only_a_warning(self, caplog):
+        """A database gone for good refuses the rollback as well as the statement.
+
+        Letting that one out of the handler would stop the webserver over the very
+        clean-up meant to keep it running.
+        """
+        sm = _FakeSecurityManager(session_raises=RuntimeError("no database"))
+        sm.find_role = lambda name: (_ for _ in ()).throw(RuntimeError("no database"))
+
+        with caplog.at_level(
+            logging.WARNING, logger="airflow_provider_rmq.watcher.plugin"
+        ), patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
+            _grant_op_access(_state(sm))
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert sm.get_session.rollbacks == 1
+        assert any("rolled back" in m for m in messages), messages
 
 
 class _FakeBackend:

@@ -61,7 +61,7 @@ def _grant_op_access(state) -> None:
 
     Runs as a deferred blueprint callback, by which point ``app.appbuilder`` exists and
     an application context is up. Nothing it does may keep the webserver from starting,
-    so every failure ends as a warning.
+    so every failure ends as a warning over a session handed back rolled back.
     """
     grant: bool | None = None
     try:
@@ -126,6 +126,21 @@ def _grant_op_access(state) -> None:
             len(_OP_PERMISSIONS),
         )
     except Exception:
+        # Every statement above runs on FAB's session, and Airflow reuses that same
+        # session right after this callback to synchronise its own roles. A statement
+        # that failed leaves the transaction aborted, and the synchronisation then
+        # raises on a database that has already recovered, taking the webserver start
+        # down with it — the outcome this handler exists to prevent. The rollback hands
+        # it a clean transaction, and can fail in turn, so it is guarded on its own.
+        try:
+            state.app.appbuilder.sm.get_session.rollback()
+        except Exception:
+            log.warning(
+                "RMQ Watcher: the session could not be rolled back after the "
+                "Subscriptions page access of role %s failed",
+                _OP_ROLE,
+                exc_info=True,
+            )
         if grant is None:
             log.warning(
                 "RMQ Watcher: Variable %s could not be read — the Subscriptions page "
