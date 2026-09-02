@@ -238,8 +238,9 @@ DAG на паузе в результат `get_active_dag_ids` попадает 
 
 ### Цена терпения: нечитаемый файл держит разбор один цикл
 
-`_extract_subscriptions_from_file` отвечает `None` вместо `[]`, когда файл не
-прочитался или не распарсился. `_scan_subscriptions` на такой ответ оставляет в
+`_extract_subscriptions_from_file` отвечает `None` вместо `[]`, когда содержимое
+файла не поддалось разбору, и поднимает `OSError`, когда доступа к файлу не было
+вовсе. `_scan_subscriptions` на любой из двух ответов оставляет в
 кэше прошлый разбор — но только на `_UNREADABLE_FILE_LIMIT = 1` цикл, после чего
 записывает `[]`, и ключ уходит в обычный путь со счётчиком.
 
@@ -649,7 +650,11 @@ else:
       удаление `_last_mtimes[path]` на исходе терпения по **любому** отказу
       ввода-вывода
 - [ ] переписать `test_extract_subscriptions_returns_empty_list_on_ioerror`
-      (`test_listener.py:603`) под новый контракт `None`
+      (`test_listener.py:603`) под фактический контракт: он зовёт функцию на
+      несуществующем пути, то есть `open` бросает `FileNotFoundError`, и ожидать
+      надо `pytest.raises(OSError)`, а не `None`. Переименовать соответственно;
+      `None` остаётся тестам `SyntaxError`, `UnicodeDecodeError` и широкой
+      `except Exception`
 - [ ] проверить `test_mtime_recorded_even_when_extraction_raises`
       (`test_listener.py:608`): гарантия «постоянно сломанный файл не
       перепарсивается вечно» должна сохраниться, сдвинувшись на исход терпения
