@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:267
+where: airflow_provider_rmq/watcher/listener.py:315
 added: 2026-08-08
 ---
 # AST-резолвинг `dag_id` не покрывает сложные и динамические случаи

@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:1111
+where: airflow_provider_rmq/watcher/listener.py:1185
 added: 2026-09-02
 ---
 # Скан подписок читает файлы, которые сам Airflow не загружает

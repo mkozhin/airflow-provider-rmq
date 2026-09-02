@@ -1,20 +1,20 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/listener.py:491
+where: airflow_provider_rmq/watcher/listener.py:539
 added: 2026-08-08
 ---
 # Нелитеральный аргумент `@rmq_trigger` молча теряется
 
 **Симптом.** `_parse_rmq_trigger_decorator`
-(`airflow_provider_rmq/watcher/listener.py:450`) обходит kwargs вызова декоратора,
-отбрасывает всё, чего нет в `_RMQ_TRIGGER_KWARGS` (`listener.py:420`), и остальное
+(`airflow_provider_rmq/watcher/listener.py:498`) обходит kwargs вызова декоратора,
+отбрасывает всё, чего нет в `_RMQ_TRIGGER_KWARGS` (`listener.py:468`), и остальное
 пытается прочитать через `ast.literal_eval`:
 
 ```python
 try:
     value = ast.literal_eval(kw.value)
 except (ValueError, TypeError):
-    continue                      # listener.py:491
+    continue                      # listener.py:539
 kwargs[kw.arg] = value
 ```
 
@@ -25,7 +25,7 @@ kwargs[kw.arg] = value
 
 **Потерян маркер режима.** `queue=` / `queues=` / `exchange=` — единственный признак,
 по которому выбирается режим подписки. Без него `build_subscriptions` не вызывается
-вовсе, функция возвращает `[]` (`listener.py:494-495`), и подписка не появляется в
+вовсе, функция возвращает `[]` (`listener.py:542-543`), и подписка не появляется в
 UI без какого-либо объяснения. Даже WARNING не пишется — в отличие от
 нерезолвящегося `dag_id`, который пропускается с предупреждением.
 
