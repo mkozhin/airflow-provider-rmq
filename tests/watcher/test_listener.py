@@ -821,6 +821,10 @@ class TestEmptyScanDistrust:
         assert listener._last_mtimes == {}
         assert listener._cached_subs == {}
 
+        # A folder that stays empty stays believed: nothing is known any more, so
+        # the distrust has nothing to compare the emptiness against.
+        assert self._scan_empty(listener) == []
+
     def test_a_non_empty_glob_resets_the_streak(self):
         listener = self._warm_listener()
 
