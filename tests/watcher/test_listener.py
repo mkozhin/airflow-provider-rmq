@@ -627,20 +627,27 @@ class TestScanSubscriptions:
         # Regression for the permanent-DoS scenario: a DAG file whose parse keeps
         # failing must be re-parsed once per edit, not once per cycle. The parse
         # happened, so its mtime says something about the content and is recorded —
-        # after the hold that a file caught mid-write is entitled to.
+        # after the hold that a file caught mid-write is entitled to. The second file
+        # is what keeps the listing itself a statement about the code, so the per-file
+        # bookkeeping is what the cycles below exercise.
         listener = self._listener()
         file = "/dags/broken.py"
+        healthy = "/dags/healthy.py"
+        files = [file, healthy]
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[file]), \
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file",
                           return_value=[{"dag_id": "d", "queue_name": "q"}]):
             listener._scan_subscriptions()
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[file]), \
+        def fake_extract(path):
+            return None if path == file else [{"dag_id": "h", "queue_name": "hq"}]
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=2000.0), \
              patch.object(
-                 listener, "_extract_subscriptions_from_file", return_value=None
+                 listener, "_extract_subscriptions_from_file", side_effect=fake_extract
              ) as mock_ex:
             for _ in range(_UNREADABLE_FILE_LIMIT + 2):
                 listener._scan_subscriptions()
@@ -649,7 +656,30 @@ class TestScanSubscriptions:
         assert listener._cached_subs[file] == []
         # One call per cycle of the hold, one when patience ran out, none after:
         # the recorded mtime stops the re-parse.
-        assert mock_ex.call_count == _UNREADABLE_FILE_LIMIT + 1
+        assert [c for c in mock_ex.call_args_list if c == call(file)] == \
+            [call(file)] * (_UNREADABLE_FILE_LIMIT + 1)
+
+    def test_a_file_the_parser_refuses_does_not_escape_the_scan(self, tmp_path):
+        """The scan step answers with a result or with `_UntrustedScan` and nothing else.
+
+        A ``ValueError`` out of ``ast.parse`` would leave the whole cycle — the sync,
+        the consumer relaunches, the liveness check and the status writes — undone, on
+        every cycle for as long as the file sits in the folder.
+        """
+        (tmp_path / "good.py").write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag(dag_id='good')\n"
+            "def good(): pass\n"
+        )
+        (tmp_path / "binary.py").write_bytes(b"\x00\x01\x02\n")
+        listener = RMQWatcherListener()
+
+        with patch("airflow.settings.DAGS_FOLDER", str(tmp_path)):
+            result = listener._scan_subscriptions()
+
+        assert [s["dag_id"] for s in result] == ["good"]
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +834,33 @@ class TestUnreadableFileHold:
 
         assert [r for r in caplog.records if "dropping its subscriptions" in r.getMessage()] == []
 
+    def test_content_the_parser_refuses_outright_answers_none(self, tmp_path):
+        """A file caught mid-write, or a binary one under a .py name.
+
+        ``ast.parse`` answers a null byte in the source with ``ValueError``, not with
+        ``SyntaxError``, and the caller's whole contract is that the only thing this
+        method raises is the ``OSError`` of a file that gave no access: anything else
+        escapes the scan step and takes the reconcile cycle — consumer relaunches,
+        liveness check and status writes with it — down every cycle the file is there.
+        """
+        dag_file = tmp_path / "half_written.py"
+        dag_file.write_bytes(b"from airflow.decorators import dag\n\x00\x00\x00\n")
+        listener = RMQWatcherListener()
+
+        assert listener._extract_subscriptions_from_file(str(dag_file)) is None
+
+    def test_content_the_parser_refuses_outright_is_logged(self, tmp_path, caplog):
+        dag_file = tmp_path / "half_written.py"
+        dag_file.write_bytes(b"x = 1\n\x00\n")
+        listener = RMQWatcherListener()
+
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"):
+            listener._extract_subscriptions_from_file(str(dag_file))
+
+        assert any("Failed to parse DAG file" in r.getMessage() for r in caplog.records), \
+            [r.getMessage() for r in caplog.records]
+
     def test_undecodable_content_answers_none(self, tmp_path):
         dag_file = tmp_path / "latin1.py"
         dag_file.write_bytes(b"# \xff\xfe not utf-8\n")
@@ -928,20 +985,41 @@ class TestEveryFileUnreadable:
 
         assert listener._read_failures == {_HELD_FILE: 1}
 
-    def test_a_listing_of_files_that_all_fail_to_parse_is_still_trusted(self):
-        """Unparseable content is a statement about the code; an absent stat is not."""
-        listener = self._listener()
-
+    def _scan_all_unparseable(self, listener):
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
                    return_value=list(listener._files)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=2000.0), \
              patch.object(listener, "_extract_subscriptions_from_file",
                           return_value=None):
-            result = listener._scan_subscriptions()
+            return listener._scan_subscriptions()
 
-        assert result == _HELD_SUBS * len(listener._files)
-        assert listener._read_failures == {path: 1 for path in listener._files}
+    def test_a_listing_of_files_that_all_fail_to_parse_is_distrusted_too(self):
+        """An aborted checkout truncates files: they read, they do not parse.
+
+        A folder in which nothing parses any more is the filesystem mid-swap, not a
+        statement that the installation has no subscriptions — and Airflow deactivates
+        those DAGs within a minute or two, which is what would otherwise put every
+        enabled row on the short-circuit path to deletion.
+        """
+        listener = self._listener()
+        cached = {path: list(subs) for path, subs in listener._cached_subs.items()}
+
+        with pytest.raises(_UntrustedScan, match="none of the 2 files"):
+            self._scan_all_unparseable(listener)
+
+        assert listener._cached_subs == cached
+        assert listener._read_failures == {}
+
+    def test_the_distrust_of_an_unparseable_listing_ends_at_the_limit(self):
+        listener = self._listener()
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_all_unparseable(listener)
+
+        assert self._scan_all_unparseable(listener) == _HELD_SUBS * len(listener._files)
+        assert self._scan_all_unparseable(listener) == []
 
     def test_a_healthy_scan_resets_the_streak(self):
         listener = self._listener()
@@ -955,9 +1033,92 @@ class TestEveryFileUnreadable:
                    return_value=1000.0):
             listener._scan_subscriptions()
 
-        assert listener._unreadable_scan_streak == 0
+        assert listener._untrusted_scan_streak == 0
         with pytest.raises(_UntrustedScan):
             self._scan_all_stale(listener)
+
+
+# ---------------------------------------------------------------------------
+# A listing that lost most of what read before is not a statement about the code
+# ---------------------------------------------------------------------------
+
+class TestCollapsedListing:
+    """Partial failures: a slow NFS backend, a subtree that lost its permissions.
+
+    The common shape of a filesystem in trouble is not that every file refuses at
+    once — it is that most of them do, which the sync step would otherwise read as
+    the installation having lost its subscriptions.
+    """
+
+    _FILES = tuple(f"/dags/dag{n}.py" for n in range(4))
+
+    def _subs_of(self, path):
+        return [{"dag_id": path, "queue_name": "q"}]
+
+    def _listener(self):
+        """A listener whose cache holds one parse of every file of ``_FILES``."""
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+        self._scan(listener)
+        return listener
+
+    def _scan(self, listener, *, files=None, unreadable=(), mtime=1000.0):
+        files = list(self._FILES if files is None else files)
+        unreadable = set(unreadable)
+
+        def fake_getmtime(path):
+            if path in unreadable:
+                raise OSError("stale handle")
+            return mtime
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   side_effect=fake_getmtime), \
+             patch.object(listener, "_extract_subscriptions_from_file",
+                          side_effect=self._subs_of):
+            return listener._scan_subscriptions()
+
+    def test_a_listing_that_mostly_stopped_reading_is_distrusted(self):
+        listener = self._listener()
+        cached = {path: list(subs) for path, subs in listener._cached_subs.items()}
+
+        with pytest.raises(_UntrustedScan, match="only 1 of the 4 files"):
+            self._scan(listener, unreadable=self._FILES[1:], mtime=2000.0)
+
+        assert listener._cached_subs == cached
+        assert listener._read_failures == {}
+
+    def test_a_broken_file_among_many_leaves_the_listing_trusted(self):
+        """One file is about the code, and the code is what the scan is there to read."""
+        listener = self._listener()
+
+        result = self._scan(listener, unreadable=self._FILES[:1], mtime=2000.0)
+
+        assert len(result) == len(self._FILES)
+        assert listener._read_failures == {self._FILES[0]: 1}
+
+    def test_the_distrust_of_a_collapsed_listing_ends_at_the_limit(self):
+        listener = self._listener()
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan(listener, unreadable=self._FILES[1:], mtime=2000.0)
+
+        # Giving in still spends the per-file hold before the subscriptions go.
+        held = self._scan(listener, unreadable=self._FILES[1:], mtime=2000.0)
+        assert len(held) == len(self._FILES)
+        dropped = self._scan(listener, unreadable=self._FILES[1:], mtime=2000.0)
+        assert [s["dag_id"] for s in dropped] == [self._FILES[0]]
+
+    def test_a_folder_that_grew_is_trusted(self):
+        """The share is measured against the last trusted scan, not against the listing."""
+        listener = self._listener()
+        grown = list(self._FILES) + [f"/dags/new{n}.py" for n in range(10)]
+
+        result = self._scan(listener, files=grown, mtime=2000.0)
+
+        assert len(result) == len(grown)
+        assert listener._untrusted_scan_streak == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1014,7 +1175,7 @@ class TestEmptyScanDistrust:
         for _ in range(_UNTRUSTED_SCAN_LIMIT):
             with pytest.raises(_UntrustedScan):
                 self._scan_empty(listener)
-        assert listener._empty_scan_streak == _UNTRUSTED_SCAN_LIMIT
+        assert listener._untrusted_scan_streak == _UNTRUSTED_SCAN_LIMIT
 
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
                    return_value=["/dags/dag1.py"]), \
@@ -1022,7 +1183,7 @@ class TestEmptyScanDistrust:
                    return_value=1000.0):
             listener._scan_subscriptions()
 
-        assert listener._empty_scan_streak == 0
+        assert listener._untrusted_scan_streak == 0
         # The whole grace period is available again.
         for _ in range(_UNTRUSTED_SCAN_LIMIT):
             with pytest.raises(_UntrustedScan):
@@ -1055,7 +1216,13 @@ class TestEmptyScanDistrust:
         assert self._scan_empty(listener) == []
 
     def test_an_io_failure_that_emptied_the_mtimes_does_not_buy_trust(self):
-        """The distrust cannot be keyed on a dict a failing filesystem erases."""
+        """The distrust cannot be keyed on a dict a failing filesystem erases.
+
+        What it is keyed on is the count of the last scan the cycle trusted, which a
+        stat that never answers cannot raise — the run of failures below leaves the
+        remembered mtimes empty, and the file reading again is what ends that run and
+        gives the emptiness after it the whole budget once more.
+        """
         listener = self._warm_listener()
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
                    return_value=["/dags/dag1.py"]), \
@@ -1068,8 +1235,41 @@ class TestEmptyScanDistrust:
                     pass
         assert listener._last_mtimes == {}
 
-        with pytest.raises(_UntrustedScan, match="listed no files"):
-            self._scan_empty(listener)
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=["/dags/dag1.py"]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=1000.0), \
+             patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
+            listener._scan_subscriptions()
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan, match="listed no files"):
+                self._scan_empty(listener)
+
+    def test_a_folder_level_outage_gives_the_next_listing_a_full_budget(self):
+        """The budget belongs to one contiguous run of listings the folder produced.
+
+        A folder that produces no listing at all — it vanished under a git-sync swap,
+        or lost its read permission — is distrusted without any limit, and a run of
+        empty listings before that outage must not spend the budget of the run after
+        it: the first empty listing back would otherwise be believed on the spot.
+        """
+        listener = self._warm_listener()
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_empty(listener)
+
+        listener._get_dags_folder = MagicMock(
+            side_effect=_UntrustedScan("the DAG folder cannot be listed")
+        )
+        for _ in range(5):
+            with pytest.raises(_UntrustedScan, match="cannot be listed"):
+                listener._scan_subscriptions()
+
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan, match="listed no files"):
+                self._scan_empty(listener)
 
     def test_the_warning_names_the_folder_when_emptiness_is_accepted(self, caplog):
         listener = self._warm_listener()
@@ -1894,6 +2094,60 @@ class TestSyncToDb:
 
         assert [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and
                 "trusted scans in a row — deleting" in r.getMessage()]
+
+    def test_a_key_recreated_after_a_deletion_is_reported(self, caplog):
+        """The flip the backlog item is about: a row comes back consuming, silently.
+
+        ``upsert_subscription`` preserves ``enabled`` for a row that exists and creates
+        a new one otherwise, so a key that returns after its row went carries the
+        default flag — and the operator who switched it off has to hear about it.
+        """
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="d", queue_name="q", enabled=False, absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, _ = _make_session_ctx(existing_subs=[existing])
+        with _sync_env(ctx, {"d"}):
+            listener._sync_to_db([])
+
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default",
+                    "filter_data": {}}]
+        ctx, _ = _make_session_ctx(existing_subs=[])
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"d"}):
+            listener._sync_to_db(scanned)
+
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and
+                "d/q" in r.getMessage() and "deleted one was disabled" in r.getMessage()]
+
+    def test_a_key_that_never_went_is_not_reported_as_recreated(self, caplog):
+        listener = RMQWatcherListener()
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default",
+                    "filter_data": {}}]
+        ctx, _ = _make_session_ctx(existing_subs=[])
+
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"d"}):
+            listener._sync_to_db(scanned)
+
+        assert [r.getMessage() for r in caplog.records
+                if "is in the scan again" in r.getMessage()] == []
+
+    def test_a_row_another_scheduler_kept_is_not_reported_as_recreated(self):
+        """The conditional DELETE that removed nothing has no recreate to report."""
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="d", queue_name="q", absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+        _delete_mock(session).return_value = 0
+
+        with _sync_env(ctx, {"d"}):
+            listener._sync_to_db([])
+
+        assert listener._deleted_dag_file_rows == {}
 
     def test_the_short_circuit_deletion_is_logged(self, caplog):
         listener = RMQWatcherListener()
@@ -3703,14 +3957,16 @@ class TestScanMissEndToEnd:
         assert after["absent_cycles"] is None
 
     @pytest.mark.asyncio
-    async def test_two_broken_cycles_with_an_inactive_dag_leave_the_disabled_row_alone(
+    async def test_a_broken_file_never_costs_the_disabled_row_its_flag(
         self, e2e_listener, dagmodel_engine, tmp_path
     ):
         """The path on which deleting at the first miss would bring the defect back.
 
         A broken DAG file makes Airflow drop ``is_active`` within a minute or two, so
         both signals fail together — and the row the operator switched off has to come
-        through it still switched off.
+        through it still switched off. The whole folder is unparseable here, which the
+        cycle distrusts to the limit before the per-file hold and the miss counter get
+        their turn.
         """
         dag_file = tmp_path / "d.py"
         _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
@@ -3720,7 +3976,12 @@ class TestScanMissEndToEnd:
         before = _snapshot(dagmodel_engine)
 
         _write_dag_file(dag_file, _DAG_HALF_WRITTEN, mtime=2000)
-        await e2e_listener._run_cycle()   # the previous parse is held for one cycle
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            await e2e_listener._run_cycle()   # the listing is not believed
+            assert _snapshot(dagmodel_engine) == before
+
+        await e2e_listener._run_cycle()   # believed; the previous parse is held
+        assert _snapshot(dagmodel_engine) == before
         await e2e_listener._run_cycle()   # patience runs out, the key is gone
 
         after = _snapshot(dagmodel_engine)

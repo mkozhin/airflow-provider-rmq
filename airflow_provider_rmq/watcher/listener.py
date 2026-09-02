@@ -68,14 +68,26 @@ _MIGRATION_BACKOFF_MAX = 60
 #: installation running more than two of them has to raise this proportionally.
 _ABSENT_GRACE_CYCLES = 3
 
-#: Empty glob results in a row the cycle refuses to believe. The first
-#: ``_UNTRUSTED_SCAN_LIMIT`` of them hold the previous parse, the next one gives in: a
-#: folder that emptied for real has to become the truth eventually, or the watcher
-#: would never sync again. The streak is the only thing the check consults, so it
-#: holds on a cold cache too — a scheduler that starts while the DAG volume is still
-#: being populated sees an existing, listable, empty folder, and believing that
-#: emptiness at once would count a miss against every row in the table.
+#: Listings in a row the cycle refuses to read as a statement about the code. The
+#: first ``_UNTRUSTED_SCAN_LIMIT`` of them hold the previous parse, the next one gives
+#: in: a folder that emptied for real, and a filesystem that is not coming back, both
+#: have to become the truth eventually, or the watcher would never sync again. One
+#: contiguous run of such listings shares this budget, whatever mix of shapes it takes.
 _UNTRUSTED_SCAN_LIMIT = 3
+
+#: Share of the file count of the last trusted scan that has to read for the listing to
+#: be a statement about the code. Which failure a file answers with takes no part in the
+#: decision: an aborted checkout leaves files truncated (a parse failure), a storage
+#: backend losing access leaves them unstattable (an I/O failure), and both say the same
+#: thing — what is on disk right now is not the code. A broken file or two among many is
+#: about the code and stays trusted; a listing that lost most of what read before is not.
+#: The comparison is against the last trusted scan rather than against the listing
+#: itself, so a folder that grew a hundred new files is trusted while a folder that lost
+#: a hundred is not, and an empty listing is distrusted on a cold cache too — a scheduler
+#: that starts while the DAG volume is still being populated sees an existing, listable,
+#: empty folder, and believing that at once would count a miss against every row in the
+#: table.
+_TRUSTED_SCAN_FRACTION = 0.5
 
 #: Cycles the previous parse of an unreadable DAG file is held for. One, not three:
 #: the case the hold exists for is a file caught mid-write, and that resolves within a
@@ -663,17 +675,24 @@ class RMQWatcherListener:
         self._last_mtimes: dict[str, float] = {}   # filepath → mtime
         self._cached_subs: dict[str, list[dict]] = {}  # filepath → list[sub dict]
         self._read_failures: dict[str, int] = {}  # filepath → failed reads in a row
-        # Empty glob results in a row, counted so that the distrust of an empty DAG
-        # folder expires at ``_UNTRUSTED_SCAN_LIMIT`` instead of lasting forever.
-        self._empty_scan_streak: int = 0
-        # Scans in a row in which every listed file refused to be read, bounded by the
-        # same limit and for the same reason: a whole folder of files nobody can stat
-        # is a filesystem talking, but the distrust of it still has to end somewhere.
-        self._unreadable_scan_streak: int = 0
+        # Listings in a row the cycle would not read as a statement about the code,
+        # counted so that the distrust expires at ``_UNTRUSTED_SCAN_LIMIT`` instead of
+        # lasting forever: a folder of files nobody can read is a filesystem talking,
+        # but the distrust of it still has to end somewhere.
+        self._untrusted_scan_streak: int = 0
+        # Files the last trusted scan read, which :data:`_TRUSTED_SCAN_FRACTION` of the
+        # next listing is measured against.
+        self._trusted_file_count: int = 0
         # Result of the last scan the cycle trusted. Stands in for the scan of a cycle
         # that raised :class:`_UntrustedScan`, which needs it for the exchange metadata:
         # that metadata lives only in memory and reconcile has no other source for it.
         self._last_good_scan: list[dict] = []
+        # dag_file keys this process deleted and the ``enabled`` flag each of them
+        # carried, held until the scan brings the key back. A key that comes back
+        # arrives as a brand new row with the default flag on it, and that is what the
+        # log line reporting it says. Written by the sync step alone, like the dicts
+        # above are written by the scan step alone.
+        self._deleted_dag_file_rows: dict[tuple[str, str, str], bool] = {}
         # Both pools are built here, in whatever thread constructs the listener, and
         # outlive every event loop the watcher thread creates.
         self._cycle_pool = BoundedExecutor("rmq-watcher-cycle", _CYCLE_POOL_WORKERS)
@@ -1122,55 +1141,35 @@ class RMQWatcherListener:
         Memory is bounded to the number of current DAG files on disk.
 
         :raises _UntrustedScan: The DAG folder is not a source the scan can be trusted
-            from, a listing that came back empty is still young enough to be a hiccup
-            of the environment, or every file the listing named refused to be read.
-            The first two are checked before the cache is touched and the third leaves
-            the cache alone by holding its failures back until the whole listing is
-            known, so a cycle that cannot trust the filesystem leaves the previous
-            parse intact — and an empty glob cannot empty ``_last_mtimes`` before the
-            check that reads it.
+            from, or too little of the listing it produced could be read for the result
+            to be a statement about the code (see :data:`_TRUSTED_SCAN_FRACTION`).
+            Nothing the sync step would count misses against is touched before that
+            verdict: the folder is checked first, the per-file failures are held back
+            until the whole listing has been tried, and the eviction of paths the
+            listing no longer names waits for the verdict too — so a listing that lost
+            a subtree to a permission error leaves the previous parse of it intact.
         """
-        dags_folder = self._get_dags_folder()
+        try:
+            dags_folder = self._get_dags_folder()
+        except _UntrustedScan:
+            # The streak counts one contiguous run of listings. A folder that produced
+            # none at all — it vanished under a git-sync swap, or refuses to be listed
+            # — is distrusted with no limit whatsoever, and letting a run continue
+            # across such an outage would spend the budget of the next run before it
+            # starts: a single empty listing after a week of a missing folder would be
+            # believed on the spot.
+            self._untrusted_scan_streak = 0
+            raise
+
         current_files = set(
             glob.glob(os.path.join(dags_folder, "**", "*.py"), recursive=True)
         )
 
-        if current_files:
-            self._empty_scan_streak = 0
-        else:
-            # An empty listing of a listable folder: a git-sync symlink swap, a folder
-            # being rebuilt, a volume mounted after the scheduler started. The first
-            # _UNTRUSTED_SCAN_LIMIT of these are not believed; the one after them is,
-            # because a folder can also empty for real. What is known about the files
-            # takes no part in the decision: an I/O failure drops a path's remembered
-            # mtime, and a process that has only just started remembers nothing at all,
-            # so a cache read here would trust the emptiness precisely when the
-            # filesystem is least worth trusting.
-            self._empty_scan_streak += 1
-            if self._empty_scan_streak <= _UNTRUSTED_SCAN_LIMIT:
-                raise _UntrustedScan(
-                    f"the DAG folder {dags_folder!r} listed no files "
-                    f"({self._empty_scan_streak} of {_UNTRUSTED_SCAN_LIMIT} in a row)"
-                )
-            log.warning(
-                "RMQ Watcher: DAG folder %r has listed no files %d times in a row — "
-                "taking the emptiness as the truth",
-                dags_folder, self._empty_scan_streak,
-            )
-
-        # Evict deleted files. Every dict keyed by path is drained, not only the one
-        # holding mtimes: an I/O failure drops the mtime and keeps the other two, and a
-        # file deleted in that state would otherwise stay in them for the process's life.
-        for path in set(self._last_mtimes) | set(self._cached_subs) | set(self._read_failures):
-            if path not in current_files:
-                self._last_mtimes.pop(path, None)
-                self._cached_subs.pop(path, None)
-                self._read_failures.pop(path, None)
-
-        # Re-parse changed or new files. Failures are collected rather than applied at
-        # once: a listing in which every file failed to read is a statement about the
-        # filesystem, not about the code, and applying them would drop every key of the
-        # installation from a scan the sync step counts misses against.
+        # Re-parse changed or new files. Failures are collected rather than applied as
+        # they are met: how much of the listing read is what decides whether the listing
+        # is about the code at all, and that is known only once every file has been
+        # tried. Applying them first would drop the keys of the installation from a scan
+        # the sync step counts misses against.
         failures: list[tuple[str, object, float | None]] = []
         for path in current_files:
             try:
@@ -1197,29 +1196,51 @@ class RMQWatcherListener:
             self._cached_subs[path] = subs
             self._last_mtimes[path] = mtime
 
-        nothing_read = (
-            bool(current_files)
-            and len(failures) == len(current_files)
-            and any(mtime is None for _, _, mtime in failures)
-        )
-        if not nothing_read:
-            self._unreadable_scan_streak = 0
+        readable = len(current_files) - len(failures)
+        if readable and readable >= self._trusted_file_count * _TRUSTED_SCAN_FRACTION:
+            self._untrusted_scan_streak = 0
         else:
-            self._unreadable_scan_streak += 1
-            if self._unreadable_scan_streak <= _UNTRUSTED_SCAN_LIMIT:
-                raise _UntrustedScan(
+            if not current_files:
+                what = f"the DAG folder {dags_folder!r} listed no files"
+            elif not readable:
+                what = (
                     f"none of the {len(current_files)} files the DAG folder "
-                    f"{dags_folder!r} listed could be read "
-                    f"({self._unreadable_scan_streak} of {_UNTRUSTED_SCAN_LIMIT} in a "
-                    f"row), first reason: {failures[0][1]!r}"
+                    f"{dags_folder!r} listed could be read"
+                )
+            else:
+                what = (
+                    f"only {readable} of the {len(current_files)} files the DAG folder "
+                    f"{dags_folder!r} listed could be read, against "
+                    f"{self._trusted_file_count} the last trusted scan read"
+                )
+            if failures:
+                what += f", first reason: {failures[0][1]!r}"
+            self._untrusted_scan_streak += 1
+            if self._untrusted_scan_streak <= _UNTRUSTED_SCAN_LIMIT:
+                raise _UntrustedScan(
+                    f"{what} ({self._untrusted_scan_streak} of "
+                    f"{_UNTRUSTED_SCAN_LIMIT} in a row)"
                 )
             log.warning(
-                "RMQ Watcher: none of the %d files in DAG folder %r could be read %d "
-                "times in a row — letting their subscriptions go the counted-miss way",
-                len(current_files), dags_folder, self._unreadable_scan_streak,
+                "RMQ Watcher: %s — %d times in a row now, so the listing is taken as "
+                "the truth and the keys missing from it go the counted-miss way",
+                what, self._untrusted_scan_streak,
             )
+
         for path, reason, mtime in failures:
             self._file_unreadable(path, reason, mtime)
+
+        # Evict files the listing no longer names. Every dict keyed by path is drained,
+        # not only the one holding mtimes: an I/O failure drops the mtime and keeps the
+        # other two, and a file deleted in that state would otherwise stay in them for
+        # the process's life.
+        for path in set(self._last_mtimes) | set(self._cached_subs) | set(self._read_failures):
+            if path not in current_files:
+                self._last_mtimes.pop(path, None)
+                self._cached_subs.pop(path, None)
+                self._read_failures.pop(path, None)
+
+        self._trusted_file_count = readable
 
         # Flatten all cached subscriptions
         result: list[dict] = []
@@ -1320,9 +1341,10 @@ class RMQWatcherListener:
         the entire reconcile cycle for every other DAG, so it too answers
         ``None``.
 
-        :returns: The file's subscriptions, or ``None`` when the content was read
-            but did not yield a parse (``SyntaxError``, ``UnicodeDecodeError``, or
-            anything the broad guard catches).
+        :returns: The file's subscriptions, or ``None`` when the content was read but
+            did not yield a parse — content that does not decode, that the parser
+            refuses in any of its ways, or anything the broad guard around the walk
+            catches.
         :raises OSError: The file gave no access at all. The two answers are kept
             apart because ``_scan_subscriptions`` records the file's mtime only
             after a failed parse: a parse happened means the content was read and
@@ -1340,8 +1362,15 @@ class RMQWatcherListener:
 
         try:
             tree = ast.parse(source, filename=path)
-        except SyntaxError as exc:
-            log.warning("Failed to parse DAG file %s: %s", path, exc)
+        except Exception as exc:  # noqa: BLE001 - the caller's contract is OSError alone
+            # Every way the parser has of refusing the content it was handed lands
+            # here: a syntax error, the ``ValueError: source code string cannot contain
+            # null bytes`` of a file caught mid-write or of a binary one under a ``.py``
+            # name, the ``RecursionError`` of a deeply nested one. All of them say the
+            # same thing to the caller — the content was read and did not yield a parse
+            # — and the one exception this method may raise is the ``OSError`` of a file
+            # that gave no access, which a caller counting misses reads differently.
+            log.warning("Failed to parse DAG file %s: %r", path, exc)
             return None
 
         try:
@@ -1414,9 +1443,8 @@ class RMQWatcherListener:
             )
             return None
 
-    @staticmethod
     def _delete_absent_sub(
-        session: Session, sub: RMQSubscription, observed: int
+        self, session: Session, sub: RMQSubscription, observed: int
     ) -> None:
         """Delete one dag_file row, but only while its miss counter still reads ``observed``.
 
@@ -1424,13 +1452,21 @@ class RMQWatcherListener:
         between this cycle's read and its write; the condition leaves that row alone
         instead of deleting it and letting the next scan recreate it with a fresh ``id``
         and ``enabled=True``.
+
+        A row that really went is remembered by key, together with the ``enabled`` flag
+        it carried, so that the scan bringing the key back reports the recreated row
+        instead of quietly handing the subscription a consumer again.
         """
-        session.query(RMQSubscription).filter_by(
+        deleted = session.query(RMQSubscription).filter_by(
             dag_id=sub.dag_id,
             queue_name=sub.queue_name,
             conn_id=sub.conn_id,
             source="dag_file",
         ).filter(RMQSubscription.absent_cycles == observed).delete()
+        if deleted:
+            self._deleted_dag_file_rows[
+                (sub.dag_id, sub.queue_name, sub.conn_id)
+            ] = bool(sub.enabled)
 
     def _sync_to_db(self, scanned: list[dict]) -> None:
         """Reconcile dag_file subscriptions in DB with the current scan result.
@@ -1444,6 +1480,10 @@ class RMQWatcherListener:
           longer counts its ``dag_id`` as active, because a delivery on such a
           subscription is acknowledged and dropped. A disabled row has no consumer and
           therefore always gets the full grace period.
+        - Reports a key that comes back after this watcher deleted its row: what the
+          scan recreates is a new row carrying the default ``enabled``, so a
+          subscription an operator had switched off starts consuming again — with a
+          WARNING naming it and the flag the deleted row held.
         - Never touches ui-sourced subscriptions.
         """
         scanned_keys = {
@@ -1461,6 +1501,7 @@ class RMQWatcherListener:
                 .filter_by(source="dag_file")
                 .all()
             )
+            existing_keys = {(s.dag_id, s.queue_name, s.conn_id) for s in existing}
 
             for sub in existing:
                 key = (sub.dag_id, sub.queue_name, sub.conn_id)
@@ -1511,6 +1552,16 @@ class RMQWatcherListener:
                 )
 
             for s in scanned:
+                key = (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default"))
+                was_enabled = self._deleted_dag_file_rows.pop(key, None)
+                if was_enabled is not None and key not in existing_keys:
+                    log.warning(
+                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is in the "
+                        "scan again after this watcher deleted it — it is recreated as a "
+                        "new row carrying the default enabled flag, and the deleted one "
+                        "was %s",
+                        *key, "enabled" if was_enabled else "disabled",
+                    )
                 upsert_subscription(
                     session,
                     dag_id=s["dag_id"],
