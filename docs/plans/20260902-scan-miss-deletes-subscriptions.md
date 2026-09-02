@@ -744,25 +744,25 @@ else:
 - Modify: `CONTEXT.md`
 - Delete: `docs/backlog/scan-miss-deletes-subscriptions.md`
 
-- [ ] описать в разделе про reconcile-цикл (`readme_ru.md:559` и соответствующее
+- [x] описать в разделе про reconcile-цикл (`readme_ru.md:559` и соответствующее
       место в `readme.md`), что пропажа ключа из скана даёт отсрочку в три
       доверенных цикла; что включённая подписка неактивного DAG'а удаляется
       быстрее — на втором промахе; что **выключенная подписка полную отсрочку
       получает всегда, независимо от состояния DAG'а**; и что скан пустой,
       ненайденной или нечитаемой папки DAG'ов не синхронизируется вовсе
-- [ ] дописать в разделе про управление подписками (`readme_ru.md:757-760`), что
+- [x] дописать в разделе про управление подписками (`readme_ru.md:757-760`), что
       выключение `dag_file`-подписки переживает сбой чтения DAG-файлов
-- [ ] обновить `CONTEXT.md` ровно в двух местах: определение **Orphaned
+- [x] обновить `CONTEXT.md` ровно в двух местах: определение **Orphaned
       subscription** (`:53`, «после того, как соответствующая подписка исчезла из
       БД … или файл временно не парсится») и Example dialogue (`:132`,
       «**Subscription** в БД удалится и consumer-таск остановится»). Буллет про
       **Bind-diff** (`:120`) утверждений об удалении не содержит и правки не
       требует
-- [ ] `git rm docs/backlog/scan-miss-deletes-subscriptions.md`
-- [ ] поправить `docs/backlog/scan-ignores-airflowignore.md:20-24`: абзац про
+- [x] `git rm docs/backlog/scan-miss-deletes-subscriptions.md`
+- [x] поправить `docs/backlog/scan-ignores-airflowignore.md:20-24`: абзац про
       молчаливый фолбэк на `/opt/airflow/dags` этот план закрывает, и ссылка
       `[[scan-miss-deletes-subscriptions]]` в нём повиснет
-- [ ] перенести этот план в `docs/plans/completed/`
+- [x] перенести этот план в `docs/plans/completed/`
 
 ## Post-Completion
 

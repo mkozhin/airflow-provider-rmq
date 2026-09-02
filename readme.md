@@ -558,6 +558,10 @@ The Scheduler process runs a background asyncio loop (via Airflow Listener API) 
 
 Every 60 seconds (configurable via Airflow Variable `rmq_watcher_reconcile_interval`) a reconciliation loop re-scans DAG files for `@rmq_trigger` decorators (mtime-based — only changed files are re-parsed) and syncs subscriptions to the database.
 
+A subscription key going missing from a scan is not an event in itself: the row stays exactly where it was — same `id`, same consumer task, same `enabled` — while the cycle counts the misses and logs a WARNING with the attempts left. Deletion happens once the key has been absent from three trusted scans in a row. An enabled subscription whose `dag_id` Airflow no longer counts as active goes sooner — on the second miss: a matching message on such a subscription is ACKed without triggering anything, which makes its consumer more expensive than the row. A disabled subscription always gets the full grace period, whatever the state of its DAG: it has no consumer, its messages pile up in the queue, and deleting it early would cost it the `enabled` flag — a returning key recreates the row enabled.
+
+A scan that is not a statement about the code is not believed at all: the sync step is skipped whole, and no row counts a miss. That covers a DAG folder setting that is unreadable or empty, a folder that does not exist or cannot be listed, and a listing that came back with zero files where the previous cycle knew of some (a folder that emptied for real is taken as the truth after three such cycles). The reason goes to the log as an ERROR; the rest of the cycle — reading subscriptions, reconcile, the liveness check, the status rows — runs as usual, off the database. A file whose content failed to parse, or gave no access at all, holds its previous parse for one cycle and then joins the ordinary miss count.
+
 `dag_id` in `@dag(...)` (positional or keyword) must be a string literal, or a simple module-level string constant defined earlier in the file than the decorated function, for the AST scan of `dag_file` subscriptions to find it. If it isn't, the subscription simply does not appear on the Subscriptions page at all. This is the one case the `⚠ dag not found` badge (see [Subscription Management](#subscription-management)) cannot catch: there's no row to highlight, since the subscription never registers in the first place. The only signal is a WARNING in the Scheduler log, and only after a restart or when the file's mtime changes (not on every reconcile cycle — only when the file is actually re-scanned).
 
 ### Quick Start
@@ -759,6 +763,8 @@ conf = context["dag_run"].conf
 | Direct DB insert | For automation via Terraform / scripts (`source='ui'`) |
 
 `dag_file` subscriptions are **read-only** in the UI — reconciliation overwrites DB from code every 60 s. Only the `enabled` toggle can be changed via UI for code-managed subscriptions.
+
+Toggling a `dag_file` subscription off survives a failure to read the DAG files. A cycle whose scan cannot be trusted — the DAG folder gone for a second under git-sync, stripped of read permission, or listing nothing — skips the sync altogether; a trusted scan missing the key gives the row a three-cycle grace period, and a disabled row gets that grace in full even when Airflow has already stopped counting its DAG as active. Throughout, it is the same row, and with it the flag the operator cleared. The grace is not indefinite: a key that stays away for three trusted scans deletes the row — and a decorator that comes back later recreates it enabled.
 
 Exchange-mode subscriptions show up in the UI like any other `dag_file` subscription — by their queue name (`rmq_watcher.sub.{dag_id}`) only. The `exchange`/`routing_keys` metadata is not displayed there; the DAG source file is the single source of truth for that.
 
