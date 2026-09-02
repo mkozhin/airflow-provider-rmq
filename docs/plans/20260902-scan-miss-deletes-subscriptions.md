@@ -462,20 +462,20 @@ else:
 - Modify: `airflow_provider_rmq/watcher/models.py`
 - Modify: `tests/watcher/test_models.py`
 
-- [ ] добавить `absent_cycles = Column(Integer, nullable=True)` в `RMQSubscription`
+- [x] добавить `absent_cycles = Column(Integer, nullable=True)` в `RMQSubscription`
       с комментарием о том, что колонка означает и кто её пишет
-- [ ] в `upsert_subscription` обнулять `sub.absent_cycles = None` в общей части,
+- [x] в `upsert_subscription` обнулять `sub.absent_cycles = None` в общей части,
       рядом с `filter_data`/`source`/`trigger_mode`
-- [ ] написать тест: апсерт существующей строки с ненулевым `absent_cycles`
+- [x] написать тест: апсерт существующей строки с ненулевым `absent_cycles`
       обнуляет счётчик и не трогает `enabled`
-- [ ] написать тест: апсерт создаёт новую строку с `absent_cycles is None`
-- [ ] написать тест автомиграции: **завести legacy-DDL именно для
+- [x] написать тест: апсерт создаёт новую строку с `absent_cycles is None`
+- [x] написать тест автомиграции: **завести legacy-DDL именно для
       `rmq_watcher_subscriptions`** (без `absent_cycles`) по образцу
       `_conn_status_ddl_without_diagnostics` (`test_models.py:34-44`), создать
       таблицу им до `ensure_table_exists()` — иначе `create_all` создаст таблицу
       сразу с колонкой, ни одного ALTER не выполнится и тест окажется тавтологией
-- [ ] в том же тесте проверить, что записанная до миграции строка уцелела
-- [ ] прогнать `.venv/bin/pytest tests/watcher/test_models.py -q` — зелено до Task 2
+- [x] в том же тесте проверить, что записанная до миграции строка уцелела
+- [x] прогнать `.venv/bin/pytest tests/watcher/test_models.py -q` — зелено до Task 2
 
 ### Task 2: Страница подписок переживает неактуальную схему
 

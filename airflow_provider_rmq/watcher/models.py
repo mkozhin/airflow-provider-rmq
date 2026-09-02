@@ -42,6 +42,10 @@ class RMQSubscription(WatcherBase):
     trigger_mode = Column(String(20), nullable=False, default="any")
     group_key = Column(String(250), nullable=True)
     cooldown = Column(Integer, nullable=True)
+    # how many trusted scans in a row failed to mention this row's key; NULL and 0
+    # both mean "the key is there". Written by the watcher's _sync_to_db and reset
+    # by upsert_subscription; readers of the row ignore it
+    absent_cycles = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
@@ -183,6 +187,8 @@ def upsert_subscription(
     sub.trigger_mode = trigger_mode
     sub.group_key = group_key
     sub.cooldown = cooldown
+    # the key is in the scan, so the miss counter starts over
+    sub.absent_cycles = None
     return sub
 
 

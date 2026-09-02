@@ -43,6 +43,29 @@ CREATE TABLE rmq_watcher_conn_status (
 """
 
 
+#: Table the migration has to bring up to date: rmq_watcher_subscriptions without the
+#: miss counter.
+_subscriptions_ddl_without_absent_cycles = """
+CREATE TABLE rmq_watcher_subscriptions (
+    id INTEGER NOT NULL PRIMARY KEY,
+    dag_id VARCHAR(250) NOT NULL,
+    queue_name VARCHAR(250) NOT NULL,
+    conn_id VARCHAR(250) NOT NULL,
+    filter_data JSON,
+    source VARCHAR(10) NOT NULL,
+    enabled BOOLEAN NOT NULL,
+    consumer_status VARCHAR(20) NOT NULL,
+    last_error TEXT,
+    trigger_mode VARCHAR(20) NOT NULL,
+    group_key VARCHAR(250),
+    cooldown INTEGER,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    CONSTRAINT uq_rmq_sub_dag_queue_conn UNIQUE (dag_id, queue_name, conn_id)
+)
+"""
+
+
 @pytest.fixture(scope="function")
 def session():
     """SQLite in-memory session with fresh schema per test."""
@@ -181,6 +204,31 @@ class TestUpsertEnabled:
 
         row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
         assert row.enabled is False
+
+
+class TestAbsentCycles:
+    def test_upsert_resets_counter_and_keeps_enabled(self, session):
+        """Вернувшийся ключ обнуляет счётчик промахов, не трогая enabled."""
+        sub = upsert_subscription(session, dag_id="d", queue_name="q", source="dag_file")
+        session.commit()
+        sub.enabled = False
+        sub.absent_cycles = 2
+        session.commit()
+
+        upsert_subscription(session, dag_id="d", queue_name="q", source="dag_file", enabled=True)
+        session.commit()
+
+        row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+        assert row.absent_cycles is None
+        assert row.enabled is False
+
+    def test_new_subscription_starts_without_counter(self, session):
+        """Новая строка заводится без счётчика промахов."""
+        upsert_subscription(session, dag_id="d", queue_name="q")
+        session.commit()
+
+        row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+        assert row.absent_cycles is None
 
 
 class TestGetEnabled:
@@ -387,6 +435,33 @@ class TestSchemaMigration:
         assert "broker_consumer_count" in columns
         assert "last_reconcile_at" in columns
         assert models.is_schema_ready() is True
+
+    def test_adds_absent_cycles_to_legacy_subscriptions(self, schema_engine):
+        """Счётчик промахов приезжает на живую таблицу и данные в ней переживают ALTER."""
+        with schema_engine.begin() as conn:
+            conn.execute(text(_subscriptions_ddl_without_absent_cycles))
+            conn.execute(text(
+                "INSERT INTO rmq_watcher_subscriptions "
+                "(dag_id, queue_name, conn_id, source, enabled, consumer_status, "
+                " trigger_mode, created_at, updated_at) "
+                "VALUES ('d', 'q', 'rmq_default', 'dag_file', 0, 'connecting', "
+                " 'any', '2026-09-02 10:00:00', '2026-09-02 10:00:00')"
+            ))
+
+        ensure_table_exists()
+
+        columns = {
+            c["name"] for c in inspect(schema_engine).get_columns("rmq_watcher_subscriptions")
+        }
+        assert "absent_cycles" in columns
+
+        session = sessionmaker(bind=schema_engine)()
+        try:
+            row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+            assert row.enabled is False
+            assert row.absent_cycles is None
+        finally:
+            session.close()
 
     def test_migrated_table_accepts_diagnostic_writes(self, schema_engine):
         with schema_engine.begin() as conn:
