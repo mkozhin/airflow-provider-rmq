@@ -86,9 +86,14 @@
   <div class="panel panel-default">
     <div class="panel-heading">
       <h4>Subscriptions
+        {# The form behind this button writes through the same mapping the notice
+           below says could not be read, so it would answer with a 500 for as long
+           as the notice stands. #}
+        {% if not subscriptions_error %}
         <a href="{{ url_for('RMQWatcherView.create') }}" class="btn btn-sm btn-primary pull-right">
           + Create subscription
         </a>
+        {% endif %}
       </h4>
     </div>
     <div class="panel-body">

@@ -1010,6 +1010,20 @@ class TestSubscriptionsTemplateRendering:
         html = _render_subscriptions_html([grouped, single], active_dag_ids={"other_dag"})
         assert _badge_present(html)
 
+    def test_the_create_button_is_gone_while_the_notice_stands(self):
+        """The form behind the button writes through the mapping the notice is about.
+
+        Its POST goes to ``upsert_subscription``, whose query selects every column the
+        ORM maps — so on the schema the notice describes the button leads to a 500,
+        offered from the very page that has just said the table cannot be read.
+        """
+        html = _render_subscriptions_html([], subscriptions_error="cannot be read")
+        assert "Create subscription" not in html
+
+    def test_the_create_button_is_there_when_the_table_reads(self):
+        html = _render_subscriptions_html([_make_single_row(dag_id="d")])
+        assert "Create subscription" in html
+
     def test_active_dag_ids_empty_set_shows_badge_on_all_rows(self):
         """set() (lookup succeeded, genuinely zero active DAGs) is a
         different sentinel than None (lookup failed) per the plan's

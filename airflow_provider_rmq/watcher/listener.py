@@ -667,6 +667,21 @@ def _read_active_dag_ids() -> set[str] | None:
         return None
 
 
+def _absent_cycles_still(observed: int | None) -> Any:
+    """Predicate matching a row whose miss counter still reads exactly ``observed``.
+
+    The counter is read once per row and written back under this predicate, so a
+    scheduler whose read went stale — the key came back and another scheduler cleared
+    the counter, or moved it on — writes nothing instead of overwriting what that one
+    committed. ``NULL`` and ``0`` say the same thing about a row and different things
+    to SQL, where nothing at all equals ``NULL``, so the value the row was read as
+    carries into the predicate unnormalised.
+    """
+    if observed is None:
+        return RMQSubscription.absent_cycles.is_(None)
+    return RMQSubscription.absent_cycles == observed
+
+
 def _sub_key(sub: dict) -> tuple[str, str, str]:
     """The key a scanned subscription is identified by: ``(dag_id, queue_name, conn_id)``.
 
@@ -776,6 +791,16 @@ class RMQWatcherListener:
         # cycle stopped waiting for goes on to finish in its pool worker, and the
         # listing it observed is an observation of the folder either way.
         self._trusted_file_count: int | None = None
+        # Whether the listing the cycle last took as the truth named files and read
+        # none of them. Such a listing is the folder collapsing, and it is refused for
+        # the whole budget before it is given in to; once it has been given in to, the
+        # same listing every cycle after it is the steady state that was already paid
+        # for, and refusing it again would leave the sync step running one cycle in
+        # four for the life of the process. It also tells the two zeroes apart: a
+        # folder believed to hold nothing readable and a folder believed to be empty
+        # both leave the mark at zero, and only the first of them has a collapse behind
+        # it.
+        self._trusted_listing_read_nothing: bool = False
         # Result of the last scan the cycle trusted. Stands in for the scan of a cycle
         # that raised :class:`_UntrustedScan`, which needs it for the exchange metadata:
         # that metadata lives only in memory and reconcile has no other source for it.
@@ -1290,7 +1315,13 @@ class RMQWatcherListener:
 
         readable = len(current_files) - len(failures)
         baseline = self._trusted_file_count
-        if baseline is None:
+        if current_files and not readable and not self._trusted_listing_read_nothing:
+            # A folder that named files not one of which could be read says nothing
+            # about the code in them, whatever the mark stands at — and it stands at
+            # zero for as long as an empty folder is what was last believed, which is
+            # a mark every listing clears. The share below is a share of something.
+            trusted = False
+        elif baseline is None:
             # No listing of this process has been believed yet, so there is nothing to
             # measure this one against and the only listing a cold start can refuse is
             # the one that produced nothing readable at all. What a partial listing
@@ -1308,6 +1339,7 @@ class RMQWatcherListener:
             # unmounting piece by piece all the way down and call every step of it
             # trustworthy.
             self._trusted_file_count = readable if baseline is None else max(baseline, readable)
+            self._trusted_listing_read_nothing = bool(current_files) and not readable
         else:
             what = _untrusted_listing_reason(
                 dags_folder, current_files, readable, baseline, failures
@@ -1331,6 +1363,7 @@ class RMQWatcherListener:
             # no grace at all.
             self._untrusted_scan_streak = 0
             self._trusted_file_count = readable
+            self._trusted_listing_read_nothing = bool(current_files) and not readable
 
         for path, reason, mtime in failures:
             self._file_unreadable(path, reason, mtime)
@@ -1528,15 +1561,24 @@ class RMQWatcherListener:
         self,
         session: Session,
         sub: RMQSubscription,
-        observed: int,
+        observed: int | None,
         deleted_now: list[tuple[tuple[str, str, str], bool]],
+        *,
+        only_enabled: bool = False,
     ) -> None:
-        """Delete one dag_file row, but only while its miss counter still reads ``observed``.
+        """Delete one dag_file row, but only while it still reads the way it was read.
 
         Another scheduler may have seen the key come back and cleared the counter
-        between this cycle's read and its write; the condition leaves that row alone
-        instead of deleting it and letting the next scan recreate it with a fresh ``id``
-        and ``enabled=True``.
+        between this cycle's read and its write; the condition on the counter leaves
+        that row alone instead of deleting it and letting the next scan recreate it
+        with a fresh ``id`` and ``enabled=True``.
+
+        ``only_enabled`` puts ``enabled`` into the same predicate, for the deletion an
+        enabled row of an inactive DAG gets ahead of the grace period. That deletion is
+        owed entirely to the consumer such a row keeps — one that acks and drops every
+        delivery — so an operator switching the row off in the window between the read
+        and the write leaves a row with no consumer, which is a row the full grace
+        period covers.
 
         A row that really went is appended to ``deleted_now`` as its key and the
         ``enabled`` flag it carried, for the caller to remember once the transaction
@@ -1546,14 +1588,55 @@ class RMQWatcherListener:
         """
         key = (sub.dag_id, sub.queue_name, sub.conn_id)
         was_enabled = bool(sub.enabled)
+        criteria = [_absent_cycles_still(observed)]
+        if only_enabled:
+            criteria.append(RMQSubscription.enabled.is_(True))
         deleted = session.query(RMQSubscription).filter_by(
             dag_id=sub.dag_id,
             queue_name=sub.queue_name,
             conn_id=sub.conn_id,
             source="dag_file",
-        ).filter(RMQSubscription.absent_cycles == observed).delete()
+        ).filter(*criteria).delete()
         if deleted:
             deleted_now.append((key, was_enabled))
+
+    def _count_absent_cycle(
+        self, session: Session, sub: RMQSubscription, observed: int | None
+    ) -> None:
+        """Write one more miss onto ``sub``, while its counter still reads ``observed``.
+
+        The counter is the whole of what stands between a key that went missing for a
+        moment and a row that gets deleted, and every scheduler writes it from a value
+        it read some milliseconds earlier. A plain assignment would carry that value
+        over a recovery another scheduler has already committed — the key came back in
+        its scan, the upsert cleared the counter — and put the row back at a count from
+        which the next miss deletes it, an intervening successful scan notwithstanding.
+        The write therefore matches on what was read, and a scheduler holding a stale
+        value writes nothing.
+        """
+        counted = observed + 1 if observed else 1
+        updated = session.query(RMQSubscription).filter_by(
+            dag_id=sub.dag_id,
+            queue_name=sub.queue_name,
+            conn_id=sub.conn_id,
+            source="dag_file",
+        ).filter(_absent_cycles_still(observed)).update(
+            {"absent_cycles": counted}, synchronize_session=False
+        )
+        if updated:
+            log.warning(
+                "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
+                "the scan (%s of %s allowed) — keeping the row for now",
+                sub.dag_id, sub.queue_name, sub.conn_id,
+                counted, _ABSENT_GRACE_CYCLES,
+            )
+        else:
+            log.info(
+                "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from the "
+                "scan, but its miss counter moved since this cycle read it — leaving "
+                "the row to the scheduler that wrote it",
+                sub.dag_id, sub.queue_name, sub.conn_id,
+            )
 
     def _remember_deleted_row(self, key: tuple[str, str, str], was_enabled: bool) -> None:
         """Record one committed deletion, dropping the oldest record to stay in bounds."""
@@ -1585,10 +1668,7 @@ class RMQWatcherListener:
         - Never touches ui-sourced subscriptions.
         """
         scanned_keys = {_sub_key(s) for s in scanned}
-        # Read lazily: on the overwhelmingly common cycle every key is in the scan, and
-        # the query behind it is an unindexed full scan of Airflow's ``dag`` table.
         active_dag_ids: set[str] | None = None
-        active_dag_ids_read = False
         # Deletions this cycle made and keys it saw come back. Both are applied to the
         # map of deleted keys once the transaction carrying them is committed: a commit
         # that fails leaves neither a record of a row that is still there nor a hole
@@ -1604,6 +1684,23 @@ class RMQWatcherListener:
             )
             existing_keys = {(s.dag_id, s.queue_name, s.conn_id) for s in existing}
 
+            # The active dag_ids are read before the loop writes anything, and only
+            # when a row of this cycle could reach the short circuit at all — on the
+            # overwhelmingly common cycle every key is in the scan and the query behind
+            # them, an unindexed full scan of Airflow's ``dag`` table, is never run.
+            # The read gets a session of its own, and a pool one connection wide hands
+            # that session the connection this one is already writing through: closing
+            # it rolls the connection back, so anything this cycle had flushed by then
+            # would be gone from the database while the code above went on believing it
+            # deleted a row.
+            if any(
+                sub.enabled
+                and (sub.absent_cycles or 0) >= 1
+                and (sub.dag_id, sub.queue_name, sub.conn_id) not in scanned_keys
+                for sub in existing
+            ):
+                active_dag_ids = _read_active_dag_ids()
+
             for sub in existing:
                 key = (sub.dag_id, sub.queue_name, sub.conn_id)
                 if key in scanned_keys:
@@ -1616,10 +1713,11 @@ class RMQWatcherListener:
                     continue
 
                 # ``NULL`` and ``0`` are the same statement about a row that has never
-                # missed a scan, and the arithmetic below reads them as one. Both
-                # deletion branches need a counter of at least 1 to fire, so what the
-                # DELETE filters on is a value the row really carries.
-                current = sub.absent_cycles or 0
+                # missed a scan, and the arithmetic here reads them as one; the writes
+                # below take the value as the row carries it, because SQL matches
+                # ``NULL`` on nothing at all.
+                observed = sub.absent_cycles
+                current = observed or 0
 
                 if current + 1 > _ABSENT_GRACE_CYCLES:
                     log.info(
@@ -1627,30 +1725,27 @@ class RMQWatcherListener:
                         "%s trusted scans in a row — deleting",
                         sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
                     )
-                    self._delete_absent_sub(session, sub, current, deleted_now)
+                    self._delete_absent_sub(session, sub, observed, deleted_now)
                     continue
 
-                if sub.enabled and current >= 1:
-                    if not active_dag_ids_read:
-                        active_dag_ids = _read_active_dag_ids()
-                        active_dag_ids_read = True
-                    if active_dag_ids is not None and sub.dag_id not in active_dag_ids:
-                        log.info(
-                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
-                            "from the scan and DAG %s is no longer active — deleting without "
-                            "waiting out the grace period",
-                            sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
-                        )
-                        self._delete_absent_sub(session, sub, current, deleted_now)
-                        continue
+                if (
+                    sub.enabled
+                    and current >= 1
+                    and active_dag_ids is not None
+                    and sub.dag_id not in active_dag_ids
+                ):
+                    log.info(
+                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
+                        "from the scan and DAG %s is no longer active — deleting without "
+                        "waiting out the grace period",
+                        sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
+                    )
+                    self._delete_absent_sub(
+                        session, sub, observed, deleted_now, only_enabled=True
+                    )
+                    continue
 
-                sub.absent_cycles = current + 1
-                log.warning(
-                    "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
-                    "the scan (%s of %s allowed) — keeping the row for now",
-                    sub.dag_id, sub.queue_name, sub.conn_id,
-                    current + 1, _ABSENT_GRACE_CYCLES,
-                )
+                self._count_absent_cycle(session, sub, observed)
 
             for s in scanned:
                 key = _sub_key(s)

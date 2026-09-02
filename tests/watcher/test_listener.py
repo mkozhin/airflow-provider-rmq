@@ -13,7 +13,9 @@ import time
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.executor import BoundedExecutor
@@ -33,7 +35,7 @@ from airflow_provider_rmq.watcher.listener import (
     _parse_rmq_trigger_decorator,
     _read_settings,
 )
-from airflow_provider_rmq.watcher.models import RMQSubscription
+from airflow_provider_rmq.watcher.models import RMQSubscription, WatcherBase
 
 
 # ---------------------------------------------------------------------------
@@ -1274,6 +1276,29 @@ class TestEmptyScanDistrust:
         assert self._scan_empty(listener) == []
         assert self._scan_empty(listener) == []
 
+    def test_a_believed_empty_folder_buys_no_trust_for_a_listing_nothing_read_of(self):
+        """A share of zero is met by everything, an unreadable listing included.
+
+        The mark an empty folder leaves once it is believed is zero, and files that
+        appear in it and refuse every read are the folder collapsing like any other:
+        the whole budget stands between such a listing and the miss counters of the
+        rows in the table.
+        """
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_empty(listener)
+        assert self._scan_empty(listener) == []
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=["/dags/dag1.py"]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   side_effect=OSError("stale handle")):
+            for _ in range(_UNTRUSTED_SCAN_LIMIT):
+                with pytest.raises(_UntrustedScan, match="none of the 1 files"):
+                    listener._scan_subscriptions()
+
     def test_an_io_failure_that_emptied_the_mtimes_does_not_buy_trust(self):
         """The distrust cannot be keyed on a dict a failing filesystem erases.
 
@@ -2005,6 +2030,24 @@ def _delete_mock(session):
     return session.query.return_value.filter_by.return_value.filter.return_value.delete
 
 
+def _update_mock(session):
+    """The update() the miss counter writes through, conditional on the value read."""
+    return session.query.return_value.filter_by.return_value.filter.return_value.update
+
+
+def _counted_miss(session):
+    """The count the miss counter wrote this synchronisation, or ``None`` if it did not.
+
+    The counter goes to the database as an UPDATE matched on the value the row was
+    read as, so what a row now carries is what that statement wrote — the attribute on
+    the object the cycle read is not where the count lives.
+    """
+    update = _update_mock(session)
+    if not update.call_args_list:
+        return None
+    return update.call_args.args[0]["absent_cycles"]
+
+
 @contextlib.contextmanager
 def _sync_env(ctx, active_dag_ids):
     """Patch everything _sync_to_db reaches outside itself.
@@ -2049,7 +2092,7 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         _delete_mock(session).assert_not_called()
-        assert existing.absent_cycles == 1
+        assert _counted_miss(session) == 1
 
     def test_row_is_deleted_one_miss_past_the_grace_period(self):
         listener = RMQWatcherListener()
@@ -2070,7 +2113,7 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         _delete_mock(session).assert_not_called()
-        assert existing.absent_cycles == _ABSENT_GRACE_CYCLES
+        assert _counted_miss(session) == _ABSENT_GRACE_CYCLES
 
     def test_enabled_sub_of_inactive_dag_survives_the_first_miss(self):
         """A broken DAG file drops the key and is_active at once — one shared miss must survive."""
@@ -2082,7 +2125,7 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         _delete_mock(session).assert_not_called()
-        assert existing.absent_cycles == 1
+        assert _counted_miss(session) == 1
 
     def test_enabled_sub_of_inactive_dag_is_deleted_on_the_second_miss(self):
         listener = RMQWatcherListener()
@@ -2105,7 +2148,7 @@ class TestSyncToDb:
             with _sync_env(ctx, {"other_dag"}):
                 listener._sync_to_db([])
             _delete_mock(session).assert_not_called()
-            assert existing.absent_cycles == miss
+            assert _counted_miss(session) == miss
 
         existing = _existing_sub(
             dag_id="gone_dag", enabled=False, absent_cycles=_ABSENT_GRACE_CYCLES
@@ -2124,7 +2167,7 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         _delete_mock(session).assert_not_called()
-        assert existing.absent_cycles == 2
+        assert _counted_miss(session) == 2
 
     def test_paused_dag_counts_as_active_and_keeps_the_grace_period(self):
         """get_active_dag_ids reports a paused DAG as active (ADR 0006), so no shortcut."""
@@ -2136,7 +2179,7 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         _delete_mock(session).assert_not_called()
-        assert existing.absent_cycles == 2
+        assert _counted_miss(session) == 2
 
     def test_key_back_in_scan_is_reported_and_leaves_deletion_alone(self, caplog):
         listener = RMQWatcherListener()
@@ -4301,3 +4344,165 @@ class TestScanMissEndToEnd:
 
         await e2e_listener._run_cycle()
         assert _snapshot(dagmodel_engine) is None
+
+
+# ---------------------------------------------------------------------------
+# Two schedulers writing the same row
+# ---------------------------------------------------------------------------
+
+
+def _add_dag_file_subscription(
+    engine, dag_id="d", queue_name="q", *, enabled=True, absent_cycles=None
+):
+    """Row of a dag_file subscription in whatever state a scenario starts from."""
+    with _db(engine) as session:
+        session.add(RMQSubscription(
+            dag_id=dag_id, queue_name=queue_name, conn_id="rmq_default",
+            source="dag_file", enabled=enabled, absent_cycles=absent_cycles,
+        ))
+        session.commit()
+
+
+def _reader_another_scheduler_writes_inside(engine, values, *, active):
+    """Active-dag read with another scheduler's committed write landing inside it.
+
+    Every one of these races lives in the window between this cycle reading a row and
+    writing it, and the active-dag read is the point inside that window a test can
+    hold open. ``active`` is what Airflow answers about ``d`` once the write is in.
+    """
+    def read():
+        with _db(engine) as session:
+            session.query(RMQSubscription).filter_by(dag_id="d").update(values)
+            session.commit()
+        return {"d"} if active else set()
+    return read
+
+
+@pytest.fixture
+def two_process_engine(tmp_path):
+    """File-backed engine whose sessions each get a connection of their own.
+
+    A row committed by another scheduler mid-cycle is what these cases turn on, and
+    it needs a database two connections can hold transactions on at once: the
+    in-memory engine the scenarios above share is one connection wide, where a commit
+    from the second session would carry the first one's unfinished work with it.
+    """
+    from airflow.models import DagModel
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'watcher.db'}", poolclass=NullPool)
+    WatcherBase.metadata.create_all(engine)
+    DagModel.__table__.create(engine, checkfirst=True)
+    yield engine
+    engine.dispose()
+
+
+class TestConcurrentSchedulerWrites:
+    """Every row is written from a value read some milliseconds earlier.
+
+    Both writes the miss counter makes are matched on that value, so a scheduler
+    holding a stale one writes nothing rather than undoing what another scheduler
+    committed in between.
+    """
+
+    @staticmethod
+    def _sync(listener, engine, read_active):
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession",
+                   sessionmaker(bind=engine)), \
+             patch("airflow_provider_rmq.watcher.listener._read_active_dag_ids",
+                   read_active):
+            listener._sync_to_db([])
+
+    def test_a_row_switched_off_in_the_window_keeps_the_full_grace_period(
+        self, two_process_engine
+    ):
+        """The early deletion is owed to the consumer, and a row switched off has none.
+
+        An operator pressing the button on the Subscriptions page while the cycle is
+        between its read and its write leaves a disabled row, and a disabled row gets
+        the whole grace period — the flag is the very thing the grace period is there
+        to keep.
+        """
+        listener = RMQWatcherListener()
+        _add_dag_file_subscription(two_process_engine, enabled=True, absent_cycles=1)
+
+        self._sync(
+            listener, two_process_engine,
+            _reader_another_scheduler_writes_inside(
+                two_process_engine, {"enabled": False}, active=False
+            ),
+        )
+
+        row = _snapshot(two_process_engine)
+        assert row is not None
+        assert row["enabled"] is False
+        assert listener._deleted_dag_file_rows == {}
+
+    def test_a_recovery_another_scheduler_committed_is_not_overwritten(
+        self, two_process_engine
+    ):
+        """The key came back in that scheduler's scan, and its upsert cleared the count."""
+        listener = RMQWatcherListener()
+        _add_dag_file_subscription(two_process_engine, enabled=True, absent_cycles=2)
+
+        self._sync(
+            listener, two_process_engine,
+            _reader_another_scheduler_writes_inside(
+                two_process_engine, {"absent_cycles": None}, active=True
+            ),
+        )
+
+        assert _snapshot(two_process_engine)["absent_cycles"] is None
+
+    def test_a_stale_count_cannot_delete_the_row_the_recovery_saved(
+        self, two_process_engine
+    ):
+        """What the overwritten recovery costs is the row, one miss later.
+
+        A count written from a stale read puts the row back where the next miss
+        deletes it, and the successful scan in between — a whole cycle of another
+        scheduler seeing the key — leaves no trace at all.
+        """
+        listener = RMQWatcherListener()
+        _add_dag_file_subscription(
+            two_process_engine, enabled=True, absent_cycles=_ABSENT_GRACE_CYCLES - 1
+        )
+
+        self._sync(
+            listener, two_process_engine,
+            _reader_another_scheduler_writes_inside(
+                two_process_engine, {"absent_cycles": None}, active=True
+            ),
+        )
+        self._sync(listener, two_process_engine, lambda: {"d"})
+
+        row = _snapshot(two_process_engine)
+        assert row is not None
+        assert row["absent_cycles"] == 1
+
+    def test_a_deletion_already_flushed_survives_the_active_dag_read(
+        self, dagmodel_engine
+    ):
+        """The active-dag read runs before the loop writes, and this is why.
+
+        Its session is one of its own, and a pool one connection wide — an in-memory
+        SQLite, which is what an installation on it has — hands that session the
+        connection this cycle is writing through. Closing it rolls the connection
+        back, taking with it every statement the cycle had already flushed, while the
+        cycle goes on to commit and to remember deletions the database no longer has.
+        """
+        listener = RMQWatcherListener()
+        _record_dag(dagmodel_engine, dag_id="b", is_active=False)
+        _add_dag_file_subscription(
+            dagmodel_engine, dag_id="a", absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        _add_dag_file_subscription(dagmodel_engine, dag_id="b", absent_cycles=1)
+
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession",
+                   sessionmaker(bind=dagmodel_engine)):
+            listener._sync_to_db([])
+
+        assert _snapshot(dagmodel_engine, dag_id="a") is None
+        assert _snapshot(dagmodel_engine, dag_id="b") is None
+        assert set(listener._deleted_dag_file_rows) == {
+            ("a", "q", "rmq_default"), ("b", "q", "rmq_default"),
+        }
