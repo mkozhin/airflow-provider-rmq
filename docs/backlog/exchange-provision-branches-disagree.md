@@ -64,3 +64,8 @@ if provisioned:
 удаление, и ожидаемый WARNING про осиротевшую очередь.
 
 Смежное по той же функции: [[exchange-change-leaves-old-bindings]].
+
+Ещё два пункта про ту же инфраструктуру, найденные аудитом 2026-09-02:
+[[exchange-declared-not-passive]] — активный declare чужого exchange'а даёт
+`PRECONDITION_FAILED` навсегда; [[exchange-log-queue-unbounded]] — очередь
+`.log` без `x-max-length`.

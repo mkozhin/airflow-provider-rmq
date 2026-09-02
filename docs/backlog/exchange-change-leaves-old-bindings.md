@@ -29,3 +29,5 @@ exchange'а: недостающие добавляются, лишние на **
 отдаёт для неё, а не только по текущему.
 
 Смежное по той же функции: [[exchange-provision-branches-disagree]].
+
+Смежное по объявлению exchange'а: [[exchange-declared-not-passive]].
