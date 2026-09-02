@@ -10,7 +10,7 @@ import re
 import sys
 import threading
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -656,13 +656,24 @@ class TestScanSubscriptions:
 # An unreadable DAG file holds its previous parse for a bounded number of cycles
 # ---------------------------------------------------------------------------
 
-#: The single DAG file the cases below scan, and what a successful parse of it gives.
+#: The DAG file the cases below put through failures, and a successful parse of it.
 _HELD_FILE = "/dags/orders.py"
 _HELD_SUBS = [{"dag_id": "orders", "queue_name": "q"}]
+
+#: A second file that always reads. Its presence is what keeps the listing a statement
+#: about the code: a scan in which *every* file failed is distrusted as a whole, so
+#: without it the per-file behaviour below could never be reached.
+_HEALTHY_FILE = "/dags/other.py"
+_HEALTHY_SUBS = [{"dag_id": "other", "queue_name": "oq"}]
 
 #: Default for the ``result`` argument below: a successful parse. A literal default
 #: cannot say it, because ``None`` is itself a meaningful answer.
 _PARSED = object()
+
+
+def _held_subs_of(result):
+    """The scanned subscriptions that came from ``_HELD_FILE``."""
+    return [s for s in result if s["dag_id"] == "orders"]
 
 
 class TestUnreadableFileHold:
@@ -673,15 +684,34 @@ class TestUnreadableFileHold:
 
     def _scan(self, listener, *, mtime=1000.0, mtime_error=None,
               result=_PARSED, error=None):
-        """One scan cycle over ``_HELD_FILE``; returns ``(result, extraction mock)``."""
+        """One scan cycle; returns ``(result, extraction mock)``.
+
+        Only ``_HELD_FILE`` is subject to the arguments — ``_HEALTHY_FILE`` always
+        stats and parses.
+        """
         if result is _PARSED:
             result = list(_HELD_SUBS)
+
+        def fake_getmtime(path):
+            if path != _HELD_FILE:
+                return 1000.0
+            if mtime_error is not None:
+                raise mtime_error
+            return mtime
+
+        def fake_extract(path):
+            if path != _HELD_FILE:
+                return list(_HEALTHY_SUBS)
+            if error is not None:
+                raise error
+            return None if result is None else list(result)
+
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=[_HELD_FILE]), \
+                   return_value=[_HELD_FILE, _HEALTHY_FILE]), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
-                   return_value=mtime, side_effect=mtime_error), \
+                   side_effect=fake_getmtime), \
              patch.object(listener, "_extract_subscriptions_from_file",
-                          return_value=result, side_effect=error) as mock_ex:
+                          side_effect=fake_extract) as mock_ex:
             return listener._scan_subscriptions(), mock_ex
 
     def test_a_failed_parse_keeps_the_previous_subscriptions_for_one_cycle(self, caplog):
@@ -691,7 +721,7 @@ class TestUnreadableFileHold:
         with caplog.at_level(logging.WARNING):
             result, _ = self._scan(listener, mtime=2000.0, result=None)
 
-        assert result == _HELD_SUBS
+        assert _held_subs_of(result) == _HELD_SUBS
         assert listener._last_mtimes[_HELD_FILE] == 1000.0
         assert "holding its previous parse" in caplog.text
 
@@ -703,9 +733,24 @@ class TestUnreadableFileHold:
 
         result, _ = self._scan(listener, mtime=2000.0)
 
-        assert result == _HELD_SUBS
+        assert _held_subs_of(result) == _HELD_SUBS
         assert _HELD_FILE not in listener._read_failures
         assert listener._last_mtimes[_HELD_FILE] == 2000.0
+
+    def test_a_stat_that_answers_again_gives_the_next_failure_its_full_patience(self):
+        """The hold is one cycle of patience, not one per file for the process's life."""
+        listener = self._listener()
+        self._scan(listener)
+        self._scan(listener, mtime_error=OSError("stale handle"))
+        assert listener._read_failures[_HELD_FILE] == 1
+
+        # The content did not change, so the file takes the unchanged-mtime fast path —
+        # which is still a stat that answered.
+        self._scan(listener, mtime=1000.0)
+        assert _HELD_FILE not in listener._read_failures
+
+        result, _ = self._scan(listener, mtime_error=OSError("stale handle"))
+        assert _held_subs_of(result) == _HELD_SUBS
 
     def test_a_stat_that_keeps_failing_drops_the_remembered_mtime(self):
         listener = self._listener()
@@ -716,7 +761,7 @@ class TestUnreadableFileHold:
             assert listener._cached_subs[_HELD_FILE] == _HELD_SUBS
 
         result, _ = self._scan(listener, mtime_error=OSError("stale handle"))
-        assert result == []
+        assert _held_subs_of(result) == []
         assert listener._cached_subs[_HELD_FILE] == []
         assert _HELD_FILE not in listener._last_mtimes
 
@@ -724,8 +769,8 @@ class TestUnreadableFileHold:
         # still lead to a re-read, or the file would count as subscription-less
         # until somebody edits it.
         result, mock_ex = self._scan(listener, mtime=1000.0)
-        assert mock_ex.call_count == 1
-        assert result == _HELD_SUBS
+        assert mock_ex.call_args_list == [call(_HELD_FILE)]
+        assert _held_subs_of(result) == _HELD_SUBS
 
     def test_an_open_that_keeps_failing_drops_the_remembered_mtime(self):
         listener = self._listener()
@@ -736,13 +781,28 @@ class TestUnreadableFileHold:
             assert listener._cached_subs[_HELD_FILE] == _HELD_SUBS
 
         result, _ = self._scan(listener, mtime=2000.0, error=PermissionError("denied"))
-        assert result == []
+        assert _held_subs_of(result) == []
         assert _HELD_FILE not in listener._last_mtimes
 
         # Permissions come back with the content untouched — mtime is still 2000.
         result, mock_ex = self._scan(listener, mtime=2000.0)
-        assert mock_ex.call_count == 1
-        assert result == _HELD_SUBS
+        assert mock_ex.call_args_list == [call(_HELD_FILE)]
+        assert _held_subs_of(result) == _HELD_SUBS
+
+    def test_a_file_that_stays_unreadable_is_reported_a_bounded_number_of_times(self, caplog):
+        """Its mtime is dropped, so it is re-read every cycle — and would be re-logged."""
+        listener = self._listener()
+        self._scan(listener)
+        for _ in range(_UNREADABLE_FILE_LIMIT + 1):
+            self._scan(listener, mtime_error=OSError("stale handle"))
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"):
+            for _ in range(5):
+                self._scan(listener, mtime_error=OSError("stale handle"))
+
+        assert [r for r in caplog.records if "dropping its subscriptions" in r.getMessage()] == []
 
     def test_undecodable_content_answers_none(self, tmp_path):
         dag_file = tmp_path / "latin1.py"
@@ -750,6 +810,18 @@ class TestUnreadableFileHold:
         listener = RMQWatcherListener()
 
         assert listener._extract_subscriptions_from_file(str(dag_file)) is None
+
+    def test_undecodable_content_is_logged(self, tmp_path, caplog):
+        dag_file = tmp_path / "latin1.py"
+        dag_file.write_bytes(b"# \xff\xfe not utf-8\n")
+        listener = RMQWatcherListener()
+
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"):
+            listener._extract_subscriptions_from_file(str(dag_file))
+
+        assert any("Failed to decode DAG file" in r.getMessage() for r in caplog.records), \
+            [r.getMessage() for r in caplog.records]
 
     def test_a_parse_failure_and_an_io_failure_leave_different_mtimes(self):
         parsed, io = self._listener(), self._listener()
@@ -768,13 +840,124 @@ class TestUnreadableFileHold:
     def test_a_file_unreadable_from_the_very_first_cycle_gets_no_hold(self):
         parsed, io = self._listener(), self._listener()
 
-        assert self._scan(parsed, result=None)[0] == []
+        assert _held_subs_of(self._scan(parsed, result=None)[0]) == []
         assert parsed._cached_subs[_HELD_FILE] == []
         assert parsed._last_mtimes[_HELD_FILE] == 1000.0
 
-        assert self._scan(io, error=OSError("no access"))[0] == []
+        assert _held_subs_of(self._scan(io, error=OSError("no access"))[0]) == []
         assert io._cached_subs[_HELD_FILE] == []
         assert _HELD_FILE not in io._last_mtimes
+
+    def test_a_deleted_file_leaves_nothing_behind_even_after_an_io_failure(self):
+        """The I/O branch drops the mtime, and eviction reads more than that dict."""
+        listener = self._listener()
+        self._scan(listener)
+        for _ in range(_UNREADABLE_FILE_LIMIT + 1):
+            self._scan(listener, mtime_error=OSError("stale handle"))
+        assert _HELD_FILE not in listener._last_mtimes
+        assert _HELD_FILE in listener._cached_subs
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=[_HEALTHY_FILE]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=1000.0):
+            listener._scan_subscriptions()
+
+        assert _HELD_FILE not in listener._cached_subs
+        assert _HELD_FILE not in listener._read_failures
+
+
+# ---------------------------------------------------------------------------
+# A listing in which no file could be read is not a statement about the code
+# ---------------------------------------------------------------------------
+
+class TestEveryFileUnreadable:
+    def _listener(self, files=(_HELD_FILE, _HEALTHY_FILE)):
+        """A listener whose cache holds one parse of every file in ``files``."""
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+        listener._files = list(files)
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=list(files)), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=1000.0), \
+             patch.object(listener, "_extract_subscriptions_from_file",
+                          return_value=list(_HELD_SUBS)):
+            listener._scan_subscriptions()
+        return listener
+
+    def _scan_all_stale(self, listener):
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=list(listener._files)), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   side_effect=OSError("stale handle")):
+            return listener._scan_subscriptions()
+
+    def test_a_listing_nobody_can_stat_raises_untrusted_scan(self):
+        listener = self._listener()
+        cached = {path: list(subs) for path, subs in listener._cached_subs.items()}
+
+        with pytest.raises(_UntrustedScan, match="none of the 2 files"):
+            self._scan_all_stale(listener)
+
+        assert listener._cached_subs == cached
+        assert listener._read_failures == {}
+
+    def test_the_distrust_ends_and_the_keys_go_the_counted_miss_way(self):
+        listener = self._listener()
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_all_stale(listener)
+
+        # Giving in still spends the per-file hold before the subscriptions go.
+        assert self._scan_all_stale(listener) == _HELD_SUBS * len(listener._files)
+        assert self._scan_all_stale(listener) == []
+
+    def test_one_file_that_still_reads_makes_the_listing_trustworthy(self):
+        listener = self._listener()
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=list(listener._files)), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   side_effect=lambda path: 2000.0 if path == _HEALTHY_FILE
+                   else (_ for _ in ()).throw(OSError("stale handle"))), \
+             patch.object(listener, "_extract_subscriptions_from_file",
+                          return_value=list(_HEALTHY_SUBS)):
+            listener._scan_subscriptions()
+
+        assert listener._read_failures == {_HELD_FILE: 1}
+
+    def test_a_listing_of_files_that_all_fail_to_parse_is_still_trusted(self):
+        """Unparseable content is a statement about the code; an absent stat is not."""
+        listener = self._listener()
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=list(listener._files)), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=2000.0), \
+             patch.object(listener, "_extract_subscriptions_from_file",
+                          return_value=None):
+            result = listener._scan_subscriptions()
+
+        assert result == _HELD_SUBS * len(listener._files)
+        assert listener._read_failures == {path: 1 for path in listener._files}
+
+    def test_a_healthy_scan_resets_the_streak(self):
+        listener = self._listener()
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_all_stale(listener)
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=list(listener._files)), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=1000.0):
+            listener._scan_subscriptions()
+
+        assert listener._unreadable_scan_streak == 0
+        with pytest.raises(_UntrustedScan):
+            self._scan_all_stale(listener)
 
 
 # ---------------------------------------------------------------------------
@@ -845,13 +1028,48 @@ class TestEmptyScanDistrust:
             with pytest.raises(_UntrustedScan):
                 self._scan_empty(listener)
 
-    def test_empty_glob_on_the_very_first_cycle_is_believed(self):
-        # An installation with no DAG files at all has to stay workable.
+    def test_empty_glob_on_a_cold_cache_is_distrusted_too(self):
+        """A scheduler restarting into a folder git-sync has not populated yet.
+
+        The folder exists and lists, so nothing above this check objects, and the
+        cache of a process that has just started remembers no files to compare the
+        emptiness against — believing it at once would count a miss against every
+        row in the table.
+        """
         listener = RMQWatcherListener()
         listener._get_dags_folder = MagicMock(return_value="/dags")
 
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan, match="listed no files"):
+                self._scan_empty(listener)
+
+    def test_an_installation_with_no_dag_files_at_all_stays_workable(self):
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_empty(listener)
+
         assert self._scan_empty(listener) == []
-        assert listener._empty_scan_streak == 0
+        assert self._scan_empty(listener) == []
+
+    def test_an_io_failure_that_emptied_the_mtimes_does_not_buy_trust(self):
+        """The distrust cannot be keyed on a dict a failing filesystem erases."""
+        listener = self._warm_listener()
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=["/dags/dag1.py"]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   side_effect=OSError("stale handle")):
+            for _ in range(_UNTRUSTED_SCAN_LIMIT + _UNREADABLE_FILE_LIMIT + 1):
+                try:
+                    listener._scan_subscriptions()
+                except _UntrustedScan:
+                    pass
+        assert listener._last_mtimes == {}
+
+        with pytest.raises(_UntrustedScan, match="listed no files"):
+            self._scan_empty(listener)
 
     def test_the_warning_names_the_folder_when_emptiness_is_accepted(self, caplog):
         listener = self._warm_listener()
@@ -921,6 +1139,10 @@ class TestGetDagsFolder:
              pytest.raises(_UntrustedScan, match="not a directory"):
             listener._get_dags_folder()
 
+    @pytest.mark.skipif(
+        os.geteuid() == 0,
+        reason="root reads a directory whatever its mode says, so there is no unlistable folder to build",
+    )
     def test_unlistable_directory_raises_untrusted_scan(self, tmp_path):
         # os.path.isdir says True for a directory with no read permission and glob
         # returns [] for it, so the explicit listability check is the only thing
@@ -942,6 +1164,10 @@ class TestGetDagsFolder:
         finally:
             folder.chmod(0o755)
 
+    @pytest.mark.skipif(
+        os.geteuid() == 0,
+        reason="root reads a directory whatever its mode says, so there is no unlistable folder to build",
+    )
     def test_unlistable_directory_raises_with_a_warm_cache_too(self, tmp_path):
         folder = tmp_path / "dags"
         folder.mkdir()
@@ -960,6 +1186,10 @@ class TestGetDagsFolder:
             finally:
                 folder.chmod(0o755)
 
+    @pytest.mark.skipif(
+        os.geteuid() == 0,
+        reason="root reads a directory whatever its mode says, so there is no unlistable folder to build",
+    )
     def test_untrusted_folder_evicts_nothing_from_the_cache(self, tmp_path):
         folder = tmp_path / "dags"
         folder.mkdir()
@@ -1614,8 +1844,6 @@ class TestSyncToDb:
 
     def test_delete_is_conditional_on_the_counter_that_was_read(self):
         """A scheduler that read a stale counter must not delete a row another one revived."""
-        from airflow_provider_rmq.watcher.models import RMQSubscription
-
         listener = RMQWatcherListener()
         existing = _existing_sub(dag_id="old_dag", absent_cycles=_ABSENT_GRACE_CYCLES)
         ctx, session = _make_session_ctx(existing_subs=[existing])
@@ -1624,31 +1852,122 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         clause = session.query.return_value.filter_by.return_value.filter.call_args.args[0]
-        expected = RMQSubscription.absent_cycles == _ABSENT_GRACE_CYCLES
-        assert str(clause) == str(expected)
+        # str() on the expression renders the value as a bind parameter, which reads the
+        # same whatever the value is — the value itself is the whole point here.
+        assert clause.right.value == _ABSENT_GRACE_CYCLES
 
-    def test_delete_helper_matches_a_null_counter_with_is_null(self):
-        """NULL and 0 mean the same thing to the schema and different things to SQL."""
-        session = MagicMock()
-        sub = _existing_sub(dag_id="d", absent_cycles=None)
-
-        RMQWatcherListener._delete_absent_sub(session, sub, sub.absent_cycles)
-
-        clause = session.query.return_value.filter_by.return_value.filter.call_args.args[0]
-        assert "IS NULL" in str(clause.compile(compile_kwargs={"literal_binds": True}))
-
-    def test_sync_to_db_preserves_ui_subscriptions(self):
+    def test_the_short_circuit_delete_is_conditional_on_its_counter_too(self):
         listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
 
-        # Only dag_file subs are returned (filter_by source='dag_file') → none
-        ctx, session = _make_session_ctx(existing_subs=[])
-
-        with _sync_env(ctx, set()):
+        with _sync_env(ctx, {"other_dag"}):
             listener._sync_to_db([])
 
-        # No dag_file subs to delete → delete never called
-        _delete_mock(session).assert_not_called()
-        session.query.return_value.filter_by.assert_any_call(source="dag_file")
+        clause = session.query.return_value.filter_by.return_value.filter.call_args.args[0]
+        assert clause.right.value == 1
+
+    def test_a_counted_miss_is_logged_as_a_warning(self, caplog):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="old_dag", queue_name="q")
+        ctx, _ = _make_session_ctx(existing_subs=[existing])
+
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"old_dag"}):
+            listener._sync_to_db([])
+
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and
+                "old_dag/q" in r.getMessage() and "missing from the scan" in r.getMessage()]
+
+    def test_the_grace_period_deletion_is_logged(self, caplog):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="old_dag", queue_name="q", absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, _ = _make_session_ctx(existing_subs=[existing])
+
+        with caplog.at_level(logging.INFO,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"old_dag"}):
+            listener._sync_to_db([])
+
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and
+                "trusted scans in a row — deleting" in r.getMessage()]
+
+    def test_the_short_circuit_deletion_is_logged(self, caplog):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="gone_dag", queue_name="q", absent_cycles=1)
+        ctx, _ = _make_session_ctx(existing_subs=[existing])
+
+        with caplog.at_level(logging.INFO,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"other_dag"}):
+            listener._sync_to_db([])
+
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and
+                "is no longer active — deleting" in r.getMessage()]
+
+    def test_failure_to_read_active_dag_ids_is_logged(self, caplog):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        ctx, _ = _make_session_ctx(existing_subs=[existing])
+
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, RuntimeError("db is down")):
+            listener._sync_to_db([])
+
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and
+                "cannot read the active DAG ids" in r.getMessage()]
+
+    def test_the_active_dag_ids_are_not_read_when_every_key_is_in_the_scan(self):
+        """An unindexed full scan of Airflow's dag table, on every cycle, for nothing."""
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="d", queue_name="q")
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default", "filter_data": {}}]
+        ctx, _ = _make_session_ctx(existing_subs=[existing])
+
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.listener.upsert_subscription"), \
+             patch("airflow_provider_rmq.watcher.listener.get_active_dag_ids") as mock_active:
+            listener._sync_to_db(scanned)
+
+        mock_active.assert_not_called()
+
+    def test_the_active_dag_ids_are_read_at_most_once_per_synchronisation(self):
+        listener = RMQWatcherListener()
+        existing = [
+            _existing_sub(dag_id="a", queue_name="q", enabled=True, absent_cycles=1),
+            _existing_sub(dag_id="b", queue_name="q", enabled=True, absent_cycles=1),
+        ]
+        ctx, _ = _make_session_ctx(existing_subs=existing)
+
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.listener.upsert_subscription"), \
+             patch("airflow_provider_rmq.watcher.listener.get_active_dag_ids") as mock_active:
+            mock_active.return_value = {"a", "b"}
+            listener._sync_to_db([])
+
+        mock_active.assert_called_once()
+
+    def test_the_active_dag_id_read_gets_a_session_of_its_own(self):
+        """A failed read poisons the transaction it ran in on PostgreSQL."""
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        write_ctx, write_session = _make_session_ctx(existing_subs=[existing])
+        read_ctx, read_session = _make_session_ctx(existing_subs=[])
+
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession",
+                   side_effect=[write_ctx, read_ctx]), \
+             patch("airflow_provider_rmq.watcher.listener.upsert_subscription"), \
+             patch("airflow_provider_rmq.watcher.listener.get_active_dag_ids") as mock_active:
+            mock_active.return_value = set()
+            listener._sync_to_db([])
+
+        mock_active.assert_called_once_with(read_session)
+        assert read_session is not write_session
+        write_session.commit.assert_called_once()
 
     def test_deletion_is_scoped_to_dag_file_rows(self):
         listener = RMQWatcherListener()
@@ -3288,6 +3607,16 @@ def _disable_subscription(engine, dag_id="d", queue_name="q") -> None:
         session.commit()
 
 
+def _add_ui_subscription(engine, dag_id="d", queue_name="ui_q") -> None:
+    """Row the Subscriptions page created, which no scan is a statement about."""
+    with _db(engine) as session:
+        session.add(RMQSubscription(
+            dag_id=dag_id, queue_name=queue_name, conn_id="rmq_default",
+            source="ui", enabled=True,
+        ))
+        session.commit()
+
+
 def _record_dag(engine, dag_id="d", *, is_active: bool) -> None:
     """Give Airflow's dag table a row, which is what the short circuit consults."""
     from airflow.models import DagModel
@@ -3314,7 +3643,13 @@ def e2e_listener(dagmodel_engine, tmp_path, monkeypatch):
     ), patch(
         "airflow_provider_rmq.watcher.listener._read_settings", return_value=(None, None)
     ):
-        yield listener
+        try:
+            yield listener
+        finally:
+            # Every listener builds two thread pools in its constructor, and the cases
+            # below actually put work on them.
+            listener._cycle_pool.shutdown()
+            listener._consumer_pool.shutdown()
 
 
 class TestScanMissEndToEnd:
@@ -3346,7 +3681,7 @@ class TestScanMissEndToEnd:
         assert after["id"] == before["id"]
         assert after["enabled"] is False
         # The sync step never ran on the empty cycle, so the miss was never counted.
-        assert not after["absent_cycles"]
+        assert after["absent_cycles"] is None
 
     @pytest.mark.asyncio
     async def test_disabled_row_survives_a_syntax_error_in_its_file(
@@ -3365,7 +3700,7 @@ class TestScanMissEndToEnd:
         assert after is not None
         assert after["id"] == before["id"]
         assert after["enabled"] is False
-        assert not after["absent_cycles"]
+        assert after["absent_cycles"] is None
 
     @pytest.mark.asyncio
     async def test_two_broken_cycles_with_an_inactive_dag_leave_the_disabled_row_alone(
@@ -3454,3 +3789,87 @@ class TestScanMissEndToEnd:
         assert _snapshot(dagmodel_engine)["absent_cycles"] == 1
         active_subs = e2e_listener._manager.reconcile.await_args.args[0]
         assert [(s["dag_id"], s["queue_name"]) for s in active_subs] == [("d", "q")]
+
+    @pytest.mark.asyncio
+    async def test_a_dag_the_scheduler_never_parsed_takes_the_short_circuit(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        """No row in ``dag`` at all reads as inactive, exactly like ``is_active=False``."""
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+
+        _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
+        await e2e_listener._run_cycle()
+        assert _snapshot(dagmodel_engine)["absent_cycles"] == 1
+
+        await e2e_listener._run_cycle()
+        assert _snapshot(dagmodel_engine) is None
+
+    @pytest.mark.asyncio
+    async def test_a_ui_row_survives_the_grace_period_deletion(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=True)
+        _add_ui_subscription(dagmodel_engine)
+        before = _snapshot(dagmodel_engine, queue_name="ui_q")
+
+        _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
+        for _ in range(_ABSENT_GRACE_CYCLES + 1):
+            await e2e_listener._run_cycle()
+
+        assert _snapshot(dagmodel_engine) is None
+        after = _snapshot(dagmodel_engine, queue_name="ui_q")
+        assert after == before
+
+    @pytest.mark.asyncio
+    async def test_a_ui_row_survives_the_short_circuit_deletion(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=False)
+        _add_ui_subscription(dagmodel_engine)
+        before = _snapshot(dagmodel_engine, queue_name="ui_q")
+
+        _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
+        await e2e_listener._run_cycle()
+        await e2e_listener._run_cycle()
+
+        assert _snapshot(dagmodel_engine) is None
+        after = _snapshot(dagmodel_engine, queue_name="ui_q")
+        assert after == before
+
+    @pytest.mark.asyncio
+    async def test_a_folder_that_empties_for_good_eventually_deletes_the_row(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        """The one path on which both counters run one after the other.
+
+        The empty listing is distrusted for :data:`_UNTRUSTED_SCAN_LIMIT` cycles, the
+        one after them evicts the cache, and only then do the trusted misses start
+        counting towards the deletion.
+        """
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=True)
+        before = _snapshot(dagmodel_engine)
+
+        dag_file.unlink()
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            await e2e_listener._run_cycle()
+        assert _snapshot(dagmodel_engine) == before
+
+        for miss in range(1, _ABSENT_GRACE_CYCLES + 1):
+            await e2e_listener._run_cycle()
+            row = _snapshot(dagmodel_engine)
+            assert row is not None, f"deleted after {miss} trusted miss(es)"
+            assert row["absent_cycles"] == miss
+
+        await e2e_listener._run_cycle()
+        assert _snapshot(dagmodel_engine) is None

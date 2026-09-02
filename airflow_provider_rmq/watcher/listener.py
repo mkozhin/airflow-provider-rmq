@@ -71,8 +71,10 @@ _ABSENT_GRACE_CYCLES = 3
 #: Empty glob results in a row the cycle refuses to believe. The first
 #: ``_UNTRUSTED_SCAN_LIMIT`` of them hold the previous parse, the next one gives in: a
 #: folder that emptied for real has to become the truth eventually, or the watcher
-#: would never sync again — the emptiness is checked before the cache is evicted, so
-#: ``_last_mtimes`` never empties on its own.
+#: would never sync again. The streak is the only thing the check consults, so it
+#: holds on a cold cache too — a scheduler that starts while the DAG volume is still
+#: being populated sees an existing, listable, empty folder, and believing that
+#: emptiness at once would count a miss against every row in the table.
 _UNTRUSTED_SCAN_LIMIT = 3
 
 #: Cycles the previous parse of an unreadable DAG file is held for. One, not three:
@@ -664,6 +666,10 @@ class RMQWatcherListener:
         # Empty glob results in a row, counted so that the distrust of an empty DAG
         # folder expires at ``_UNTRUSTED_SCAN_LIMIT`` instead of lasting forever.
         self._empty_scan_streak: int = 0
+        # Scans in a row in which every listed file refused to be read, bounded by the
+        # same limit and for the same reason: a whole folder of files nobody can stat
+        # is a filesystem talking, but the distrust of it still has to end somewhere.
+        self._unreadable_scan_streak: int = 0
         # Result of the last scan the cycle trusted. Stands in for the scan of a cycle
         # that raised :class:`_UntrustedScan`, which needs it for the exchange metadata:
         # that metadata lives only in memory and reconcile has no other source for it.
@@ -1116,11 +1122,13 @@ class RMQWatcherListener:
         Memory is bounded to the number of current DAG files on disk.
 
         :raises _UntrustedScan: The DAG folder is not a source the scan can be trusted
-            from, or a listing that came back empty is still young enough to be a
-            hiccup of the environment. Both are checked before the cache is touched,
-            so a cycle that cannot trust the filesystem leaves the previous parse
-            intact — and an empty glob cannot empty ``_last_mtimes`` before the check
-            that reads it.
+            from, a listing that came back empty is still young enough to be a hiccup
+            of the environment, or every file the listing named refused to be read.
+            The first two are checked before the cache is touched and the third leaves
+            the cache alone by holding its failures back until the whole listing is
+            known, so a cycle that cannot trust the filesystem leaves the previous
+            parse intact — and an empty glob cannot empty ``_last_mtimes`` before the
+            check that reads it.
         """
         dags_folder = self._get_dags_folder()
         current_files = set(
@@ -1129,15 +1137,19 @@ class RMQWatcherListener:
 
         if current_files:
             self._empty_scan_streak = 0
-        elif self._last_mtimes:
-            # Files were there a moment ago: a git-sync symlink swap, a folder being
-            # rebuilt. The first _UNTRUSTED_SCAN_LIMIT of these are not believed; the
-            # one after them is, because a folder can also empty for real.
+        else:
+            # An empty listing of a listable folder: a git-sync symlink swap, a folder
+            # being rebuilt, a volume mounted after the scheduler started. The first
+            # _UNTRUSTED_SCAN_LIMIT of these are not believed; the one after them is,
+            # because a folder can also empty for real. What is known about the files
+            # takes no part in the decision: an I/O failure drops a path's remembered
+            # mtime, and a process that has only just started remembers nothing at all,
+            # so a cache read here would trust the emptiness precisely when the
+            # filesystem is least worth trusting.
             self._empty_scan_streak += 1
             if self._empty_scan_streak <= _UNTRUSTED_SCAN_LIMIT:
                 raise _UntrustedScan(
-                    f"the DAG folder {dags_folder!r} listed no files while "
-                    f"{len(self._last_mtimes)} were known "
+                    f"the DAG folder {dags_folder!r} listed no files "
                     f"({self._empty_scan_streak} of {_UNTRUSTED_SCAN_LIMIT} in a row)"
                 )
             log.warning(
@@ -1146,35 +1158,68 @@ class RMQWatcherListener:
                 dags_folder, self._empty_scan_streak,
             )
 
-        # Evict deleted files
-        for path in list(self._last_mtimes):
+        # Evict deleted files. Every dict keyed by path is drained, not only the one
+        # holding mtimes: an I/O failure drops the mtime and keeps the other two, and a
+        # file deleted in that state would otherwise stay in them for the process's life.
+        for path in set(self._last_mtimes) | set(self._cached_subs) | set(self._read_failures):
             if path not in current_files:
-                self._last_mtimes.pop(path)
+                self._last_mtimes.pop(path, None)
                 self._cached_subs.pop(path, None)
                 self._read_failures.pop(path, None)
 
-        # Re-parse changed or new files
+        # Re-parse changed or new files. Failures are collected rather than applied at
+        # once: a listing in which every file failed to read is a statement about the
+        # filesystem, not about the code, and applying them would drop every key of the
+        # installation from a scan the sync step counts misses against.
+        failures: list[tuple[str, object, float | None]] = []
         for path in current_files:
             try:
                 mtime = os.path.getmtime(path)
             except OSError as exc:
                 # The file is in the glob but gives no stat — permissions, a stale NFS
                 # handle. Nothing is known about its content, so no mtime is kept.
-                self._file_unreadable(path, exc, mtime=None)
+                failures.append((path, exc, None))
                 continue
             if mtime == self._last_mtimes.get(path):
+                # A stat that answered is evidence the previous failure is over, and
+                # the patience the next one gets is measured from here.
+                self._read_failures.pop(path, None)
                 continue
             try:
                 subs = self._extract_subscriptions_from_file(path)
             except OSError as exc:
-                self._file_unreadable(path, exc, mtime=None)
+                failures.append((path, exc, None))
                 continue
             if subs is None:
-                self._file_unreadable(path, "parse failed", mtime=mtime)
+                failures.append((path, "parse failed", mtime))
                 continue
             self._read_failures.pop(path, None)
             self._cached_subs[path] = subs
             self._last_mtimes[path] = mtime
+
+        nothing_read = (
+            bool(current_files)
+            and len(failures) == len(current_files)
+            and any(mtime is None for _, _, mtime in failures)
+        )
+        if not nothing_read:
+            self._unreadable_scan_streak = 0
+        else:
+            self._unreadable_scan_streak += 1
+            if self._unreadable_scan_streak <= _UNTRUSTED_SCAN_LIMIT:
+                raise _UntrustedScan(
+                    f"none of the {len(current_files)} files the DAG folder "
+                    f"{dags_folder!r} listed could be read "
+                    f"({self._unreadable_scan_streak} of {_UNTRUSTED_SCAN_LIMIT} in a "
+                    f"row), first reason: {failures[0][1]!r}"
+                )
+            log.warning(
+                "RMQ Watcher: none of the %d files in DAG folder %r could be read %d "
+                "times in a row — letting their subscriptions go the counted-miss way",
+                len(current_files), dags_folder, self._unreadable_scan_streak,
+            )
+        for path, reason, mtime in failures:
+            self._file_unreadable(path, reason, mtime)
 
         # Flatten all cached subscriptions
         result: list[dict] = []
@@ -1213,7 +1258,12 @@ class RMQWatcherListener:
             )
             return
 
-        log.warning(
+        # A file whose mtime is dropped is re-read every cycle, so a permanently
+        # unreadable one reaches this line for as long as it stays in the folder. The
+        # streak that first ran out of patience is worth a WARNING; the ones after it
+        # repeat a state the operator has already been told about.
+        log.log(
+            logging.WARNING if streak <= _UNREADABLE_FILE_LIMIT + 1 else logging.DEBUG,
             "RMQ Watcher: DAG file %s did not read (%s) %d cycle(s) in a row — "
             "dropping its subscriptions",
             path, reason, streak,
@@ -1341,14 +1391,21 @@ class RMQWatcherListener:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _read_active_dag_ids(session: Session) -> set[str] | None:
+    def _read_active_dag_ids() -> set[str] | None:
         """Return the dag_ids Airflow counts as active, or ``None`` when they cannot be read.
 
         ``None`` is the caller's cue to treat every DAG as active: an unreachable
         database must not be the thing that speeds a deletion up.
+
+        The read gets a session of its own, opened and closed around this call alone.
+        PostgreSQL answers every statement that follows a failed one in the same
+        transaction with ``InFailedSqlTransaction``, so sharing the session that writes
+        the counters would turn "treat every DAG as active" into "synchronise nothing
+        at all" for as long as the ``dag`` table stays unreadable.
         """
         try:
-            return get_active_dag_ids(session)
+            with WatcherSession() as session:
+                return get_active_dag_ids(session)
         except Exception as exc:
             log.warning(
                 "RMQ Watcher: cannot read the active DAG ids (%s) — treating every DAG "
@@ -1359,7 +1416,7 @@ class RMQWatcherListener:
 
     @staticmethod
     def _delete_absent_sub(
-        session: Session, sub: RMQSubscription, observed: int | None
+        session: Session, sub: RMQSubscription, observed: int
     ) -> None:
         """Delete one dag_file row, but only while its miss counter still reads ``observed``.
 
@@ -1380,8 +1437,8 @@ class RMQWatcherListener:
 
         - Upserts all subscriptions found in code (source='dag_file').
         - Counts the scans a dag_file row's key was missing from, in
-          ``absent_cycles``, and deletes the row once the count passes
-          :data:`_ABSENT_GRACE_CYCLES`. Until then the row lives an entirely ordinary
+          ``absent_cycles``. :data:`_ABSENT_GRACE_CYCLES` misses are survivable and the
+          one after them deletes the row. Until then the row lives an entirely ordinary
           life: same ``id``, same consumer task, same ``enabled``.
         - Deletes an enabled row earlier — from its second miss on — when Airflow no
           longer counts its ``dag_id`` as active, because a delivery on such a
@@ -1393,6 +1450,10 @@ class RMQWatcherListener:
             (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default"))
             for s in scanned
         }
+        # Read lazily: on the overwhelmingly common cycle every key is in the scan, and
+        # the query behind it is an unindexed full scan of Airflow's ``dag`` table.
+        active_dag_ids: set[str] | None = None
+        active_dag_ids_read = False
 
         with WatcherSession() as session:
             existing = (
@@ -1400,7 +1461,6 @@ class RMQWatcherListener:
                 .filter_by(source="dag_file")
                 .all()
             )
-            active_dag_ids = self._read_active_dag_ids(session)
 
             for sub in existing:
                 key = (sub.dag_id, sub.queue_name, sub.conn_id)
@@ -1413,12 +1473,11 @@ class RMQWatcherListener:
                         )
                     continue
 
-                # The arithmetic runs on the normalised value, the DELETE filter on the
-                # raw one: the schema calls NULL and 0 the same thing, SQL does not, and
-                # ``absent_cycles = 0`` never matches a NULL row.
-                observed = sub.absent_cycles
+                # ``NULL`` and ``0`` are the same statement about a row that has never
+                # missed a scan, and the arithmetic below reads them as one. Both
+                # deletion branches need a counter of at least 1 to fire, so what the
+                # DELETE filters on is a value the row really carries.
                 current = sub.absent_cycles or 0
-                dag_inactive = active_dag_ids is not None and sub.dag_id not in active_dag_ids
 
                 if current + 1 > _ABSENT_GRACE_CYCLES:
                     log.info(
@@ -1426,23 +1485,30 @@ class RMQWatcherListener:
                         "%s trusted scans in a row — deleting",
                         sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
                     )
-                    self._delete_absent_sub(session, sub, observed)
-                elif sub.enabled and dag_inactive and current >= 1:
-                    log.info(
-                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
-                        "the scan and DAG %s is no longer active — deleting without waiting "
-                        "out the grace period",
-                        sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
-                    )
-                    self._delete_absent_sub(session, sub, observed)
-                else:
-                    sub.absent_cycles = current + 1
-                    log.warning(
-                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
-                        "the scan (%s of %s) — keeping the row for now",
-                        sub.dag_id, sub.queue_name, sub.conn_id,
-                        current + 1, _ABSENT_GRACE_CYCLES,
-                    )
+                    self._delete_absent_sub(session, sub, current)
+                    continue
+
+                if sub.enabled and current >= 1:
+                    if not active_dag_ids_read:
+                        active_dag_ids = self._read_active_dag_ids()
+                        active_dag_ids_read = True
+                    if active_dag_ids is not None and sub.dag_id not in active_dag_ids:
+                        log.info(
+                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
+                            "from the scan and DAG %s is no longer active — deleting without "
+                            "waiting out the grace period",
+                            sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
+                        )
+                        self._delete_absent_sub(session, sub, current)
+                        continue
+
+                sub.absent_cycles = current + 1
+                log.warning(
+                    "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
+                    "the scan (%s of %s allowed) — keeping the row for now",
+                    sub.dag_id, sub.queue_name, sub.conn_id,
+                    current + 1, _ABSENT_GRACE_CYCLES,
+                )
 
             for s in scanned:
                 upsert_subscription(

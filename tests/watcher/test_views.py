@@ -1175,6 +1175,54 @@ class TestSubscriptionsSchemaOutdated:
         finally:
             engine.dispose()
 
+    def test_the_failed_query_is_rolled_back(self, app, view):
+        """SQLite goes on answering after a failed statement; PostgreSQL does not.
+
+        Only the rollback keeps the Connections block below readable there, and
+        SQLite cannot show its absence — so the call itself is what is asserted.
+        """
+        engine = self._legacy_engine()
+        RealSession = sessionmaker(bind=engine)
+        sessions = []
+
+        def spied_session():
+            session = RealSession()
+            session.rollback = MagicMock(wraps=session.rollback)
+            sessions.append(session)
+            return session
+
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", spied_session), \
+                 patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
+                view.subscriptions()
+
+            sessions[0].rollback.assert_called_once()
+        finally:
+            engine.dispose()
+
+    def test_a_rollback_that_fails_too_leaves_the_page_standing(self, app, view):
+        """A connection broken enough to refuse the rollback is the case for this."""
+        engine = self._legacy_engine()
+        RealSession = sessionmaker(bind=engine)
+
+        def failing_rollback_session():
+            session = RealSession()
+            session.rollback = MagicMock(side_effect=OSError("connection is gone"))
+            return session
+
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", failing_rollback_session), \
+                 patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
+                result = view.subscriptions()
+
+            assert result == "<html>mocked</html>"
+            kwargs = view.render_template.call_args.kwargs
+            assert kwargs["subscriptions_error"] == SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE
+        finally:
+            engine.dispose()
+
     def test_notice_names_the_subscriptions_table_in_html(self, app, view):
         """Rendered for real: the operator reads about the table that is
         actually behind, and the empty-state text does not claim there are
