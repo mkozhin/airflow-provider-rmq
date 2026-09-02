@@ -18,6 +18,7 @@ from airflow_provider_rmq.watcher.listener import (
     CYCLE_TIMEOUT_VAR,
     RECONCILE_INTERVAL_VAR,
     RMQWatcherListener,
+    _ABSENT_GRACE_CYCLES,
     _UNRESOLVED_DAG_ID,
     _collect_module_constants,
     _extract_dag_id_from_decorators,
@@ -1076,6 +1077,55 @@ class TestExtractSubscriptionsUnresolvedDagId:
 # _sync_to_db
 # ---------------------------------------------------------------------------
 
+def _existing_sub(
+    dag_id="d",
+    queue_name="q",
+    conn_id="rmq_default",
+    *,
+    enabled=True,
+    absent_cycles=None,
+):
+    """Build a stand-in for one dag_file row of RMQSubscription.
+
+    ``absent_cycles`` and ``enabled`` are set explicitly on purpose: an unset attribute
+    of a MagicMock is another MagicMock, which is neither ``None`` nor a number and
+    would walk into the miss-counter arithmetic.
+    """
+    sub = MagicMock()
+    sub.dag_id = dag_id
+    sub.queue_name = queue_name
+    sub.conn_id = conn_id
+    sub.source = "dag_file"
+    sub.enabled = enabled
+    sub.absent_cycles = absent_cycles
+    return sub
+
+
+def _delete_mock(session):
+    """The delete() bound to the conditional query the miss counter builds."""
+    return session.query.return_value.filter_by.return_value.filter.return_value.delete
+
+
+@contextlib.contextmanager
+def _sync_env(ctx, active_dag_ids):
+    """Patch everything _sync_to_db reaches outside itself.
+
+    ``active_dag_ids`` is a set, or an exception instance to raise from
+    ``get_active_dag_ids``. It is always given explicitly: the session helper only
+    configures ``.filter_by(...).all()``, so an unpatched ``get_active_dag_ids`` would
+    quietly collect an empty set out of a MagicMock and make every DAG read as
+    inactive.
+    """
+    with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
+         patch("airflow_provider_rmq.watcher.listener.upsert_subscription") as mock_up, \
+         patch("airflow_provider_rmq.watcher.listener.get_active_dag_ids") as mock_active:
+        if isinstance(active_dag_ids, Exception):
+            mock_active.side_effect = active_dag_ids
+        else:
+            mock_active.return_value = active_dag_ids
+        yield mock_up
+
+
 class TestSyncToDb:
     def test_sync_to_db_upserts_dag_file_subscriptions(self):
         listener = RMQWatcherListener()
@@ -1083,8 +1133,7 @@ class TestSyncToDb:
 
         ctx, session = _make_session_ctx(existing_subs=[])
 
-        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
-             patch("airflow_provider_rmq.watcher.listener.upsert_subscription") as mock_up:
+        with _sync_env(ctx, {"d"}) as mock_up:
             listener._sync_to_db(scanned)
 
         mock_up.assert_called_once()
@@ -1092,22 +1141,142 @@ class TestSyncToDb:
         assert call_kwargs.kwargs["dag_id"] == "d"
         assert call_kwargs.kwargs["source"] == "dag_file"
 
-    def test_sync_to_db_deletes_removed_dag_subscriptions(self):
+    def test_one_miss_on_active_dag_keeps_the_row_and_counts_it(self):
         listener = RMQWatcherListener()
-
-        # One dag_file subscription in DB, but nothing in scan
-        existing = MagicMock()
-        existing.dag_id = "old_dag"
-        existing.queue_name = "q"
-        existing.conn_id = "rmq_default"
-
+        existing = _existing_sub(dag_id="old_dag")
         ctx, session = _make_session_ctx(existing_subs=[existing])
 
-        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
-             patch("airflow_provider_rmq.watcher.listener.upsert_subscription"):
-            listener._sync_to_db([])  # empty scan → old_dag sub should be deleted
+        with _sync_env(ctx, {"old_dag"}):
+            listener._sync_to_db([])
 
-        session.query.return_value.filter_by.return_value.delete.assert_called()
+        _delete_mock(session).assert_not_called()
+        assert existing.absent_cycles == 1
+
+    def test_row_is_deleted_one_miss_past_the_grace_period(self):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="old_dag", absent_cycles=_ABSENT_GRACE_CYCLES)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, {"old_dag"}):
+            listener._sync_to_db([])
+
+        _delete_mock(session).assert_called_once()
+
+    def test_last_miss_inside_the_grace_period_still_keeps_the_row(self):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="old_dag", absent_cycles=_ABSENT_GRACE_CYCLES - 1)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, {"old_dag"}):
+            listener._sync_to_db([])
+
+        _delete_mock(session).assert_not_called()
+        assert existing.absent_cycles == _ABSENT_GRACE_CYCLES
+
+    def test_enabled_sub_of_inactive_dag_survives_the_first_miss(self):
+        """A broken DAG file drops the key and is_active at once — one shared miss must survive."""
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=None)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, {"other_dag"}):
+            listener._sync_to_db([])
+
+        _delete_mock(session).assert_not_called()
+        assert existing.absent_cycles == 1
+
+    def test_enabled_sub_of_inactive_dag_is_deleted_on_the_second_miss(self):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, {"other_dag"}):
+            listener._sync_to_db([])
+
+        _delete_mock(session).assert_called_once()
+
+    def test_disabled_sub_of_inactive_dag_gets_the_full_grace_period(self):
+        """No consumer, nothing to lose — and the flag is exactly what must not be lost."""
+        listener = RMQWatcherListener()
+        ctx, session = _make_session_ctx(existing_subs=[])
+
+        for miss in range(1, _ABSENT_GRACE_CYCLES + 1):
+            existing = _existing_sub(dag_id="gone_dag", enabled=False, absent_cycles=miss - 1)
+            ctx, session = _make_session_ctx(existing_subs=[existing])
+            with _sync_env(ctx, {"other_dag"}):
+                listener._sync_to_db([])
+            _delete_mock(session).assert_not_called()
+            assert existing.absent_cycles == miss
+
+        existing = _existing_sub(
+            dag_id="gone_dag", enabled=False, absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+        with _sync_env(ctx, {"other_dag"}):
+            listener._sync_to_db([])
+        _delete_mock(session).assert_called_once()
+
+    def test_failure_to_read_active_dag_ids_does_not_speed_deletion_up(self):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, RuntimeError("db is down")):
+            listener._sync_to_db([])
+
+        _delete_mock(session).assert_not_called()
+        assert existing.absent_cycles == 2
+
+    def test_paused_dag_counts_as_active_and_keeps_the_grace_period(self):
+        """get_active_dag_ids reports a paused DAG as active (ADR 0006), so no shortcut."""
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="paused_dag", enabled=True, absent_cycles=1)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, {"paused_dag"}):
+            listener._sync_to_db([])
+
+        _delete_mock(session).assert_not_called()
+        assert existing.absent_cycles == 2
+
+    def test_key_back_in_scan_is_reported_and_leaves_deletion_alone(self, caplog):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="d", queue_name="q", absent_cycles=2)
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default", "filter_data": {}}]
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with caplog.at_level(logging.INFO), _sync_env(ctx, {"d"}) as mock_up:
+            listener._sync_to_db(scanned)
+
+        _delete_mock(session).assert_not_called()
+        # the counter itself is cleared by upsert_subscription, which is patched here
+        mock_up.assert_called_once()
+        assert any("is back in the scan" in r.getMessage() for r in caplog.records)
+
+    def test_delete_is_conditional_on_the_counter_that_was_read(self):
+        """A scheduler that read a stale counter must not delete a row another one revived."""
+        from airflow_provider_rmq.watcher.models import RMQSubscription
+
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="old_dag", absent_cycles=_ABSENT_GRACE_CYCLES)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, {"old_dag"}):
+            listener._sync_to_db([])
+
+        clause = session.query.return_value.filter_by.return_value.filter.call_args.args[0]
+        expected = RMQSubscription.absent_cycles == _ABSENT_GRACE_CYCLES
+        assert str(clause) == str(expected)
+
+    def test_delete_helper_matches_a_null_counter_with_is_null(self):
+        """NULL and 0 mean the same thing to the schema and different things to SQL."""
+        session = MagicMock()
+        sub = _existing_sub(dag_id="d", absent_cycles=None)
+
+        RMQWatcherListener._delete_absent_sub(session, sub, sub.absent_cycles)
+
+        clause = session.query.return_value.filter_by.return_value.filter.call_args.args[0]
+        assert "IS NULL" in str(clause.compile(compile_kwargs={"literal_binds": True}))
 
     def test_sync_to_db_preserves_ui_subscriptions(self):
         listener = RMQWatcherListener()
@@ -1115,33 +1284,36 @@ class TestSyncToDb:
         # Only dag_file subs are returned (filter_by source='dag_file') → none
         ctx, session = _make_session_ctx(existing_subs=[])
 
-        delete_mock = session.query.return_value.filter_by.return_value.delete
-
-        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
-             patch("airflow_provider_rmq.watcher.listener.upsert_subscription"):
+        with _sync_env(ctx, set()):
             listener._sync_to_db([])
 
         # No dag_file subs to delete → delete never called
-        delete_mock.assert_not_called()
+        _delete_mock(session).assert_not_called()
+        session.query.return_value.filter_by.assert_any_call(source="dag_file")
+
+    def test_deletion_is_scoped_to_dag_file_rows(self):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="old_dag", absent_cycles=_ABSENT_GRACE_CYCLES)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, {"old_dag"}):
+            listener._sync_to_db([])
+
+        session.query.return_value.filter_by.assert_any_call(
+            dag_id="old_dag", queue_name="q", conn_id="rmq_default", source="dag_file",
+        )
 
     def test_sync_to_db_does_not_delete_subscription_still_in_scan(self):
         listener = RMQWatcherListener()
-
-        existing = MagicMock()
-        existing.dag_id = "d"
-        existing.queue_name = "q"
-        existing.conn_id = "rmq_default"
-
+        existing = _existing_sub(dag_id="d", queue_name="q")
         scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default", "filter_data": {}}]
         ctx, session = _make_session_ctx(existing_subs=[existing])
-        delete_mock = session.query.return_value.filter_by.return_value.delete
 
-        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
-             patch("airflow_provider_rmq.watcher.listener.upsert_subscription"):
+        with _sync_env(ctx, {"d"}):
             listener._sync_to_db(scanned)
 
         # Subscription is still in scan → must NOT be deleted
-        delete_mock.assert_not_called()
+        _delete_mock(session).assert_not_called()
 
 
 # ---------------------------------------------------------------------------

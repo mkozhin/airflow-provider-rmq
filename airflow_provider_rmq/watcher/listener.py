@@ -14,6 +14,7 @@ from concurrent.futures import Future
 from typing import Any
 
 from airflow.listeners import hookimpl
+from sqlalchemy.orm import Session
 
 from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.backoff import next_backoff
@@ -24,6 +25,7 @@ from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
     WatcherSession,
     ensure_table_exists,
+    get_active_dag_ids,
     get_enabled_subscriptions,
     is_schema_ready,
     upsert_subscription,
@@ -60,6 +62,11 @@ _STEP_TIMEOUT = 60.0
 #: cap (an hour of cycles at the default interval).
 _MIGRATION_BACKOFF_START = 1
 _MIGRATION_BACKOFF_MAX = 60
+
+#: Trusted synchronisations in a row a dag_file subscription's key may be missing from
+#: the scan before its row is deleted. Every scheduler increments on its own, so an
+#: installation running more than two of them has to raise this proportionally.
+_ABSENT_GRACE_CYCLES = 3
 
 #: Seconds allowed for the manager to stop before the loop is torn down anyway.
 _STOP_TIMEOUT = 30.0
@@ -1159,11 +1166,53 @@ class RMQWatcherListener:
     # DB synchronisation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _read_active_dag_ids(session: Session) -> set[str] | None:
+        """Return the dag_ids Airflow counts as active, or ``None`` when they cannot be read.
+
+        ``None`` is the caller's cue to treat every DAG as active: an unreachable
+        database must not be the thing that speeds a deletion up.
+        """
+        try:
+            return get_active_dag_ids(session)
+        except Exception as exc:
+            log.warning(
+                "RMQ Watcher: cannot read the active DAG ids (%s) — treating every DAG "
+                "as active for this synchronisation",
+                exc,
+            )
+            return None
+
+    @staticmethod
+    def _delete_absent_sub(
+        session: Session, sub: RMQSubscription, observed: int | None
+    ) -> None:
+        """Delete one dag_file row, but only while its miss counter still reads ``observed``.
+
+        Another scheduler may have seen the key come back and cleared the counter
+        between this cycle's read and its write; the condition leaves that row alone
+        instead of deleting it and letting the next scan recreate it with a fresh ``id``
+        and ``enabled=True``.
+        """
+        session.query(RMQSubscription).filter_by(
+            dag_id=sub.dag_id,
+            queue_name=sub.queue_name,
+            conn_id=sub.conn_id,
+            source="dag_file",
+        ).filter(RMQSubscription.absent_cycles == observed).delete()
+
     def _sync_to_db(self, scanned: list[dict]) -> None:
         """Reconcile dag_file subscriptions in DB with the current scan result.
 
         - Upserts all subscriptions found in code (source='dag_file').
-        - Deletes dag_file subscriptions that no longer exist in code.
+        - Counts the scans a dag_file row's key was missing from, in
+          ``absent_cycles``, and deletes the row once the count passes
+          :data:`_ABSENT_GRACE_CYCLES`. Until then the row lives an entirely ordinary
+          life: same ``id``, same consumer task, same ``enabled``.
+        - Deletes an enabled row earlier — from its second miss on — when Airflow no
+          longer counts its ``dag_id`` as active, because a delivery on such a
+          subscription is acknowledged and dropped. A disabled row has no consumer and
+          therefore always gets the full grace period.
         - Never touches ui-sourced subscriptions.
         """
         scanned_keys = {
@@ -1177,16 +1226,49 @@ class RMQWatcherListener:
                 .filter_by(source="dag_file")
                 .all()
             )
+            active_dag_ids = self._read_active_dag_ids(session)
 
             for sub in existing:
                 key = (sub.dag_id, sub.queue_name, sub.conn_id)
-                if key not in scanned_keys:
-                    session.query(RMQSubscription).filter_by(
-                        dag_id=sub.dag_id,
-                        queue_name=sub.queue_name,
-                        conn_id=sub.conn_id,
-                        source="dag_file",
-                    ).delete()
+                if key in scanned_keys:
+                    if sub.absent_cycles:
+                        log.info(
+                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is back in "
+                            "the scan after %s miss(es) — miss counter cleared",
+                            sub.dag_id, sub.queue_name, sub.conn_id, sub.absent_cycles,
+                        )
+                    continue
+
+                # The arithmetic runs on the normalised value, the DELETE filter on the
+                # raw one: the schema calls NULL and 0 the same thing, SQL does not, and
+                # ``absent_cycles = 0`` never matches a NULL row.
+                observed = sub.absent_cycles
+                current = sub.absent_cycles or 0
+                dag_inactive = active_dag_ids is not None and sub.dag_id not in active_dag_ids
+
+                if current + 1 > _ABSENT_GRACE_CYCLES:
+                    log.info(
+                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
+                        "%s trusted scans in a row — deleting",
+                        sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
+                    )
+                    self._delete_absent_sub(session, sub, observed)
+                elif sub.enabled and dag_inactive and current >= 1:
+                    log.info(
+                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
+                        "the scan and DAG %s is no longer active — deleting without waiting "
+                        "out the grace period",
+                        sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
+                    )
+                    self._delete_absent_sub(session, sub, observed)
+                else:
+                    sub.absent_cycles = current + 1
+                    log.warning(
+                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
+                        "the scan (%s of %s) — keeping the row for now",
+                        sub.dag_id, sub.queue_name, sub.conn_id,
+                        current + 1, _ABSENT_GRACE_CYCLES,
+                    )
 
             for s in scanned:
                 upsert_subscription(
