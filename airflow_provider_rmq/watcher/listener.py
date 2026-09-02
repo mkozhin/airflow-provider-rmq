@@ -612,6 +612,18 @@ class _StepInFlight(Exception):
     """
 
 
+class _UntrustedScan(Exception):
+    """The scan result is not a statement about the code, so the cycle must not sync it.
+
+    Raised by the scan step when the DAG folder could not be read, was empty or
+    unlistable, or when an empty listing is still young enough to be a hiccup of the
+    environment rather than the truth. ``_sync_to_db`` deletes every ``dag_file`` row
+    whose key the scan did not return, so a result that means "the filesystem looked
+    away for a second" must never reach it; the rest of the cycle — reading the rows,
+    the liveness check and the status writes — carries on from the database.
+    """
+
+
 class RMQWatcherListener:
     """Airflow Listener that runs a background RabbitMQ consumer loop inside the Scheduler process.
 
@@ -633,6 +645,10 @@ class RMQWatcherListener:
         # in _cycle_step), which is what keeps two workers out of these dicts at once.
         self._last_mtimes: dict[str, float] = {}   # filepath → mtime
         self._cached_subs: dict[str, list[dict]] = {}  # filepath → list[sub dict]
+        # Result of the last scan the cycle trusted. Stands in for the scan of a cycle
+        # that raised :class:`_UntrustedScan`, which needs it for the exchange metadata:
+        # that metadata lives only in memory and reconcile has no other source for it.
+        self._last_good_scan: list[dict] = []
         # Both pools are built here, in whatever thread constructs the listener, and
         # outlive every event loop the watcher thread creates.
         self._cycle_pool = BoundedExecutor("rmq-watcher-cycle", _CYCLE_POOL_WORKERS)
@@ -821,10 +837,23 @@ class RMQWatcherListener:
             await self._ensure_schema()
 
             self._phase = "scan"
-            scanned = await self._cycle_step("scan", self._scan_subscriptions)
+            try:
+                scanned = await self._cycle_step("scan", self._scan_subscriptions)
+            except _UntrustedScan as exc:
+                # The rest of the cycle runs from the database rows, so consumption, the
+                # liveness check and the status writes survive a filesystem that looked
+                # away — including on a watcher that has no good scan behind it yet, where
+                # the substitute is empty and the ui subscriptions still get reconciled.
+                log.error(
+                    "RMQ Watcher: the scan result cannot be trusted (%s) — skipping the "
+                    "sync step, keeping the subscription rows as they are", exc,
+                )
+                scanned = self._last_good_scan
+            else:
+                self._last_good_scan = scanned
 
-            self._phase = "sync"
-            await self._cycle_step("sync", self._sync_to_db, scanned)
+                self._phase = "sync"
+                await self._cycle_step("sync", self._sync_to_db, scanned)
 
             # Exchange/routing_keys metadata is never persisted to the DB (see
             # plan Technical Details → "Почему миграция БД не нужна") — it only

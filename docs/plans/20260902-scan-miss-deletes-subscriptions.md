@@ -559,23 +559,23 @@ else:
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] завести исключение `_UntrustedScan` рядом с `_StepInFlight`, с докстрокой о
+- [x] завести исключение `_UntrustedScan` рядом с `_StepInFlight`, с докстрокой о
       том, что оно означает для цикла
-- [ ] завести `self._last_good_scan: list[dict] = []` в `__init__`
-- [ ] обернуть шаг `scan` в `_run_cycle` по образцу из Technical Details: на
+- [x] завести `self._last_good_scan: list[dict] = []` в `__init__`
+- [x] обернуть шаг `scan` в `_run_cycle` по образцу из Technical Details: на
       `_UntrustedScan` — ERROR, пропуск шага `sync`, подстановка `_last_good_scan`;
       цикл продолжается всегда
-- [ ] запоминать удачный результат скана в `_last_good_scan`
-- [ ] написать тест: искусственно поднятый `_UntrustedScan` не вызывает
+- [x] запоминать удачный результат скана в `_last_good_scan`
+- [x] написать тест: искусственно поднятый `_UntrustedScan` не вызывает
       `_sync_to_db`, но доходит до `reconcile`
-- [ ] написать тест: `exchange_meta` на таком цикле собирается из последнего
+- [x] написать тест: `exchange_meta` на таком цикле собирается из последнего
       удачного скана
-- [ ] написать тест: `_UntrustedScan` без единого удачного скана до него всё равно
+- [x] написать тест: `_UntrustedScan` без единого удачного скана до него всё равно
       доводит цикл до `reconcile`, с пустым `exchange_meta`
-- [ ] написать тест: ERROR пишется и называет причину
-- [ ] написать тест-регрессию: шаг `scan`, упавший с `_StepInFlight` или
+- [x] написать тест: ERROR пишется и называет причину
+- [x] написать тест-регрессию: шаг `scan`, упавший с `_StepInFlight` или
       `asyncio.TimeoutError`, ведёт себя как раньше и не обновляет `_last_good_scan`
-- [ ] прогнать `.venv/bin/pytest tests/watcher/test_listener.py -q` — зелено до Task 5
+- [x] прогнать `.venv/bin/pytest tests/watcher/test_listener.py -q` — зелено до Task 5
 
 ### Task 5: `_get_dags_folder` читает `settings.DAGS_FOLDER` и проверяет результат
 

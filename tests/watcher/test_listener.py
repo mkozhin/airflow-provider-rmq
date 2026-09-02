@@ -20,6 +20,7 @@ from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
     _ABSENT_GRACE_CYCLES,
     _UNRESOLVED_DAG_ID,
+    _UntrustedScan,
     _collect_module_constants,
     _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
@@ -2180,6 +2181,113 @@ class TestCycleStepsAreBounded:
                 release.set()
 
         manager.reconcile.assert_not_awaited()
+
+
+class TestUntrustedScan:
+    """A scan the cycle cannot trust skips the sync step and nothing else.
+
+    `_sync_to_db` deletes every dag_file row whose key the scan did not return, so a
+    result that says nothing about the code must not reach it — while consumption, the
+    liveness check and the status writes keep running from the database rows.
+    """
+
+    @pytest.mark.asyncio
+    async def test_untrusted_scan_skips_sync_but_reaches_reconcile(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        listener._scan_subscriptions = MagicMock(side_effect=_UntrustedScan("folder gone"))
+
+        with _cycle_patches(manager):
+            await listener._run_cycle()
+
+        listener._sync_to_db.assert_not_called()
+        manager.reconcile.assert_awaited_once_with([])
+
+    @pytest.mark.asyncio
+    async def test_exchange_meta_comes_from_the_last_good_scan(self):
+        """The exchange flag lives only in the scan cache, and reconcile has no other
+        source for it: an untrusted cycle borrows the last trusted result."""
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        scanned = [{
+            "dag_id": "d", "queue_name": "q", "conn_id": "rmq_default",
+            "exchange": "ex", "routing_keys": ["rk"],
+        }]
+        db_subs = [_make_db_sub("d", "q")]
+
+        with _cycle_patches(manager, db_subs=db_subs):
+            listener._scan_subscriptions = MagicMock(return_value=scanned)
+            await listener._run_cycle()
+            listener._scan_subscriptions = MagicMock(side_effect=_UntrustedScan("empty glob"))
+            await listener._run_cycle()
+
+        assert listener._last_good_scan == scanned
+        entry = manager.reconcile.await_args.args[0][0]
+        assert entry["exchange"] == "ex"
+        assert entry["routing_keys"] == ["rk"]
+
+    @pytest.mark.asyncio
+    async def test_untrusted_scan_without_any_good_scan_still_reconciles(self):
+        """A watcher that never had a trusted scan keeps consuming: the ui
+        subscriptions in the database have nothing to do with the DAG files."""
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        listener._scan_subscriptions = MagicMock(side_effect=_UntrustedScan("no dags folder"))
+        db_subs = [_make_db_sub("d", "q")]
+
+        with _cycle_patches(manager, db_subs=db_subs):
+            await listener._run_cycle()
+
+        listener._sync_to_db.assert_not_called()
+        entry = manager.reconcile.await_args.args[0][0]
+        assert "exchange" not in entry
+
+    @pytest.mark.asyncio
+    async def test_error_is_logged_with_the_reason(self, caplog):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        listener._scan_subscriptions = MagicMock(
+            side_effect=_UntrustedScan("the DAG folder cannot be listed")
+        )
+
+        with _cycle_patches(manager), caplog.at_level(
+            logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
+        ):
+            await listener._run_cycle()
+
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("the DAG folder cannot be listed" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_a_step_in_flight_scan_behaves_as_before(self, caplog):
+        """Only `_UntrustedScan` substitutes the previous result; the other two ways the
+        scan step ends still end the cycle before reconcile."""
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        listener._last_good_scan = [{"dag_id": "d", "queue_name": "q"}]
+        release = threading.Event()
+        listener._scan_subscriptions = _blocked_by(release, result=[])
+        try:
+            with _cycle_patches(manager), patch(
+                "airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.05
+            ), caplog.at_level(
+                logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+            ):
+                await listener._run_cycle()   # times out, leaving the attempt in flight
+                await listener._run_cycle()   # _StepInFlight
+        finally:
+            release.set()
+
+        assert listener._last_good_scan == [{"dag_id": "d", "queue_name": "q"}]
+        listener._sync_to_db.assert_not_called()
+        manager.reconcile.assert_not_awaited()
+        assert any("did not finish" in r.getMessage() for r in caplog.records)
+        assert any("still running" in r.getMessage() for r in caplog.records)
 
 
 class TestCycleWatchdog:
