@@ -1053,11 +1053,41 @@ class RMQWatcherListener:
     # ------------------------------------------------------------------
 
     def _get_dags_folder(self) -> str:
+        """Path of the DAG folder, verified to be a source a scan can be trusted from.
+
+        The value comes from ``airflow.settings.DAGS_FOLDER`` — the same path the
+        Scheduler parses DAGs from — and every one of the checks below turns a bad
+        value into :class:`_UntrustedScan` instead of a scan result:
+
+        - an empty value is expensive on its own: the caller joins it into a glob
+          pattern, and ``glob.glob("/**/*.py", recursive=True)`` walks the whole
+          filesystem from the root inside a worker of the cycle pool;
+        - a missing directory is not a statement about the code either — it is what a
+          git-sync symlink swap looks like for the second it lasts;
+        - listability is checked explicitly, because ``os.path.isdir`` answers ``True``
+          for a directory with no read permission while ``glob`` swallows the
+          ``OSError`` and returns an empty list. Without this check an unreadable
+          folder is indistinguishable from an honestly empty one, which the scan is
+          required to take as the truth.
+        """
         try:
-            from airflow.configuration import conf as airflow_conf
-            return airflow_conf.get("core", "dags_folder")
-        except Exception:
-            return "/opt/airflow/dags"
+            from airflow import settings as airflow_settings
+            dags_folder = airflow_settings.DAGS_FOLDER
+        except Exception as exc:
+            raise _UntrustedScan(f"the DAG folder setting is unreadable: {exc!r}") from exc
+
+        if not dags_folder:
+            raise _UntrustedScan("the DAG folder setting is empty")
+        if not os.path.isdir(dags_folder):
+            raise _UntrustedScan(f"the DAG folder {dags_folder!r} is not a directory")
+        try:
+            with os.scandir(dags_folder) as entries:
+                next(entries, None)
+        except OSError as exc:
+            raise _UntrustedScan(
+                f"the DAG folder {dags_folder!r} cannot be listed: {exc!r}"
+            ) from exc
+        return dags_folder
 
     def _scan_subscriptions(self) -> list[dict]:
         """Incrementally scan DAG files for @rmq_trigger subscriptions using mtime.
@@ -1065,9 +1095,15 @@ class RMQWatcherListener:
         On a stable deployment (no file changes) this costs only N mtime syscalls.
         Changed or new files are re-parsed; deleted files are evicted from the cache.
         Memory is bounded to the number of current DAG files on disk.
+
+        :raises _UntrustedScan: The DAG folder is not a source the scan can be trusted
+            from. It is checked before the cache is touched, so a cycle that cannot
+            trust the filesystem leaves the previous parse intact.
         """
         dags_folder = self._get_dags_folder()
-        current_files = set(glob.glob(f"{dags_folder}/**/*.py", recursive=True))
+        current_files = set(
+            glob.glob(os.path.join(dags_folder, "**", "*.py"), recursive=True)
+        )
 
         # Evict deleted files
         for path in list(self._last_mtimes):

@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import glob
 import logging
+import os
 import re
 import sys
 import threading
@@ -628,6 +630,128 @@ class TestScanSubscriptions:
 
         assert file in listener._last_mtimes
         assert mock_ex.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# _get_dags_folder — the DAG folder is checked before the scan is believed
+# ---------------------------------------------------------------------------
+
+class TestGetDagsFolder:
+    def test_readable_folder_is_returned(self, tmp_path):
+        listener = RMQWatcherListener()
+        (tmp_path / "dag1.py").write_text("")
+
+        with patch("airflow.settings.DAGS_FOLDER", str(tmp_path)):
+            assert listener._get_dags_folder() == str(tmp_path)
+
+    def test_empty_folder_is_returned_too(self, tmp_path):
+        # An honestly empty directory is the truth about the code and must reach glob.
+        listener = RMQWatcherListener()
+
+        with patch("airflow.settings.DAGS_FOLDER", str(tmp_path)):
+            assert listener._get_dags_folder() == str(tmp_path)
+
+    def test_unreadable_setting_raises_untrusted_scan(self, monkeypatch):
+        import airflow.settings
+
+        listener = RMQWatcherListener()
+        monkeypatch.delattr(airflow.settings, "DAGS_FOLDER")
+
+        with pytest.raises(_UntrustedScan, match="unreadable"):
+            listener._get_dags_folder()
+
+    def test_empty_setting_raises_untrusted_scan(self):
+        listener = RMQWatcherListener()
+
+        with patch("airflow.settings.DAGS_FOLDER", ""), \
+             pytest.raises(_UntrustedScan, match="empty"):
+            listener._get_dags_folder()
+
+    def test_empty_setting_keeps_glob_from_running(self):
+        # glob.glob("/**/*.py", recursive=True) is a walk of the whole filesystem
+        # from the root inside a worker of the cycle pool.
+        listener = RMQWatcherListener()
+
+        with patch("airflow.settings.DAGS_FOLDER", ""), \
+             patch("airflow_provider_rmq.watcher.listener.glob.glob") as mock_glob, \
+             pytest.raises(_UntrustedScan):
+            listener._scan_subscriptions()
+
+        mock_glob.assert_not_called()
+
+    def test_missing_directory_raises_untrusted_scan(self, tmp_path):
+        listener = RMQWatcherListener()
+        missing = str(tmp_path / "swapped-away")
+
+        with patch("airflow.settings.DAGS_FOLDER", missing), \
+             pytest.raises(_UntrustedScan, match="not a directory"):
+            listener._get_dags_folder()
+
+    def test_unlistable_directory_raises_untrusted_scan(self, tmp_path):
+        # os.path.isdir says True for a directory with no read permission and glob
+        # returns [] for it, so the explicit listability check is the only thing
+        # telling it apart from an honestly empty folder.
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        (folder / "dag1.py").write_text("")
+        folder.chmod(0o111)
+        listener = RMQWatcherListener()
+
+        try:
+            assert os.path.isdir(str(folder))
+            assert glob.glob(os.path.join(str(folder), "**", "*.py"), recursive=True) == []
+            with patch("airflow.settings.DAGS_FOLDER", str(folder)):
+                # The distrust has no limit: an unreadable folder never becomes truth.
+                for _ in range(5):
+                    with pytest.raises(_UntrustedScan, match="cannot be listed"):
+                        listener._get_dags_folder()
+        finally:
+            folder.chmod(0o755)
+
+    def test_unlistable_directory_raises_with_a_warm_cache_too(self, tmp_path):
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        (folder / "dag1.py").write_text("")
+        listener = RMQWatcherListener()
+
+        with patch("airflow.settings.DAGS_FOLDER", str(folder)):
+            listener._scan_subscriptions()
+            assert listener._last_mtimes
+
+            folder.chmod(0o111)
+            try:
+                for _ in range(5):
+                    with pytest.raises(_UntrustedScan, match="cannot be listed"):
+                        listener._scan_subscriptions()
+            finally:
+                folder.chmod(0o755)
+
+    def test_untrusted_folder_evicts_nothing_from_the_cache(self, tmp_path):
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        dag_file = folder / "dag1.py"
+        dag_file.write_text("")
+        listener = RMQWatcherListener()
+
+        with patch("airflow.settings.DAGS_FOLDER", str(folder)), \
+             patch.object(listener, "_extract_subscriptions_from_file",
+                          return_value=[{"dag_id": "d", "queue_name": "q"}]):
+            listener._scan_subscriptions()
+
+        mtimes = dict(listener._last_mtimes)
+        cached = {path: list(subs) for path, subs in listener._cached_subs.items()}
+        assert str(dag_file) in mtimes
+
+        folder.chmod(0o111)
+        try:
+            with patch("airflow.settings.DAGS_FOLDER", str(folder)), \
+                 pytest.raises(_UntrustedScan):
+                listener._scan_subscriptions()
+        finally:
+            folder.chmod(0o755)
+
+        assert listener._last_mtimes == mtimes
+        assert listener._cached_subs == cached
 
 
 # ---------------------------------------------------------------------------

@@ -583,21 +583,21 @@ else:
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] переписать `_get_dags_folder` на `airflow.settings.DAGS_FOLDER`, поднимая
+- [x] переписать `_get_dags_folder` на `airflow.settings.DAGS_FOLDER`, поднимая
       `_UntrustedScan` при ошибке чтения, пустом значении, несуществующей
       директории и директории, которую не удаётся перечислить
-- [ ] собрать путь в `_scan_subscriptions` через `os.path.join`
-- [ ] написать тест: ошибка чтения источника поднимает `_UntrustedScan`
-- [ ] написать тест: пустое значение поднимает `_UntrustedScan` и `glob` не
+- [x] собрать путь в `_scan_subscriptions` через `os.path.join`
+- [x] написать тест: ошибка чтения источника поднимает `_UntrustedScan`
+- [x] написать тест: пустое значение поднимает `_UntrustedScan` и `glob` не
       вызывается вовсе
-- [ ] написать тест: несуществующая директория поднимает `_UntrustedScan`
-- [ ] написать тест: директория без права чтения поднимает `_UntrustedScan` — и
+- [x] написать тест: несуществующая директория поднимает `_UntrustedScan`
+- [x] написать тест: директория без права чтения поднимает `_UntrustedScan` — и
       делает это при прогретом кэше и при пустом одинаково, бессрочно
-- [ ] написать тест: `_scan_subscriptions` при этом не выселяет ничего из
+- [x] написать тест: `_scan_subscriptions` при этом не выселяет ничего из
       `_last_mtimes` и `_cached_subs`
-- [ ] поправить существующие тесты, мокающие `_get_dags_folder`
+- [x] поправить существующие тесты, мокающие `_get_dags_folder`
       (`test_listener.py:516` и соседние)
-- [ ] прогнать `.venv/bin/pytest tests/watcher/test_listener.py -q` — зелено до Task 6
+- [x] прогнать `.venv/bin/pytest tests/watcher/test_listener.py -q` — зелено до Task 6
 
 ### Task 6: Пустой `glob` — недоверенный скан на ограниченное число циклов
 
