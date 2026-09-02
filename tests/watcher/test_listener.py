@@ -13,6 +13,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.orm import sessionmaker
 
 from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.executor import BoundedExecutor
@@ -31,6 +32,7 @@ from airflow_provider_rmq.watcher.listener import (
     _parse_rmq_trigger_decorator,
     _read_settings,
 )
+from airflow_provider_rmq.watcher.models import RMQSubscription
 
 
 # ---------------------------------------------------------------------------
@@ -3217,3 +3219,234 @@ class TestLifecycleDiagnostics:
         assert any(
             "still running" in r.getMessage() for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end scenarios of the backlog item, on a real session (Task 8)
+# ---------------------------------------------------------------------------
+
+#: DAG file the scan finds one subscription in.
+_DAG_WITH_TRIGGER = (
+    "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+    "from airflow.decorators import dag\n"
+    "@rmq_trigger(queue='q')\n"
+    "@dag(dag_id='d')\n"
+    "def d(): pass\n"
+)
+
+#: The same DAG with the decorator taken off — a scan of it is a statement that the
+#: subscription is gone from the code.
+_DAG_WITHOUT_TRIGGER = (
+    "from airflow.decorators import dag\n"
+    "@dag(dag_id='d')\n"
+    "def d(): pass\n"
+)
+
+#: A file caught mid-write: readable, unparseable.
+_DAG_HALF_WRITTEN = "from airflow.decorators import dag\n@dag(dag_id='d'\n"
+
+
+def _write_dag_file(path, source: str, mtime: float) -> None:
+    """Write a DAG file and stamp its mtime, which drives the incremental scan."""
+    path.write_text(source)
+    os.utime(path, (mtime, mtime))
+
+
+@contextlib.contextmanager
+def _db(engine):
+    """Short-lived session on the engine the cycle writes to."""
+    s = sessionmaker(bind=engine)()
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+def _snapshot(engine, dag_id="d", queue_name="q"):
+    """Values of the dag_file row that the scenarios below assert on, or ``None``."""
+    with _db(engine) as session:
+        row = (
+            session.query(RMQSubscription)
+            .filter_by(dag_id=dag_id, queue_name=queue_name)
+            .one_or_none()
+        )
+        if row is None:
+            return None
+        return {"id": row.id, "enabled": row.enabled, "absent_cycles": row.absent_cycles}
+
+
+def _disable_subscription(engine, dag_id="d", queue_name="q") -> None:
+    """Turn the row off the way the Subscriptions page's button does."""
+    with _db(engine) as session:
+        session.query(RMQSubscription).filter_by(
+            dag_id=dag_id, queue_name=queue_name
+        ).update({"enabled": False})
+        session.commit()
+
+
+def _record_dag(engine, dag_id="d", *, is_active: bool) -> None:
+    """Give Airflow's dag table a row, which is what the short circuit consults."""
+    from airflow.models import DagModel
+
+    with _db(engine) as session:
+        session.add(DagModel(dag_id=dag_id, is_active=is_active, is_paused=False))
+        session.commit()
+
+
+@pytest.fixture
+def e2e_listener(dagmodel_engine, tmp_path, monkeypatch):
+    """Listener whose scan reads ``tmp_path`` and whose sync writes a real database."""
+    monkeypatch.setattr("airflow.settings.DAGS_FOLDER", str(tmp_path), raising=False)
+    listener = RMQWatcherListener()
+    listener._stop_event = threading.Event()
+    listener._reconcile_interval = 0
+    listener._refresh_settings = AsyncMock()
+    listener._manager = _fake_manager()
+    with patch(
+        "airflow_provider_rmq.watcher.listener.WatcherSession",
+        sessionmaker(bind=dagmodel_engine),
+    ), patch(
+        "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=True
+    ), patch(
+        "airflow_provider_rmq.watcher.listener._read_settings", return_value=(None, None)
+    ):
+        yield listener
+
+
+class TestScanMissEndToEnd:
+    """The scenarios of the backlog item, driven through whole cycles.
+
+    Only a real session shows what these are about: SQL does not call ``NULL`` and
+    ``0`` the same thing, so the condition on the DELETE is right or wrong here and
+    nowhere else, and ``enabled`` survives precisely because the row keeps its ``id``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disabled_row_survives_an_empty_glob_between_two_full_scans(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _disable_subscription(dagmodel_engine)
+        before = _snapshot(dagmodel_engine)
+
+        dag_file.unlink()
+        await e2e_listener._run_cycle()
+
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=2000)
+        await e2e_listener._run_cycle()
+
+        after = _snapshot(dagmodel_engine)
+        assert after is not None
+        assert after["id"] == before["id"]
+        assert after["enabled"] is False
+        # The sync step never ran on the empty cycle, so the miss was never counted.
+        assert not after["absent_cycles"]
+
+    @pytest.mark.asyncio
+    async def test_disabled_row_survives_a_syntax_error_in_its_file(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _disable_subscription(dagmodel_engine)
+        before = _snapshot(dagmodel_engine)
+
+        _write_dag_file(dag_file, _DAG_HALF_WRITTEN, mtime=2000)
+        await e2e_listener._run_cycle()
+
+        after = _snapshot(dagmodel_engine)
+        assert after is not None
+        assert after["id"] == before["id"]
+        assert after["enabled"] is False
+        assert not after["absent_cycles"]
+
+    @pytest.mark.asyncio
+    async def test_two_broken_cycles_with_an_inactive_dag_leave_the_disabled_row_alone(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        """The path on which deleting at the first miss would bring the defect back.
+
+        A broken DAG file makes Airflow drop ``is_active`` within a minute or two, so
+        both signals fail together — and the row the operator switched off has to come
+        through it still switched off.
+        """
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=False)
+        _disable_subscription(dagmodel_engine)
+        before = _snapshot(dagmodel_engine)
+
+        _write_dag_file(dag_file, _DAG_HALF_WRITTEN, mtime=2000)
+        await e2e_listener._run_cycle()   # the previous parse is held for one cycle
+        await e2e_listener._run_cycle()   # patience runs out, the key is gone
+
+        after = _snapshot(dagmodel_engine)
+        assert after is not None
+        assert after["id"] == before["id"]
+        assert after["enabled"] is False
+        assert after["absent_cycles"] == 1
+
+    @pytest.mark.asyncio
+    async def test_removed_decorator_on_an_active_dag_waits_out_the_grace_period(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=True)
+
+        _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
+        for miss in range(1, _ABSENT_GRACE_CYCLES + 1):
+            await e2e_listener._run_cycle()
+            row = _snapshot(dagmodel_engine)
+            assert row is not None, f"deleted after {miss} miss(es)"
+            assert row["absent_cycles"] == miss
+
+        await e2e_listener._run_cycle()
+        assert _snapshot(dagmodel_engine) is None
+
+    @pytest.mark.asyncio
+    async def test_removed_decorator_on_an_inactive_dag_deletes_on_the_second_miss(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        """An enabled row of a DAG Airflow no longer runs still gets one miss for free.
+
+        Its consumer acks and drops every delivery, hence the hurry; one shared hiccup
+        of the filesystem still has to be survivable, hence not the first miss.
+        """
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=False)
+
+        _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
+        await e2e_listener._run_cycle()
+
+        row = _snapshot(dagmodel_engine)
+        assert row is not None
+        assert row["enabled"] is True
+        assert row["absent_cycles"] == 1
+
+        await e2e_listener._run_cycle()
+        assert _snapshot(dagmodel_engine) is None
+
+    @pytest.mark.asyncio
+    async def test_a_row_under_the_counter_still_reaches_reconcile(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        """The counter is not a visibility flag: the row keeps its consumer task."""
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=True)
+
+        _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
+        await e2e_listener._run_cycle()
+
+        assert _snapshot(dagmodel_engine)["absent_cycles"] == 1
+        active_subs = e2e_listener._manager.reconcile.await_args.args[0]
+        assert [(s["dag_id"], s["queue_name"]) for s in active_subs] == [("d", "q")]

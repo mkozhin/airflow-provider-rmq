@@ -66,43 +66,6 @@ CREATE TABLE rmq_watcher_subscriptions (
 """
 
 
-@pytest.fixture(scope="function")
-def session():
-    """SQLite in-memory session with fresh schema per test."""
-    engine = create_engine("sqlite:///:memory:")
-    WatcherBase.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    s = Session()
-    yield s
-    s.close()
-    WatcherBase.metadata.drop_all(engine)
-
-
-@pytest.fixture(scope="function")
-def schema_engine(monkeypatch):
-    """Engine standing in for Airflow's, with the migration flag reset."""
-    engine = create_engine("sqlite:///:memory:")
-    monkeypatch.setattr("airflow.settings.engine", engine, raising=False)
-    monkeypatch.setattr(models, "_schema_ready", False)
-    yield engine
-    engine.dispose()
-
-
-@pytest.fixture(scope="function")
-def session_with_dagmodel():
-    """SQLite in-memory session with watcher schema plus Airflow's DagModel table."""
-    from airflow.models import DagModel
-
-    engine = create_engine("sqlite:///:memory:")
-    WatcherBase.metadata.create_all(engine)
-    DagModel.__table__.create(engine, checkfirst=True)
-    Session = sessionmaker(bind=engine)
-    s = Session()
-    yield s
-    s.close()
-    WatcherBase.metadata.drop_all(engine)
-
-
 # ---------------------------------------------------------------------------
 
 class TestCreateSubscription:
