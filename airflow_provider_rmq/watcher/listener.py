@@ -75,19 +75,31 @@ _ABSENT_GRACE_CYCLES = 3
 #: contiguous run of such listings shares this budget, whatever mix of shapes it takes.
 _UNTRUSTED_SCAN_LIMIT = 3
 
-#: Share of the file count of the last trusted scan that has to read for the listing to
-#: be a statement about the code. Which failure a file answers with takes no part in the
-#: decision: an aborted checkout leaves files truncated (a parse failure), a storage
-#: backend losing access leaves them unstattable (an I/O failure), and both say the same
-#: thing — what is on disk right now is not the code. A broken file or two among many is
-#: about the code and stays trusted; a listing that lost most of what read before is not.
-#: The comparison is against the last trusted scan rather than against the listing
-#: itself, so a folder that grew a hundred new files is trusted while a folder that lost
-#: a hundred is not, and an empty listing is distrusted on a cold cache too — a scheduler
-#: that starts while the DAG volume is still being populated sees an existing, listable,
-#: empty folder, and believing that at once would count a miss against every row in the
-#: table.
+#: Share of the file count the folder is known to have held that has to read for the
+#: listing to be a statement about the code. Which failure a file answers with takes no
+#: part in the decision: an aborted checkout leaves files truncated (a parse failure), a
+#: storage backend losing access leaves them unstattable (an I/O failure), and both say
+#: the same thing — what is on disk right now is not the code. A broken file or two among
+#: many is about the code and stays trusted; a listing that lost most of what read before
+#: is not. The count it is measured against is a high-water mark that only comes down
+#: where a shrink has been believed, so a folder unmounting a slice per cycle is compared
+#: with what it held rather than with its own previous step.
+#:
+#: A process that has believed no listing yet holds no such count, and there is nothing
+#: else on the filesystem to derive one from: it can refuse a listing that produced
+#: nothing readable, and beyond that it has to take what it is given. A scheduler that
+#: starts into a half-mounted DAG volume therefore believes it, and the rows whose files
+#: are missing count misses from that cycle on — :data:`_ABSENT_GRACE_CYCLES` of them is
+#: what stands between such a start and the deletions, where a process with a mark behind
+#: it also has this distrust in front of that.
 _TRUSTED_SCAN_FRACTION = 0.5
+
+#: Deletions of dag_file rows this process keeps the key of, so that a key the scan
+#: brings back is reported instead of silently becoming an enabled row again. The report
+#: is about a key returning within a few cycles of its deletion — a redeploy that fixes
+#: the DAG file — so the oldest entry makes room for a newer one once the map is this
+#: full, rather than the map growing for the life of the process.
+_DELETED_ROWS_REMEMBERED = 256
 
 #: Cycles the previous parse of an unreadable DAG file is held for. One, not three:
 #: the case the hold exists for is a file caught mid-write, and that resolves within a
@@ -678,11 +690,21 @@ class RMQWatcherListener:
         # Listings in a row the cycle would not read as a statement about the code,
         # counted so that the distrust expires at ``_UNTRUSTED_SCAN_LIMIT`` instead of
         # lasting forever: a folder of files nobody can read is a filesystem talking,
-        # but the distrust of it still has to end somewhere.
+        # but the distrust of it still has to end somewhere. Every way out of the
+        # distrust — a listing believed, and a listing given in to — puts it back to
+        # zero, so each episode gets the whole budget.
         self._untrusted_scan_streak: int = 0
-        # Files the last trusted scan read, which :data:`_TRUSTED_SCAN_FRACTION` of the
-        # next listing is measured against.
-        self._trusted_file_count: int = 0
+        # Files the folder is known to have held, which :data:`_TRUSTED_SCAN_FRACTION`
+        # of the next listing is measured against. It rises with a listing that read
+        # more and comes down only where a shrink has been believed, so a folder losing
+        # a slice of itself per cycle is measured against what it held rather than
+        # against its own previous step. ``None`` until the first listing is believed:
+        # a process that has seen none has nothing to compare one against, which is a
+        # different statement from a folder known to be empty. Like the caches above it
+        # holds what the folder showed, not what a cycle managed to use: a step the
+        # cycle stopped waiting for goes on to finish in its pool worker, and the
+        # listing it observed is an observation of the folder either way.
+        self._trusted_file_count: int | None = None
         # Result of the last scan the cycle trusted. Stands in for the scan of a cycle
         # that raised :class:`_UntrustedScan`, which needs it for the exchange metadata:
         # that metadata lives only in memory and reconcile has no other source for it.
@@ -691,7 +713,10 @@ class RMQWatcherListener:
         # carried, held until the scan brings the key back. A key that comes back
         # arrives as a brand new row with the default flag on it, and that is what the
         # log line reporting it says. Written by the sync step alone, like the dicts
-        # above are written by the scan step alone.
+        # above are written by the scan step alone, and bounded by
+        # :data:`_DELETED_ROWS_REMEMBERED`: a deleted key is far more often gone for
+        # good than back, and an installation generating dag_ids on the fly would
+        # otherwise leave one entry per deletion here for the life of the process.
         self._deleted_dag_file_rows: dict[tuple[str, str, str], bool] = {}
         # Both pools are built here, in whatever thread constructs the listener, and
         # outlive every event loop the watcher thread creates.
@@ -1149,17 +1174,13 @@ class RMQWatcherListener:
             listing no longer names waits for the verdict too — so a listing that lost
             a subtree to a permission error leaves the previous parse of it intact.
         """
-        try:
-            dags_folder = self._get_dags_folder()
-        except _UntrustedScan:
-            # The streak counts one contiguous run of listings. A folder that produced
-            # none at all — it vanished under a git-sync swap, or refuses to be listed
-            # — is distrusted with no limit whatsoever, and letting a run continue
-            # across such an outage would spend the budget of the next run before it
-            # starts: a single empty listing after a week of a missing folder would be
-            # believed on the spot.
-            self._untrusted_scan_streak = 0
-            raise
+        # The streak below counts listings, and a folder that produces none at all — it
+        # vanished under a git-sync swap, or refuses to be listed — leaves it untouched:
+        # such an outage neither spends the budget nor refills it. Refilling it would let
+        # a folder alternating between unlistable and degraded hold the distrust for as
+        # long as it keeps alternating, and the sync step, deletions and new
+        # subscriptions alike, would never run again on such an installation.
+        dags_folder = self._get_dags_folder()
 
         current_files = set(
             glob.glob(os.path.join(dags_folder, "**", "*.py"), recursive=True)
@@ -1197,8 +1218,25 @@ class RMQWatcherListener:
             self._last_mtimes[path] = mtime
 
         readable = len(current_files) - len(failures)
-        if readable and readable >= self._trusted_file_count * _TRUSTED_SCAN_FRACTION:
+        baseline = self._trusted_file_count
+        if baseline is None:
+            # No listing of this process has been believed yet, so there is nothing to
+            # measure this one against and the only listing a cold start can refuse is
+            # the one that produced nothing readable at all. What a partial listing
+            # costs here is bounded by the miss counter alone — see the note on the
+            # cold start in :data:`_TRUSTED_SCAN_FRACTION`.
+            trusted = readable > 0
+        else:
+            trusted = readable >= baseline * _TRUSTED_SCAN_FRACTION
+
+        if trusted:
             self._untrusted_scan_streak = 0
+            # The high-water mark, so that a decline slower than the share per cycle is
+            # measured against what the folder held rather than against its own previous
+            # step: a baseline every trusted listing rewrote would follow a folder
+            # unmounting piece by piece all the way down and call every step of it
+            # trustworthy.
+            self._trusted_file_count = readable if baseline is None else max(baseline, readable)
         else:
             if not current_files:
                 what = f"the DAG folder {dags_folder!r} listed no files"
@@ -1207,11 +1245,16 @@ class RMQWatcherListener:
                     f"none of the {len(current_files)} files the DAG folder "
                     f"{dags_folder!r} listed could be read"
                 )
+            elif readable == len(current_files):
+                what = (
+                    f"the DAG folder {dags_folder!r} listed only {readable} files, "
+                    f"against {baseline} it is known to have held"
+                )
             else:
                 what = (
                     f"only {readable} of the {len(current_files)} files the DAG folder "
                     f"{dags_folder!r} listed could be read, against "
-                    f"{self._trusted_file_count} the last trusted scan read"
+                    f"{baseline} the folder is known to have held"
                 )
             if failures:
                 what += f", first reason: {failures[0][1]!r}"
@@ -1226,6 +1269,14 @@ class RMQWatcherListener:
                 "the truth and the keys missing from it go the counted-miss way",
                 what, self._untrusted_scan_streak,
             )
+            # Giving in is believing the shrink, so the mark comes down to it and the
+            # streak starts over. Both halves matter: a mark left where it was would
+            # distrust every listing that follows for the rest of the process — an
+            # installation whose DAG folder is legitimately empty would log this line
+            # every cycle forever — and a streak left spent would hand the next collapse
+            # no grace at all.
+            self._untrusted_scan_streak = 0
+            self._trusted_file_count = readable
 
         for path, reason, mtime in failures:
             self._file_unreadable(path, reason, mtime)
@@ -1239,8 +1290,6 @@ class RMQWatcherListener:
                 self._last_mtimes.pop(path, None)
                 self._cached_subs.pop(path, None)
                 self._read_failures.pop(path, None)
-
-        self._trusted_file_count = readable
 
         # Flatten all cached subscriptions
         result: list[dict] = []
@@ -1445,7 +1494,7 @@ class RMQWatcherListener:
 
     def _delete_absent_sub(
         self, session: Session, sub: RMQSubscription, observed: int
-    ) -> None:
+    ) -> tuple[tuple[str, str, str], bool] | None:
         """Delete one dag_file row, but only while its miss counter still reads ``observed``.
 
         Another scheduler may have seen the key come back and cleared the counter
@@ -1453,20 +1502,27 @@ class RMQWatcherListener:
         instead of deleting it and letting the next scan recreate it with a fresh ``id``
         and ``enabled=True``.
 
-        A row that really went is remembered by key, together with the ``enabled`` flag
-        it carried, so that the scan bringing the key back reports the recreated row
+        Returns the key of a row that really went, together with the ``enabled`` flag it
+        carried, for the caller to remember once the transaction holding the deletion is
+        committed — the scan bringing that key back then reports the recreated row
         instead of quietly handing the subscription a consumer again.
         """
+        key = (sub.dag_id, sub.queue_name, sub.conn_id)
+        was_enabled = bool(sub.enabled)
         deleted = session.query(RMQSubscription).filter_by(
             dag_id=sub.dag_id,
             queue_name=sub.queue_name,
             conn_id=sub.conn_id,
             source="dag_file",
         ).filter(RMQSubscription.absent_cycles == observed).delete()
-        if deleted:
-            self._deleted_dag_file_rows[
-                (sub.dag_id, sub.queue_name, sub.conn_id)
-            ] = bool(sub.enabled)
+        return (key, was_enabled) if deleted else None
+
+    def _remember_deleted_row(self, key: tuple[str, str, str], was_enabled: bool) -> None:
+        """Record one committed deletion, dropping the oldest record to stay in bounds."""
+        self._deleted_dag_file_rows.pop(key, None)
+        self._deleted_dag_file_rows[key] = was_enabled
+        while len(self._deleted_dag_file_rows) > _DELETED_ROWS_REMEMBERED:
+            self._deleted_dag_file_rows.pop(next(iter(self._deleted_dag_file_rows)))
 
     def _sync_to_db(self, scanned: list[dict]) -> None:
         """Reconcile dag_file subscriptions in DB with the current scan result.
@@ -1483,7 +1539,11 @@ class RMQWatcherListener:
         - Reports a key that comes back after this watcher deleted its row: what the
           scan recreates is a new row carrying the default ``enabled``, so a
           subscription an operator had switched off starts consuming again — with a
-          WARNING naming it and the flag the deleted row held.
+          WARNING naming it and the flag the deleted row held. The deletions it is
+          matched against are the ones this process made and still remembers, so the
+          line follows the memory of the process rather than the row: a scheduler
+          restarted in between, or another scheduler recreating what this one deleted,
+          leaves the recreation to the miss counter's own INFO lines.
         - Never touches ui-sourced subscriptions.
         """
         scanned_keys = {
@@ -1494,6 +1554,12 @@ class RMQWatcherListener:
         # the query behind it is an unindexed full scan of Airflow's ``dag`` table.
         active_dag_ids: set[str] | None = None
         active_dag_ids_read = False
+        # Deletions this cycle made and keys it saw come back. Both are applied to the
+        # map of deleted keys once the transaction carrying them is committed: a commit
+        # that fails leaves neither a record of a row that is still there nor a hole
+        # where the report of a key's return has yet to be made.
+        deleted_now: list[tuple[tuple[str, str, str], bool]] = []
+        returned_now: list[tuple[str, str, str]] = []
 
         with WatcherSession() as session:
             existing = (
@@ -1526,7 +1592,9 @@ class RMQWatcherListener:
                         "%s trusted scans in a row — deleting",
                         sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
                     )
-                    self._delete_absent_sub(session, sub, current)
+                    gone = self._delete_absent_sub(session, sub, current)
+                    if gone:
+                        deleted_now.append(gone)
                     continue
 
                 if sub.enabled and current >= 1:
@@ -1540,7 +1608,9 @@ class RMQWatcherListener:
                             "waiting out the grace period",
                             sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
                         )
-                        self._delete_absent_sub(session, sub, current)
+                        gone = self._delete_absent_sub(session, sub, current)
+                        if gone:
+                            deleted_now.append(gone)
                         continue
 
                 sub.absent_cycles = current + 1
@@ -1553,7 +1623,9 @@ class RMQWatcherListener:
 
             for s in scanned:
                 key = (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default"))
-                was_enabled = self._deleted_dag_file_rows.pop(key, None)
+                was_enabled = self._deleted_dag_file_rows.get(key)
+                if was_enabled is not None:
+                    returned_now.append(key)
                 if was_enabled is not None and key not in existing_keys:
                     log.warning(
                         "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is in the "
@@ -1574,3 +1646,8 @@ class RMQWatcherListener:
                 )
 
             session.commit()
+
+            for key in returned_now:
+                self._deleted_dag_file_rows.pop(key, None)
+            for key, was_enabled in deleted_now:
+                self._remember_deleted_row(key, was_enabled)

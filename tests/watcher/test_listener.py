@@ -24,6 +24,7 @@ from airflow_provider_rmq.watcher.listener import (
     _ABSENT_GRACE_CYCLES,
     _UNRESOLVED_DAG_ID,
     _UNREADABLE_FILE_LIMIT,
+    _DELETED_ROWS_REMEMBERED,
     _UNTRUSTED_SCAN_LIMIT,
     _UntrustedScan,
     _collect_module_constants,
@@ -985,6 +986,29 @@ class TestEveryFileUnreadable:
 
         assert listener._read_failures == {_HELD_FILE: 1}
 
+    def test_a_listing_nobody_can_read_is_reported_and_then_left_alone(self, caplog):
+        """A filesystem that is not coming back is a state told once, not every minute.
+
+        The listing is believed, its files count as having no subscriptions, and from
+        there the folder is in a steady state: a WARNING per cycle on it would drown the
+        line that says a listing has just collapsed.
+        """
+        listener = self._listener()
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_all_stale(listener)
+        self._scan_all_stale(listener)   # believed; the per-file hold is spent here
+        self._scan_all_stale(listener)   # the subscriptions of both files go
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"):
+            for _ in range(5):
+                assert self._scan_all_stale(listener) == []
+
+        assert [r.getMessage() for r in caplog.records] == []
+        assert listener._untrusted_scan_streak == 0
+
     def _scan_all_unparseable(self, listener):
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
                    return_value=list(listener._files)), \
@@ -1109,6 +1133,40 @@ class TestCollapsedListing:
         assert len(held) == len(self._FILES)
         dropped = self._scan(listener, unreadable=self._FILES[1:], mtime=2000.0)
         assert [s["dag_id"] for s in dropped] == [self._FILES[0]]
+
+    def test_a_decline_slower_than_the_share_is_distrusted_too(self):
+        """The share is measured against what the folder held, not against last cycle.
+
+        A count every trusted listing rewrote would follow a folder unmounting piece by
+        piece all the way down and call every step of the way trustworthy, while the
+        sync step counted misses against everything that had gone.
+        """
+        listener = self._listener()
+
+        assert len(self._scan(listener, files=self._FILES[:3], mtime=2000.0)) == 3
+        assert len(self._scan(listener, files=self._FILES[:2], mtime=3000.0)) == 2
+        with pytest.raises(_UntrustedScan, match="listed only 1 files"):
+            self._scan(listener, files=self._FILES[:1], mtime=4000.0)
+
+    def test_giving_in_to_a_shrink_leaves_the_next_collapse_its_whole_grace(self):
+        """Believing a listing is the end of one episode of distrust, not of them all.
+
+        A folder that legitimately loses most of its files is given in to after the
+        limit — and the next collapse, of a filesystem that really is failing, has to
+        meet the same limit rather than a budget the shrink before it spent.
+        """
+        listener = self._listener()
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan(listener, files=self._FILES[:1], mtime=2000.0)
+        assert len(self._scan(listener, files=self._FILES[:1], mtime=2000.0)) == 1
+        assert listener._untrusted_scan_streak == 0
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan(listener, files=self._FILES[:1],
+                           unreadable=self._FILES[:1], mtime=3000.0)
 
     def test_a_folder_that_grew_is_trusted(self):
         """The share is measured against the last trusted scan, not against the listing."""
@@ -1246,27 +1304,78 @@ class TestEmptyScanDistrust:
             with pytest.raises(_UntrustedScan, match="listed no files"):
                 self._scan_empty(listener)
 
-    def test_a_folder_level_outage_gives_the_next_listing_a_full_budget(self):
-        """The budget belongs to one contiguous run of listings the folder produced.
+    def _fail_the_folder(self, listener):
+        listener._get_dags_folder = MagicMock(
+            side_effect=_UntrustedScan("the DAG folder cannot be listed")
+        )
+        with pytest.raises(_UntrustedScan, match="cannot be listed"):
+            listener._scan_subscriptions()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
 
-        A folder that produces no listing at all — it vanished under a git-sync swap,
-        or lost its read permission — is distrusted without any limit, and a run of
-        empty listings before that outage must not spend the budget of the run after
-        it: the first empty listing back would otherwise be believed on the spot.
+    def test_a_folder_level_outage_leaves_the_budget_where_it_was(self):
+        """The budget is spent by listings, and an outage produces none of them.
+
+        A folder that vanished under a git-sync swap, or lost its read permission, is
+        distrusted without any limit — and the listings before and after it are one run
+        as far as the budget goes.
         """
+        listener = self._warm_listener()
+        for _ in range(5):
+            self._fail_the_folder(listener)
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan, match="listed no files"):
+                self._scan_empty(listener)
+
+    def test_a_folder_flickering_between_unlistable_and_empty_still_converges(self):
+        """The bound on the distrust has to hold whatever the folder alternates between.
+
+        An outage that refilled the budget would let this pattern hold the distrust for
+        as long as it lasts, and the sync step — the deletions and every new
+        subscription with them — would never run again on such an installation.
+        """
+        listener = self._warm_listener()
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            self._fail_the_folder(listener)
+            with pytest.raises(_UntrustedScan, match="listed no files"):
+                self._scan_empty(listener)
+
+        self._fail_the_folder(listener)
+        assert self._scan_empty(listener) == []
+
+    def test_a_believed_emptiness_is_reported_and_then_left_alone(self, caplog):
+        """An installation with no DAG files at all is a supported, quiet one."""
         listener = self._warm_listener()
         for _ in range(_UNTRUSTED_SCAN_LIMIT):
             with pytest.raises(_UntrustedScan):
                 self._scan_empty(listener)
+        self._scan_empty(listener)   # the emptiness is believed, with a WARNING
 
-        listener._get_dags_folder = MagicMock(
-            side_effect=_UntrustedScan("the DAG folder cannot be listed")
-        )
-        for _ in range(5):
-            with pytest.raises(_UntrustedScan, match="cannot be listed"):
-                listener._scan_subscriptions()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"):
+            for _ in range(5):
+                assert self._scan_empty(listener) == []
 
-        listener._get_dags_folder = MagicMock(return_value="/dags")
+        assert [r.getMessage() for r in caplog.records] == []
+        assert listener._untrusted_scan_streak == 0
+
+    def test_a_file_appearing_in_an_empty_folder_gets_the_whole_grace_back(self):
+        """The folder is known to hold one file again, and losing it is news again."""
+        listener = self._warm_listener()
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_empty(listener)
+        self._scan_empty(listener)
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=["/dags/dag1.py"]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=2000.0), \
+             patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
+            listener._scan_subscriptions()
+
         for _ in range(_UNTRUSTED_SCAN_LIMIT):
             with pytest.raises(_UntrustedScan, match="listed no files"):
                 self._scan_empty(listener)
@@ -2148,6 +2257,63 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         assert listener._deleted_dag_file_rows == {}
+
+    def test_a_deletion_is_remembered_only_once_it_is_committed(self):
+        """A transaction that never landed leaves no record of a row still in the table.
+
+        The record is what makes the next scan report a recreation, and a row the
+        database still holds is not going to be recreated by anything.
+        """
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="d", queue_name="q", absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+        _delete_mock(session).return_value = 1
+        session.commit.side_effect = RuntimeError("the database went away")
+
+        with _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
+            listener._sync_to_db([])
+
+        assert listener._deleted_dag_file_rows == {}
+
+    def test_a_returning_key_is_forgotten_only_once_the_upsert_is_committed(self):
+        """The report is owed until the row it is about has actually been recreated."""
+        listener = RMQWatcherListener()
+        listener._deleted_dag_file_rows[("d", "q", "rmq_default")] = False
+        ctx, session = _make_session_ctx(existing_subs=[])
+        session.commit.side_effect = RuntimeError("the database went away")
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default",
+                    "filter_data": {}}]
+
+        with _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
+            listener._sync_to_db(scanned)
+
+        assert listener._deleted_dag_file_rows == {("d", "q", "rmq_default"): False}
+
+    def test_the_deleted_keys_a_process_remembers_are_bounded(self):
+        """Deleted keys mostly never come back, and dag_ids can be generated per run.
+
+        What the map is for is a key returning within a few cycles of its deletion, so
+        the oldest record makes room rather than the map growing for the life of the
+        process.
+        """
+        listener = RMQWatcherListener()
+        existing = [
+            _existing_sub(dag_id=f"d{n}", queue_name="q",
+                          absent_cycles=_ABSENT_GRACE_CYCLES)
+            for n in range(_DELETED_ROWS_REMEMBERED + 10)
+        ]
+        ctx, session = _make_session_ctx(existing_subs=existing)
+        _delete_mock(session).return_value = 1
+
+        with _sync_env(ctx, {s.dag_id for s in existing}):
+            listener._sync_to_db([])
+
+        assert len(listener._deleted_dag_file_rows) == _DELETED_ROWS_REMEMBERED
+        assert ("d0", "q", "rmq_default") not in listener._deleted_dag_file_rows
+        newest = f"d{_DELETED_ROWS_REMEMBERED + 9}"
+        assert (newest, "q", "rmq_default") in listener._deleted_dag_file_rows
 
     def test_the_short_circuit_deletion_is_logged(self, caplog):
         listener = RMQWatcherListener()
