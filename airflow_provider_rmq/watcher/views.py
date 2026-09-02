@@ -29,6 +29,14 @@ from airflow_provider_rmq.watcher.tunables import (
 log = logging.getLogger(__name__)
 
 
+#: Shown instead of the Subscriptions table when the subscription rows cannot be read.
+SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE = (
+    "Subscriptions are unavailable: the rmq_watcher_subscriptions table does "
+    "not yet match this version of the provider. The watcher loop in the "
+    "scheduler migrates it on one of its next cycles."
+)
+
+
 # ------------------------------------------------------------------
 # Group helpers
 # ------------------------------------------------------------------
@@ -254,7 +262,19 @@ class RMQWatcherView(BaseView):
     @has_access
     def subscriptions(self):
         with WatcherSession() as session:
-            subs = session.query(RMQSubscription).order_by(RMQSubscription.dag_id).all()
+            try:
+                subs = session.query(RMQSubscription).order_by(RMQSubscription.dag_id).all()
+            except Exception:
+                log.warning(
+                    "Failed to read rmq_watcher_subscriptions — the Subscriptions "
+                    "block is replaced with a schema notice for this request",
+                    exc_info=True,
+                )
+                # a backend that aborts the transaction on a failed statement
+                # would refuse every later read in this session otherwise; no
+                # row has been loaded yet, so nothing is expired by this
+                session.rollback()
+                subs = None
             try:
                 conn_statuses = get_conn_statuses(session)
             except Exception:
@@ -264,7 +284,9 @@ class RMQWatcherView(BaseView):
                     exc_info=True,
                 )
                 conn_statuses = None
-            rows = _group_subscriptions(subs)
+            rows = _group_subscriptions(subs) if subs is not None else []
+
+        subscriptions_error = None if subs is not None else SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE
 
         conn_status_error = None
         conn_status_rows: list[ConnStatusRow] = []
@@ -295,6 +317,7 @@ class RMQWatcherView(BaseView):
         return self.render_template(
             "rmq_watcher/subscriptions.html",
             subscriptions=rows,
+            subscriptions_error=subscriptions_error,
             conn_statuses=conn_status_rows,
             conn_status_error=conn_status_error,
             stale_after_display=format_duration(stale_seconds),

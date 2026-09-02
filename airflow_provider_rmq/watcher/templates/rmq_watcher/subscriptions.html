@@ -92,7 +92,9 @@
       </h4>
     </div>
     <div class="panel-body">
-      {% if subscriptions %}
+      {% if subscriptions_error %}
+      <p class="text-warning">⚠ {{ subscriptions_error }}</p>
+      {% elif subscriptions %}
       <table class="table table-hover table-bordered">
         <thead>
           <tr>

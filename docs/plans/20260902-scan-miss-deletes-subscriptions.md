@@ -484,22 +484,22 @@ else:
 - Modify: `airflow_provider_rmq/watcher/templates/rmq_watcher/subscriptions.html`
 - Modify: `tests/watcher/test_views.py`
 
-- [ ] проверить, чем отвечает `views.py:257` на таблице без колонки `absent_cycles`
+- [x] проверить, чем отвечает `views.py:257` на таблице без колонки `absent_cycles`
       (сценарий «новый код, `_add_missing_columns` не смог сделать ALTER» —
       см. `docs/backlog/plugin-on-load-runs-ddl-in-every-process.md`)
-- [ ] если запрос падает — обернуть его по **образцу** чтения
+- [x] если запрос падает — обернуть его по **образцу** чтения
       `rmq_watcher_conn_status` (`views.py:263-273`), но с **собственной
       константой** вроде `SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE`, называющей
       таблицу `rmq_watcher_subscriptions`. Переиспользовать
       `SCHEMA_OUTDATED_MESSAGE` нельзя: это готовый текст про таблицу соединений
       (`views.py:109-114`), и оператор на устаревшей схеме увидел бы пустой список
       подписок с предупреждением про совсем другую таблицу
-- [ ] добавить в шаблон отдельную переменную и слот под эту ошибку: под
+- [x] добавить в шаблон отдельную переменную и слот под эту ошибку: под
       `conn_status_error` слот единственный и занят (`subscriptions.html:20-21`)
-- [ ] написать тест: страница на устаревшей схеме отдаёт уведомление про
+- [x] написать тест: страница на устаревшей схеме отдаёт уведомление про
       `rmq_watcher_subscriptions`, а не 500 и не текст про соединения
-- [ ] написать тест: страница на актуальной схеме работает как прежде
-- [ ] прогнать `.venv/bin/pytest tests/watcher/test_views.py -q` — зелено до Task 3
+- [x] написать тест: страница на актуальной схеме работает как прежде
+- [x] прогнать `.venv/bin/pytest tests/watcher/test_views.py -q` — зелено до Task 3
 
 ### Task 3: `_sync_to_db` считает промахи и замыкается по активности DAG'а
 
