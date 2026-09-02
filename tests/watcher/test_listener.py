@@ -22,6 +22,7 @@ from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
     _ABSENT_GRACE_CYCLES,
     _UNRESOLVED_DAG_ID,
+    _UNTRUSTED_SCAN_LIMIT,
     _UntrustedScan,
     _collect_module_constants,
     _extract_dag_id_from_decorators,
@@ -559,22 +560,30 @@ class TestScanSubscriptions:
 
     def test_scan_subscriptions_deleted_file_removed_from_cache(self):
         listener = self._listener()
-        file = "/dags/dag1.py"
+        kept = "/dags/dag1.py"
+        deleted = "/dags/dag2.py"
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[file]), \
-             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1000.0), \
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=[kept, deleted]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
             listener._scan_subscriptions()
 
-        assert file in listener._last_mtimes
+        assert deleted in listener._last_mtimes
+        listener._read_failures[deleted] = 1
 
-        # Second scan: file is gone
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[]), \
+        # Second scan: one of the two files is gone, the other is still there
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[kept]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
             listener._scan_subscriptions()
 
-        assert file not in listener._last_mtimes
-        assert file not in listener._cached_subs
+        assert deleted not in listener._last_mtimes
+        assert deleted not in listener._cached_subs
+        assert deleted not in listener._read_failures
+        assert kept in listener._last_mtimes
 
     def test_scan_subscriptions_finds_decorated_dags(self):
         listener = self._listener()
@@ -630,6 +639,91 @@ class TestScanSubscriptions:
 
         assert file in listener._last_mtimes
         assert mock_ex.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# An empty glob is distrusted for a bounded number of cycles
+# ---------------------------------------------------------------------------
+
+class TestEmptyScanDistrust:
+    def _warm_listener(self, files=("/dags/dag1.py",)):
+        """A listener whose cache holds one parse of every file in ``files``."""
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+        subs = [{"dag_id": "d", "queue_name": "q"}]
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=list(files)), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=1000.0), \
+             patch.object(listener, "_extract_subscriptions_from_file", return_value=subs):
+            listener._scan_subscriptions()
+        return listener
+
+    def _scan_empty(self, listener):
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[]):
+            return listener._scan_subscriptions()
+
+    def test_empty_glob_between_two_full_ones_is_untrusted(self):
+        listener = self._warm_listener()
+        mtimes = dict(listener._last_mtimes)
+        cached = {path: list(subs) for path, subs in listener._cached_subs.items()}
+
+        with pytest.raises(_UntrustedScan, match="listed no files"):
+            self._scan_empty(listener)
+
+        assert listener._last_mtimes == mtimes
+        assert listener._cached_subs == cached
+
+    def test_emptiness_becomes_the_truth_after_the_limit(self):
+        listener = self._warm_listener()
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_empty(listener)
+
+        assert self._scan_empty(listener) == []
+        assert listener._last_mtimes == {}
+        assert listener._cached_subs == {}
+
+    def test_a_non_empty_glob_resets_the_streak(self):
+        listener = self._warm_listener()
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_empty(listener)
+        assert listener._empty_scan_streak == _UNTRUSTED_SCAN_LIMIT
+
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=["/dags/dag1.py"]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=1000.0):
+            listener._scan_subscriptions()
+
+        assert listener._empty_scan_streak == 0
+        # The whole grace period is available again.
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_empty(listener)
+
+    def test_empty_glob_on_the_very_first_cycle_is_believed(self):
+        # An installation with no DAG files at all has to stay workable.
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+
+        assert self._scan_empty(listener) == []
+        assert listener._empty_scan_streak == 0
+
+    def test_the_warning_names_the_folder_when_emptiness_is_accepted(self, caplog):
+        listener = self._warm_listener()
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan_empty(listener)
+
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"):
+            self._scan_empty(listener)
+
+        assert "/dags" in caplog.text
 
 
 # ---------------------------------------------------------------------------

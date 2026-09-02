@@ -68,6 +68,13 @@ _MIGRATION_BACKOFF_MAX = 60
 #: installation running more than two of them has to raise this proportionally.
 _ABSENT_GRACE_CYCLES = 3
 
+#: Empty glob results in a row the cycle refuses to believe. The first
+#: ``_UNTRUSTED_SCAN_LIMIT`` of them hold the previous parse, the next one gives in: a
+#: folder that emptied for real has to become the truth eventually, or the watcher
+#: would never sync again — the emptiness is checked before the cache is evicted, so
+#: ``_last_mtimes`` never empties on its own.
+_UNTRUSTED_SCAN_LIMIT = 3
+
 #: Seconds allowed for the manager to stop before the loop is torn down anyway.
 _STOP_TIMEOUT = 30.0
 
@@ -645,6 +652,10 @@ class RMQWatcherListener:
         # in _cycle_step), which is what keeps two workers out of these dicts at once.
         self._last_mtimes: dict[str, float] = {}   # filepath → mtime
         self._cached_subs: dict[str, list[dict]] = {}  # filepath → list[sub dict]
+        self._read_failures: dict[str, int] = {}  # filepath → failed reads in a row
+        # Empty glob results in a row, counted so that the distrust of an empty DAG
+        # folder expires at ``_UNTRUSTED_SCAN_LIMIT`` instead of lasting forever.
+        self._empty_scan_streak: int = 0
         # Result of the last scan the cycle trusted. Stands in for the scan of a cycle
         # that raised :class:`_UntrustedScan`, which needs it for the exchange metadata:
         # that metadata lives only in memory and reconcile has no other source for it.
@@ -1097,19 +1108,42 @@ class RMQWatcherListener:
         Memory is bounded to the number of current DAG files on disk.
 
         :raises _UntrustedScan: The DAG folder is not a source the scan can be trusted
-            from. It is checked before the cache is touched, so a cycle that cannot
-            trust the filesystem leaves the previous parse intact.
+            from, or a listing that came back empty is still young enough to be a
+            hiccup of the environment. Both are checked before the cache is touched,
+            so a cycle that cannot trust the filesystem leaves the previous parse
+            intact — and an empty glob cannot empty ``_last_mtimes`` before the check
+            that reads it.
         """
         dags_folder = self._get_dags_folder()
         current_files = set(
             glob.glob(os.path.join(dags_folder, "**", "*.py"), recursive=True)
         )
 
+        if current_files:
+            self._empty_scan_streak = 0
+        elif self._last_mtimes:
+            # Files were there a moment ago: a git-sync symlink swap, a folder being
+            # rebuilt. The first _UNTRUSTED_SCAN_LIMIT of these are not believed; the
+            # one after them is, because a folder can also empty for real.
+            self._empty_scan_streak += 1
+            if self._empty_scan_streak <= _UNTRUSTED_SCAN_LIMIT:
+                raise _UntrustedScan(
+                    f"the DAG folder {dags_folder!r} listed no files while "
+                    f"{len(self._last_mtimes)} were known "
+                    f"({self._empty_scan_streak} of {_UNTRUSTED_SCAN_LIMIT} in a row)"
+                )
+            log.warning(
+                "RMQ Watcher: DAG folder %r has listed no files %d times in a row — "
+                "taking the emptiness as the truth",
+                dags_folder, self._empty_scan_streak,
+            )
+
         # Evict deleted files
         for path in list(self._last_mtimes):
             if path not in current_files:
                 self._last_mtimes.pop(path)
                 self._cached_subs.pop(path, None)
+                self._read_failures.pop(path, None)
 
         # Re-parse changed or new files
         for path in current_files:

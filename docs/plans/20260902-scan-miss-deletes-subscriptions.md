@@ -605,24 +605,24 @@ else:
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] добавить `_UNTRUSTED_SCAN_LIMIT = 3` и `self._empty_scan_streak: int = 0`
-- [ ] поднимать `_UntrustedScan` при `not current_files and self._last_mtimes`,
+- [x] добавить `_UNTRUSTED_SCAN_LIMIT = 3` и `self._empty_scan_streak: int = 0`
+- [x] поднимать `_UntrustedScan` при `not current_files and self._last_mtimes`,
       пока счётчик в пределах лимита — **до** цикла выселения; непустой `glob`
       счётчик обнуляет
-- [ ] завести `self._read_failures: dict[str, int]` в `__init__` и выселять из него
+- [x] завести `self._read_failures: dict[str, int]` в `__init__` и выселять из него
       исчезнувшие файлы вместе с `_last_mtimes` и `_cached_subs` (наполняется в
       Task 7)
-- [ ] переписать `test_scan_subscriptions_deleted_file_removed_from_cache`
+- [x] переписать `test_scan_subscriptions_deleted_file_removed_from_cache`
       (`test_listener.py:556`) на сценарий «было два файла — остался один»: он
       проверяет выселение, а не пустую папку
-- [ ] написать тест: пустой `glob` между двумя полными поднимает `_UntrustedScan` и
+- [x] написать тест: пустой `glob` между двумя полными поднимает `_UntrustedScan` и
       оставляет кэш нетронутым
-- [ ] написать тест: `_UNTRUSTED_SCAN_LIMIT + 1` пустых `glob` подряд принимается
+- [x] написать тест: `_UNTRUSTED_SCAN_LIMIT + 1` пустых `glob` подряд принимается
       как правда — исключения нет, кэш выселен, результат `[]`
-- [ ] написать тест: непустой `glob` между пустыми обнуляет счётчик
-- [ ] написать тест: пустой `glob` на самом первом цикле (кэш пуст) исключения не
+- [x] написать тест: непустой `glob` между пустыми обнуляет счётчик
+- [x] написать тест: пустой `glob` на самом первом цикле (кэш пуст) исключения не
       поднимает — установка без DAG'ов остаётся рабочей
-- [ ] прогнать `.venv/bin/pytest tests/watcher/test_listener.py -q` — зелено до Task 7
+- [x] прогнать `.venv/bin/pytest tests/watcher/test_listener.py -q` — зелено до Task 7
 
 ### Task 7: Нечитаемый файл держит последний удачный разбор один цикл
 
