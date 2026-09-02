@@ -630,53 +630,53 @@ else:
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] добавить `_UNREADABLE_FILE_LIMIT = 1` с объяснением, почему единица
-- [ ] **расщепить общий `except (SyntaxError, OSError, UnicodeDecodeError)`
+- [x] добавить `_UNREADABLE_FILE_LIMIT = 1` с объяснением, почему единица
+- [x] **расщепить общий `except (SyntaxError, OSError, UnicodeDecodeError)`
       (`listener.py:1108-1114`) на два, потому что правило про mtime различает
       природу отказа, а один `None` её стирает.** Чтение и разбор разносятся:
       `OSError` от `open` **пробрасывается наружу**, `UnicodeDecodeError` от
       `f.read()` и `SyntaxError` от `ast.parse` дают `None`. Содержимое,
       прочитанное и оказавшееся не UTF-8, — это свойство содержимого, значит mtime
       про него что-то говорит; отсутствие доступа не говорит ничего
-- [ ] контракт становится `list[dict] | None`, **но функция теперь может поднять
+- [x] контракт становится `list[dict] | None`, **но функция теперь может поднять
       `OSError`**; широкая `except Exception` по-прежнему даёт `None`. Обновить
       докстроку: утверждение «никогда не поднимает исключений» больше не верно, и
       именно на нём держалось объяснение про запись mtime
-- [ ] ловить проброшенный `OSError` в `_scan_subscriptions` там же, где ловится
+- [x] ловить проброшенный `OSError` в `_scan_subscriptions` там же, где ловится
       `OSError` от `os.path.getmtime` — это одна ветка ввода-вывода
-- [ ] вести `self._read_failures` по обоим видам отказа — `None` от разбора и
+- [x] вести `self._read_failures` по обоим видам отказа — `None` от разбора и
       `OSError` от `os.path.getmtime` **или от `open`**
-- [ ] реализовать исходы из «Бухгалтерия mtime при неудачном чтении», включая
+- [x] реализовать исходы из «Бухгалтерия mtime при неудачном чтении», включая
       удаление `_last_mtimes[path]` на исходе терпения по **любому** отказу
       ввода-вывода
-- [ ] переписать `test_extract_subscriptions_returns_empty_list_on_ioerror`
+- [x] переписать `test_extract_subscriptions_returns_empty_list_on_ioerror`
       (`test_listener.py:603`) под фактический контракт: он зовёт функцию на
       несуществующем пути, то есть `open` бросает `FileNotFoundError`, и ожидать
       надо `pytest.raises(OSError)`, а не `None`. Переименовать соответственно;
       `None` остаётся тестам `SyntaxError`, `UnicodeDecodeError` и широкой
       `except Exception`
-- [ ] проверить `test_mtime_recorded_even_when_extraction_raises`
+- [x] проверить `test_mtime_recorded_even_when_extraction_raises`
       (`test_listener.py:608`): гарантия «постоянно сломанный файл не
       перепарсивается вечно» должна сохраниться, сдвинувшись на исход терпения
-- [ ] написать тест: `SyntaxError` на один цикл сохраняет подписки файла, WARNING в
+- [x] написать тест: `SyntaxError` на один цикл сохраняет подписки файла, WARNING в
       логе есть
-- [ ] написать тест: файл, починившийся после одной неудачи, снова разбирается и
+- [x] написать тест: файл, починившийся после одной неудачи, снова разбирается и
       счётчик сброшен
-- [ ] написать тест: `_UNREADABLE_FILE_LIMIT + 1` отказов разбора подряд дают `[]`,
+- [x] написать тест: `_UNREADABLE_FILE_LIMIT + 1` отказов разбора подряд дают `[]`,
       и после этого mtime записан
-- [ ] написать тест: `_UNREADABLE_FILE_LIMIT + 1` отказов `getmtime` подряд дают
+- [x] написать тест: `_UNREADABLE_FILE_LIMIT + 1` отказов `getmtime` подряд дают
       `[]`, а `path` из `_last_mtimes` удалён — и следующий успешный `stat` с тем же
       mtime файл всё-таки перечитывает
-- [ ] написать тот же тест для `open`: `PermissionError` два цикла подряд, затем
+- [x] написать тот же тест для `open`: `PermissionError` два цикла подряд, затем
       права возвращаются **без правки содержимого** — файл обязан быть перечитан, а
       подписка обязана вернуться. Это тот сценарий, в котором записанный mtime
       делает подписку исчезнувшей навсегда
-- [ ] написать тест: `UnicodeDecodeError` идёт путём `SyntaxError` (mtime
+- [x] написать тест: `UnicodeDecodeError` идёт путём `SyntaxError` (mtime
       записывается), а `OSError` — путём ввода-вывода (`path` из `_last_mtimes`
       удаляется)
-- [ ] написать тест: файл, который не читается с самого первого раза, даёт `[]` без
+- [x] написать тест: файл, который не читается с самого первого раза, даёт `[]` без
       удержания
-- [ ] прогнать `.venv/bin/pytest tests/watcher/test_listener.py -q` — зелено до Task 8
+- [x] прогнать `.venv/bin/pytest tests/watcher/test_listener.py -q` — зелено до Task 8
 
 ### Task 8: Сквозные сценарии из бэклог-item'а на реальной сессии
 

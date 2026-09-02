@@ -22,6 +22,7 @@ from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
     _ABSENT_GRACE_CYCLES,
     _UNRESOLVED_DAG_ID,
+    _UNREADABLE_FILE_LIMIT,
     _UNTRUSTED_SCAN_LIMIT,
     _UntrustedScan,
     _collect_module_constants,
@@ -613,32 +614,165 @@ class TestScanSubscriptions:
 
         assert result == []
 
-    def test_extract_subscriptions_returns_empty_list_on_ioerror(self):
+    def test_extract_subscriptions_raises_on_ioerror(self):
+        # No access to the file at all: the caller has to tell this apart from a
+        # file that was read and did not parse, so the OSError propagates.
         listener = RMQWatcherListener()
-        result = listener._extract_subscriptions_from_file("/nonexistent/broken.py")
-        assert result == []
+        with pytest.raises(OSError):
+            listener._extract_subscriptions_from_file("/nonexistent/broken.py")
 
-    def test_mtime_recorded_even_when_extraction_raises(self):
-        # Regression for the permanent-DoS scenario: if a single DAG file's
-        # @rmq_trigger(...) decorator can't be parsed and somehow raised
-        # instead of returning [] (defense in depth — see
-        # _extract_subscriptions_from_file's broad except Exception), its
-        # mtime must still be recorded as "seen". Otherwise this file would
-        # be re-parsed (and re-crash) on every single reconcile cycle
-        # forever, instead of just once until the file is fixed.
+    def test_mtime_recorded_once_patience_over_a_failed_parse_runs_out(self):
+        # Regression for the permanent-DoS scenario: a DAG file whose parse keeps
+        # failing must be re-parsed once per edit, not once per cycle. The parse
+        # happened, so its mtime says something about the content and is recorded —
+        # after the hold that a file caught mid-write is entitled to.
         listener = self._listener()
         file = "/dags/broken.py"
 
         with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[file]), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1000.0), \
-             patch.object(
-                 listener, "_extract_subscriptions_from_file", return_value=[]
-             ) as mock_ex:
+             patch.object(listener, "_extract_subscriptions_from_file",
+                          return_value=[{"dag_id": "d", "queue_name": "q"}]):
             listener._scan_subscriptions()
-            listener._scan_subscriptions()  # same mtime — must NOT re-parse
 
-        assert file in listener._last_mtimes
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[file]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=2000.0), \
+             patch.object(
+                 listener, "_extract_subscriptions_from_file", return_value=None
+             ) as mock_ex:
+            for _ in range(_UNREADABLE_FILE_LIMIT + 2):
+                listener._scan_subscriptions()
+
+        assert listener._last_mtimes[file] == 2000.0
+        assert listener._cached_subs[file] == []
+        # One call per cycle of the hold, one when patience ran out, none after:
+        # the recorded mtime stops the re-parse.
+        assert mock_ex.call_count == _UNREADABLE_FILE_LIMIT + 1
+
+
+# ---------------------------------------------------------------------------
+# An unreadable DAG file holds its previous parse for a bounded number of cycles
+# ---------------------------------------------------------------------------
+
+#: The single DAG file the cases below scan, and what a successful parse of it gives.
+_HELD_FILE = "/dags/orders.py"
+_HELD_SUBS = [{"dag_id": "orders", "queue_name": "q"}]
+
+#: Default for the ``result`` argument below: a successful parse. A literal default
+#: cannot say it, because ``None`` is itself a meaningful answer.
+_PARSED = object()
+
+
+class TestUnreadableFileHold:
+    def _listener(self):
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+        return listener
+
+    def _scan(self, listener, *, mtime=1000.0, mtime_error=None,
+              result=_PARSED, error=None):
+        """One scan cycle over ``_HELD_FILE``; returns ``(result, extraction mock)``."""
+        if result is _PARSED:
+            result = list(_HELD_SUBS)
+        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
+                   return_value=[_HELD_FILE]), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=mtime, side_effect=mtime_error), \
+             patch.object(listener, "_extract_subscriptions_from_file",
+                          return_value=result, side_effect=error) as mock_ex:
+            return listener._scan_subscriptions(), mock_ex
+
+    def test_a_failed_parse_keeps_the_previous_subscriptions_for_one_cycle(self, caplog):
+        listener = self._listener()
+        self._scan(listener)
+
+        with caplog.at_level(logging.WARNING):
+            result, _ = self._scan(listener, mtime=2000.0, result=None)
+
+        assert result == _HELD_SUBS
+        assert listener._last_mtimes[_HELD_FILE] == 1000.0
+        assert "holding its previous parse" in caplog.text
+
+    def test_a_file_that_healed_is_parsed_again_and_its_streak_is_cleared(self):
+        listener = self._listener()
+        self._scan(listener)
+        self._scan(listener, mtime=2000.0, result=None)
+        assert listener._read_failures[_HELD_FILE] == 1
+
+        result, _ = self._scan(listener, mtime=2000.0)
+
+        assert result == _HELD_SUBS
+        assert _HELD_FILE not in listener._read_failures
+        assert listener._last_mtimes[_HELD_FILE] == 2000.0
+
+    def test_a_stat_that_keeps_failing_drops_the_remembered_mtime(self):
+        listener = self._listener()
+        self._scan(listener)
+
+        for _ in range(_UNREADABLE_FILE_LIMIT):
+            self._scan(listener, mtime_error=OSError("stale handle"))
+            assert listener._cached_subs[_HELD_FILE] == _HELD_SUBS
+
+        result, _ = self._scan(listener, mtime_error=OSError("stale handle"))
+        assert result == []
+        assert listener._cached_subs[_HELD_FILE] == []
+        assert _HELD_FILE not in listener._last_mtimes
+
+        # Access is back and the content never changed: the very same mtime must
+        # still lead to a re-read, or the file would count as subscription-less
+        # until somebody edits it.
+        result, mock_ex = self._scan(listener, mtime=1000.0)
         assert mock_ex.call_count == 1
+        assert result == _HELD_SUBS
+
+    def test_an_open_that_keeps_failing_drops_the_remembered_mtime(self):
+        listener = self._listener()
+        self._scan(listener)
+
+        for _ in range(_UNREADABLE_FILE_LIMIT):
+            self._scan(listener, mtime=2000.0, error=PermissionError("denied"))
+            assert listener._cached_subs[_HELD_FILE] == _HELD_SUBS
+
+        result, _ = self._scan(listener, mtime=2000.0, error=PermissionError("denied"))
+        assert result == []
+        assert _HELD_FILE not in listener._last_mtimes
+
+        # Permissions come back with the content untouched — mtime is still 2000.
+        result, mock_ex = self._scan(listener, mtime=2000.0)
+        assert mock_ex.call_count == 1
+        assert result == _HELD_SUBS
+
+    def test_undecodable_content_answers_none(self, tmp_path):
+        dag_file = tmp_path / "latin1.py"
+        dag_file.write_bytes(b"# \xff\xfe not utf-8\n")
+        listener = RMQWatcherListener()
+
+        assert listener._extract_subscriptions_from_file(str(dag_file)) is None
+
+    def test_a_parse_failure_and_an_io_failure_leave_different_mtimes(self):
+        parsed, io = self._listener(), self._listener()
+        self._scan(parsed)
+        self._scan(io)
+
+        for _ in range(_UNREADABLE_FILE_LIMIT + 1):
+            self._scan(parsed, mtime=2000.0, result=None)
+            self._scan(io, mtime=2000.0, error=OSError("no access"))
+
+        # Content was read and did not parse — its mtime says something about it.
+        assert parsed._last_mtimes[_HELD_FILE] == 2000.0
+        # Nothing is known about the content — a remembered mtime would be a lie.
+        assert _HELD_FILE not in io._last_mtimes
+
+    def test_a_file_unreadable_from_the_very_first_cycle_gets_no_hold(self):
+        parsed, io = self._listener(), self._listener()
+
+        assert self._scan(parsed, result=None)[0] == []
+        assert parsed._cached_subs[_HELD_FILE] == []
+        assert parsed._last_mtimes[_HELD_FILE] == 1000.0
+
+        assert self._scan(io, error=OSError("no access"))[0] == []
+        assert io._cached_subs[_HELD_FILE] == []
+        assert _HELD_FILE not in io._last_mtimes
 
 
 # ---------------------------------------------------------------------------
@@ -1074,7 +1208,7 @@ class TestExtractSubscriptionsFromFile:
         assert result[0]["exchange"] == "exchange.one"
         assert any("double_exchange_dag" in r.message for r in caplog.records)
 
-    def test_unexpected_exception_during_extraction_returns_empty_not_raises(self, tmp_path):
+    def test_unexpected_exception_during_extraction_answers_none_not_raises(self, tmp_path):
         # Regression: if _parse_rmq_trigger_decorator (or build_subscriptions)
         # ever lets an unexpected exception type leak past its own
         # except ValueError, _extract_subscriptions_from_file must still not
@@ -1095,7 +1229,7 @@ class TestExtractSubscriptionsFromFile:
             side_effect=AttributeError("boom"),
         ):
             result = listener._extract_subscriptions_from_file(str(dag_file))
-        assert result == []
+        assert result is None
 
     def test_unexpected_exception_during_extraction_logs_and_does_not_propagate(
         self, tmp_path, caplog
@@ -1114,7 +1248,7 @@ class TestExtractSubscriptionsFromFile:
             side_effect=TypeError("boom"),
         ):
             result = listener._extract_subscriptions_from_file(str(dag_file))
-        assert result == []
+        assert result is None
         assert any(str(dag_file) in r.message for r in caplog.records)
 
 

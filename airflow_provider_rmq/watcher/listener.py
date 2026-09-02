@@ -75,6 +75,14 @@ _ABSENT_GRACE_CYCLES = 3
 #: ``_last_mtimes`` never empties on its own.
 _UNTRUSTED_SCAN_LIMIT = 3
 
+#: Cycles the previous parse of an unreadable DAG file is held for. One, not three:
+#: the case the hold exists for is a file caught mid-write, and that resolves within a
+#: single cycle. Anything lasting longer is a genuinely broken file, whose DAG Airflow
+#: deactivates in 50–110 seconds — after which every delivery on its subscriptions is
+#: acked and dropped. Patience here is paid for in messages, so there is exactly as
+#: much of it as a file being written needs.
+_UNREADABLE_FILE_LIMIT = 1
+
 #: Seconds allowed for the manager to stop before the loop is torn down anyway.
 _STOP_TIMEOUT = 30.0
 
@@ -1149,11 +1157,22 @@ class RMQWatcherListener:
         for path in current_files:
             try:
                 mtime = os.path.getmtime(path)
-            except OSError:
+            except OSError as exc:
+                # The file is in the glob but gives no stat — permissions, a stale NFS
+                # handle. Nothing is known about its content, so no mtime is kept.
+                self._file_unreadable(path, exc, mtime=None)
                 continue
             if mtime == self._last_mtimes.get(path):
                 continue
-            subs = self._extract_subscriptions_from_file(path)
+            try:
+                subs = self._extract_subscriptions_from_file(path)
+            except OSError as exc:
+                self._file_unreadable(path, exc, mtime=None)
+                continue
+            if subs is None:
+                self._file_unreadable(path, "parse failed", mtime=mtime)
+                continue
+            self._read_failures.pop(path, None)
             self._cached_subs[path] = subs
             self._last_mtimes[path] = mtime
 
@@ -1163,7 +1182,49 @@ class RMQWatcherListener:
             result.extend(subs)
         return result
 
-    def _extract_subscriptions_from_file(self, path: str) -> list[dict]:
+    def _file_unreadable(self, path: str, reason: object, mtime: float | None) -> None:
+        """Account for one failed read of ``path`` and decide what its cache now holds.
+
+        The previous parse is kept for ``_UNREADABLE_FILE_LIMIT`` cycles — long enough
+        for a file caught mid-write to finish being written, so its keys stay in the
+        scan and neither the miss counter nor the orphan tracker notices. Once patience
+        runs out (or there was never a parse to keep) the file counts as having no
+        subscriptions and its keys go the ordinary counted-miss way.
+
+        ``mtime`` carries the whole difference between the two kinds of failure. A
+        parse failure passes the file's mtime and it is recorded, so a permanently
+        malformed file is re-parsed once per edit rather than once per cycle. An I/O
+        failure passes ``None`` and the remembered mtime is dropped instead: nothing is
+        known about the content, and keeping the old value would make the empty cache
+        stick — once access came back with the content unchanged, ``mtime ==
+        self._last_mtimes.get(path)`` would skip the re-read and the file would count
+        as subscription-less until its next edit. Re-reading an unreadable file every
+        cycle costs one failed syscall, orders of magnitude less than the parse the
+        mtime bookkeeping exists to avoid.
+        """
+        streak = self._read_failures.get(path, 0) + 1
+        self._read_failures[path] = streak
+
+        if path in self._cached_subs and streak <= _UNREADABLE_FILE_LIMIT:
+            log.warning(
+                "RMQ Watcher: DAG file %s did not read (%s) — holding its previous "
+                "parse for this cycle (%d of %d)",
+                path, reason, streak, _UNREADABLE_FILE_LIMIT,
+            )
+            return
+
+        log.warning(
+            "RMQ Watcher: DAG file %s did not read (%s) %d cycle(s) in a row — "
+            "dropping its subscriptions",
+            path, reason, streak,
+        )
+        self._cached_subs[path] = []
+        if mtime is None:
+            self._last_mtimes.pop(path, None)
+        else:
+            self._last_mtimes[path] = mtime
+
+    def _extract_subscriptions_from_file(self, path: str) -> list[dict] | None:
         """Extract @rmq_trigger subscriptions from a DAG file via AST parsing.
 
         AST parsing never executes the file and never acquires the Python import
@@ -1206,18 +1267,32 @@ class RMQWatcherListener:
         ever lets an unexpected exception type leak past that (e.g. a
         non-str/non-list literal reaching a helper that isn't guarded yet),
         it must still only cost this one DAG file's subscriptions, not crash
-        the entire reconcile cycle for every other DAG. ``_scan_subscriptions``
-        relies on this function never raising so it can still record the
-        file's mtime — without that, a permanently malformed file would be
-        re-parsed (and re-crash) on every single cycle forever.
+        the entire reconcile cycle for every other DAG, so it too answers
+        ``None``.
+
+        :returns: The file's subscriptions, or ``None`` when the content was read
+            but did not yield a parse (``SyntaxError``, ``UnicodeDecodeError``, or
+            anything the broad guard catches).
+        :raises OSError: The file gave no access at all. The two answers are kept
+            apart because ``_scan_subscriptions`` records the file's mtime only
+            after a failed parse: a parse happened means the content was read and
+            its mtime says something about it, which is what keeps a permanently
+            malformed file from being re-parsed on every single cycle forever. An
+            ``open`` that never answered says nothing about the content, and a
+            remembered mtime would be a lie.
         """
         try:
             with open(path, encoding="utf-8") as f:
                 source = f.read()
+        except UnicodeDecodeError as exc:
+            log.warning("Failed to decode DAG file %s: %s", path, exc)
+            return None
+
+        try:
             tree = ast.parse(source, filename=path)
-        except (SyntaxError, OSError, UnicodeDecodeError) as exc:
-            log.warning("Failed to read/parse DAG file %s: %s", path, exc)
-            return []
+        except SyntaxError as exc:
+            log.warning("Failed to parse DAG file %s: %s", path, exc)
+            return None
 
         try:
             # module_constants: {name: (value, lineno)}; module_scope_function_ids:
@@ -1259,7 +1334,7 @@ class RMQWatcherListener:
                 "skipping this file's subscriptions for this cycle",
                 path,
             )
-            return []
+            return None
 
     # ------------------------------------------------------------------
     # DB synchronisation
