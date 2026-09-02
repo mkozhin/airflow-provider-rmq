@@ -643,6 +643,77 @@ def _read_active_subs(exchange_meta: dict) -> list[dict]:
     return active_subs
 
 
+def _read_active_dag_ids() -> set[str] | None:
+    """Return the dag_ids Airflow counts as active, or ``None`` when they cannot be read.
+
+    ``None`` is the caller's cue to treat every DAG as active: an unreachable
+    database must not be the thing that speeds a deletion up.
+
+    The read gets a session of its own, opened and closed around this call alone.
+    PostgreSQL answers every statement that follows a failed one in the same
+    transaction with ``InFailedSqlTransaction``, so sharing the session that writes
+    the counters would turn "treat every DAG as active" into "synchronise nothing
+    at all" for as long as the ``dag`` table stays unreadable.
+    """
+    try:
+        with WatcherSession() as session:
+            return get_active_dag_ids(session)
+    except Exception as exc:  # noqa: BLE001 - an unreachable database must not speed a deletion up
+        log.warning(
+            "RMQ Watcher: cannot read the active DAG ids (%s) — treating every DAG "
+            "as active for this synchronisation",
+            exc,
+        )
+        return None
+
+
+def _sub_key(sub: dict) -> tuple[str, str, str]:
+    """The key a scanned subscription is identified by: ``(dag_id, queue_name, conn_id)``.
+
+    The same triple the unique constraint on ``RMQSubscription`` is built from, so a
+    scanned dict and a database row are comparable by it. ``conn_id`` carries the
+    default the decorator leaves out.
+    """
+    return (sub["dag_id"], sub["queue_name"], sub.get("conn_id", "rmq_default"))
+
+
+def _untrusted_listing_reason(
+    dags_folder: str,
+    current_files: set[str],
+    readable: int,
+    baseline: int | None,
+    failures: list[tuple[str, Exception | str, float | None]],
+) -> str:
+    """Phrase what about this listing of ``dags_folder`` keeps it from being believed.
+
+    The four shapes a distrusted listing takes — a folder that named nothing, one
+    whose every file refused, one that read whole but came back smaller than the
+    folder is known to have been, and one that both shrank and lost files — followed
+    by the first failure behind it when there is one.
+    """
+    if not current_files:
+        what = f"the DAG folder {dags_folder!r} listed no files"
+    elif not readable:
+        what = (
+            f"none of the {len(current_files)} files the DAG folder "
+            f"{dags_folder!r} listed could be read"
+        )
+    elif readable == len(current_files):
+        what = (
+            f"the DAG folder {dags_folder!r} listed only {readable} files, "
+            f"against {baseline} it is known to have held"
+        )
+    else:
+        what = (
+            f"only {readable} of the {len(current_files)} files the DAG folder "
+            f"{dags_folder!r} listed could be read, against "
+            f"{baseline} the folder is known to have held"
+        )
+    if failures:
+        what += f", first reason: {failures[0][1]!r}"
+    return what
+
+
 class _StepInFlight(Exception):
     """The previous attempt at a cycle step is still occupying a worker of the pool.
 
@@ -930,7 +1001,7 @@ class RMQWatcherListener:
             # a lookup keyed the same way as the unique constraint on
             # RMQSubscription so it can be merged back onto DB rows below.
             exchange_meta = {
-                (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default")): {
+                _sub_key(s): {
                     "exchange": s["exchange"],
                     "routing_keys": s["routing_keys"],
                 }
@@ -1191,7 +1262,7 @@ class RMQWatcherListener:
         # is about the code at all, and that is known only once every file has been
         # tried. Applying them first would drop the keys of the installation from a scan
         # the sync step counts misses against.
-        failures: list[tuple[str, object, float | None]] = []
+        failures: list[tuple[str, Exception | str, float | None]] = []
         for path in current_files:
             try:
                 mtime = os.path.getmtime(path)
@@ -1238,26 +1309,9 @@ class RMQWatcherListener:
             # trustworthy.
             self._trusted_file_count = readable if baseline is None else max(baseline, readable)
         else:
-            if not current_files:
-                what = f"the DAG folder {dags_folder!r} listed no files"
-            elif not readable:
-                what = (
-                    f"none of the {len(current_files)} files the DAG folder "
-                    f"{dags_folder!r} listed could be read"
-                )
-            elif readable == len(current_files):
-                what = (
-                    f"the DAG folder {dags_folder!r} listed only {readable} files, "
-                    f"against {baseline} it is known to have held"
-                )
-            else:
-                what = (
-                    f"only {readable} of the {len(current_files)} files the DAG folder "
-                    f"{dags_folder!r} listed could be read, against "
-                    f"{baseline} the folder is known to have held"
-                )
-            if failures:
-                what += f", first reason: {failures[0][1]!r}"
+            what = _untrusted_listing_reason(
+                dags_folder, current_files, readable, baseline, failures
+            )
             self._untrusted_scan_streak += 1
             if self._untrusted_scan_streak <= _UNTRUSTED_SCAN_LIMIT:
                 raise _UntrustedScan(
@@ -1297,7 +1351,9 @@ class RMQWatcherListener:
             result.extend(subs)
         return result
 
-    def _file_unreadable(self, path: str, reason: object, mtime: float | None) -> None:
+    def _file_unreadable(
+        self, path: str, reason: Exception | str, mtime: float | None
+    ) -> None:
         """Account for one failed read of ``path`` and decide what its cache now holds.
 
         The previous parse is kept for ``_UNREADABLE_FILE_LIMIT`` cycles — long enough
@@ -1468,33 +1524,13 @@ class RMQWatcherListener:
     # DB synchronisation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _read_active_dag_ids() -> set[str] | None:
-        """Return the dag_ids Airflow counts as active, or ``None`` when they cannot be read.
-
-        ``None`` is the caller's cue to treat every DAG as active: an unreachable
-        database must not be the thing that speeds a deletion up.
-
-        The read gets a session of its own, opened and closed around this call alone.
-        PostgreSQL answers every statement that follows a failed one in the same
-        transaction with ``InFailedSqlTransaction``, so sharing the session that writes
-        the counters would turn "treat every DAG as active" into "synchronise nothing
-        at all" for as long as the ``dag`` table stays unreadable.
-        """
-        try:
-            with WatcherSession() as session:
-                return get_active_dag_ids(session)
-        except Exception as exc:
-            log.warning(
-                "RMQ Watcher: cannot read the active DAG ids (%s) — treating every DAG "
-                "as active for this synchronisation",
-                exc,
-            )
-            return None
-
     def _delete_absent_sub(
-        self, session: Session, sub: RMQSubscription, observed: int
-    ) -> tuple[tuple[str, str, str], bool] | None:
+        self,
+        session: Session,
+        sub: RMQSubscription,
+        observed: int,
+        deleted_now: list[tuple[tuple[str, str, str], bool]],
+    ) -> None:
         """Delete one dag_file row, but only while its miss counter still reads ``observed``.
 
         Another scheduler may have seen the key come back and cleared the counter
@@ -1502,10 +1538,11 @@ class RMQWatcherListener:
         instead of deleting it and letting the next scan recreate it with a fresh ``id``
         and ``enabled=True``.
 
-        Returns the key of a row that really went, together with the ``enabled`` flag it
-        carried, for the caller to remember once the transaction holding the deletion is
-        committed — the scan bringing that key back then reports the recreated row
-        instead of quietly handing the subscription a consumer again.
+        A row that really went is appended to ``deleted_now`` as its key and the
+        ``enabled`` flag it carried, for the caller to remember once the transaction
+        holding the deletion is committed — the scan bringing that key back then
+        reports the recreated row instead of quietly handing the subscription a
+        consumer again.
         """
         key = (sub.dag_id, sub.queue_name, sub.conn_id)
         was_enabled = bool(sub.enabled)
@@ -1515,7 +1552,8 @@ class RMQWatcherListener:
             conn_id=sub.conn_id,
             source="dag_file",
         ).filter(RMQSubscription.absent_cycles == observed).delete()
-        return (key, was_enabled) if deleted else None
+        if deleted:
+            deleted_now.append((key, was_enabled))
 
     def _remember_deleted_row(self, key: tuple[str, str, str], was_enabled: bool) -> None:
         """Record one committed deletion, dropping the oldest record to stay in bounds."""
@@ -1546,10 +1584,7 @@ class RMQWatcherListener:
           leaves the recreation to the miss counter's own INFO lines.
         - Never touches ui-sourced subscriptions.
         """
-        scanned_keys = {
-            (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default"))
-            for s in scanned
-        }
+        scanned_keys = {_sub_key(s) for s in scanned}
         # Read lazily: on the overwhelmingly common cycle every key is in the scan, and
         # the query behind it is an unindexed full scan of Airflow's ``dag`` table.
         active_dag_ids: set[str] | None = None
@@ -1592,14 +1627,12 @@ class RMQWatcherListener:
                         "%s trusted scans in a row — deleting",
                         sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
                     )
-                    gone = self._delete_absent_sub(session, sub, current)
-                    if gone:
-                        deleted_now.append(gone)
+                    self._delete_absent_sub(session, sub, current, deleted_now)
                     continue
 
                 if sub.enabled and current >= 1:
                     if not active_dag_ids_read:
-                        active_dag_ids = self._read_active_dag_ids()
+                        active_dag_ids = _read_active_dag_ids()
                         active_dag_ids_read = True
                     if active_dag_ids is not None and sub.dag_id not in active_dag_ids:
                         log.info(
@@ -1608,9 +1641,7 @@ class RMQWatcherListener:
                             "waiting out the grace period",
                             sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
                         )
-                        gone = self._delete_absent_sub(session, sub, current)
-                        if gone:
-                            deleted_now.append(gone)
+                        self._delete_absent_sub(session, sub, current, deleted_now)
                         continue
 
                 sub.absent_cycles = current + 1
@@ -1622,23 +1653,23 @@ class RMQWatcherListener:
                 )
 
             for s in scanned:
-                key = (s["dag_id"], s["queue_name"], s.get("conn_id", "rmq_default"))
+                key = _sub_key(s)
                 was_enabled = self._deleted_dag_file_rows.get(key)
                 if was_enabled is not None:
                     returned_now.append(key)
-                if was_enabled is not None and key not in existing_keys:
-                    log.warning(
-                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is in the "
-                        "scan again after this watcher deleted it — it is recreated as a "
-                        "new row carrying the default enabled flag, and the deleted one "
-                        "was %s",
-                        *key, "enabled" if was_enabled else "disabled",
-                    )
+                    if key not in existing_keys:
+                        log.warning(
+                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is in "
+                            "the scan again after this watcher deleted it — it is "
+                            "recreated as a new row carrying the default enabled flag, "
+                            "and the deleted one was %s",
+                            *key, "enabled" if was_enabled else "disabled",
+                        )
                 upsert_subscription(
                     session,
                     dag_id=s["dag_id"],
                     queue_name=s["queue_name"],
-                    conn_id=s.get("conn_id", "rmq_default"),
+                    conn_id=key[2],
                     filter_data=s.get("filter_data", {}),
                     source="dag_file",
                     cooldown=s.get("cooldown", 0) or None,

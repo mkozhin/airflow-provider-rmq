@@ -23,6 +23,7 @@ from airflow_provider_rmq.watcher.models import (
     upsert_conn_status,
     upsert_subscription,
 )
+from tests.watcher.conftest import SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES
 
 
 def _naive(stamp: str) -> datetime:
@@ -39,29 +40,6 @@ CREATE TABLE rmq_watcher_conn_status (
     consumer_count INTEGER NOT NULL,
     last_error TEXT,
     updated_at DATETIME NOT NULL
-)
-"""
-
-
-#: Table the migration has to bring up to date: rmq_watcher_subscriptions without the
-#: miss counter.
-_subscriptions_ddl_without_absent_cycles = """
-CREATE TABLE rmq_watcher_subscriptions (
-    id INTEGER NOT NULL PRIMARY KEY,
-    dag_id VARCHAR(250) NOT NULL,
-    queue_name VARCHAR(250) NOT NULL,
-    conn_id VARCHAR(250) NOT NULL,
-    filter_data JSON,
-    source VARCHAR(10) NOT NULL,
-    enabled BOOLEAN NOT NULL,
-    consumer_status VARCHAR(20) NOT NULL,
-    last_error TEXT,
-    trigger_mode VARCHAR(20) NOT NULL,
-    group_key VARCHAR(250),
-    cooldown INTEGER,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
-    CONSTRAINT uq_rmq_sub_dag_queue_conn UNIQUE (dag_id, queue_name, conn_id)
 )
 """
 
@@ -400,9 +378,8 @@ class TestSchemaMigration:
         assert models.is_schema_ready() is True
 
     def test_adds_absent_cycles_to_legacy_subscriptions(self, schema_engine):
-        """Счётчик промахов приезжает на живую таблицу и данные в ней переживают ALTER."""
         with schema_engine.begin() as conn:
-            conn.execute(text(_subscriptions_ddl_without_absent_cycles))
+            conn.execute(text(SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES))
             conn.execute(text(
                 "INSERT INTO rmq_watcher_subscriptions "
                 "(dag_id, queue_name, conn_id, source, enabled, consumer_status, "

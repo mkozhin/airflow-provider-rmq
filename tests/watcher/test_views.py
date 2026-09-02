@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from airflow_provider_rmq.watcher.models import RMQSubscription, WatcherBase
+from tests.watcher.conftest import SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES
 
 # ---------------------------------------------------------------------------
 # Patch has_access → identity before loading views, so the class is built
@@ -1085,28 +1086,6 @@ class TestSubscriptionsDagLookupSessionIsolationReal:
 # the scheduler runs its migration.
 # ---------------------------------------------------------------------------
 
-#: rmq_watcher_subscriptions as an installation that has not migrated yet has
-#: it: every column the ORM maps except the miss counter.
-_subscriptions_ddl_without_absent_cycles = """
-CREATE TABLE rmq_watcher_subscriptions (
-    id INTEGER NOT NULL PRIMARY KEY,
-    dag_id VARCHAR(250) NOT NULL,
-    queue_name VARCHAR(250) NOT NULL,
-    conn_id VARCHAR(250) NOT NULL,
-    filter_data JSON,
-    source VARCHAR(10) NOT NULL,
-    enabled BOOLEAN NOT NULL,
-    consumer_status VARCHAR(20) NOT NULL,
-    last_error TEXT,
-    trigger_mode VARCHAR(20) NOT NULL,
-    group_key VARCHAR(250),
-    cooldown INTEGER,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
-    CONSTRAINT uq_rmq_sub_dag_queue_conn UNIQUE (dag_id, queue_name, conn_id)
-)
-"""
-
 #: One subscription row, written through raw SQL so it lands in whichever
 #: shape of the table the test built.
 _seed_subscription_sql = """
@@ -1134,7 +1113,7 @@ class TestSubscriptionsSchemaOutdated:
         WatcherBase.metadata.create_all(engine)
         with engine.begin() as conn:
             conn.execute(text("DROP TABLE rmq_watcher_subscriptions"))
-            conn.execute(text(_subscriptions_ddl_without_absent_cycles))
+            conn.execute(text(SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES))
             conn.execute(text(_seed_subscription_sql))
         return engine
 

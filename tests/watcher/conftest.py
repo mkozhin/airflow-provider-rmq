@@ -8,6 +8,29 @@ from sqlalchemy.pool import StaticPool
 from airflow_provider_rmq.watcher import models
 from airflow_provider_rmq.watcher.models import WatcherBase
 
+#: rmq_watcher_subscriptions as an installation that has not run the migration yet has
+#: it: every column the ORM maps except the miss counter. The table the migration has
+#: to bring up to date, and the table the Subscriptions page has to survive reading.
+SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES = """
+CREATE TABLE rmq_watcher_subscriptions (
+    id INTEGER NOT NULL PRIMARY KEY,
+    dag_id VARCHAR(250) NOT NULL,
+    queue_name VARCHAR(250) NOT NULL,
+    conn_id VARCHAR(250) NOT NULL,
+    filter_data JSON,
+    source VARCHAR(10) NOT NULL,
+    enabled BOOLEAN NOT NULL,
+    consumer_status VARCHAR(20) NOT NULL,
+    last_error TEXT,
+    trigger_mode VARCHAR(20) NOT NULL,
+    group_key VARCHAR(250),
+    cooldown INTEGER,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    CONSTRAINT uq_rmq_sub_dag_queue_conn UNIQUE (dag_id, queue_name, conn_id)
+)
+"""
+
 
 def _memory_engine():
     """In-memory SQLite engine that is one connection wide and shared across threads.

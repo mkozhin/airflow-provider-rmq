@@ -22,9 +22,9 @@ from airflow_provider_rmq.watcher.listener import (
     RECONCILE_INTERVAL_VAR,
     RMQWatcherListener,
     _ABSENT_GRACE_CYCLES,
-    _UNRESOLVED_DAG_ID,
-    _UNREADABLE_FILE_LIMIT,
     _DELETED_ROWS_REMEMBERED,
+    _UNREADABLE_FILE_LIMIT,
+    _UNRESOLVED_DAG_ID,
     _UNTRUSTED_SCAN_LIMIT,
     _UntrustedScan,
     _collect_module_constants,
@@ -930,13 +930,14 @@ class TestUnreadableFileHold:
 # ---------------------------------------------------------------------------
 
 class TestEveryFileUnreadable:
-    def _listener(self, files=(_HELD_FILE, _HEALTHY_FILE)):
-        """A listener whose cache holds one parse of every file in ``files``."""
+    _FILES = (_HELD_FILE, _HEALTHY_FILE)
+
+    def _listener(self):
+        """A listener whose cache holds one parse of every file of ``_FILES``."""
         listener = RMQWatcherListener()
         listener._get_dags_folder = MagicMock(return_value="/dags")
-        listener._files = list(files)
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(files)), \
+                   return_value=list(self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file",
@@ -946,7 +947,7 @@ class TestEveryFileUnreadable:
 
     def _scan_all_stale(self, listener):
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(listener._files)), \
+                   return_value=list(self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=OSError("stale handle")):
             return listener._scan_subscriptions()
@@ -969,14 +970,14 @@ class TestEveryFileUnreadable:
                 self._scan_all_stale(listener)
 
         # Giving in still spends the per-file hold before the subscriptions go.
-        assert self._scan_all_stale(listener) == _HELD_SUBS * len(listener._files)
+        assert self._scan_all_stale(listener) == _HELD_SUBS * len(self._FILES)
         assert self._scan_all_stale(listener) == []
 
     def test_one_file_that_still_reads_makes_the_listing_trustworthy(self):
         listener = self._listener()
 
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(listener._files)), \
+                   return_value=list(self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=lambda path: 2000.0 if path == _HEALTHY_FILE
                    else (_ for _ in ()).throw(OSError("stale handle"))), \
@@ -1011,7 +1012,7 @@ class TestEveryFileUnreadable:
 
     def _scan_all_unparseable(self, listener):
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(listener._files)), \
+                   return_value=list(self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=2000.0), \
              patch.object(listener, "_extract_subscriptions_from_file",
@@ -1042,7 +1043,7 @@ class TestEveryFileUnreadable:
             with pytest.raises(_UntrustedScan):
                 self._scan_all_unparseable(listener)
 
-        assert self._scan_all_unparseable(listener) == _HELD_SUBS * len(listener._files)
+        assert self._scan_all_unparseable(listener) == _HELD_SUBS * len(self._FILES)
         assert self._scan_all_unparseable(listener) == []
 
     def test_a_healthy_scan_resets_the_streak(self):
@@ -1052,7 +1053,7 @@ class TestEveryFileUnreadable:
                 self._scan_all_stale(listener)
 
         with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(listener._files)), \
+                   return_value=list(self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0):
             listener._scan_subscriptions()
@@ -3360,7 +3361,7 @@ class TestUntrustedScan:
         assert any("the DAG folder cannot be listed" in m for m in messages)
 
     @pytest.mark.asyncio
-    async def test_a_step_in_flight_scan_behaves_as_before(self, caplog):
+    async def test_a_step_in_flight_scan_ends_the_cycle_before_reconcile(self, caplog):
         """Only `_UntrustedScan` substitutes the previous result; the other two ways the
         scan step ends still end the cycle before reconcile."""
         listener = _cycle_listener()

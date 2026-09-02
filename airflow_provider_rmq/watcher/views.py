@@ -286,7 +286,7 @@ class RMQWatcherView(BaseView):
                     # leave the page standing — the reads that follow will fail into
                     # their own notices
                     log.warning("Rollback after the failed read failed too", exc_info=True)
-                subs = None
+                subs = []
                 subscriptions_error = SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE
             try:
                 conn_statuses = get_conn_statuses(session)
@@ -297,7 +297,7 @@ class RMQWatcherView(BaseView):
                     exc_info=True,
                 )
                 conn_statuses = None
-            rows = _group_subscriptions(subs) if subs is not None else []
+            rows = _group_subscriptions(subs)
 
         conn_status_error = None
         conn_status_rows: list[ConnStatusRow] = []
