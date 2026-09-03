@@ -1177,7 +1177,7 @@ class TestCollapsedListing:
                            unreadable=self._FILES[:1], mtime=3000.0)
 
     def test_a_folder_that_grew_is_trusted(self):
-        """The share is measured against the last trusted scan, not against the listing."""
+        """The share is measured against what the folder held, not against the listing."""
         listener = self._listener()
         grown = list(self._FILES) + [f"/dags/new{n}.py" for n in range(10)]
 
@@ -3525,9 +3525,10 @@ class TestCycleStepsAreBounded:
 class TestUntrustedScan:
     """A scan the cycle cannot trust skips the sync step and nothing else.
 
-    `_sync_to_db` deletes every dag_file row whose key the scan did not return, so a
-    result that says nothing about the code must not reach it — while consumption, the
-    liveness check and the status writes keep running from the database rows.
+    Skipping `_sync_to_db` is what keeps a result that says nothing about the code from
+    counting a miss against every dag_file row whose key it failed to name — while
+    consumption, the liveness check and the status writes keep running from the
+    database rows.
     """
 
     @pytest.mark.asyncio

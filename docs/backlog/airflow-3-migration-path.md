@@ -11,7 +11,7 @@ added: 2026-09-02
 
 - поток с asyncio-петлёй внутри процесса шедулера, поднятый через listener
   `on_starting`, и определение «мы в шедулере» по стеку вызовов
-  (`listener.py:747-764`);
+  (`listener.py:856-873`);
 - прямой ORM к метабазе из плагина: `DagModel`, `serialized_dag` через
   `trigger_dag`, собственные таблицы через `airflow.settings.engine`;
 - вызов внутреннего `airflow.api.common.trigger_dag` из потока;

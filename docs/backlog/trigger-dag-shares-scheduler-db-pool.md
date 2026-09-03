@@ -18,7 +18,7 @@ added: 2026-09-02
 overflow 10 reached`.
 
 Что watcher делает с базой на одну доставку в immediate-режиме, всё в потоках
-пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:127`):
+пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:132`):
 
 | шаг | где | соединений |
 |---|---|---|

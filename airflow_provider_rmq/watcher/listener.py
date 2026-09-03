@@ -748,11 +748,11 @@ class _UntrustedScan(Exception):
     """The scan result is not a statement about the code, so the cycle must not sync it.
 
     Raised by the scan step when the DAG folder could not be read, was empty or
-    unlistable, or when an empty listing is still young enough to be a hiccup of the
-    environment rather than the truth. ``_sync_to_db`` deletes every ``dag_file`` row
-    whose key the scan did not return, so a result that means "the filesystem looked
-    away for a second" must never reach it; the rest of the cycle — reading the rows,
-    the liveness check and the status writes — carries on from the database.
+    unlistable, or when a listing short of ``_TRUSTED_SCAN_FRACTION`` of what the folder
+    is known to have held is still young enough to be a hiccup of the environment rather
+    than the truth. Skipping ``_sync_to_db`` keeps such a listing from counting a miss
+    against any ``dag_file`` row it failed to name, with ``_ABSENT_GRACE_CYCLES`` behind
+    that; reading the rows, the liveness check and the status writes carry on regardless.
     """
 
 
