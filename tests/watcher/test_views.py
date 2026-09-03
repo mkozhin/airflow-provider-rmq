@@ -18,10 +18,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from flask import Flask
 from jinja2 import ChoiceLoader, DictLoader, Environment, FileSystemLoader
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from airflow_provider_rmq.watcher.models import RMQSubscription, WatcherBase
+from tests.watcher.conftest import SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES
 
 # ---------------------------------------------------------------------------
 # Patch has_access → identity before loading views, so the class is built
@@ -39,6 +40,7 @@ if "airflow_provider_rmq.watcher.views" in sys.modules:
 from airflow_provider_rmq.watcher.views import (  # noqa: E402
     DEFAULT_RECONCILE_INTERVAL,
     SCHEMA_OUTDATED_MESSAGE,
+    SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE,
     ConnStatusRow,
     RMQWatcherView,
     SubscriptionGroup,
@@ -1008,6 +1010,20 @@ class TestSubscriptionsTemplateRendering:
         html = _render_subscriptions_html([grouped, single], active_dag_ids={"other_dag"})
         assert _badge_present(html)
 
+    def test_the_create_button_is_gone_while_the_notice_stands(self):
+        """The form behind the button writes through the mapping the notice is about.
+
+        Its POST goes to ``upsert_subscription``, whose query selects every column the
+        ORM maps — so on the schema the notice describes the button leads to a 500,
+        offered from the very page that has just said the table cannot be read.
+        """
+        html = _render_subscriptions_html([], subscriptions_error="cannot be read")
+        assert "Create subscription" not in html
+
+    def test_the_create_button_is_there_when_the_table_reads(self):
+        html = _render_subscriptions_html([_make_single_row(dag_id="d")])
+        assert "Create subscription" in html
+
     def test_active_dag_ids_empty_set_shows_badge_on_all_rows(self):
         """set() (lookup succeeded, genuinely zero active DAGs) is a
         different sentinel than None (lookup failed) per the plan's
@@ -1076,6 +1092,184 @@ class TestSubscriptionsDagLookupSessionIsolationReal:
             assert "ghost_dag" in html
         finally:
             WatcherBase.metadata.drop_all(engine)
+
+
+# ---------------------------------------------------------------------------
+# The page against a database whose rmq_watcher_subscriptions is older than
+# the provider — the state an installation is in until the watcher loop in
+# the scheduler runs its migration.
+# ---------------------------------------------------------------------------
+
+#: One subscription row, written through raw SQL so it lands in whichever
+#: shape of the table the test built.
+_seed_subscription_sql = """
+INSERT INTO rmq_watcher_subscriptions (
+    dag_id, queue_name, conn_id, source, enabled, consumer_status,
+    trigger_mode, created_at, updated_at
+) VALUES (
+    'my_dag', 'q1', 'rmq_default', 'dag_file', 1, 'listening',
+    'per_message', '2026-09-02 10:00:00', '2026-09-02 10:00:00'
+)
+"""
+
+
+class TestSubscriptionsSchemaOutdated:
+    """The Subscriptions table is read through the ORM, so a column the
+    provider maps and the database does not have makes the query itself
+    fail. The page has to survive that the way the Connections block does.
+    """
+
+    @staticmethod
+    def _legacy_engine():
+        """Engine whose subscriptions table predates the miss counter, with
+        the rest of the watcher schema current."""
+        engine = create_engine("sqlite:///:memory:")
+        WatcherBase.metadata.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE rmq_watcher_subscriptions"))
+            conn.execute(text(SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES))
+            conn.execute(text(_seed_subscription_sql))
+        return engine
+
+    def test_outdated_schema_yields_notice_not_error(self, app, view, caplog):
+        engine = self._legacy_engine()
+        RealSession = sessionmaker(bind=engine)
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", RealSession), \
+                 patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value={"my_dag"}), \
+                 caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.views"):
+                result = view.subscriptions()
+
+            assert result == "<html>mocked</html>"
+            kwargs = view.render_template.call_args.kwargs
+            assert kwargs["subscriptions_error"] == SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE
+            assert "rmq_watcher_subscriptions" in kwargs["subscriptions_error"]
+            assert kwargs["subscriptions"] == []
+            assert any(r.exc_info is not None for r in caplog.records)
+        finally:
+            engine.dispose()
+
+    def test_connections_block_still_reads_after_the_failed_query(self, app, view):
+        """The failed read leaves the session usable: the Connections block
+        is read from the same session afterwards and gets no notice of its
+        own."""
+        engine = self._legacy_engine()
+        RealSession = sessionmaker(bind=engine)
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", RealSession), \
+                 patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
+                view.subscriptions()
+
+            kwargs = view.render_template.call_args.kwargs
+            assert kwargs["conn_status_error"] is None
+            assert kwargs["conn_statuses"] == []
+        finally:
+            engine.dispose()
+
+    def test_the_failed_query_is_rolled_back(self, app, view):
+        """SQLite goes on answering after a failed statement; PostgreSQL does not.
+
+        Only the rollback keeps the Connections block below readable there, and
+        SQLite cannot show its absence — so the call itself is what is asserted.
+        """
+        engine = self._legacy_engine()
+        RealSession = sessionmaker(bind=engine)
+        sessions = []
+
+        def spied_session():
+            session = RealSession()
+            session.rollback = MagicMock(wraps=session.rollback)
+            sessions.append(session)
+            return session
+
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", spied_session), \
+                 patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
+                view.subscriptions()
+
+            sessions[0].rollback.assert_called_once()
+        finally:
+            engine.dispose()
+
+    def test_a_rollback_that_fails_too_leaves_the_page_standing(self, app, view):
+        """A connection broken enough to refuse the rollback is the case for this."""
+        engine = self._legacy_engine()
+        RealSession = sessionmaker(bind=engine)
+
+        def failing_rollback_session():
+            session = RealSession()
+            session.rollback = MagicMock(side_effect=OSError("connection is gone"))
+            return session
+
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", failing_rollback_session), \
+                 patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
+                result = view.subscriptions()
+
+            assert result == "<html>mocked</html>"
+            kwargs = view.render_template.call_args.kwargs
+            assert kwargs["subscriptions_error"] == SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE
+        finally:
+            engine.dispose()
+
+    def test_notice_names_the_subscriptions_table_in_html(self, app, view):
+        """Rendered for real: the operator reads about the table that is
+        actually behind, and the empty-state text does not claim there are
+        no subscriptions."""
+        engine = self._legacy_engine()
+        RealSession = sessionmaker(bind=engine)
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", RealSession), \
+                 patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=set()):
+                view.subscriptions()
+
+            kwargs = view.render_template.call_args.kwargs
+            html = _render_subscriptions_html(
+                kwargs["subscriptions"],
+                subscriptions_error=kwargs["subscriptions_error"],
+                conn_statuses=kwargs["conn_statuses"],
+                conn_status_error=kwargs["conn_status_error"],
+                active_dag_ids=kwargs["active_dag_ids"],
+            )
+            assert "rmq_watcher_subscriptions" in html
+            assert "No subscriptions yet." not in html
+            assert SCHEMA_OUTDATED_MESSAGE not in html
+        finally:
+            engine.dispose()
+
+    def test_current_schema_renders_the_table(self, app, view):
+        """The guard costs the healthy page nothing: rows are read and
+        rendered, and no notice is raised."""
+        engine = create_engine("sqlite:///:memory:")
+        WatcherBase.metadata.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(text(_seed_subscription_sql))
+        RealSession = sessionmaker(bind=engine)
+        try:
+            with app.test_request_context("/subscriptions"), \
+                 patch("airflow_provider_rmq.watcher.views.WatcherSession", RealSession), \
+                 patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value={"my_dag"}):
+                view.subscriptions()
+
+            kwargs = view.render_template.call_args.kwargs
+            assert kwargs["subscriptions_error"] is None
+            assert [s.dag_id for s in kwargs["subscriptions"]] == ["my_dag"]
+
+            html = _render_subscriptions_html(
+                kwargs["subscriptions"],
+                subscriptions_error=kwargs["subscriptions_error"],
+                conn_statuses=kwargs["conn_statuses"],
+                active_dag_ids=kwargs["active_dag_ids"],
+            )
+            assert "my_dag" in html
+            assert "rmq_watcher_subscriptions" not in html
+        finally:
+            engine.dispose()
 
 
 # ---------------------------------------------------------------------------

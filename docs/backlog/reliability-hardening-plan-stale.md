@@ -19,7 +19,7 @@ added: 2026-09-02
 | 1. decode `errors="replace"` | сделано в триггере (`triggers/rmq.py`) и в watcher'е; **не** сделано в `RMQHook.consume_messages` |
 | 2. `queue_info` с `consumer_count`, guard в `__del__`, warning на пустой publish | не сделано |
 | 3–4. publisher confirms в хуке и операторе | не сделано → [[publish-operator-no-confirms]] |
-| 5. ленивый `WatcherSession` | не сделано, фабрика по-прежнему создаётся при импорте (`models.py:79`) |
+| 5. ленивый `WatcherSession` | не сделано, фабрика по-прежнему создаётся при импорте (`models.py:83`) |
 | 6–7. защита `source` и takeover-warning | не сделано → [[ui-subscription-taken-over-by-scan]] |
 | 8. at-least-once, `DagRunAlreadyExists`, детерминированный `run_id` | сделано (`consumer.py:246-302`) |
 | 9. валидация cooldown `conn_id` | частично: ERROR при разъезде есть (`_report_split_cooldown`), исключения лишних подписок из активного набора и `error` в их строках нет |

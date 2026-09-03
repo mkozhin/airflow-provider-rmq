@@ -29,6 +29,19 @@ from airflow_provider_rmq.watcher.tunables import (
 log = logging.getLogger(__name__)
 
 
+#: Shown instead of the Subscriptions table when the subscription rows cannot be read.
+#: The read fails for one reason far more often than any other — a table that does not
+#: yet carry this version's columns — but a database that is down or a role without the
+#: rights fail the same way, so the notice names the likely cause and points at the log
+#: for the actual one instead of stating a diagnosis it does not have.
+SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE = (
+    "Subscriptions are unavailable: the rmq_watcher_subscriptions table could "
+    "not be read. Most often this means it does not yet match this version of "
+    "the provider, and the watcher loop in the scheduler migrates it on one of "
+    "its next cycles; the webserver log carries the actual error."
+)
+
+
 # ------------------------------------------------------------------
 # Group helpers
 # ------------------------------------------------------------------
@@ -253,8 +266,28 @@ class RMQWatcherView(BaseView):
     @expose("/subscriptions")
     @has_access
     def subscriptions(self):
+        subscriptions_error = None
         with WatcherSession() as session:
-            subs = session.query(RMQSubscription).order_by(RMQSubscription.dag_id).all()
+            try:
+                subs = session.query(RMQSubscription).order_by(RMQSubscription.dag_id).all()
+            except Exception:
+                log.warning(
+                    "Failed to read rmq_watcher_subscriptions — the Subscriptions "
+                    "block is replaced with a notice for this request",
+                    exc_info=True,
+                )
+                try:
+                    # a backend that aborts the transaction on a failed statement
+                    # would refuse every later read in this session otherwise; no
+                    # row has been loaded yet, so nothing is expired by this
+                    session.rollback()
+                except Exception:
+                    # a connection broken enough to refuse the rollback still has to
+                    # leave the page standing — the reads that follow will fail into
+                    # their own notices
+                    log.warning("Rollback after the failed read failed too", exc_info=True)
+                subs = []
+                subscriptions_error = SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE
             try:
                 conn_statuses = get_conn_statuses(session)
             except Exception:
@@ -295,6 +328,7 @@ class RMQWatcherView(BaseView):
         return self.render_template(
             "rmq_watcher/subscriptions.html",
             subscriptions=rows,
+            subscriptions_error=subscriptions_error,
             conn_statuses=conn_status_rows,
             conn_status_error=conn_status_error,
             stale_after_display=format_duration(stale_seconds),

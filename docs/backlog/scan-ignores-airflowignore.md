@@ -1,27 +1,23 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:1034
+where: airflow_provider_rmq/watcher/listener.py:1185
 added: 2026-09-02
 ---
 # Скан подписок читает файлы, которые сам Airflow не загружает
 
 **Контекст.** `_scan_subscriptions` (`airflow_provider_rmq/watcher/listener.py`)
-собирает список файлов через `glob("{dags_folder}/**/*.py")`. Airflow для того
-же использует `airflow.utils.file.list_py_file_paths`, и у него другой набор:
-он учитывает `.airflowignore` в каждой директории (синтаксис по
+берёт папку из `airflow.settings.DAGS_FOLDER` — того же источника, что и
+шедулер, — а список файлов в ней собирает через `glob("{dags_folder}/**/*.py")`.
+Airflow для того же использует `airflow.utils.file.list_py_file_paths`, и у него
+другой набор: он учитывает `.airflowignore` в каждой директории (синтаксис по
 `[core] dag_ignore_file_syntax`, regexp или glob), читает `.zip`-пакеты и в
-`safe_mode` пропускает файлы без слов `dag` и `airflow` внутри.
-
-Расхождения:
+`safe_mode` пропускает файлы без слов `dag` и `airflow` внутри. Папка у обоих
+одна, расходится только набор файлов в ней:
 
 - файл в директории с `.airflowignore` — Airflow его не парсит, DAG'а из него
   не существует, а скан его читает и регистрирует подписку;
 - `.zip` с DAG'ами — Airflow загружает, скан не видит; подписка из декоратора
-  внутри архива никогда не появится, и в логе об этом ничего;
-- при ошибке чтения `[core] dags_folder` скан молча идёт в
-  `/opt/airflow/dags` (`listener.py:1024`) — на установке с другим путём это
-  пустая директория и пустой результат, со всеми последствиями из
-  [[scan-miss-deletes-subscriptions]].
+  внутри архива никогда не появится, и в логе об этом ничего.
 
 **Трасса для первого случая.** В репозитории DAG'ов лежит `tests/` с копией
 DAG-файла для юнит-тестов и `.airflowignore` с `tests/`. Копия несёт тот же
@@ -38,5 +34,4 @@ DAG-файла для юнит-тестов и `.airflowignore` с `tests/`. К�
 `list_py_file_paths(dags_folder, safe_mode=False, include_examples=False)`:
 одна строка, тот же набор файлов, что у шедулера, zip включительно (`ast` их
 читать не умеет, для архивов нужен `zipfile` + `ast.parse` по каждому
-`.py` внутри). Папку DAG'ов брать из `airflow.settings.DAGS_FOLDER` без
-запасного пути.
+`.py` внутри).

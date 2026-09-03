@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from airflow_provider_rmq.watcher import models
 from airflow_provider_rmq.watcher.models import (
@@ -23,6 +24,7 @@ from airflow_provider_rmq.watcher.models import (
     upsert_conn_status,
     upsert_subscription,
 )
+from tests.watcher.conftest import SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES
 
 
 def _naive(stamp: str) -> datetime:
@@ -41,43 +43,6 @@ CREATE TABLE rmq_watcher_conn_status (
     updated_at DATETIME NOT NULL
 )
 """
-
-
-@pytest.fixture(scope="function")
-def session():
-    """SQLite in-memory session with fresh schema per test."""
-    engine = create_engine("sqlite:///:memory:")
-    WatcherBase.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    s = Session()
-    yield s
-    s.close()
-    WatcherBase.metadata.drop_all(engine)
-
-
-@pytest.fixture(scope="function")
-def schema_engine(monkeypatch):
-    """Engine standing in for Airflow's, with the migration flag reset."""
-    engine = create_engine("sqlite:///:memory:")
-    monkeypatch.setattr("airflow.settings.engine", engine, raising=False)
-    monkeypatch.setattr(models, "_schema_ready", False)
-    yield engine
-    engine.dispose()
-
-
-@pytest.fixture(scope="function")
-def session_with_dagmodel():
-    """SQLite in-memory session with watcher schema plus Airflow's DagModel table."""
-    from airflow.models import DagModel
-
-    engine = create_engine("sqlite:///:memory:")
-    WatcherBase.metadata.create_all(engine)
-    DagModel.__table__.create(engine, checkfirst=True)
-    Session = sessionmaker(bind=engine)
-    s = Session()
-    yield s
-    s.close()
-    WatcherBase.metadata.drop_all(engine)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +146,72 @@ class TestUpsertEnabled:
 
         row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
         assert row.enabled is False
+
+
+class TestAbsentCycles:
+    def test_upsert_resets_counter_and_keeps_enabled(self, session):
+        """Вернувшийся ключ обнуляет счётчик промахов, не трогая enabled."""
+        sub = upsert_subscription(session, dag_id="d", queue_name="q", source="dag_file")
+        session.commit()
+        sub.enabled = False
+        sub.absent_cycles = 2
+        session.commit()
+
+        upsert_subscription(session, dag_id="d", queue_name="q", source="dag_file", enabled=True)
+        session.commit()
+
+        row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+        assert row.absent_cycles is None
+        assert row.enabled is False
+
+    def test_counter_written_after_the_read_is_still_cleared(self, tmp_path):
+        """Апсерт обнуляет счётчик, записанный другим шедулером после чтения строки.
+
+        Сессия прочитала строку со счётчиком `NULL`, и `None` для неё — то же самое
+        значение: диффа нет, писать нечего. Обнуление поэтому идёт условным
+        `UPDATE`'ом, который выполняет база: иначе успешный скан не прерывал бы
+        череду промахов, и следующий промах удалял бы строку.
+
+        База файловая: чужой коммит внутри окна между чтением и записью должен
+        прийти по своему соединению, а не по тому, через которое идёт апсерт.
+        Ссылку на прочитанную строку тест держит, как держит её `_sync_to_db` в
+        своём `existing`: карта объектов сессии слабая, и отпущенная строка
+        перечиталась бы к апсерту заново — то есть уже без устаревшего значения.
+        """
+        engine = create_engine(f"sqlite:///{tmp_path / 'watcher.db'}", poolclass=NullPool)
+        WatcherBase.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+
+        scanning = Session()
+        scanning.add(RMQSubscription(
+            dag_id="d", queue_name="q", conn_id="rmq_default",
+            source="dag_file", enabled=True,
+        ))
+        scanning.commit()
+        read_by_the_scan = scanning.query(RMQSubscription).one()
+        assert read_by_the_scan.absent_cycles is None
+
+        other = Session()
+        other.query(RMQSubscription).filter_by(dag_id="d").update({"absent_cycles": 1})
+        other.commit()
+        other.close()
+
+        upsert_subscription(scanning, dag_id="d", queue_name="q", source="dag_file")
+        scanning.commit()
+        scanning.close()
+
+        checking = Session()
+        assert checking.query(RMQSubscription).one().absent_cycles is None
+        checking.close()
+        engine.dispose()
+
+    def test_new_subscription_starts_without_counter(self, session):
+        """Новая строка заводится без счётчика промахов."""
+        upsert_subscription(session, dag_id="d", queue_name="q")
+        session.commit()
+
+        row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+        assert row.absent_cycles is None
 
 
 class TestGetEnabled:
@@ -387,6 +418,32 @@ class TestSchemaMigration:
         assert "broker_consumer_count" in columns
         assert "last_reconcile_at" in columns
         assert models.is_schema_ready() is True
+
+    def test_adds_absent_cycles_to_legacy_subscriptions(self, schema_engine):
+        with schema_engine.begin() as conn:
+            conn.execute(text(SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES))
+            conn.execute(text(
+                "INSERT INTO rmq_watcher_subscriptions "
+                "(dag_id, queue_name, conn_id, source, enabled, consumer_status, "
+                " trigger_mode, created_at, updated_at) "
+                "VALUES ('d', 'q', 'rmq_default', 'dag_file', 0, 'connecting', "
+                " 'any', '2026-09-02 10:00:00', '2026-09-02 10:00:00')"
+            ))
+
+        ensure_table_exists()
+
+        columns = {
+            c["name"] for c in inspect(schema_engine).get_columns("rmq_watcher_subscriptions")
+        }
+        assert "absent_cycles" in columns
+
+        session = sessionmaker(bind=schema_engine)()
+        try:
+            row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+            assert row.enabled is False
+            assert row.absent_cycles is None
+        finally:
+            session.close()
 
     def test_migrated_table_accepts_diagnostic_writes(self, schema_engine):
         with schema_engine.begin() as conn:

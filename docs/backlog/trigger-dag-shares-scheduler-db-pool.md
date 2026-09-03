@@ -7,7 +7,7 @@ added: 2026-09-02
 
 **Контекст.** Это про соединения с Postgres, не с RabbitMQ. Watcher живёт в
 процессе шедулера и ходит в метабазу через `WatcherSession`
-(`airflow_provider_rmq/watcher/models.py:79`), привязанную к движку Airflow.
+(`airflow_provider_rmq/watcher/models.py:83`), привязанную к движку Airflow.
 Своего пула у него нет — осознанно, чтобы не плодить соединений к базе. Обратная
 сторона: watcher и шедулер берут соединения из одного пула.
 
@@ -18,7 +18,7 @@ added: 2026-09-02
 overflow 10 reached`.
 
 Что watcher делает с базой на одну доставку в immediate-режиме, всё в потоках
-пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:79`):
+пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:127`):
 
 | шаг | где | соединений |
 |---|---|---|
