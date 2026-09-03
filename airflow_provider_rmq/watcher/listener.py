@@ -1565,7 +1565,7 @@ class RMQWatcherListener:
         deleted_now: list[tuple[tuple[str, str, str], bool]],
         *,
         only_enabled: bool = False,
-    ) -> None:
+    ) -> bool:
         """Delete one dag_file row, but only while it still reads the way it was read.
 
         Another scheduler may have seen the key come back and cleared the counter
@@ -1584,7 +1584,8 @@ class RMQWatcherListener:
         ``enabled`` flag it carried, for the caller to remember once the transaction
         holding the deletion is committed — the scan bringing that key back then
         reports the recreated row instead of quietly handing the subscription a
-        consumer again.
+        consumer again. Returns whether the row went, so that the caller says in the
+        log what happened rather than what it set out to do.
         """
         key = (sub.dag_id, sub.queue_name, sub.conn_id)
         was_enabled = bool(sub.enabled)
@@ -1599,6 +1600,7 @@ class RMQWatcherListener:
         ).filter(*criteria).delete()
         if deleted:
             deleted_now.append((key, was_enabled))
+        return bool(deleted)
 
     def _count_absent_cycle(
         self, session: Session, sub: RMQSubscription, observed: int | None
@@ -1720,12 +1722,20 @@ class RMQWatcherListener:
                 current = observed or 0
 
                 if current + 1 > _ABSENT_GRACE_CYCLES:
-                    log.info(
-                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
-                        "%s trusted scans in a row — deleting",
-                        sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
-                    )
-                    self._delete_absent_sub(session, sub, observed, deleted_now)
+                    if self._delete_absent_sub(session, sub, observed, deleted_now):
+                        log.info(
+                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
+                            "from %s trusted scans in a row — deleted",
+                            sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
+                        )
+                    else:
+                        log.info(
+                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
+                            "from %s trusted scans in a row, but its miss counter moved "
+                            "since this cycle read it — leaving the row to the scheduler "
+                            "that wrote it",
+                            sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
+                        )
                     continue
 
                 if (
@@ -1734,15 +1744,24 @@ class RMQWatcherListener:
                     and active_dag_ids is not None
                     and sub.dag_id not in active_dag_ids
                 ):
-                    log.info(
-                        "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
-                        "from the scan and DAG %s is no longer active — deleting without "
-                        "waiting out the grace period",
-                        sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
-                    )
-                    self._delete_absent_sub(
+                    if self._delete_absent_sub(
                         session, sub, observed, deleted_now, only_enabled=True
-                    )
+                    ):
+                        log.info(
+                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
+                            "from the scan and DAG %s is no longer active — deleted "
+                            "without waiting out the grace period",
+                            sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
+                        )
+                    else:
+                        log.info(
+                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
+                            "from the scan and DAG %s is no longer active, but the row "
+                            "changed since this cycle read it — its miss counter, or the "
+                            "enabled flag an operator turned off — so it keeps the grace "
+                            "period",
+                            sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
+                        )
                     continue
 
                 self._count_absent_cycle(session, sub, observed)

@@ -153,6 +153,27 @@ def ensure_table_exists() -> None:
 # CRUD helpers — callers provide the session; these do not commit
 # ---------------------------------------------------------------------------
 
+def _clear_absent_cycles(session: Session, sub: RMQSubscription) -> None:
+    """Clear the miss counter of an existing row, as a statement the database runs.
+
+    The caller writes the row from a source that says the key is there, so whatever
+    misses stood behind it are over. Assigning the attribute would leave the decision
+    to the session's own diff, and the session compares against the value it read some
+    milliseconds earlier: one that read ``NULL`` and assigns ``None`` has nothing to
+    flush, so a count another scheduler committed in between would survive the write
+    and the next miss would delete the row — a successful scan notwithstanding.
+
+    The ``IS NOT NULL`` predicate keeps the ordinary case a no-op the database
+    decides on, and the loaded value is expired so that the object the caller gets
+    back reads the counter from the row rather than from the stale load.
+    """
+    session.query(RMQSubscription).filter(
+        RMQSubscription.id == sub.id,
+        RMQSubscription.absent_cycles.isnot(None),
+    ).update({"absent_cycles": None}, synchronize_session=False)
+    session.expire(sub, ["absent_cycles"])
+
+
 def upsert_subscription(
     session: Session,
     dag_id: str,
@@ -179,16 +200,17 @@ def upsert_subscription(
             enabled=enabled,
         )
         session.add(sub)
-    elif source == "ui":
-        sub.enabled = enabled
-    # dag_file source: preserve current enabled value from DB
+        # a row that has just been created has missed no scan
+    else:
+        if source == "ui":
+            sub.enabled = enabled
+        # dag_file source: preserve current enabled value from DB
+        _clear_absent_cycles(session, sub)
     sub.filter_data = filter_data or {}
     sub.source = source
     sub.trigger_mode = trigger_mode
     sub.group_key = group_key
     sub.cooldown = cooldown
-    # the key is in the scan, so the miss counter starts over
-    sub.absent_cycles = None
     return sub
 
 

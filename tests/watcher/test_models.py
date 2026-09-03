@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from airflow_provider_rmq.watcher import models
 from airflow_provider_rmq.watcher.models import (
@@ -162,6 +163,47 @@ class TestAbsentCycles:
         row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
         assert row.absent_cycles is None
         assert row.enabled is False
+
+    def test_counter_written_after_the_read_is_still_cleared(self, tmp_path):
+        """Апсерт обнуляет счётчик, записанный другим шедулером после чтения строки.
+
+        Сессия прочитала строку со счётчиком `NULL`, и `None` для неё — то же самое
+        значение: диффа нет, писать нечего. Обнуление поэтому идёт условным
+        `UPDATE`'ом, который выполняет база: иначе успешный скан не прерывал бы
+        череду промахов, и следующий промах удалял бы строку.
+
+        База файловая: чужой коммит внутри окна между чтением и записью должен
+        прийти по своему соединению, а не по тому, через которое идёт апсерт.
+        Ссылку на прочитанную строку тест держит, как держит её `_sync_to_db` в
+        своём `existing`: карта объектов сессии слабая, и отпущенная строка
+        перечиталась бы к апсерту заново — то есть уже без устаревшего значения.
+        """
+        engine = create_engine(f"sqlite:///{tmp_path / 'watcher.db'}", poolclass=NullPool)
+        WatcherBase.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+
+        scanning = Session()
+        scanning.add(RMQSubscription(
+            dag_id="d", queue_name="q", conn_id="rmq_default",
+            source="dag_file", enabled=True,
+        ))
+        scanning.commit()
+        read_by_the_scan = scanning.query(RMQSubscription).one()
+        assert read_by_the_scan.absent_cycles is None
+
+        other = Session()
+        other.query(RMQSubscription).filter_by(dag_id="d").update({"absent_cycles": 1})
+        other.commit()
+        other.close()
+
+        upsert_subscription(scanning, dag_id="d", queue_name="q", source="dag_file")
+        scanning.commit()
+        scanning.close()
+
+        checking = Session()
+        assert checking.query(RMQSubscription).one().absent_cycles is None
+        checking.close()
+        engine.dispose()
 
     def test_new_subscription_starts_without_counter(self, session):
         """Новая строка заводится без счётчика промахов."""

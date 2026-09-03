@@ -35,7 +35,11 @@ from airflow_provider_rmq.watcher.listener import (
     _parse_rmq_trigger_decorator,
     _read_settings,
 )
-from airflow_provider_rmq.watcher.models import RMQSubscription, WatcherBase
+from airflow_provider_rmq.watcher.models import (
+    RMQSubscription,
+    WatcherBase,
+    upsert_subscription,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2246,7 +2250,7 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         assert [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and
-                "trusted scans in a row — deleting" in r.getMessage()]
+                "trusted scans in a row — deleted" in r.getMessage()]
 
     def test_a_key_recreated_after_a_deletion_is_reported(self, caplog):
         """The flip the backlog item is about: a row comes back consuming, silently.
@@ -2370,7 +2374,7 @@ class TestSyncToDb:
             listener._sync_to_db([])
 
         assert [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and
-                "is no longer active — deleting" in r.getMessage()]
+                "is no longer active — deleted" in r.getMessage()]
 
     def test_failure_to_read_active_dag_ids_is_logged(self, caplog):
         listener = RMQWatcherListener()
@@ -4413,29 +4417,99 @@ class TestConcurrentSchedulerWrites:
             listener._sync_to_db([])
 
     def test_a_row_switched_off_in_the_window_keeps_the_full_grace_period(
-        self, two_process_engine
+        self, two_process_engine, caplog
     ):
         """The early deletion is owed to the consumer, and a row switched off has none.
 
         An operator pressing the button on the Subscriptions page while the cycle is
         between its read and its write leaves a disabled row, and a disabled row gets
         the whole grace period — the flag is the very thing the grace period is there
-        to keep.
+        to keep. The line about the row says what happened to it: a deletion the
+        predicate refused is not a deletion, and a log claiming one would be the only
+        record anybody has of the cycle.
         """
         listener = RMQWatcherListener()
         _add_dag_file_subscription(two_process_engine, enabled=True, absent_cycles=1)
 
-        self._sync(
-            listener, two_process_engine,
-            _reader_another_scheduler_writes_inside(
-                two_process_engine, {"enabled": False}, active=False
-            ),
-        )
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+        ):
+            self._sync(
+                listener, two_process_engine,
+                _reader_another_scheduler_writes_inside(
+                    two_process_engine, {"enabled": False}, active=False
+                ),
+            )
 
         row = _snapshot(two_process_engine)
         assert row is not None
         assert row["enabled"] is False
         assert listener._deleted_dag_file_rows == {}
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("deleted" in m for m in messages), messages
+        assert any("keeps the grace period" in m for m in messages), messages
+
+    def test_a_deletion_the_recovery_refused_is_not_reported_as_done(
+        self, two_process_engine, caplog
+    ):
+        """The row outlived its last miss, and the line about it says so.
+
+        The counter another scheduler cleared inside the window is what the ``DELETE``
+        is matched on, so it matches nothing — and the observability the counted miss
+        replaced silent deletion with is worth only what its lines are true about.
+        """
+        listener = RMQWatcherListener()
+        _add_dag_file_subscription(
+            two_process_engine, enabled=True, absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+        ):
+            self._sync(
+                listener, two_process_engine,
+                _reader_another_scheduler_writes_inside(
+                    two_process_engine, {"absent_cycles": None}, active=True
+                ),
+            )
+
+        assert _snapshot(two_process_engine) is not None
+        assert listener._deleted_dag_file_rows == {}
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("deleted" in m for m in messages), messages
+        assert any(
+            "its miss counter moved since this cycle read it" in m for m in messages
+        ), messages
+
+    def test_a_count_committed_inside_the_window_loses_to_the_scan(
+        self, two_process_engine
+    ):
+        """The key is in this cycle's scan, so the count another scheduler wrote goes.
+
+        The reset is written the same way the counter is: a statement the database
+        runs, not an attribute the session diffs against the value it read. A session
+        that read the counter as ``NULL`` sees no change in assigning ``None``, and
+        the count that landed in between would survive a whole cycle of the key being
+        there — leaving the row one miss from deletion.
+        """
+        listener = RMQWatcherListener()
+        _add_dag_file_subscription(two_process_engine, enabled=True)
+
+        def upsert_after_another_scheduler_counted(session, **kwargs):
+            with _db(two_process_engine) as other:
+                other.query(RMQSubscription).filter_by(dag_id="d").update(
+                    {"absent_cycles": 1}
+                )
+                other.commit()
+            return upsert_subscription(session, **kwargs)
+
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession",
+                   sessionmaker(bind=two_process_engine)), \
+             patch("airflow_provider_rmq.watcher.listener.upsert_subscription",
+                   upsert_after_another_scheduler_counted):
+            listener._sync_to_db([{"dag_id": "d", "queue_name": "q", "filter_data": {}}])
+
+        assert _snapshot(two_process_engine)["absent_cycles"] is None
 
     def test_a_recovery_another_scheduler_committed_is_not_overwritten(
         self, two_process_engine
