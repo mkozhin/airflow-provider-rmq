@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/models.py:259
+where: airflow_provider_rmq/watcher/models.py:281
 added: 2026-08-09
 ---
 # Запрос активных `dag_id` для бейджа сканирует всю таблицу `dag`
@@ -12,7 +12,7 @@ added: 2026-08-09
 всех активных id, даже когда спрашивают про один `dag_id`.
 
 **Два вызывающих.** Бейдж `⚠ dag not found` — на каждый рендер страницы
-Subscriptions. И `_sync_to_db` (`listener.py:1527`) — на каждом цикле
+Subscriptions. И `_sync_to_db` (`listener.py:1760`) — на каждом цикле
 reconcile, где промахнулась хотя бы одна включённая `dag_file`-строка, то есть
 раз в 60 секунд на шедулер во время выкатки, снявшей декоратор.
 

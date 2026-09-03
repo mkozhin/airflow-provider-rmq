@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:1222
+where: airflow_provider_rmq/watcher/listener.py:1340
 added: 2026-09-02
 ---
 # Первому перечислению процесса нечего противопоставить
