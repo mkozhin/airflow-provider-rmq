@@ -25,6 +25,7 @@ from airflow_provider_rmq.watcher.listener import (
     RMQWatcherListener,
     _ABSENT_GRACE_CYCLES,
     _DELETED_ROWS_REMEMBERED,
+    _INACTIVE_DAG_MISSES,
     _UNREADABLE_FILE_LIMIT,
     _UNRESOLVED_DAG_ID,
     _UNTRUSTED_SCAN_LIMIT,
@@ -2131,9 +2132,28 @@ class TestSyncToDb:
         _delete_mock(session).assert_not_called()
         assert _counted_miss(session) == 1
 
-    def test_enabled_sub_of_inactive_dag_is_deleted_on_the_second_miss(self):
+    def test_enabled_sub_of_inactive_dag_survives_the_second_miss(self):
+        """One count can be a race between schedulers rather than a miss.
+
+        A miss written from a value read before another scheduler's successful scan
+        lands after that scan's reset and is indistinguishable from a real one, so the
+        early deletion asks for a count that no single such write can produce.
+        """
         listener = RMQWatcherListener()
         existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with _sync_env(ctx, {"other_dag"}):
+            listener._sync_to_db([])
+
+        _delete_mock(session).assert_not_called()
+        assert _counted_miss(session) == 2
+
+    def test_enabled_sub_of_inactive_dag_is_deleted_on_the_third_miss(self):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="gone_dag", enabled=True, absent_cycles=_INACTIVE_DAG_MISSES
+        )
         ctx, session = _make_session_ctx(existing_subs=[existing])
 
         with _sync_env(ctx, {"other_dag"}):
@@ -2164,26 +2184,30 @@ class TestSyncToDb:
 
     def test_failure_to_read_active_dag_ids_does_not_speed_deletion_up(self):
         listener = RMQWatcherListener()
-        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        existing = _existing_sub(
+            dag_id="gone_dag", enabled=True, absent_cycles=_INACTIVE_DAG_MISSES
+        )
         ctx, session = _make_session_ctx(existing_subs=[existing])
 
         with _sync_env(ctx, RuntimeError("db is down")):
             listener._sync_to_db([])
 
         _delete_mock(session).assert_not_called()
-        assert _counted_miss(session) == 2
+        assert _counted_miss(session) == _INACTIVE_DAG_MISSES + 1
 
     def test_paused_dag_counts_as_active_and_keeps_the_grace_period(self):
         """get_active_dag_ids reports a paused DAG as active (ADR 0006), so no shortcut."""
         listener = RMQWatcherListener()
-        existing = _existing_sub(dag_id="paused_dag", enabled=True, absent_cycles=1)
+        existing = _existing_sub(
+            dag_id="paused_dag", enabled=True, absent_cycles=_INACTIVE_DAG_MISSES
+        )
         ctx, session = _make_session_ctx(existing_subs=[existing])
 
         with _sync_env(ctx, {"paused_dag"}):
             listener._sync_to_db([])
 
         _delete_mock(session).assert_not_called()
-        assert _counted_miss(session) == 2
+        assert _counted_miss(session) == _INACTIVE_DAG_MISSES + 1
 
     def test_key_back_in_scan_is_reported_and_leaves_deletion_alone(self, caplog):
         listener = RMQWatcherListener()
@@ -2215,14 +2239,17 @@ class TestSyncToDb:
 
     def test_the_short_circuit_delete_is_conditional_on_its_counter_too(self):
         listener = RMQWatcherListener()
-        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        existing = _existing_sub(
+            dag_id="gone_dag", enabled=True, absent_cycles=_INACTIVE_DAG_MISSES
+        )
         ctx, session = _make_session_ctx(existing_subs=[existing])
 
         with _sync_env(ctx, {"other_dag"}):
             listener._sync_to_db([])
 
+        _delete_mock(session).assert_called_once()
         clause = session.query.return_value.filter_by.return_value.filter.call_args.args[0]
-        assert clause.right.value == 1
+        assert clause.right.value == _INACTIVE_DAG_MISSES
 
     def test_a_counted_miss_is_logged_as_a_warning(self, caplog):
         listener = RMQWatcherListener()
@@ -2325,6 +2352,29 @@ class TestSyncToDb:
 
         assert listener._deleted_dag_file_rows == {}
 
+    def test_a_deletion_is_logged_only_once_it_is_committed(self, caplog):
+        """A line saying a row went, for a row that is still in the table.
+
+        The deletion is one statement of a transaction that goes on to upsert every
+        scanned key, and a failure anywhere in it takes the deletion back — so the
+        line about the row is written from what the commit kept.
+        """
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="d", queue_name="q", absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+        _delete_mock(session).return_value = 1
+        session.commit.side_effect = RuntimeError("the database went away")
+
+        with caplog.at_level(logging.INFO,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
+            listener._sync_to_db([])
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("deleted" in m for m in messages), messages
+
     def test_a_returning_key_is_forgotten_only_once_the_upsert_is_committed(self):
         """The report is owed until the row it is about has actually been recreated."""
         listener = RMQWatcherListener()
@@ -2365,7 +2415,9 @@ class TestSyncToDb:
 
     def test_the_short_circuit_deletion_is_logged(self, caplog):
         listener = RMQWatcherListener()
-        existing = _existing_sub(dag_id="gone_dag", queue_name="q", absent_cycles=1)
+        existing = _existing_sub(
+            dag_id="gone_dag", queue_name="q", absent_cycles=_INACTIVE_DAG_MISSES
+        )
         ctx, _ = _make_session_ctx(existing_subs=[existing])
 
         with caplog.at_level(logging.INFO,
@@ -2378,7 +2430,9 @@ class TestSyncToDb:
 
     def test_failure_to_read_active_dag_ids_is_logged(self, caplog):
         listener = RMQWatcherListener()
-        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        existing = _existing_sub(
+            dag_id="gone_dag", enabled=True, absent_cycles=_INACTIVE_DAG_MISSES
+        )
         ctx, _ = _make_session_ctx(existing_subs=[existing])
 
         with caplog.at_level(logging.WARNING,
@@ -2406,8 +2460,10 @@ class TestSyncToDb:
     def test_the_active_dag_ids_are_read_at_most_once_per_synchronisation(self):
         listener = RMQWatcherListener()
         existing = [
-            _existing_sub(dag_id="a", queue_name="q", enabled=True, absent_cycles=1),
-            _existing_sub(dag_id="b", queue_name="q", enabled=True, absent_cycles=1),
+            _existing_sub(dag_id="a", queue_name="q", enabled=True,
+                          absent_cycles=_INACTIVE_DAG_MISSES),
+            _existing_sub(dag_id="b", queue_name="q", enabled=True,
+                          absent_cycles=_INACTIVE_DAG_MISSES),
         ]
         ctx, _ = _make_session_ctx(existing_subs=existing)
 
@@ -2422,7 +2478,9 @@ class TestSyncToDb:
     def test_the_active_dag_id_read_gets_a_session_of_its_own(self):
         """A failed read poisons the transaction it ran in on PostgreSQL."""
         listener = RMQWatcherListener()
-        existing = _existing_sub(dag_id="gone_dag", enabled=True, absent_cycles=1)
+        existing = _existing_sub(
+            dag_id="gone_dag", enabled=True, absent_cycles=_INACTIVE_DAG_MISSES
+        )
         write_ctx, write_session = _make_session_ctx(existing_subs=[existing])
         read_ctx, read_session = _make_session_ctx(existing_subs=[])
 
@@ -4224,13 +4282,14 @@ class TestScanMissEndToEnd:
         assert _snapshot(dagmodel_engine) is None
 
     @pytest.mark.asyncio
-    async def test_removed_decorator_on_an_inactive_dag_deletes_on_the_second_miss(
+    async def test_removed_decorator_on_an_inactive_dag_deletes_on_the_third_miss(
         self, e2e_listener, dagmodel_engine, tmp_path
     ):
-        """An enabled row of a DAG Airflow no longer runs still gets one miss for free.
+        """An enabled row of a DAG Airflow no longer runs still gets two misses free.
 
         Its consumer acks and drops every delivery, hence the hurry; one shared hiccup
-        of the filesystem still has to be survivable, hence not the first miss.
+        of the filesystem has to be survivable, and one count can be a race between
+        two schedulers rather than a miss at all, hence two.
         """
         dag_file = tmp_path / "d.py"
         _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
@@ -4238,12 +4297,12 @@ class TestScanMissEndToEnd:
         _record_dag(dagmodel_engine, is_active=False)
 
         _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
-        await e2e_listener._run_cycle()
-
-        row = _snapshot(dagmodel_engine)
-        assert row is not None
-        assert row["enabled"] is True
-        assert row["absent_cycles"] == 1
+        for miss in range(1, _INACTIVE_DAG_MISSES + 1):
+            await e2e_listener._run_cycle()
+            row = _snapshot(dagmodel_engine)
+            assert row is not None, f"deleted after {miss} miss(es)"
+            assert row["enabled"] is True
+            assert row["absent_cycles"] == miss
 
         await e2e_listener._run_cycle()
         assert _snapshot(dagmodel_engine) is None
@@ -4275,8 +4334,9 @@ class TestScanMissEndToEnd:
         await e2e_listener._run_cycle()
 
         _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
-        await e2e_listener._run_cycle()
-        assert _snapshot(dagmodel_engine)["absent_cycles"] == 1
+        for miss in range(1, _INACTIVE_DAG_MISSES + 1):
+            await e2e_listener._run_cycle()
+            assert _snapshot(dagmodel_engine)["absent_cycles"] == miss
 
         await e2e_listener._run_cycle()
         assert _snapshot(dagmodel_engine) is None
@@ -4312,8 +4372,8 @@ class TestScanMissEndToEnd:
         before = _snapshot(dagmodel_engine, queue_name="ui_q")
 
         _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
-        await e2e_listener._run_cycle()
-        await e2e_listener._run_cycle()
+        for _ in range(_INACTIVE_DAG_MISSES + 1):
+            await e2e_listener._run_cycle()
 
         assert _snapshot(dagmodel_engine) is None
         after = _snapshot(dagmodel_engine, queue_name="ui_q")
@@ -4429,7 +4489,9 @@ class TestConcurrentSchedulerWrites:
         record anybody has of the cycle.
         """
         listener = RMQWatcherListener()
-        _add_dag_file_subscription(two_process_engine, enabled=True, absent_cycles=1)
+        _add_dag_file_subscription(
+            two_process_engine, enabled=True, absent_cycles=_INACTIVE_DAG_MISSES
+        )
 
         with caplog.at_level(
             logging.INFO, logger="airflow_provider_rmq.watcher.listener"
@@ -4553,6 +4615,46 @@ class TestConcurrentSchedulerWrites:
         assert row is not None
         assert row["absent_cycles"] == 1
 
+    def test_a_count_this_race_leaves_behind_cannot_delete_the_row_alone(
+        self, two_process_engine
+    ):
+        """One count is not proof of a miss, so the early deletion asks for two.
+
+        A cycle that read the counter as ``NULL`` writes its miss after another
+        scheduler's successful scan committed the reset, and on a counter that already
+        reads ``NULL`` that reset is a write the database has nothing to do about:
+        nothing the later write could be matched against is left behind. The count
+        that lands is therefore about a key that is there, and no compare-and-swap can
+        tell it from one about a key that is not — the column carries no version and
+        no ordering.
+        """
+        listener = RMQWatcherListener()
+        _add_dag_file_subscription(two_process_engine, enabled=True)
+        count_the_miss = listener._count_absent_cycle
+
+        def count_after_another_scheduler_scanned(session, sub, observed):
+            with _db(two_process_engine) as other:
+                upsert_subscription(
+                    other, dag_id="d", queue_name="q", source="dag_file"
+                )
+                other.commit()
+            return count_the_miss(session, sub, observed)
+
+        listener._count_absent_cycle = count_after_another_scheduler_scanned
+        self._sync(listener, two_process_engine, lambda: set())
+        listener._count_absent_cycle = count_the_miss
+        assert _snapshot(two_process_engine)["absent_cycles"] == 1
+
+        # One real miss, on a DAG Airflow no longer runs — the pair the short circuit
+        # used to delete on.
+        self._sync(listener, two_process_engine, lambda: set())
+        row = _snapshot(two_process_engine)
+        assert row is not None, "one real miss deleted the row"
+        assert row["absent_cycles"] == _INACTIVE_DAG_MISSES
+
+        self._sync(listener, two_process_engine, lambda: set())
+        assert _snapshot(two_process_engine) is None
+
     def test_a_deletion_already_flushed_survives_the_active_dag_read(
         self, dagmodel_engine
     ):
@@ -4569,7 +4671,9 @@ class TestConcurrentSchedulerWrites:
         _add_dag_file_subscription(
             dagmodel_engine, dag_id="a", absent_cycles=_ABSENT_GRACE_CYCLES
         )
-        _add_dag_file_subscription(dagmodel_engine, dag_id="b", absent_cycles=1)
+        _add_dag_file_subscription(
+            dagmodel_engine, dag_id="b", absent_cycles=_INACTIVE_DAG_MISSES
+        )
 
         with patch("airflow_provider_rmq.watcher.listener.WatcherSession",
                    sessionmaker(bind=dagmodel_engine)):

@@ -68,6 +68,11 @@ _MIGRATION_BACKOFF_MAX = 60
 #: installation running more than two of them has to raise this proportionally.
 _ABSENT_GRACE_CYCLES = 3
 
+#: Counted misses an enabled dag_file row of an inactive DAG carries before the early
+#: deletion applies to it. Two, because a single count is not proof of a miss under
+#: concurrent schedulers — the reasoning is where the branch reads it.
+_INACTIVE_DAG_MISSES = 2
+
 #: Listings in a row the cycle refuses to read as a statement about the code. The
 #: first ``_UNTRUSTED_SCAN_LIMIT`` of them hold the previous parse, the next one gives
 #: in: a folder that emptied for real, and a filesystem that is not coming back, both
@@ -1562,8 +1567,9 @@ class RMQWatcherListener:
         session: Session,
         sub: RMQSubscription,
         observed: int | None,
-        deleted_now: list[tuple[tuple[str, str, str], bool]],
+        deleted_now: list[tuple[tuple[str, str, str], bool, str]],
         *,
+        report: str,
         only_enabled: bool = False,
     ) -> bool:
         """Delete one dag_file row, but only while it still reads the way it was read.
@@ -1580,12 +1586,13 @@ class RMQWatcherListener:
         and the write leaves a row with no consumer, which is a row the full grace
         period covers.
 
-        A row that really went is appended to ``deleted_now`` as its key and the
-        ``enabled`` flag it carried, for the caller to remember once the transaction
-        holding the deletion is committed — the scan bringing that key back then
-        reports the recreated row instead of quietly handing the subscription a
-        consumer again. Returns whether the row went, so that the caller says in the
-        log what happened rather than what it set out to do.
+        A row that really went is appended to ``deleted_now`` as its key, the
+        ``enabled`` flag it carried and ``report`` — the sentence the log line about it
+        is made of. The caller takes all three off that list once the transaction
+        holding the deletion is committed, so that both the record making the scan
+        report a recreated key and the line saying the row went stand for a deletion
+        the database kept. Returns whether the row went, so that the caller says what
+        happened rather than what it set out to do.
         """
         key = (sub.dag_id, sub.queue_name, sub.conn_id)
         was_enabled = bool(sub.enabled)
@@ -1599,7 +1606,7 @@ class RMQWatcherListener:
             source="dag_file",
         ).filter(*criteria).delete()
         if deleted:
-            deleted_now.append((key, was_enabled))
+            deleted_now.append((key, was_enabled, report))
         return bool(deleted)
 
     def _count_absent_cycle(
@@ -1655,7 +1662,7 @@ class RMQWatcherListener:
           ``absent_cycles``. :data:`_ABSENT_GRACE_CYCLES` misses are survivable and the
           one after them deletes the row. Until then the row lives an entirely ordinary
           life: same ``id``, same consumer task, same ``enabled``.
-        - Deletes an enabled row earlier — from its second miss on — when Airflow no
+        - Deletes an enabled row earlier — from its third miss on — when Airflow no
           longer counts its ``dag_id`` as active, because a delivery on such a
           subscription is acknowledged and dropped. A disabled row has no consumer and
           therefore always gets the full grace period.
@@ -1672,10 +1679,12 @@ class RMQWatcherListener:
         scanned_keys = {_sub_key(s) for s in scanned}
         active_dag_ids: set[str] | None = None
         # Deletions this cycle made and keys it saw come back. Both are applied to the
-        # map of deleted keys once the transaction carrying them is committed: a commit
-        # that fails leaves neither a record of a row that is still there nor a hole
-        # where the report of a key's return has yet to be made.
-        deleted_now: list[tuple[tuple[str, str, str], bool]] = []
+        # map of deleted keys once the transaction carrying them is committed, and the
+        # deletions are reported in the log from there too: a commit that fails leaves
+        # neither a record of a row that is still there, nor a line saying a row went
+        # that is still in the table, nor a hole where the report of a key's return has
+        # yet to be made.
+        deleted_now: list[tuple[tuple[str, str, str], bool, str]] = []
         returned_now: list[tuple[str, str, str]] = []
 
         with WatcherSession() as session:
@@ -1697,7 +1706,7 @@ class RMQWatcherListener:
             # deleted a row.
             if any(
                 sub.enabled
-                and (sub.absent_cycles or 0) >= 1
+                and (sub.absent_cycles or 0) >= _INACTIVE_DAG_MISSES
                 and (sub.dag_id, sub.queue_name, sub.conn_id) not in scanned_keys
                 for sub in existing
             ):
@@ -1722,13 +1731,13 @@ class RMQWatcherListener:
                 current = observed or 0
 
                 if current + 1 > _ABSENT_GRACE_CYCLES:
-                    if self._delete_absent_sub(session, sub, observed, deleted_now):
-                        log.info(
-                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
-                            "from %s trusted scans in a row — deleted",
-                            sub.dag_id, sub.queue_name, sub.conn_id, current + 1,
-                        )
-                    else:
+                    if not self._delete_absent_sub(
+                        session, sub, observed, deleted_now,
+                        report=(
+                            f"missing from {current + 1} trusted scans in a row "
+                            "— deleted"
+                        ),
+                    ):
                         log.info(
                             "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
                             "from %s trusted scans in a row, but its miss counter moved "
@@ -1738,22 +1747,28 @@ class RMQWatcherListener:
                         )
                     continue
 
+                # The early deletion asks for :data:`_INACTIVE_DAG_MISSES` counted
+                # misses, because one count is not proof that a scan missed the key.
+                # Every scheduler writes this counter from a value it read milliseconds
+                # earlier, and the column carries neither a version nor an ordering: a
+                # miss written after another scheduler's successful scan cleared the
+                # counter reads exactly like one written before it, so a key that is
+                # there can leave a count of 1 behind. A second count is written
+                # against a counter that a recovery in between would have cleared, so
+                # it says what this deletion needs said — the key was missing.
                 if (
                     sub.enabled
-                    and current >= 1
+                    and current >= _INACTIVE_DAG_MISSES
                     and active_dag_ids is not None
                     and sub.dag_id not in active_dag_ids
                 ):
-                    if self._delete_absent_sub(
-                        session, sub, observed, deleted_now, only_enabled=True
+                    if not self._delete_absent_sub(
+                        session, sub, observed, deleted_now, only_enabled=True,
+                        report=(
+                            f"missing from the scan and DAG {sub.dag_id} is no longer "
+                            "active — deleted without waiting out the grace period"
+                        ),
                     ):
-                        log.info(
-                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
-                            "from the scan and DAG %s is no longer active — deleted "
-                            "without waiting out the grace period",
-                            sub.dag_id, sub.queue_name, sub.conn_id, sub.dag_id,
-                        )
-                    else:
                         log.info(
                             "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing "
                             "from the scan and DAG %s is no longer active, but the row "
@@ -1794,5 +1809,9 @@ class RMQWatcherListener:
 
             for key in returned_now:
                 self._deleted_dag_file_rows.pop(key, None)
-            for key, was_enabled in deleted_now:
+            for key, was_enabled, report in deleted_now:
+                log.info(
+                    "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) %s",
+                    *key, report,
+                )
                 self._remember_deleted_row(key, was_enabled)
