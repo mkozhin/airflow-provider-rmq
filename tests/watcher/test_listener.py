@@ -2303,7 +2303,35 @@ class TestSyncToDb:
             listener._sync_to_db(scanned)
 
         assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and
-                "d/q" in r.getMessage() and "deleted one was disabled" in r.getMessage()]
+                "d/q" in r.getMessage() and "read the row as disabled" in r.getMessage()]
+
+    def test_the_reported_flag_is_named_as_what_the_cycle_read(self, caplog):
+        """The grace-period DELETE matches on the counter, not on ``enabled``.
+
+        An operator toggling the row between this cycle's read and its write changes
+        what goes, so the line says what the cycle saw instead of asserting what the
+        row held.
+        """
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="d", queue_name="q", enabled=False, absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, _ = _make_session_ctx(existing_subs=[existing])
+        with _sync_env(ctx, {"d"}):
+            listener._sync_to_db([])
+
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default",
+                    "filter_data": {}}]
+        ctx, _ = _make_session_ctx(existing_subs=[])
+        with caplog.at_level(logging.WARNING,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"d"}):
+            listener._sync_to_db(scanned)
+
+        reported = [r.getMessage() for r in caplog.records
+                    if "is in the scan again" in r.getMessage()]
+        assert reported
+        assert "the cycle that deleted it read the row as disabled" in reported[0]
 
     def test_a_key_that_never_went_is_not_reported_as_recreated(self, caplog):
         listener = RMQWatcherListener()
@@ -2547,6 +2575,23 @@ class TestSyncToDb:
             listener._sync_to_db(scanned)
 
         mock_active.assert_not_called()
+
+    def test_the_active_dag_ids_are_not_read_for_a_row_the_grace_period_deletes(self):
+        """The grace period asks nothing of the DAG table, and waits for nothing."""
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="gone_dag", queue_name="q", enabled=True,
+            absent_cycles=_ABSENT_GRACE_CYCLES,
+        )
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+
+        with patch("airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.listener.upsert_subscription"), \
+             patch("airflow_provider_rmq.watcher.listener.get_active_dag_ids") as mock_active:
+            listener._sync_to_db([])
+
+        mock_active.assert_not_called()
+        _delete_mock(session).assert_called_once()
 
     def test_the_active_dag_ids_are_read_at_most_once_per_synchronisation(self):
         listener = RMQWatcherListener()
@@ -4598,6 +4643,24 @@ def _reader_another_scheduler_writes_inside(engine, values, *, active):
     return read
 
 
+def _another_scheduler_writes_before_the_delete(listener, engine, values):
+    """Land another scheduler's committed write between the row's read and its DELETE.
+
+    The grace-period deletion asks Airflow nothing, so the hook a race against it needs
+    is the deletion itself: the write goes in on its own connection and the statement
+    that follows is the real one, matched on the value this cycle read.
+    """
+    original = listener._delete_absent_sub
+
+    def delete(*args, **kwargs):
+        with _db(engine) as session:
+            session.query(RMQSubscription).filter_by(dag_id="d").update(values)
+            session.commit()
+        return original(*args, **kwargs)
+
+    return delete
+
+
 @pytest.fixture
 def two_process_engine(tmp_path):
     """File-backed engine whose sessions each get a connection of their own.
@@ -4681,15 +4744,14 @@ class TestConcurrentSchedulerWrites:
             two_process_engine, enabled=True, absent_cycles=_ABSENT_GRACE_CYCLES
         )
 
+        listener._delete_absent_sub = _another_scheduler_writes_before_the_delete(
+            listener, two_process_engine, {"absent_cycles": None}
+        )
+
         with caplog.at_level(
             logging.INFO, logger="airflow_provider_rmq.watcher.listener"
         ):
-            self._sync(
-                listener, two_process_engine,
-                _reader_another_scheduler_writes_inside(
-                    two_process_engine, {"absent_cycles": None}, active=True
-                ),
-            )
+            self._sync(listener, two_process_engine, lambda: {"d"})
 
         assert _snapshot(two_process_engine) is not None
         assert listener._deleted_dag_file_rows == {}

@@ -1599,8 +1599,12 @@ class RMQWatcherListener:
         period covers.
 
         A row that really went is appended to ``deleted_now`` as its key and the
-        ``enabled`` flag it carried, and the line about it — built around ``report``,
-        the sentence naming why it went — to ``pending_logs``. The caller takes both
+        ``enabled`` flag this cycle read on it, and the line about it — built around
+        ``report``, the sentence naming why it went — to ``pending_logs``. The flag is
+        an observation and is reported as one: only the early deletion puts ``enabled``
+        into the ``DELETE`` predicate, so on the grace-period path an operator's toggle
+        between the read and the write leaves the recorded flag naming what the cycle
+        saw rather than what the row held when it went. The caller takes both
         off those lists once the transaction holding the deletion is committed, so
         that the record making the scan report a recreated key and the line saying the
         row went alike stand for a deletion the database kept. Returns whether the row
@@ -1703,8 +1707,9 @@ class RMQWatcherListener:
         - Reports a key that comes back after this watcher deleted its row: what the
           scan recreates is a new row carrying the default ``enabled``, so a
           subscription an operator had switched off starts consuming again — with a
-          WARNING naming it and the flag the deleted row held. The deletions it is
-          matched against are the ones this process made and still remembers, so the
+          WARNING naming it and the flag the deleting cycle read on the row. The
+          deletions it is matched against are the ones this process made and still
+          remembers, so the
           line follows the memory of the process rather than the row: a scheduler
           restarted in between, or another scheduler recreating what this one deleted,
           leaves the recreation to the miss counter's own INFO lines.
@@ -1741,9 +1746,14 @@ class RMQWatcherListener:
             # it rolls the connection back, so anything this cycle had flushed by then
             # would be gone from the database while the code above went on believing it
             # deleted a row.
+            # The window is bounded on both sides: a row that has already counted
+            # _ABSENT_GRACE_CYCLES misses goes on the grace period alone, before the
+            # branch this read serves is reached, so its presence is no reason to run
+            # the query — and no reason to let the query's latency stand in front of a
+            # deletion that asks nothing of it.
             if any(
                 sub.enabled
-                and (sub.absent_cycles or 0) >= _INACTIVE_DAG_MISSES
+                and _INACTIVE_DAG_MISSES <= (sub.absent_cycles or 0) < _ABSENT_GRACE_CYCLES
                 and (sub.dag_id, sub.queue_name, sub.conn_id) not in scanned_keys
                 for sub in existing
             ):
@@ -1831,7 +1841,7 @@ class RMQWatcherListener:
                             ("RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is in "
                              "the scan again after this watcher deleted it — it is "
                              "recreated as a new row carrying the default enabled flag, "
-                             "and the deleted one was %s"),
+                             "and the cycle that deleted it read the row as %s"),
                             (*key, "enabled" if was_enabled else "disabled"),
                         ))
                 upsert_subscription(
