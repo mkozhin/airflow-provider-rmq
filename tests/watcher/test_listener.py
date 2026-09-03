@@ -2389,6 +2389,97 @@ class TestSyncToDb:
 
         assert listener._deleted_dag_file_rows == {("d", "q", "rmq_default"): False}
 
+    def test_a_counted_miss_is_logged_only_once_it_is_committed(self, caplog):
+        """The count is one statement of a transaction that goes on to upsert.
+
+        A failure anywhere in that transaction takes the count back, and the warning
+        is what an operator has to read the counter's progress from.
+        """
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="d", queue_name="q")
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+        _update_mock(session).return_value = 1
+        session.commit.side_effect = RuntimeError("the database went away")
+
+        with caplog.at_level(logging.INFO,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
+            listener._sync_to_db([])
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("keeping the row for now" in m for m in messages), messages
+
+    def test_a_cleared_miss_counter_is_logged_only_once_it_is_committed(self, caplog):
+        """The counter is cleared by the upsert, which is part of the same transaction."""
+        listener = RMQWatcherListener()
+        existing = _existing_sub(dag_id="d", queue_name="q", absent_cycles=2)
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+        session.commit.side_effect = RuntimeError("the database went away")
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default",
+                    "filter_data": {}}]
+
+        with caplog.at_level(logging.INFO,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
+            listener._sync_to_db(scanned)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("miss counter cleared" in m for m in messages), messages
+
+    def test_a_recreated_key_is_reported_only_once_it_is_committed(self, caplog):
+        """The row the warning is about is created by the upsert this commit carries."""
+        listener = RMQWatcherListener()
+        listener._deleted_dag_file_rows[("d", "q", "rmq_default")] = False
+        ctx, session = _make_session_ctx(existing_subs=[])
+        session.commit.side_effect = RuntimeError("the database went away")
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "rmq_default",
+                    "filter_data": {}}]
+
+        with caplog.at_level(logging.INFO,
+                             logger="airflow_provider_rmq.watcher.listener"), \
+                _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
+            listener._sync_to_db(scanned)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("is in the scan again" in m for m in messages), messages
+
+    def test_a_synchronisation_of_a_superseded_scan_commits_nothing(self):
+        """The listing this pass decided against is one the process has read past.
+
+        A sync step that outlived its timeout keeps running in its pool worker, and
+        the deletions it computed answer a question about the folder that a later
+        cycle has already asked again.
+        """
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="d", queue_name="q", enabled=False, absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+        _delete_mock(session).return_value = 1
+        listener._scan_generation = 7
+
+        with _sync_env(ctx, {"d"}):
+            listener._sync_to_db([], 6)
+
+        session.commit.assert_not_called()
+        session.rollback.assert_called_once()
+        assert listener._deleted_dag_file_rows == {}
+
+    def test_a_synchronisation_of_the_current_scan_commits(self):
+        listener = RMQWatcherListener()
+        existing = _existing_sub(
+            dag_id="d", queue_name="q", absent_cycles=_ABSENT_GRACE_CYCLES
+        )
+        ctx, session = _make_session_ctx(existing_subs=[existing])
+        _delete_mock(session).return_value = 1
+        listener._scan_generation = 7
+
+        with _sync_env(ctx, {"d"}):
+            listener._sync_to_db([], 7)
+
+        session.commit.assert_called_once()
+        assert listener._deleted_dag_file_rows == {("d", "q", "rmq_default"): True}
+
     def test_the_deleted_keys_a_process_remembers_are_bounded(self):
         """Deleted keys mostly never come back, and dag_ids can be generated per run.
 
@@ -4409,6 +4500,71 @@ class TestScanMissEndToEnd:
         await e2e_listener._run_cycle()
         assert _snapshot(dagmodel_engine) is None
 
+    @pytest.mark.asyncio
+    async def test_only_a_trusted_scan_moves_the_scan_ordinal(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        """A listing the cycle refuses to read is not a statement about the folder.
+
+        The ordinal is what a sync step checks its own listing against, so a cycle
+        that kept the rows as they are must leave a sync still running alone.
+        """
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        assert e2e_listener._scan_generation == 1
+
+        _write_dag_file(dag_file, _DAG_HALF_WRITTEN, mtime=2000)
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            await e2e_listener._run_cycle()
+
+        assert e2e_listener._scan_generation == 1
+
+    @pytest.mark.asyncio
+    async def test_a_sync_a_later_scan_overtook_deletes_nothing(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        """The defect the miss counter exists to close, reached through a stuck worker.
+
+        A sync step that outlives its timeout goes on running in its pool worker while
+        the cycles carry on. The next cycle reads the folder again — the key is back —
+        and is refused the sync step, because the earlier attempt has not returned. The
+        listing that worker holds is two cycles old, and the deletion it decided on is
+        one the grace-period branch asks nothing about ``enabled`` before making, so a
+        row an operator switched off is what it would take with it.
+        """
+        gate = threading.Event()
+        sync = e2e_listener._sync_to_db
+
+        def sync_that_outlives_its_timeout(*args):
+            gate.wait(timeout=5)
+            return sync(*args)
+
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=True)
+        _disable_subscription(dagmodel_engine)
+        with _db(dagmodel_engine) as session:
+            session.query(RMQSubscription).filter_by(dag_id="d").update(
+                {"absent_cycles": _ABSENT_GRACE_CYCLES}
+            )
+            session.commit()
+        before = _snapshot(dagmodel_engine)
+
+        e2e_listener._sync_to_db = sync_that_outlives_its_timeout
+        _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
+        with patch("airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.5):
+            await e2e_listener._run_cycle()   # the sync is given up on, its worker is not
+            _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=3000)
+            await e2e_listener._run_cycle()   # the key is back, and this scan is trusted
+
+        gate.set()
+        e2e_listener._step_attempts["sync"].result(timeout=5)
+
+        assert _snapshot(dagmodel_engine) == before
+        assert e2e_listener._deleted_dag_file_rows == {}
+
 
 # ---------------------------------------------------------------------------
 # Two schedulers writing the same row
@@ -4632,13 +4788,13 @@ class TestConcurrentSchedulerWrites:
         _add_dag_file_subscription(two_process_engine, enabled=True)
         count_the_miss = listener._count_absent_cycle
 
-        def count_after_another_scheduler_scanned(session, sub, observed):
+        def count_after_another_scheduler_scanned(session, sub, observed, pending_logs):
             with _db(two_process_engine) as other:
                 upsert_subscription(
                     other, dag_id="d", queue_name="q", source="dag_file"
                 )
                 other.commit()
-            return count_the_miss(session, sub, observed)
+            return count_the_miss(session, sub, observed, pending_logs)
 
         listener._count_absent_cycle = count_after_another_scheduler_scanned
         self._sync(listener, two_process_engine, lambda: set())

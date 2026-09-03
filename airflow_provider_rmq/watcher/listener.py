@@ -810,6 +810,14 @@ class RMQWatcherListener:
         # that raised :class:`_UntrustedScan`, which needs it for the exchange metadata:
         # that metadata lives only in memory and reconcile has no other source for it.
         self._last_good_scan: list[dict] = []
+        # Ordinal of the scan the cycle last accepted as trusted, raised by one on
+        # every acceptance. The sync step is handed the ordinal of the listing it was
+        # given and checks it against this one before committing: a step that outlived
+        # its timeout goes on running in its pool worker while later cycles scan, and
+        # what such a worker holds is a listing about a state of the folder the process
+        # has since read again. Nothing it computed from that listing may reach the
+        # database, deletions least of all.
+        self._scan_generation = 0
         # dag_file keys this process deleted and the ``enabled`` flag each of them
         # carried, held until the scan brings the key back. A key that comes back
         # arrives as a brand new row with the default flag on it, and that is what the
@@ -1021,9 +1029,12 @@ class RMQWatcherListener:
                 scanned = self._last_good_scan
             else:
                 self._last_good_scan = scanned
+                self._scan_generation += 1
 
                 self._phase = "sync"
-                await self._cycle_step("sync", self._sync_to_db, scanned)
+                await self._cycle_step(
+                    "sync", self._sync_to_db, scanned, self._scan_generation
+                )
 
             # Exchange/routing_keys metadata is never persisted to the DB (see
             # plan Technical Details → "Почему миграция БД не нужна") — it only
@@ -1567,7 +1578,8 @@ class RMQWatcherListener:
         session: Session,
         sub: RMQSubscription,
         observed: int | None,
-        deleted_now: list[tuple[tuple[str, str, str], bool, str]],
+        deleted_now: list[tuple[tuple[str, str, str], bool]],
+        pending_logs: list[tuple[int, str, tuple]],
         *,
         report: str,
         only_enabled: bool = False,
@@ -1586,13 +1598,13 @@ class RMQWatcherListener:
         and the write leaves a row with no consumer, which is a row the full grace
         period covers.
 
-        A row that really went is appended to ``deleted_now`` as its key, the
-        ``enabled`` flag it carried and ``report`` — the sentence the log line about it
-        is made of. The caller takes all three off that list once the transaction
-        holding the deletion is committed, so that both the record making the scan
-        report a recreated key and the line saying the row went stand for a deletion
-        the database kept. Returns whether the row went, so that the caller says what
-        happened rather than what it set out to do.
+        A row that really went is appended to ``deleted_now`` as its key and the
+        ``enabled`` flag it carried, and the line about it — built around ``report``,
+        the sentence naming why it went — to ``pending_logs``. The caller takes both
+        off those lists once the transaction holding the deletion is committed, so
+        that the record making the scan report a recreated key and the line saying the
+        row went alike stand for a deletion the database kept. Returns whether the row
+        went, so that the caller says what happened rather than what it set out to do.
         """
         key = (sub.dag_id, sub.queue_name, sub.conn_id)
         was_enabled = bool(sub.enabled)
@@ -1606,11 +1618,20 @@ class RMQWatcherListener:
             source="dag_file",
         ).filter(*criteria).delete()
         if deleted:
-            deleted_now.append((key, was_enabled, report))
+            deleted_now.append((key, was_enabled))
+            pending_logs.append((
+                logging.INFO,
+                "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) %s",
+                (*key, report),
+            ))
         return bool(deleted)
 
     def _count_absent_cycle(
-        self, session: Session, sub: RMQSubscription, observed: int | None
+        self,
+        session: Session,
+        sub: RMQSubscription,
+        observed: int | None,
+        pending_logs: list[tuple[int, str, tuple]],
     ) -> None:
         """Write one more miss onto ``sub``, while its counter still reads ``observed``.
 
@@ -1622,6 +1643,12 @@ class RMQWatcherListener:
         which the next miss deletes it, an intervening successful scan notwithstanding.
         The write therefore matches on what was read, and a scheduler holding a stale
         value writes nothing.
+
+        The line reporting the count goes to ``pending_logs`` for the caller to emit
+        once the transaction is committed, because the count is one statement of a
+        transaction that goes on to upsert every scanned key. The line about a write
+        the predicate refused is emitted here: it says the row was left alone, which
+        is what the whole transaction leaves it either way.
         """
         counted = observed + 1 if observed else 1
         updated = session.query(RMQSubscription).filter_by(
@@ -1633,12 +1660,12 @@ class RMQWatcherListener:
             {"absent_cycles": counted}, synchronize_session=False
         )
         if updated:
-            log.warning(
-                "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
-                "the scan (%s of %s allowed) — keeping the row for now",
-                sub.dag_id, sub.queue_name, sub.conn_id,
-                counted, _ABSENT_GRACE_CYCLES,
-            )
+            pending_logs.append((
+                logging.WARNING,
+                ("RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from "
+                 "the scan (%s of %s allowed) — keeping the row for now"),
+                (sub.dag_id, sub.queue_name, sub.conn_id, counted, _ABSENT_GRACE_CYCLES),
+            ))
         else:
             log.info(
                 "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) missing from the "
@@ -1654,8 +1681,15 @@ class RMQWatcherListener:
         while len(self._deleted_dag_file_rows) > _DELETED_ROWS_REMEMBERED:
             self._deleted_dag_file_rows.pop(next(iter(self._deleted_dag_file_rows)))
 
-    def _sync_to_db(self, scanned: list[dict]) -> None:
+    def _sync_to_db(self, scanned: list[dict], generation: int | None = None) -> None:
         """Reconcile dag_file subscriptions in DB with the current scan result.
+
+        :param scanned: Subscriptions the scan found in the DAG files.
+        :param generation: :attr:`_scan_generation` ``scanned`` was accepted as, or
+            ``None`` from a caller that has no scan sequence behind it. A pass whose
+            ordinal no longer matches the listener's commits nothing: the folder has
+            been read again since, and every deletion below was decided against a
+            listing that reading superseded.
 
         - Upserts all subscriptions found in code (source='dag_file').
         - Counts the scans a dag_file row's key was missing from, in
@@ -1679,13 +1713,16 @@ class RMQWatcherListener:
         scanned_keys = {_sub_key(s) for s in scanned}
         active_dag_ids: set[str] | None = None
         # Deletions this cycle made and keys it saw come back. Both are applied to the
-        # map of deleted keys once the transaction carrying them is committed, and the
-        # deletions are reported in the log from there too: a commit that fails leaves
-        # neither a record of a row that is still there, nor a line saying a row went
-        # that is still in the table, nor a hole where the report of a key's return has
-        # yet to be made.
-        deleted_now: list[tuple[tuple[str, str, str], bool, str]] = []
+        # map of deleted keys once the transaction carrying them is committed: a commit
+        # that fails leaves neither a record of a row that is still there, nor a hole
+        # where the report of a key's return has yet to be made.
+        deleted_now: list[tuple[tuple[str, str, str], bool]] = []
         returned_now: list[tuple[str, str, str]] = []
+        # Lines about writes this transaction is making, each of them a level, a format
+        # string and the arguments filling it. They are emitted from the same place,
+        # after the commit, so that a line claiming a row was deleted, a miss counted
+        # or a counter cleared stands for a write the database kept.
+        pending_logs: list[tuple[int, str, tuple]] = []
 
         with WatcherSession() as session:
             existing = (
@@ -1716,11 +1753,12 @@ class RMQWatcherListener:
                 key = (sub.dag_id, sub.queue_name, sub.conn_id)
                 if key in scanned_keys:
                     if sub.absent_cycles:
-                        log.info(
-                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is back in "
-                            "the scan after %s miss(es) — miss counter cleared",
-                            sub.dag_id, sub.queue_name, sub.conn_id, sub.absent_cycles,
-                        )
+                        pending_logs.append((
+                            logging.INFO,
+                            ("RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is "
+                             "back in the scan after %s miss(es) — miss counter cleared"),
+                            (sub.dag_id, sub.queue_name, sub.conn_id, sub.absent_cycles),
+                        ))
                     continue
 
                 # ``NULL`` and ``0`` are the same statement about a row that has never
@@ -1732,7 +1770,7 @@ class RMQWatcherListener:
 
                 if current + 1 > _ABSENT_GRACE_CYCLES:
                     if not self._delete_absent_sub(
-                        session, sub, observed, deleted_now,
+                        session, sub, observed, deleted_now, pending_logs,
                         report=(
                             f"missing from {current + 1} trusted scans in a row "
                             "— deleted"
@@ -1763,7 +1801,8 @@ class RMQWatcherListener:
                     and sub.dag_id not in active_dag_ids
                 ):
                     if not self._delete_absent_sub(
-                        session, sub, observed, deleted_now, only_enabled=True,
+                        session, sub, observed, deleted_now, pending_logs,
+                        only_enabled=True,
                         report=(
                             f"missing from the scan and DAG {sub.dag_id} is no longer "
                             "active — deleted without waiting out the grace period"
@@ -1779,7 +1818,7 @@ class RMQWatcherListener:
                         )
                     continue
 
-                self._count_absent_cycle(session, sub, observed)
+                self._count_absent_cycle(session, sub, observed, pending_logs)
 
             for s in scanned:
                 key = _sub_key(s)
@@ -1787,13 +1826,14 @@ class RMQWatcherListener:
                 if was_enabled is not None:
                     returned_now.append(key)
                     if key not in existing_keys:
-                        log.warning(
-                            "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is in "
-                            "the scan again after this watcher deleted it — it is "
-                            "recreated as a new row carrying the default enabled flag, "
-                            "and the deleted one was %s",
-                            *key, "enabled" if was_enabled else "disabled",
-                        )
+                        pending_logs.append((
+                            logging.WARNING,
+                            ("RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) is in "
+                             "the scan again after this watcher deleted it — it is "
+                             "recreated as a new row carrying the default enabled flag, "
+                             "and the deleted one was %s"),
+                            (*key, "enabled" if was_enabled else "disabled"),
+                        ))
                 upsert_subscription(
                     session,
                     dag_id=s["dag_id"],
@@ -1805,13 +1845,22 @@ class RMQWatcherListener:
                     group_key=s.get("group_key"),
                 )
 
+            if generation is not None and generation != self._scan_generation:
+                session.rollback()
+                incr("rmq_watcher.sync_superseded")
+                log.warning(
+                    "RMQ Watcher: discarding the synchronisation of scan %s — scan %s "
+                    "has been accepted while it ran, so its deletions were decided "
+                    "against a listing the process has already read past",
+                    generation, self._scan_generation,
+                )
+                return
+
             session.commit()
 
+            for level, msg, args in pending_logs:
+                log.log(level, msg, *args)
             for key in returned_now:
                 self._deleted_dag_file_rows.pop(key, None)
-            for key, was_enabled, report in deleted_now:
-                log.info(
-                    "RMQ Watcher: dag_file subscription %s/%s (conn_id=%s) %s",
-                    *key, report,
-                )
+            for key, was_enabled in deleted_now:
                 self._remember_deleted_row(key, was_enabled)
