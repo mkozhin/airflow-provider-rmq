@@ -136,6 +136,29 @@
           <div class="col-sm-offset-2 col-sm-6">
             <div class="checkbox">
               <label>
+                <input type="checkbox" name="ack_unmatched"
+                       {% if sub and sub.ack_unmatched %}checked{% endif %}
+                       {% if is_dag_file %}disabled{% endif %}>
+                Acknowledge unmatched messages
+              </label>
+            </div>
+            <p class="help-block">
+              {% if is_dag_file %}
+                Set in the DAG file — <code>@rmq_trigger(ack_unmatched=True)</code>.
+              {% else %}
+                A message this subscription's filter rejects is acknowledged and gone
+                instead of being returned to the queue. Dead-lettering does not apply
+                to an acknowledgement, so the message simply disappears — turn this on
+                only for a queue this subscription owns.
+              {% endif %}
+            </p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <div class="col-sm-offset-2 col-sm-6">
+            <div class="checkbox">
+              <label>
                 <input type="checkbox" name="enabled"
                        {% if (sub is none) or sub.enabled %}checked{% endif %}>
                 Enabled

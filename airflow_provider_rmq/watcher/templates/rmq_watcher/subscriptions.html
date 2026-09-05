@@ -107,6 +107,7 @@
             <th>Queue(s)</th>
             <th>conn_id</th>
             <th>Cooldown</th>
+            <th>Ack unmatched</th>
             <th>Source</th>
             <th>Status</th>
             <th>Last Error</th>
@@ -114,9 +115,24 @@
           </tr>
         </thead>
         <tbody>
+        {# `is defined` guards the same way the dag-not-found badge does: Undefined
+           raises on `in`, so a context without these keys would break the page
+           instead of rendering it without badges. #}
+        {% set have_sharing = shared_queues is defined and shared_queues is not none %}
+        {% set have_acking = ack_unmatched_queues is defined and ack_unmatched_queues is not none %}
         {% for item in subscriptions %}
           {% if item.is_group is defined and item.is_group %}
           {# ---- Grouped row (multiple queues, shared cooldown) ---- #}
+          {# A group spans several queues, so the badge names the shared ones. #}
+          {% set shared_ns = namespace(queues=[], acking=false) %}
+          {% for q in item.queue_names %}
+            {% if have_sharing and (q, item.conn_id) in shared_queues %}
+              {% set shared_ns.queues = shared_ns.queues + [q] %}
+              {% if have_acking and (q, item.conn_id) in ack_unmatched_queues %}
+                {% set shared_ns.acking = true %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
           <tr class="{{ 'text-muted' if not item.enabled else '' }}">
             <td>
               {{ item.dag_id }}
@@ -131,11 +147,25 @@
               {% for q in item.queue_names %}
                 <span class="label label-default">{{ q }}</span>
               {% endfor %}
+              {% if shared_ns.queues %}
+                <span class="label label-warning"
+                      title="Another enabled subscription listens to this queue on the same conn_id. The broker splits deliveries round-robin between competing consumers, so a message that suits both filters — every message, when filter_data is empty — is acknowledged by whichever consumer received it and the other subscription's DAG does not run. Fan-out is built from separate queues and bindings, not from two subscriptions on one queue.{% if shared_ns.acking %} One of the subscriptions on this queue acknowledges unmatched messages: a message that only the neighbour's filter accepts is deleted the moment it lands on the acknowledging consumer. The neighbour stays listening and reports no error, and its DAG never runs.{% endif %}">
+                  ⚠ shared queue: {{ shared_ns.queues | join(', ') }}{% if shared_ns.acking %} — messages deleted{% endif %}
+                </span>
+              {% endif %}
             </td>
             <td>{{ item.conn_id }}</td>
             <td>
               {% if item.cooldown %}
                 <span class="text-info">{{ item.cooldown }}s</span>
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td>
+              {% if item.ack_unmatched %}
+                <span class="label label-info"
+                      title="A message this subscription's filter rejects is acknowledged and gone instead of being returned to the queue. Dead-lettering does not apply to an acknowledgement, so the message simply disappears.">on</span>
               {% else %}
                 —
               {% endif %}
@@ -176,6 +206,8 @@
           </tr>
           {% else %}
           {# ---- Single-queue row (no group_key) ---- #}
+          {% set row_shared = have_sharing and (item.queue_name, item.conn_id) in shared_queues %}
+          {% set row_acking = have_acking and (item.queue_name, item.conn_id) in ack_unmatched_queues %}
           <tr class="{{ 'text-muted' if not item.enabled else '' }}">
             <td>
               {{ item.dag_id }}
@@ -186,11 +218,27 @@
                 </span>
               {% endif %}
             </td>
-            <td>{{ item.queue_name }}</td>
+            <td>
+              {{ item.queue_name }}
+              {% if row_shared %}
+                <span class="label label-warning"
+                      title="Another enabled subscription listens to this queue on the same conn_id. The broker splits deliveries round-robin between competing consumers, so a message that suits both filters — every message, when filter_data is empty — is acknowledged by whichever consumer received it and the other subscription's DAG does not run. Fan-out is built from separate queues and bindings, not from two subscriptions on one queue.{% if row_acking %} One of the subscriptions on this queue acknowledges unmatched messages: a message that only the neighbour's filter accepts is deleted the moment it lands on the acknowledging consumer. The neighbour stays listening and reports no error, and its DAG never runs.{% endif %}">
+                  ⚠ shared queue{% if row_acking %} — messages deleted{% endif %}
+                </span>
+              {% endif %}
+            </td>
             <td>{{ item.conn_id }}</td>
             <td>
               {% if item.cooldown %}
                 <span class="text-info">{{ item.cooldown }}s</span>
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td>
+              {% if item.ack_unmatched %}
+                <span class="label label-info"
+                      title="A message this subscription's filter rejects is acknowledged and gone instead of being returned to the queue. Dead-lettering does not apply to an acknowledgement, so the message simply disappears.">on</span>
               {% else %}
                 —
               {% endif %}
