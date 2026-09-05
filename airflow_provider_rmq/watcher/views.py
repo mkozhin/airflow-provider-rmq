@@ -192,9 +192,9 @@ def _flash_shared_queues(session, pairs: Iterable[tuple[str, str]]) -> None:
 
     Called after the commit, because the answer depends on the rows as they stand
     once the save has landed. The form cannot ask beforehand: subscription_form.html
-    renders its fields out of the row and never reads request.form, so a confirmation
-    round trip would redraw the checkbox from the database and lose the very value it
-    is confirming — and toggle/toggle_group have no form at all.
+    renders dag_id, the queue list, conn_id, cooldown and filter_data out of the row,
+    so a confirmation round trip would redraw them from the database and lose the very
+    input it is confirming — and toggle/toggle_group have no form at all.
     """
     wanted = set(pairs)
     if not wanted:
@@ -451,7 +451,10 @@ class RMQWatcherView(BaseView):
             if not dag_id or not queue_names:
                 flash("dag_id and at least one queue_name are required", "error")
                 return self.render_template(
-                    "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
+                    "rmq_watcher/subscription_form.html",
+                    sub=None,
+                    is_dag_file=False,
+                    ack_unmatched_checked=ack_unmatched,
                 )
 
             try:
@@ -459,7 +462,10 @@ class RMQWatcherView(BaseView):
             except ValueError:
                 flash("cooldown must be a non-negative integer", "error")
                 return self.render_template(
-                    "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
+                    "rmq_watcher/subscription_form.html",
+                    sub=None,
+                    is_dag_file=False,
+                    ack_unmatched_checked=ack_unmatched,
                 )
 
             try:
@@ -467,7 +473,10 @@ class RMQWatcherView(BaseView):
             except ValueError:
                 flash("filter_data must be valid JSON", "error")
                 return self.render_template(
-                    "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
+                    "rmq_watcher/subscription_form.html",
+                    sub=None,
+                    is_dag_file=False,
+                    ack_unmatched_checked=ack_unmatched,
                 )
 
             group_key = dag_id if cooldown > 0 else None
@@ -493,7 +502,12 @@ class RMQWatcherView(BaseView):
 
             return redirect(url_for("RMQWatcherView.subscriptions"))
 
-        return self.render_template("rmq_watcher/subscription_form.html", sub=None, is_dag_file=False)
+        return self.render_template(
+            "rmq_watcher/subscription_form.html",
+            sub=None,
+            is_dag_file=False,
+            ack_unmatched_checked=False,
+        )
 
     @expose("/subscriptions/<int:sub_id>/edit", methods=["GET", "POST"])
     @has_access
@@ -517,6 +531,9 @@ class RMQWatcherView(BaseView):
                     # enabled stands outside it because it is the one field the UI
                     # owns on a dag_file row as well
                     ack_unmatched = request.form.get("ack_unmatched") == "on"
+                    # the error paths below redraw the box from this value rather than
+                    # from the row: a save that trips on cooldown or filter_data must
+                    # not put permanent deletion back on for a user who cleared it
                     dag_id = request.form.get("dag_id", sub.dag_id).strip()
                     queue_name = request.form.get("queue_name", sub.queue_name).strip()
                     conn_id = (
@@ -528,7 +545,9 @@ class RMQWatcherView(BaseView):
                     if not dag_id or not queue_name:
                         flash("dag_id and queue_name are required", "error")
                         return self.render_template(
-                            "rmq_watcher/subscription_form.html", sub=sub
+                            "rmq_watcher/subscription_form.html",
+                            sub=sub,
+                            ack_unmatched_checked=ack_unmatched,
                         )
 
                     try:
@@ -536,7 +555,9 @@ class RMQWatcherView(BaseView):
                     except ValueError:
                         flash("cooldown must be a non-negative integer", "error")
                         return self.render_template(
-                            "rmq_watcher/subscription_form.html", sub=sub
+                            "rmq_watcher/subscription_form.html",
+                            sub=sub,
+                            ack_unmatched_checked=ack_unmatched,
                         )
 
                     try:
@@ -544,7 +565,9 @@ class RMQWatcherView(BaseView):
                     except ValueError:
                         flash("filter_data must be valid JSON", "error")
                         return self.render_template(
-                            "rmq_watcher/subscription_form.html", sub=sub
+                            "rmq_watcher/subscription_form.html",
+                            sub=sub,
+                            ack_unmatched_checked=ack_unmatched,
                         )
 
                     sub.dag_id = dag_id
@@ -565,6 +588,7 @@ class RMQWatcherView(BaseView):
                 "rmq_watcher/subscription_form.html",
                 sub=sub,
                 is_dag_file=is_dag_file,
+                ack_unmatched_checked=bool(sub.ack_unmatched),
             )
 
     @expose("/subscriptions/<int:sub_id>/delete", methods=["POST"])
@@ -678,13 +702,14 @@ class RMQWatcherView(BaseView):
             is_dag_file = any(s.source == "dag_file" for s in subs)
             # Representative sub for display defaults
             rep = subs[0]
-            # The Subscriptions page reads the group's ack_unmatched as an OR over
-            # its rows (_group_subscriptions), so the form reads it the same way:
-            # the box the page shows on is the box the form offers, and a save
-            # writes that one value to every row.
-            ack_unmatched_group = any(s.ack_unmatched for s in subs)
-            ack_unmatched_mixed = ack_unmatched_group and not all(
-                s.ack_unmatched for s in subs
+            # A save writes one value to every row, so the box carries the value
+            # the whole group already agrees on: a group whose rows disagree is
+            # drawn off, and a save that only touched cooldown or filter_data
+            # cannot switch permanent deletion on for a row that runs without it.
+            # The disagreement itself is named under the checkbox.
+            ack_unmatched_all = all(s.ack_unmatched for s in subs)
+            ack_unmatched_mixed = (
+                any(s.ack_unmatched for s in subs) and not ack_unmatched_all
             )
 
             if request.method == "POST":
@@ -693,7 +718,9 @@ class RMQWatcherView(BaseView):
                 if not is_dag_file:
                     # the group is rewritten row by row through upsert_subscription,
                     # which assigns ack_unmatched unconditionally — without passing it
-                    # here the save would clear the setting for the whole group
+                    # here the save would clear the setting for the whole group. The
+                    # error paths below redraw the box from this value, so a save that
+                    # trips elsewhere keeps the setting the user submitted
                     ack_unmatched = request.form.get("ack_unmatched") == "on"
                     dag_id = request.form.get("dag_id", rep.dag_id).strip()
                     queue_names_raw = request.form.getlist("queue_name")
@@ -711,7 +738,7 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
-                            ack_unmatched_group=ack_unmatched_group,
+                            ack_unmatched_checked=ack_unmatched,
                             ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
@@ -724,7 +751,7 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
-                            ack_unmatched_group=ack_unmatched_group,
+                            ack_unmatched_checked=ack_unmatched,
                             ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
@@ -737,7 +764,7 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
-                            ack_unmatched_group=ack_unmatched_group,
+                            ack_unmatched_checked=ack_unmatched,
                             ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
@@ -790,6 +817,6 @@ class RMQWatcherView(BaseView):
                 sub=rep,
                 is_dag_file=is_dag_file,
                 group_subs=subs,
-                ack_unmatched_group=ack_unmatched_group,
+                ack_unmatched_checked=ack_unmatched_all,
                 ack_unmatched_mixed=ack_unmatched_mixed,
             )
