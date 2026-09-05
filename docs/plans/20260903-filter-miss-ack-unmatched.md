@@ -841,14 +841,14 @@ CHANGELOG и readme число называется как «порядка 300 
 - Modify: `airflow_provider_rmq/watcher/models.py`
 - Modify: `tests/watcher/test_models.py`
 
-- [ ] добавить `ack_unmatched = Column(Boolean, nullable=True)` в `RMQSubscription`
-- [ ] провести параметр через `upsert_subscription` (`models.py:177-188`);
+- [x] добавить `ack_unmatched = Column(Boolean, nullable=True)` в `RMQSubscription`
+- [x] провести параметр через `upsert_subscription` (`models.py:177-188`);
       `None` читается как `False`
-- [ ] тест: обобщённая миграция (`models.py:93-131`) добавляет колонку в таблицу
+- [x] тест: обобщённая миграция (`models.py:93-131`) добавляет колонку в таблицу
       без неё — по образцу теста на `absent_cycles`
-- [ ] тест: `upsert_subscription` пишет и обновляет значение
-- [ ] тест: строка, созданная без параметра, читается как `False`
-- [ ] прогнать тесты — обязаны пройти до задачи 5
+- [x] тест: `upsert_subscription` пишет и обновляет значение
+- [x] тест: строка, созданная без параметра, читается как `False`
+- [x] прогнать тесты — обязаны пройти до задачи 5
 
 ### Task 5: Путь параметра от декоратора до consumer'а
 

@@ -42,6 +42,12 @@ class RMQSubscription(WatcherBase):
     trigger_mode = Column(String(20), nullable=False, default="any")
     group_key = Column(String(250), nullable=True)
     cooldown = Column(Integer, nullable=True)
+    # whether a message this subscription's filter rejected is acknowledged and gone
+    # instead of returned to the queue; NULL reads as False. Nullable because
+    # _add_missing_columns attaches a column without NOT NULL whatever the model says,
+    # and a NOT NULL model would give a new install a different schema than a migrated
+    # one
+    ack_unmatched = Column(Boolean, nullable=True)
     # how many trusted scans in a row failed to mention this row's key; NULL and 0
     # both mean "the key is there". Written by the watcher's _sync_to_db and reset
     # by upsert_subscription; readers of the row ignore it
@@ -185,6 +191,7 @@ def upsert_subscription(
     trigger_mode: str = "any",
     group_key: str | None = None,
     cooldown: int | None = None,
+    ack_unmatched: bool = False,
 ) -> RMQSubscription:
     """Insert or update a subscription. Caller must commit."""
     sub = (
@@ -211,6 +218,7 @@ def upsert_subscription(
     sub.trigger_mode = trigger_mode
     sub.group_key = group_key
     sub.cooldown = cooldown
+    sub.ack_unmatched = ack_unmatched
     return sub
 
 

@@ -22,7 +22,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from airflow_provider_rmq.watcher.models import RMQSubscription, WatcherBase
-from tests.watcher.conftest import SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES
+from tests.watcher.conftest import SUBSCRIPTIONS_DDL_PRE_MIGRATION
 
 # ---------------------------------------------------------------------------
 # Patch has_access → identity before loading views, so the class is built
@@ -1121,13 +1121,13 @@ class TestSubscriptionsSchemaOutdated:
 
     @staticmethod
     def _legacy_engine():
-        """Engine whose subscriptions table predates the miss counter, with
-        the rest of the watcher schema current."""
+        """Engine whose subscriptions table predates the columns later releases
+        added, with the rest of the watcher schema current."""
         engine = create_engine("sqlite:///:memory:")
         WatcherBase.metadata.create_all(engine)
         with engine.begin() as conn:
             conn.execute(text("DROP TABLE rmq_watcher_subscriptions"))
-            conn.execute(text(SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES))
+            conn.execute(text(SUBSCRIPTIONS_DDL_PRE_MIGRATION))
             conn.execute(text(_seed_subscription_sql))
         return engine
 
