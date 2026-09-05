@@ -863,51 +863,51 @@ CHANGELOG и readme число называется как «порядка 300 
 - Modify: `tests/watcher/test_subscription_builder.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] добавить `ack_unmatched: bool = False` в `rmq_trigger`
+- [x] добавить `ack_unmatched: bool = False` в `rmq_trigger`
       (`decorators.py:12-23`) и в `build_subscriptions`
       (`subscription_builder.py:28-40`)
-- [ ] добавить ключ в `_RMQ_TRIGGER_KWARGS` (`listener.py:473`), чтобы AST-скан
+- [x] добавить ключ в `_RMQ_TRIGGER_KWARGS` (`listener.py:473`), чтобы AST-скан
       его не отбрасывал
-- [ ] `build_subscriptions` проверяет `isinstance(ack_unmatched, bool)` рядом с
+- [x] `build_subscriptions` проверяет `isinstance(ack_unmatched, bool)` рядом с
       проверкой `cooldown` (`subscription_builder.py:64-67`) — без неё
       `ack_unmatched="yes"` доедет строкой до `Column(Boolean)`, на SQLite
       запишется без возражений и прочитается как истина
-- [ ] AST-скан пишет WARNING, когда kwarg из `_RMQ_TRIGGER_KWARGS` задан, но
+- [x] AST-скан пишет WARNING, когда kwarg из `_RMQ_TRIGGER_KWARGS` задан, но
       литералом не является: с именем DAG'а, очереди и параметра. Молчаливая
       подстановка умолчания даёт подписку, работающую вопреки объявленному в DAG
       — `ACK_UNMATCHED = True` в модуле и `ack_unmatched=ACK_UNMATCHED` в
       декораторе это корректный Python
-- [ ] тем же WARNING'ом закрыть распаковку: `kw.arg is None` — это
+- [x] тем же WARNING'ом закрыть распаковку: `kw.arg is None` — это
       `@rmq_trigger(**opts)`, где не читается ни один параметр, и без своей ветки
       новая диагностика имеет на ней дыру
-- [ ] `:param ack_unmatched:` в докстринге `rmq_trigger` и `build_subscriptions`
-- [ ] там же поправить перечисления, ставшие неполными: блок «Returns a list of
+- [x] `:param ack_unmatched:` в докстринге `rmq_trigger` и `build_subscriptions`
+- [x] там же поправить перечисления, ставшие неполными: блок «Returns a list of
       dicts with keys …» (`subscription_builder.py:55-58`) и список разделяемых
       полей в `:param queues:` декоратора — оба называют набор, в который
       `ack_unmatched` теперь входит
-- [ ] `_sync_to_db` передаёт значение в `upsert_subscription`
+- [x] `_sync_to_db` передаёт значение в `upsert_subscription`
       (`listener.py:1847-1856`): kwargs там перечислены вручную, и забытый
       `ack_unmatched=` не даёт ни ошибки, ни падения типов — dag_file-строка
       просто всегда пишется с умолчанием, а весь набор остаётся зелёным
-- [ ] **добавить ключ в проекцию `_read_active_subs` (`listener.py:635-643`)** —
+- [x] **добавить ключ в проекцию `_read_active_subs` (`listener.py:635-643`)** —
       это единственный dict, который видит consumer
-- [ ] тест: декоратор с `ack_unmatched=True` даёт запись подписки с этим значением
-- [ ] тест: AST-скан читает литералы `True` и `False`
-- [ ] тест: нелитеральное значение даёт умолчание **и WARNING** с именем
+- [x] тест: декоратор с `ack_unmatched=True` даёт запись подписки с этим значением
+- [x] тест: AST-скан читает литералы `True` и `False`
+- [x] тест: нелитеральное значение даёт умолчание **и WARNING** с именем
       параметра
-- [ ] тест: `ack_unmatched="yes"` даёт `ValueError` и пропущенную подписку — как
+- [x] тест: `ack_unmatched="yes"` даёт `ValueError` и пропущенную подписку — как
       невалидный `cooldown`
-- [ ] тест: multi-queue и exchange-режимы разносят значение по всем записям
-- [ ] тест: `@rmq_trigger(**opts)` даёт WARNING про распаковку
-- [ ] тест: `_read_active_subs` кладёт значение из строки в entry, а строка без
+- [x] тест: multi-queue и exchange-режимы разносят значение по всем записям
+- [x] тест: `@rmq_trigger(**opts)` даёт WARNING про распаковку
+- [x] тест: `_read_active_subs` кладёт значение из строки в entry, а строка без
       значения даёт `False`
-- [ ] тест: `_sync_to_db` передаёт `ack_unmatched` в `upsert_subscription` — по
+- [x] тест: `_sync_to_db` передаёт `ack_unmatched` в `upsert_subscription` — по
       образцу `tests/watcher/test_listener.py:2077`, где мокается
       `upsert_subscription` и ассертятся kwargs
-- [ ] проверка снятием: убрать ключ из проекции — краснеет свой тест
-- [ ] проверка снятием: убрать kwarg из вызова `upsert_subscription` в
+- [x] проверка снятием: убрать ключ из проекции — краснеет свой тест
+- [x] проверка снятием: убрать kwarg из вызова `upsert_subscription` в
       `_sync_to_db` — краснеет свой тест
-- [ ] прогнать тесты — обязаны пройти до задачи 6
+- [x] прогнать тесты — обязаны пройти до задачи 6
 
 ### Task 6: Watcher — владение состоянием, перезапуск таски, метрика
 

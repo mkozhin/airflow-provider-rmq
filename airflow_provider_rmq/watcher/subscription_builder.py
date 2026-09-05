@@ -37,6 +37,7 @@ def build_subscriptions(
     conn_id: str = "rmq_default",
     filter_data: dict[str, Any] | None = None,
     cooldown: int = 0,
+    ack_unmatched: bool = False,
 ) -> list[dict]:
     """Validate ``@rmq_trigger`` arguments and build subscription dicts.
 
@@ -52,10 +53,15 @@ def build_subscriptions(
     entries are not subject to that check (dots there are an intentionally
     written topic pattern) but must still be non-empty strings.
 
+    :param ack_unmatched: ``True`` acknowledges a message the filter rejected
+        instead of returning it to the queue, so the message leaves the broker
+        for good. Must be a ``bool``: a string would reach ``Column(Boolean)``
+        as-is and read back as truth on SQLite.
+
     Returns a list of dicts with keys ``{"queue_name", "conn_id",
-    "filter_data", "cooldown"}`` (plus ``{"exchange", "routing_keys"}`` for
-    exchange-mode) — one entry per queue in ``queues``, or a single entry for
-    ``queue=``/``exchange=``.
+    "filter_data", "cooldown", "ack_unmatched"}`` (plus ``{"exchange",
+    "routing_keys"}`` for exchange-mode) — one entry per queue in ``queues``,
+    or a single entry for ``queue=``/``exchange=``.
     """
     modes_given = sum(x is not None for x in (queue, queues, exchange))
     if modes_given != 1:
@@ -65,6 +71,11 @@ def build_subscriptions(
         raise ValueError("'cooldown' must be an int.")
     if cooldown < 0:
         raise ValueError("'cooldown' must be >= 0.")
+
+    # ValueError, like every other rejection here: the AST scan catches it and
+    # records the subscription as skipped.
+    if not isinstance(ack_unmatched, bool):
+        raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
 
     if queue is not None and not isinstance(queue, str):
         raise ValueError("'queue' must be a string.")
@@ -151,6 +162,7 @@ def build_subscriptions(
                 "conn_id": conn_id,
                 "filter_data": filter_data,
                 "cooldown": cooldown,
+                "ack_unmatched": ack_unmatched,
                 "exchange": exchange,
                 "routing_keys": final_keys,
             }
@@ -163,6 +175,7 @@ def build_subscriptions(
                 "conn_id": conn_id,
                 "filter_data": filter_data,
                 "cooldown": cooldown,
+                "ack_unmatched": ack_unmatched,
             }
             for q in queues
         ]
@@ -173,6 +186,7 @@ def build_subscriptions(
             "conn_id": conn_id,
             "filter_data": filter_data,
             "cooldown": cooldown,
+            "ack_unmatched": ack_unmatched,
         }
     ]
 

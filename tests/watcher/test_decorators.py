@@ -63,7 +63,13 @@ class TestRmqTriggerDecorator:
         dag = _make_dag()
         rmq_trigger(queue="payments", conn_id="rmq_pay", filter_data={"filter_headers": {"k": "v"}})(dag)
         sub = dag._rmq_subscriptions[0]
-        assert set(sub.keys()) == {"queue_name", "conn_id", "filter_data", "cooldown"}
+        assert set(sub.keys()) == {
+            "queue_name",
+            "conn_id",
+            "filter_data",
+            "cooldown",
+            "ack_unmatched",
+        }
         assert sub["queue_name"] == "payments"
 
     def test_stacking_preserves_order(self):
@@ -73,6 +79,34 @@ class TestRmqTriggerDecorator:
         rmq_trigger(queue="third")(dag)
         names = [s["queue_name"] for s in dag._rmq_subscriptions]
         assert names == ["first", "second", "third"]
+
+    # --- ack_unmatched ---
+
+    def test_default_ack_unmatched_is_false(self):
+        dag = _make_dag()
+        rmq_trigger(queue="orders")(dag)
+        assert dag._rmq_subscriptions[0]["ack_unmatched"] is False
+
+    def test_explicit_ack_unmatched(self):
+        dag = _make_dag()
+        rmq_trigger(queue="orders", ack_unmatched=True)(dag)
+        assert dag._rmq_subscriptions[0]["ack_unmatched"] is True
+
+    def test_queues_list_all_share_ack_unmatched(self):
+        dag = _make_dag()
+        rmq_trigger(queues=["a", "b", "c"], ack_unmatched=True)(dag)
+        assert len(dag._rmq_subscriptions) == 3
+        assert all(sub["ack_unmatched"] is True for sub in dag._rmq_subscriptions)
+
+    def test_exchange_mode_carries_ack_unmatched(self):
+        dag = _make_dag()
+        rmq_trigger(exchange="ex", routing_keys=["a.b"], ack_unmatched=True)(dag)
+        assert dag._rmq_subscriptions[0]["ack_unmatched"] is True
+
+    def test_non_bool_ack_unmatched_raises(self):
+        dag = _make_dag()
+        with pytest.raises(ValueError, match="ack_unmatched"):
+            rmq_trigger(queue="q", ack_unmatched="yes")(dag)
 
     # --- cooldown ---
 

@@ -34,6 +34,7 @@ from airflow_provider_rmq.watcher.listener import (
     _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
     _parse_rmq_trigger_decorator,
+    _read_active_subs,
     _read_settings,
 )
 from airflow_provider_rmq.watcher.models import (
@@ -2088,6 +2089,34 @@ class TestSyncToDb:
         assert call_kwargs.kwargs["dag_id"] == "d"
         assert call_kwargs.kwargs["source"] == "dag_file"
 
+    def test_sync_to_db_passes_ack_unmatched_to_upsert(self):
+        listener = RMQWatcherListener()
+        scanned = [{
+            "dag_id": "d",
+            "queue_name": "q",
+            "conn_id": "c",
+            "filter_data": {},
+            "ack_unmatched": True,
+        }]
+
+        ctx, _session = _make_session_ctx(existing_subs=[])
+
+        with _sync_env(ctx, {"d"}) as mock_up:
+            listener._sync_to_db(scanned)
+
+        assert mock_up.call_args.kwargs["ack_unmatched"] is True
+
+    def test_sync_to_db_writes_false_when_the_scan_carries_no_value(self):
+        listener = RMQWatcherListener()
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "c", "filter_data": {}}]
+
+        ctx, _session = _make_session_ctx(existing_subs=[])
+
+        with _sync_env(ctx, {"d"}) as mock_up:
+            listener._sync_to_db(scanned)
+
+        assert mock_up.call_args.kwargs["ack_unmatched"] is False
+
     def test_one_miss_on_active_dag_keeps_the_row_and_counts_it(self):
         listener = RMQWatcherListener()
         existing = _existing_sub(dag_id="old_dag")
@@ -2752,6 +2781,68 @@ class TestParseRmqTriggerDecorator:
         assert len(result) == 1
         assert result[0]["queue_name"] == "q"
 
+    def test_ack_unmatched_literal_true_parsed(self):
+        result = _parse_decorator("rmq_trigger(queue='q', ack_unmatched=True)")
+        assert result[0]["ack_unmatched"] is True
+
+    def test_ack_unmatched_literal_false_parsed(self):
+        result = _parse_decorator("rmq_trigger(queue='q', ack_unmatched=False)")
+        assert result[0]["ack_unmatched"] is False
+
+    def test_ack_unmatched_absent_is_false(self):
+        result = _parse_decorator("rmq_trigger(queue='q')")
+        assert result[0]["ack_unmatched"] is False
+
+    def test_non_literal_ack_unmatched_falls_back_to_the_default(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator(
+                "rmq_trigger(queue='q', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
+            )
+        assert result[0]["ack_unmatched"] is False
+
+    def test_non_literal_kwarg_is_warned_about_by_dag_queue_and_parameter(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator(
+                "rmq_trigger(queue='orders', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
+            )
+        assert "ack_unmatched" in caplog.text
+        assert "my_dag" in caplog.text
+        assert "orders" in caplog.text
+
+    def test_non_literal_cooldown_is_warned_about_too(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(queue='q', cooldown=COOLDOWN)")
+        assert result[0]["cooldown"] == 0
+        assert "cooldown" in caplog.text
+
+    def test_literal_kwargs_produce_no_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(queue='q', cooldown=60, ack_unmatched=True)")
+        assert caplog.records == []
+
+    def test_non_bool_ack_unmatched_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queue='q', ack_unmatched='yes')")
+        assert result == []
+
+    def test_non_bool_ack_unmatched_logs_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(queue='q', ack_unmatched='yes')")
+        assert "ack_unmatched" in caplog.text
+
+    def test_dict_unpacking_returns_empty_and_warns(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
+        assert result == []
+        assert "my_dag" in caplog.text
+        assert "**kwargs" in caplog.text
+
+    def test_dict_unpacking_beside_a_literal_queue_warns_too(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(queue='orders', **opts)", dag_id="my_dag")
+        assert result[0]["ack_unmatched"] is False
+        assert "orders" in caplog.text
+        assert "**kwargs" in caplog.text
+
     def test_negative_cooldown_skipped_returns_empty(self):
         result = _parse_decorator("rmq_trigger(queue='q', cooldown=-1)")
         assert result == []
@@ -3152,6 +3243,36 @@ def _make_db_sub(dag_id, queue_name, conn_id="rmq_default", cooldown=0, filter_d
     sub.filter_data = filter_data or {}
     sub.cooldown = cooldown
     return sub
+
+
+class TestReadActiveSubs:
+    """The projection `_read_active_subs` builds is the only dict a consumer sees —
+    a column missing from it never reaches the consumer task, whatever the row says."""
+
+    def _read(self, rows):
+        ctx, _session = _make_session_ctx()
+        with patch(
+            "airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx
+        ), patch(
+            "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
+            return_value=rows,
+        ):
+            return _read_active_subs({})
+
+    def test_ack_unmatched_from_the_row_reaches_the_entry(self):
+        row = _make_db_sub("d", "q")
+        row.ack_unmatched = True
+        assert self._read([row])[0]["ack_unmatched"] is True
+
+    def test_row_without_a_value_reads_as_false(self):
+        row = _make_db_sub("d", "q")
+        row.ack_unmatched = None
+        assert self._read([row])[0]["ack_unmatched"] is False
+
+    def test_ack_unmatched_false_on_the_row_reaches_the_entry(self):
+        row = _make_db_sub("d", "q")
+        row.ack_unmatched = False
+        assert self._read([row])[0]["ack_unmatched"] is False
 
 
 class TestMainExchangeMetaMerge:

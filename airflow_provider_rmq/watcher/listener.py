@@ -480,6 +480,7 @@ _RMQ_TRIGGER_KWARGS = (
     "conn_id",
     "filter_data",
     "cooldown",
+    "ack_unmatched",
 )
 
 
@@ -500,13 +501,60 @@ def _is_rmq_trigger_call(node: ast.expr) -> bool:
     )
 
 
+def _scanned_queue_label(kwargs: dict) -> str:
+    """Name the queue an ``@rmq_trigger`` call is about, for a diagnostic line.
+
+    The label is built from whatever the scan managed to read: ``queue=``,
+    ``queues=`` or ``exchange=``. A call whose own queue argument is the
+    unreadable one gets ``"<unresolved>"`` — the warning still names the DAG and
+    the parameter, which is what points at the decorator.
+    """
+    if "queue" in kwargs:
+        return str(kwargs["queue"])
+    if "queues" in kwargs:
+        return ",".join(str(q) for q in kwargs["queues"])
+    if "exchange" in kwargs:
+        return f"exchange:{kwargs['exchange']}"
+    return "<unresolved>"
+
+
+def _warn_unreadable_kwarg(dag_id: str, kwargs: dict, name: str | None) -> None:
+    """Report an ``@rmq_trigger`` argument the AST scan could not read.
+
+    The scan never executes the DAG file, so a value the decorator computes —
+    a module constant, an import, an f-string — is invisible to it and the
+    subscription is registered with the parameter's default. That is a working
+    subscription behaving against what the DAG declares, so it is named out
+    loud: the DAG, the queue and the parameter.
+    """
+    if name is None:
+        log.warning(
+            "rmq_trigger: dag_id=%s queue=%s — the decorator unpacks a dict "
+            "(**kwargs), and the DAG file scan does not execute the file, so it "
+            "reads no parameter from this call; the subscription is registered "
+            "with the defaults. Write the arguments out as literals in the "
+            "decorator, or set the values on the Subscriptions page",
+            dag_id, _scanned_queue_label(kwargs),
+        )
+        return
+    log.warning(
+        "rmq_trigger: dag_id=%s queue=%s — %r is not a literal, and the DAG file "
+        "scan does not execute the file, so the subscription is registered with "
+        "that parameter's default instead of what the decorator says. Write a "
+        "literal in the decorator, or set the value on the Subscriptions page",
+        dag_id, _scanned_queue_label(kwargs), name,
+    )
+
+
 def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
     """Return list of subscription dicts if node is an rmq_trigger(...) call, else [].
 
     Handles both bare name ``rmq_trigger(...)`` and attribute access
-    ``decorators.rmq_trigger(...)``.  Only literal argument values are extracted;
-    non-literal expressions are skipped (subscription won't be registered from
-    AST scan — user should create it via the UI instead).
+    ``decorators.rmq_trigger(...)``.  Only literal argument values are extracted:
+    a non-literal expression, and a ``**`` unpacking that hides every argument,
+    are reported by ``_warn_unreadable_kwarg`` and leave the parameter at its
+    default.  A call whose ``queue``/``queues``/``exchange`` is the unreadable
+    one registers no subscription at all — it is created via the UI instead.
 
     Validation/construction of the subscription dict is delegated to
     ``build_subscriptions()`` (``subscription_builder.py``) — this function is
@@ -529,6 +577,7 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
         return []
 
     kwargs: dict = {}
+    unreadable: list[str | None] = []
     # positional: rmq_trigger("queue_name")
     if node.args:
         val = node.args[0]
@@ -536,13 +585,22 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
             kwargs["queue"] = val.value
     # keyword arguments
     for kw in node.keywords:
+        if kw.arg is None:
+            # `@rmq_trigger(**opts)` — the dict is built at import time, so the
+            # scan reads no parameter out of it at all.
+            unreadable.append(None)
+            continue
         if kw.arg not in _RMQ_TRIGGER_KWARGS:
             continue
         try:
             value = ast.literal_eval(kw.value)
         except (ValueError, TypeError):
+            unreadable.append(kw.arg)
             continue
         kwargs[kw.arg] = value
+
+    for name in unreadable:
+        _warn_unreadable_kwarg(dag_id, kwargs, name)
 
     if "queue" not in kwargs and "queues" not in kwargs and "exchange" not in kwargs:
         return []
@@ -640,6 +698,7 @@ def _read_active_subs(exchange_meta: dict) -> list[dict]:
                 "conn_id": sub.conn_id,
                 "filter_data": sub.filter_data or {},
                 "cooldown": sub.cooldown or 0,
+                "ack_unmatched": bool(sub.ack_unmatched),
             }
             meta = exchange_meta.get((sub.dag_id, sub.queue_name, sub.conn_id))
             if meta is not None:
@@ -1852,6 +1911,7 @@ class RMQWatcherListener:
                     filter_data=s.get("filter_data", {}),
                     source="dag_file",
                     cooldown=s.get("cooldown", 0) or None,
+                    ack_unmatched=bool(s.get("ack_unmatched", False)),
                     group_key=s.get("group_key"),
                 )
 
