@@ -855,6 +855,38 @@ class TestFilterMissState:
         assert seen[0].dropped == 3
 
     @pytest.mark.asyncio
+    async def test_the_threshold_line_goes_to_the_task_logger(self, caplog):
+        """The run of misses spans the whole run(), so the powers of ten are reached.
+
+        The assertion is on the name of the emitted record and not only on its text:
+        ``caplog`` attaches to the root and catches records from any logger, so a test
+        reading the message alone stays green whatever logger the line came from.
+        """
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            mode="push",
+            ack_unmatched=True,
+        )
+        messages = [
+            _make_fake_message(body=b"invoice", headers={"x-type": "invoice"})
+            for _ in range(1000)
+        ]
+        messages.append(_make_fake_message(body=b"order", headers={"x-type": "order"}))
+        fake_queue = _make_push_queue(messages)
+
+        with caplog.at_level("WARNING"):
+            events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        streak_lines = [
+            r for r in caplog.records if "in a row missed the filter" in r.getMessage()
+        ]
+        assert [r.getMessage().split()[0] for r in streak_lines] == ["100", "1000"]
+        assert [r.name for r in streak_lines] == ["airflow.task", "airflow.task"]
+        assert all("q" in r.getMessage() for r in streak_lines)
+
+    @pytest.mark.asyncio
     async def test_push_mode_shares_the_same_state(self):
         trigger = RMQTrigger(
             rmq_conn_id="conn", queue_name="q",
