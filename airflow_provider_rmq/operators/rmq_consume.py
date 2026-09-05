@@ -7,6 +7,7 @@ import pika.exceptions
 from airflow.models import BaseOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
+from airflow_provider_rmq.utils.amqp import FilterMissState
 from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
@@ -16,7 +17,12 @@ class RMQConsumeOperator(BaseOperator):
     """Consume messages from a RabbitMQ queue with optional filtering.
 
     Matching messages are ACKed and returned via XCom.
-    Non-matching messages are NACKed with requeue=True (their status is not changed).
+
+    A message the filter read and rejected is disposed of according to
+    ``ack_unmatched``: NACKed with requeue=True by default, so it stays in the queue for
+    another consumer, or ACKed and gone for good when the parameter is on. A message the
+    filter could not be evaluated on — a callable that raised, a body that does not read
+    as JSON — is always returned to the queue, whatever ``ack_unmatched`` says.
     """
 
     template_fields: Sequence[str] = ("queue_name",)
@@ -31,6 +37,7 @@ class RMQConsumeOperator(BaseOperator):
         filter_headers: dict[str, Any] | None = None,
         filter_callable: Callable[[Any, str], bool] | None = None,
         qos: dict | None = None,
+        ack_unmatched: bool = False,
         **kwargs,
     ):
         """Create a new RMQConsumeOperator.
@@ -47,6 +54,12 @@ class RMQConsumeOperator(BaseOperator):
         :type filter_callable: Callable[[Any, str], bool] | None
         :param qos: QoS settings dict (``prefetch_size``, ``prefetch_count``, ``global_qos``).
         :type qos: dict | None
+        :param ack_unmatched: What to do with a message the filter rejected. ``False``
+            (default) returns it to the queue. ``True`` acknowledges it instead: the
+            message leaves the broker for good — DLX does not fire on an
+            acknowledgement. Use it only on a queue this task owns. Must be a ``bool``:
+            the string ``"false"`` is truthy, and the parameter destroys messages.
+        :type ack_unmatched: bool
         """
         super().__init__(**kwargs)
         self.queue_name = queue_name
@@ -56,13 +69,23 @@ class RMQConsumeOperator(BaseOperator):
         self.filter_callable = filter_callable
         self.qos = qos
 
+        if not isinstance(ack_unmatched, bool):
+            raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
+        self.ack_unmatched = ack_unmatched
+
     def execute(self, context: Any) -> list[dict[str, Any]]:
         msg_filter = MessageFilter(
             filter_headers=self.filter_headers,
             filter_callable=self.filter_callable,
         )
 
+        miss_state = FilterMissState(
+            queue_name=self.queue_name,
+            log=log,
+            ack_unmatched=self.ack_unmatched,
+        )
         matched_messages: list[dict[str, Any]] = []
+        dropped_in_batch = 0
 
         with RMQHook(rmq_conn_id=self.rmq_conn_id, qos=self.qos) as hook:
             try:
@@ -80,8 +103,9 @@ class RMQConsumeOperator(BaseOperator):
                 return []
 
             for msg in raw_messages:
-                verdict, _reason = msg_filter.evaluate(msg["properties"], msg["body"])
+                verdict, reason = msg_filter.evaluate(msg["properties"], msg["body"])
                 if verdict is FilterVerdict.MATCH:
+                    miss_state.on_match()
                     hook.ack(msg["method"].delivery_tag)
                     matched_messages.append({
                         "body": msg["body"],
@@ -89,8 +113,22 @@ class RMQConsumeOperator(BaseOperator):
                         "routing_key": msg["method"].routing_key or "",
                         "exchange": msg["method"].exchange or "",
                     })
-                else:
+                elif verdict is FilterVerdict.ERROR:
+                    miss_state.on_error(reason)
                     hook.nack(msg["method"].delivery_tag, requeue=True)
+                else:
+                    miss_state.on_miss()
+                    if self.ack_unmatched:
+                        hook.ack(msg["method"].delivery_tag)
+                        dropped_in_batch += 1
+                    else:
+                        hook.nack(msg["method"].delivery_tag, requeue=True)
+
+            miss_state.on_batch_done(
+                matched=len(matched_messages),
+                evaluated=len(raw_messages),
+                dropped_in_batch=dropped_in_batch,
+            )
 
         log.info(
             "Consumed %d matching messages from queue '%s'.",
