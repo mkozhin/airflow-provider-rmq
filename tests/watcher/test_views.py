@@ -1870,9 +1870,9 @@ class TestAckUnmatchedFormField:
             call.kwargs["ack_unmatched"] is True for call in mock_upsert.call_args_list
         )
 
-    def test_edit_group_reduces_a_mixed_group_to_the_representative(self, app, view):
-        """A group whose rows disagree has no mixed state: the form renders the
-        representative row, and the save applies that one value to every row."""
+    def test_edit_group_reduces_a_mixed_group_to_one_value(self, app, view):
+        """A group whose rows disagree has no mixed state: the form offers the one
+        value the Subscriptions page shows, and the save applies it to every row."""
         rep = _make_sub(
             id=1, queue_name="q1", source="ui", group_key="dag_g", ack_unmatched=True
         )
@@ -1884,7 +1884,10 @@ class TestAckUnmatchedFormField:
              patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx):
             view.edit_group("dag_g")
 
-        assert view.render_template.call_args.kwargs["sub"] is rep
+        kwargs = view.render_template.call_args.kwargs
+        assert kwargs["sub"] is rep
+        assert kwargs["ack_unmatched_group"] is True
+        assert kwargs["ack_unmatched_mixed"] is True
 
         ctx, _ = _session_ctx_with_filter_all([rep, other])
         with app.test_request_context(
@@ -1910,6 +1913,75 @@ class TestAckUnmatchedFormField:
             True,
             True,
         ]
+
+    def test_edit_group_takes_the_box_from_the_group_not_from_the_first_queue(
+        self, app, view
+    ):
+        """The Subscriptions page reads the group's value as an OR over its rows.
+        The form reading the first row by name instead would draw the box off for a
+        group the page shows as on — and the save would then clear the rows that
+        acknowledge."""
+        first = _make_sub(
+            id=1, queue_name="q1", source="ui", group_key="dag_g", ack_unmatched=False
+        )
+        second = _make_sub(
+            id=2, queue_name="q2", source="ui", group_key="dag_g", ack_unmatched=True
+        )
+        ctx, _ = _session_ctx_with_filter_all([first, second])
+        with app.test_request_context("/subscriptions/group/dag_g/edit", method="GET"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx):
+            view.edit_group("dag_g")
+
+        kwargs = view.render_template.call_args.kwargs
+        assert kwargs["sub"] is first
+        assert kwargs["ack_unmatched_group"] is True
+        assert kwargs["ack_unmatched_mixed"] is True
+
+    def test_edit_group_of_an_agreeing_group_is_not_mixed(self, app, view):
+        rows = [
+            _make_sub(
+                id=1, queue_name="q1", source="ui", group_key="dag_g", ack_unmatched=True
+            ),
+            _make_sub(
+                id=2, queue_name="q2", source="ui", group_key="dag_g", ack_unmatched=True
+            ),
+        ]
+        ctx, _ = _session_ctx_with_filter_all(rows)
+        with app.test_request_context("/subscriptions/group/dag_g/edit", method="GET"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx):
+            view.edit_group("dag_g")
+
+        kwargs = view.render_template.call_args.kwargs
+        assert kwargs["ack_unmatched_group"] is True
+        assert kwargs["ack_unmatched_mixed"] is False
+
+    def test_edit_group_of_a_group_that_acknowledges_nothing_draws_the_box_off(
+        self, app, view
+    ):
+        rows = [
+            _make_sub(
+                id=1,
+                queue_name="q1",
+                source="ui",
+                group_key="dag_g",
+                ack_unmatched=False,
+            ),
+            _make_sub(
+                id=2,
+                queue_name="q2",
+                source="ui",
+                group_key="dag_g",
+                ack_unmatched=False,
+            ),
+        ]
+        ctx, _ = _session_ctx_with_filter_all(rows)
+        with app.test_request_context("/subscriptions/group/dag_g/edit", method="GET"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx):
+            view.edit_group("dag_g")
+
+        kwargs = view.render_template.call_args.kwargs
+        assert kwargs["ack_unmatched_group"] is False
+        assert kwargs["ack_unmatched_mixed"] is False
 
 
 class TestSharedQueueBadge:
@@ -2342,13 +2414,72 @@ class TestAckUnmatchedFormTemplate:
         assert "checked" not in _form_field(html, "ack_unmatched")
 
     def test_a_group_form_says_the_value_is_levelled(self):
-        """The box is the representative row's and the save writes it to every row —
-        the form has to say so, because a mixed group has no mixed state to show."""
+        """The save writes one value to every row — the form has to say so, because
+        a mixed group has no mixed state to show."""
         rows = [_make_single_row(id=1, queue_name="q1"), _make_single_row(id=2, queue_name="q2")]
         html = _render_subscription_form_html(
             sub=rows[0], is_dag_file=False, group_subs=rows
         )
         assert "stands for the whole group" in html
+
+    def test_the_group_value_beats_the_representative_row(self):
+        """The box is drawn from the group's aggregate, so a group the Subscriptions
+        page shows as acknowledging is offered as acknowledging even when the first
+        row by name does not."""
+        rows = [
+            _make_single_row(id=1, queue_name="q1", ack_unmatched=False),
+            _make_single_row(id=2, queue_name="q2", ack_unmatched=True),
+        ]
+        html = _render_subscription_form_html(
+            sub=rows[0],
+            is_dag_file=False,
+            group_subs=rows,
+            ack_unmatched_group=True,
+            ack_unmatched_mixed=True,
+        )
+        assert "checked" in _form_field(html, "ack_unmatched")
+
+    def test_a_group_that_acknowledges_nothing_draws_the_box_off(self):
+        rows = [
+            _make_single_row(id=1, queue_name="q1", ack_unmatched=True),
+            _make_single_row(id=2, queue_name="q2", ack_unmatched=False),
+        ]
+        html = _render_subscription_form_html(
+            sub=rows[0],
+            is_dag_file=False,
+            group_subs=rows,
+            ack_unmatched_group=False,
+            ack_unmatched_mixed=False,
+        )
+        assert "checked" not in _form_field(html, "ack_unmatched")
+
+    def test_a_mixed_group_is_told_its_rows_disagree(self):
+        rows = [
+            _make_single_row(id=1, queue_name="q1", ack_unmatched=False),
+            _make_single_row(id=2, queue_name="q2", ack_unmatched=True),
+        ]
+        html = _render_subscription_form_html(
+            sub=rows[0],
+            is_dag_file=False,
+            group_subs=rows,
+            ack_unmatched_group=True,
+            ack_unmatched_mixed=True,
+        )
+        assert "rows disagree today" in html
+
+    def test_an_agreeing_group_is_not_told_about_a_disagreement(self):
+        rows = [
+            _make_single_row(id=1, queue_name="q1", ack_unmatched=True),
+            _make_single_row(id=2, queue_name="q2", ack_unmatched=True),
+        ]
+        html = _render_subscription_form_html(
+            sub=rows[0],
+            is_dag_file=False,
+            group_subs=rows,
+            ack_unmatched_group=True,
+            ack_unmatched_mixed=False,
+        )
+        assert "rows disagree today" not in html
 
     def test_a_single_row_form_does_not_mention_the_group(self):
         html = _render_subscription_form_html(

@@ -678,6 +678,14 @@ class RMQWatcherView(BaseView):
             is_dag_file = any(s.source == "dag_file" for s in subs)
             # Representative sub for display defaults
             rep = subs[0]
+            # The Subscriptions page reads the group's ack_unmatched as an OR over
+            # its rows (_group_subscriptions), so the form reads it the same way:
+            # the box the page shows on is the box the form offers, and a save
+            # writes that one value to every row.
+            ack_unmatched_group = any(s.ack_unmatched for s in subs)
+            ack_unmatched_mixed = ack_unmatched_group and not all(
+                s.ack_unmatched for s in subs
+            )
 
             if request.method == "POST":
                 enabled = request.form.get("enabled") == "on"
@@ -703,6 +711,8 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
+                            ack_unmatched_group=ack_unmatched_group,
+                            ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
                     try:
@@ -714,6 +724,8 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
+                            ack_unmatched_group=ack_unmatched_group,
+                            ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
                     try:
@@ -725,6 +737,8 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
+                            ack_unmatched_group=ack_unmatched_group,
+                            ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
                     new_group_key = dag_id if cooldown > 0 else None
@@ -776,4 +790,6 @@ class RMQWatcherView(BaseView):
                 sub=rep,
                 is_dag_file=is_dag_file,
                 group_subs=subs,
+                ack_unmatched_group=ack_unmatched_group,
+                ack_unmatched_mixed=ack_unmatched_mixed,
             )

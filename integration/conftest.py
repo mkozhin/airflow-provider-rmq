@@ -11,6 +11,7 @@ Everything a test creates carries the ``rmqtest.{pid}.{uuid8}.`` prefix of its
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -22,6 +23,8 @@ import aio_pika
 import pika
 import pytest
 from pika.adapters.blocking_connection import BlockingChannel
+
+LOG = logging.getLogger(__name__)
 
 #: Environment variable holding the AMQP URL of the test broker.
 URL_ENV = "RMQ_TEST_URL"
@@ -134,6 +137,11 @@ class BrokerScratch:
         self._connection = connection
         self._queues: list[str] = []
 
+    @property
+    def queues(self) -> tuple[str, ...]:
+        """Queues this run declared and has not deleted yet."""
+        return tuple(self._queues)
+
     # --- names ---
 
     def name(self, suffix: str) -> str:
@@ -205,17 +213,34 @@ class BrokerScratch:
     # --- teardown ---
 
     def teardown(self) -> None:
-        """Delete every queue this run declared, each on a channel of its own."""
-        try:
-            for queue in self._queues:
+        """Delete every queue this run declared, each on a channel of its own.
+
+        One queue that refuses to go must not take the rest of the namespace with
+        it: every queue is attempted, a deleted one leaves the register, and the
+        names still standing are both kept in the register and named in the error
+        raised at the end, so a prod-adjacent vhost never keeps a queue whose name
+        is nowhere to be found.
+        """
+        failures: list[tuple[str, BaseException]] = []
+        for queue in list(self._queues):
+            try:
                 channel = self._connection.channel()
                 try:
                     channel.queue_delete(queue=queue)
                 finally:
                     if channel.is_open:
                         channel.close()
-        finally:
-            self._queues.clear()
+            except Exception as exc:  # noqa: BLE001 - every queue is attempted
+                failures.append((queue, exc))
+                LOG.error("failed to delete test queue %s: %r", queue, exc)
+            else:
+                self._queues.remove(queue)
+        if failures:
+            left = ", ".join(name for name, _ in failures)
+            raise RuntimeError(
+                f"{len(failures)} test queue(s) left on the broker, delete them by "
+                f"hand: {left}"
+            )
 
 
 # --- broker coordinates ---
