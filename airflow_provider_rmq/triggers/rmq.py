@@ -8,7 +8,7 @@ import aio_pika
 from airflow.hooks.base import BaseHook
 from airflow.triggers.base import BaseTrigger, TriggerEvent
 
-from airflow_provider_rmq.utils.amqp import build_amqp_connection, match_and_ack
+from airflow_provider_rmq.utils.amqp import FilterMissState, build_amqp_connection, match_and_ack
 from airflow_provider_rmq.utils.filters import MessageFilter
 
 log = logging.getLogger("airflow.task")
@@ -87,7 +87,8 @@ class RMQTrigger(BaseTrigger):
 
         Returns a success payload dict on match, or None if the message did not match.
         """
-        matched = await match_and_ack(message, msg_filter)
+        miss_state = FilterMissState(self.queue_name, log)
+        matched = await match_and_ack(message, msg_filter, miss_state)
         if not matched:
             return None
         return {

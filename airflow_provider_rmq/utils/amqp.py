@@ -276,34 +276,213 @@ def match(message: Any, msg_filter: MessageFilter) -> tuple[FilterVerdict, str |
 
 
 
+#: Smallest ``streak`` and ``dropped`` value worth a WARNING. Missing the filter is a
+#: normal mode of operation — a line per stray message would cost one log record per
+#: delivery — so the thresholds start here and then follow the powers of ten.
+_MISS_WARN_FLOOR = 100
+#: Outcomes without a single failure to evaluate that clear ``error_streak``.
+_ERROR_STREAK_RESET_RUN = 100
+
+
+def _is_threshold(value: int, floor: int = _MISS_WARN_FLOOR) -> bool:
+    """Tell whether ``value`` is a power of ten at or above ``floor``."""
+    if value < floor:
+        return False
+    while value % 10 == 0:
+        value //= 10
+    return value == 1
+
+
+class FilterMissState:
+    """Counters behind the log lines a filter miss produces on one consuming loop.
+
+    The object holds nothing about any single message: no keys, no broker calls, no
+    coroutines, so the same class serves the asynchronous and the synchronous paths.
+    Its lifetime is the owner's — a consumer task in the watcher, one ``run()`` in the
+    trigger, one task run in the operator, the sensor instance across its ``poke`` calls.
+
+    :param queue_name: Queue the counters belong to; it names the queue in every line.
+    :param log: Logger the WARNING goes to. It is the owner's, because ``FileTaskHandler``
+        is attached to ``airflow.task`` rather than to the root: a module logger would
+        keep the line out of the task log everywhere but the watcher.
+    :param ack_unmatched: ``True`` when a message the filter rejected is acknowledged
+        and gone, ``False`` when it is returned to the queue.
+
+    Counters do not reset one another. ``streak`` is the run of misses since the last
+    match, and a match ends it. ``error_streak`` survives a match: alternating
+    ``MATCH``/``ERROR`` would otherwise make every failure the first one and put a line
+    on every turn of the loop. Only a hundred outcomes in a row without a failure clear
+    it. ``dropped`` is cleared by nothing at all — it counts messages deleted for good,
+    and a stream of ninety-nine misses and one match never reaches the ``streak``
+    threshold while deleting ninety-nine messages out of every hundred.
+    """
+
+    __slots__ = (
+        "ack_unmatched",
+        "clean_run",
+        "dropped",
+        "error_streak",
+        "log",
+        "queue_name",
+        "streak",
+    )
+
+    def __init__(self, queue_name: str, log: logging.Logger, ack_unmatched: bool = False):
+        self.queue_name = queue_name
+        self.log = log
+        self.ack_unmatched = ack_unmatched
+        self.streak = 0
+        self.dropped = 0
+        self.error_streak = 0
+        self.clean_run = 0
+
+    def on_match(self) -> None:
+        """Record a message that passed the filter."""
+        self.streak = 0
+        self._count_clean_outcome()
+
+    def on_miss(self) -> None:
+        """Record a message the filter read and rejected."""
+        self.streak += 1
+        self._count_clean_outcome()
+        if _is_threshold(self.streak):
+            if self.ack_unmatched:
+                self.log.warning(
+                    "%d messages in a row missed the filter on queue %r and were acknowledged "
+                    "and dropped — check filter_data",
+                    self.streak, self.queue_name,
+                )
+            else:
+                self.log.warning(
+                    "%d messages in a row missed the filter on queue %r and were returned to "
+                    "the queue — check filter_data",
+                    self.streak, self.queue_name,
+                )
+        if self.ack_unmatched:
+            self.dropped += 1
+            if _is_threshold(self.dropped):
+                self.log.warning(
+                    "%d messages that did not pass the filter have been dropped on queue %r "
+                    "(ack_unmatched is on) — check filter_data",
+                    self.dropped, self.queue_name,
+                )
+
+    def on_error(self, reason: str | None) -> None:
+        """Record a message the filter could not be evaluated on.
+
+        :param reason: Type and text of the exception behind the failure, as returned by
+            :meth:`~airflow_provider_rmq.utils.filters.MessageFilter.evaluate`. It goes
+            into the WARNING, so the first line of a series says what failed and not
+            merely where.
+
+        The first failure is always logged — it is the diagnostic one — and the series is
+        then throttled to the powers of ten from a hundred up. An ``ERROR`` message is
+        returned to the queue whatever the subscription asked for, so it comes back every
+        0.1 s: a line per turn would put the redelivery loop itself into the log.
+        """
+        self.error_streak += 1
+        self.clean_run = 0
+        if self.error_streak == 1 or _is_threshold(self.error_streak):
+            self.log.warning(
+                "Filter could not be evaluated on queue %r (%d in this series, message "
+                "returned to the queue): %s",
+                self.queue_name, self.error_streak, reason,
+            )
+
+    def on_batch_done(self, matched: int, evaluated: int, dropped_in_batch: int) -> None:
+        """Report on a batch the caller evaluated in one go.
+
+        :param matched: Messages of the batch that passed the filter.
+        :param evaluated: Messages the filter reached a verdict on.
+        :param dropped_in_batch: Messages acknowledged because they missed the filter.
+
+        A batch is the operator's whole task run, so a line here comes out at most once
+        per run and needs no threshold: it carries the visibility ``streak`` cannot give
+        to a counter that never outlives a single ``max_messages`` batch.
+        """
+        if evaluated > 0 and matched == 0:
+            self.log.warning(
+                "None of the %d messages read from queue %r passed the filter — check filter_data",
+                evaluated, self.queue_name,
+            )
+        if dropped_in_batch > 0:
+            self.log.warning(
+                "%d of the %d messages read from queue %r did not pass the filter and were "
+                "dropped (ack_unmatched is on) — check filter_data",
+                dropped_in_batch, evaluated, self.queue_name,
+            )
+
+    def _count_clean_outcome(self) -> None:
+        """Count an outcome that was not a failure to evaluate, clearing a stale series."""
+        self.clean_run += 1
+        if self.clean_run >= _ERROR_STREAK_RESET_RUN:
+            self.error_streak = 0
+            self.clean_run = 0
+
+
 async def nack_and_sleep(message: Any) -> None:
     """NACK a message with requeue=True and sleep 0.1 s to prevent a hot redelivery loop.
 
     :param message: An ``aio_pika`` message (must have ``.nack()`` async method).
+
+    The message goes back to the queue and nothing else happens to it: acknowledging a
+    message lives in :func:`handle_miss`, so a message the filter failed on cannot be
+    routed through the acknowledging branch by mistake.
     """
     await message.nack(requeue=True)
     await asyncio.sleep(0.1)
 
 
+async def handle_miss(message: Any, miss_state: FilterMissState) -> None:
+    """Dispose of a message the filter read and rejected.
 
-async def match_and_ack(message: Any, msg_filter: MessageFilter) -> bool:
-    """Evaluate message against filter, ACK on match, NACK+requeue on miss.
+    :param message: An ``aio_pika`` message (must have ``.ack()`` and ``.nack()``).
+    :param miss_state: Counters of the consuming loop; its ``ack_unmatched`` decides
+        between acknowledging the message and returning it to the queue.
+
+    With ``ack_unmatched`` off the message is returned to the queue after the usual
+    0.1 s pause. With it on the message is acknowledged and gone for good: dead-lettering
+    follows a reject and not an acknowledgement, so no copy is kept anywhere.
+    """
+    miss_state.on_miss()
+    if miss_state.ack_unmatched:
+        await message.ack()
+    else:
+        await nack_and_sleep(message)
+
+
+async def match_and_ack(
+    message: Any,
+    msg_filter: MessageFilter,
+    miss_state: FilterMissState,
+) -> bool:
+    """Evaluate message against filter, ACK on match, dispose of the rest by verdict.
 
     :param message: An ``aio_pika`` message (must have ``.body``, ``.headers``,
         ``.ack()``, ``.nack()`` async methods).
     :param msg_filter: Pre-built :class:`~airflow_provider_rmq.utils.filters.MessageFilter`.
-    :returns: ``True`` if the message matched and was ACKed, ``False`` if NACKed.
+    :param miss_state: Counters of the consuming loop; it also carries the
+        ``ack_unmatched`` decision read from the subscription or the task parameter.
+    :returns: ``True`` if the message matched and was ACKed, ``False`` otherwise.
 
-    After a NACK, sleeps 0.1 s to prevent a hot redelivery loop on classic queues.
+    A message the filter rejected goes to :func:`handle_miss`, which acknowledges it when
+    ``ack_unmatched`` is on and returns it to the queue otherwise. A message the filter
+    could not be evaluated on is always returned to the queue, after which the call
+    sleeps 0.1 s to prevent a hot redelivery loop on classic queues.
 
     Note:
         On quorum queues (RabbitMQ 4.x default), the broker enforces a delivery-limit
-        of 20 by default — non-matching messages are dead-lettered after 20 redeliveries.
-        Use dedicated queues per DAG to avoid unintended message loss.
+        of 20 by default — a message returned to the queue is dead-lettered after 20
+        redeliveries. Use dedicated queues per DAG to avoid unintended message loss.
     """
-    verdict, _reason = match(message, msg_filter)
+    verdict, reason = match(message, msg_filter)
     if verdict is FilterVerdict.MATCH:
+        miss_state.on_match()
         await message.ack()
         return True
-    await nack_and_sleep(message)
+    if verdict is FilterVerdict.ERROR:
+        miss_state.on_error(reason)
+        await nack_and_sleep(message)
+        return False
+    await handle_miss(message, miss_state)
     return False

@@ -7,6 +7,7 @@ import pytest
 
 from airflow_provider_rmq.triggers.rmq import RMQTrigger
 from airflow_provider_rmq.utils.amqp import DEFAULT_HEARTBEAT
+from airflow_provider_rmq.utils.filters import MessageFilter
 from tests.conftest import FakeAirflowConnection
 
 
@@ -620,3 +621,26 @@ class TestPushModeError:
         assert len(events) == 1
         assert events[0]["status"] == "error"
         assert "refused" in events[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# Filter miss state
+# ---------------------------------------------------------------------------
+class TestFilterMissState:
+    @pytest.mark.asyncio
+    async def test_handle_message_passes_state_naming_the_queue_and_task_logger(self):
+        """The threshold WARNING must reach the task log, which hangs off ``airflow.task``."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="my_queue")
+        captured = {}
+
+        async def _fake_match_and_ack(message, msg_filter, miss_state):
+            captured["state"] = miss_state
+            return False
+
+        with patch("airflow_provider_rmq.triggers.rmq.match_and_ack", new=_fake_match_and_ack):
+            result = await trigger._handle_message(_make_fake_message(), MessageFilter())
+
+        assert result is None
+        assert captured["state"].queue_name == "my_queue"
+        assert captured["state"].log.name == "airflow.task"
+        assert captured["state"].ack_unmatched is False
