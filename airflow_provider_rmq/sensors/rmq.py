@@ -8,6 +8,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.sensors.base import BaseSensorOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
+from airflow_provider_rmq.utils.amqp import FilterMissState
 from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
@@ -17,7 +18,14 @@ class RMQSensor(BaseSensorOperator):
     """Wait for a message in a RabbitMQ queue matching optional conditions.
 
     Supports classic poke mode and deferrable mode (via RMQTrigger).
-    Matching message is returned via XCom. Non-matching messages are NACKed with requeue.
+    The matching message is returned via XCom.
+
+    A message the filter read and rejected is disposed of according to
+    ``ack_unmatched``: NACKed with requeue=True by default, so it stays in the queue for
+    another consumer, or ACKed and gone for good when the parameter is on. A message the
+    filter could not be evaluated on — a callable that raised, a body that does not read
+    as JSON — is always returned to the queue, whatever ``ack_unmatched`` says. So is the
+    rest of the batch behind the matching message: the filter never read it.
 
     .. note::
         ``filter_callable`` is **not supported** in deferrable mode (``deferrable=True``)
@@ -25,11 +33,13 @@ class RMQSensor(BaseSensorOperator):
         ``filter_headers`` instead, or set ``deferrable=False``.
 
     .. note::
-        When using quorum queues (default in RabbitMQ 4.x clusters), non-matching
-        messages are NACKed with requeue=True. RabbitMQ 4.0+ enforces a default
-        redelivery limit of 20 for quorum queues — after 20 redeliveries the message
-        is dead-lettered or dropped. If heavy filtering is expected, consider using
-        a dedicated queue or increasing the delivery-limit policy.
+        With ``ack_unmatched`` off, a rejected message is NACKed with requeue=True.
+        RabbitMQ 4.0+ enforces a default redelivery limit of 20 for quorum queues (the
+        default in 4.x clusters) — after 20 redeliveries the message is dead-lettered or
+        dropped. If heavy filtering is expected, use a dedicated queue with
+        ``ack_unmatched=True``, or raise the delivery-limit policy. With
+        ``ack_unmatched`` on the message is acknowledged instead and never redelivered,
+        so the limit is out of the picture.
     """
 
     template_fields: Sequence[str] = ("queue_name", "message_wait_timeout")
@@ -46,6 +56,7 @@ class RMQSensor(BaseSensorOperator):
         poke_batch_size: int = 100,
         mode: Literal["pull", "push"] = "pull",
         message_wait_timeout: float | None = None,
+        ack_unmatched: bool = False,
         **kwargs,
     ):
         """Create a new RMQSensor.
@@ -64,6 +75,12 @@ class RMQSensor(BaseSensorOperator):
             mode. ``None`` means wait indefinitely. Only valid when ``mode="push"`` and
             ``deferrable=True``. Note: actual wait may slightly exceed this value while the
             AMQP consumer is cancelled gracefully.
+        :param ack_unmatched: What to do with a message the filter rejected. ``False``
+            (default) returns it to the queue. ``True`` acknowledges it instead: the
+            message leaves the broker for good — DLX does not fire on an
+            acknowledgement. Use it only on a queue this sensor owns. Must be a
+            ``bool``: the string ``"false"`` is truthy, and the parameter destroys
+            messages.
         """
         super().__init__(**kwargs)
         self.queue_name = queue_name
@@ -75,6 +92,15 @@ class RMQSensor(BaseSensorOperator):
         self.mode = mode
         self.message_wait_timeout = message_wait_timeout
         self._return_value: dict | None = None
+
+        if not isinstance(ack_unmatched, bool):
+            raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
+        self.ack_unmatched = ack_unmatched
+
+        # One state per sensor instance, and the instance is what BaseSensorOperator.execute
+        # reuses across its poke calls: a streak of misses spanning many pokes reaches the
+        # threshold, which a counter created inside poke never could past poke_batch_size.
+        self._miss_state: FilterMissState | None = None
 
         if self.deferrable and self.filter_callable is not None:
             raise ValueError(
@@ -109,6 +135,7 @@ class RMQSensor(BaseSensorOperator):
                 filter_data=msg_filter.serialize(),
                 mode=self.mode,
                 message_wait_timeout=timeout,
+                ack_unmatched=self.ack_unmatched,
             ),
             method_name="execute_complete",
         )
@@ -128,6 +155,14 @@ class RMQSensor(BaseSensorOperator):
             filter_callable=self.filter_callable,
         )
 
+        if self._miss_state is None:
+            self._miss_state = FilterMissState(
+                queue_name=self.queue_name,
+                log=log,
+                ack_unmatched=self.ack_unmatched,
+            )
+        miss_state = self._miss_state
+
         hook = RMQHook(rmq_conn_id=self.rmq_conn_id)
         try:
             try:
@@ -144,8 +179,9 @@ class RMQSensor(BaseSensorOperator):
                 return False
 
             for i, msg in enumerate(messages):
-                verdict, _reason = msg_filter.evaluate(msg["properties"], msg["body"])
+                verdict, reason = msg_filter.evaluate(msg["properties"], msg["body"])
                 if verdict is FilterVerdict.MATCH:
+                    miss_state.on_match()
                     hook.ack(msg["method"].delivery_tag)
                     self._return_value = {
                         "body": msg["body"],
@@ -153,12 +189,21 @@ class RMQSensor(BaseSensorOperator):
                         "routing_key": msg["method"].routing_key or "",
                         "exchange": msg["method"].exchange or "",
                     }
-                    # Nack remaining messages
+                    # The filter never read the rest of the batch, so it goes back to the
+                    # queue whatever ack_unmatched says — acknowledging it would delete
+                    # messages that may well match.
                     for remaining in messages[i + 1:]:
                         hook.nack(remaining["method"].delivery_tag, requeue=True)
                     return True
-                else:
+                if verdict is FilterVerdict.ERROR:
+                    miss_state.on_error(reason)
                     hook.nack(msg["method"].delivery_tag, requeue=True)
+                else:
+                    miss_state.on_miss()
+                    if self.ack_unmatched:
+                        hook.ack(msg["method"].delivery_tag)
+                    else:
+                        hook.nack(msg["method"].delivery_tag, requeue=True)
             return False
         finally:
             hook.close()

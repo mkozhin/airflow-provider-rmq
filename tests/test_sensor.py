@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -405,3 +406,164 @@ class TestTemplateFields:
 
         trigger = mock_defer.call_args.kwargs["trigger"]
         assert trigger.message_wait_timeout is None
+
+
+# ---------------------------------------------------------------------------
+# ack_unmatched
+# ---------------------------------------------------------------------------
+
+_STREAK_TEXT = "in a row missed the filter"
+_DROPPED_TEXT = "have been dropped on queue"
+_ERROR_TEXT = "Filter could not be evaluated"
+_EMPTY_BATCH_TEXT = "passed the filter — check filter_data"
+_BATCH_DROPPED_TEXT = "did not pass the filter and were dropped"
+
+
+def _lines(caplog, text):
+    """Records whose message contains ``text``."""
+    return [r for r in caplog.records if text in r.getMessage()]
+
+
+class TestAckUnmatched:
+    def test_the_rest_of_the_batch_goes_back_to_the_queue(self, mock_hook):
+        """The filter never read what sits behind the match, so acking it would be blind."""
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1),
+            _make_raw_msg(body="b", delivery_tag=2),
+            _make_raw_msg(body="c", delivery_tag=3),
+        ]
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1, ack_unmatched=True,
+        )
+        assert sensor.poke(context={}) is True
+        assert sensor._return_value["body"] == "a"
+        hook.ack.assert_called_once_with(1)
+        assert [c.args[0] for c in hook.nack.call_args_list] == [2, 3]
+        assert all(c.kwargs == {"requeue": True} for c in hook.nack.call_args_list)
+
+    def test_rejected_messages_are_acknowledged(self, mock_hook):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+            _make_raw_msg(body="b", delivery_tag=2, headers={"x-type": "receipt"}),
+        ]
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1,
+            filter_headers={"x-type": "order"}, ack_unmatched=True,
+        )
+        assert sensor.poke(context={}) is False
+        assert [c.args[0] for c in hook.ack.call_args_list] == [1, 2]
+        hook.nack.assert_not_called()
+
+    def test_default_returns_rejected_messages_to_the_queue(self, mock_hook):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+            _make_raw_msg(body="b", delivery_tag=2, headers={"x-type": "order"}),
+        ]
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1,
+            filter_headers={"x-type": "order"},
+        )
+        assert sensor.poke(context={}) is True
+        hook.nack.assert_called_once_with(1, requeue=True)
+        hook.ack.assert_called_once_with(2)
+
+    def test_a_failing_callable_acknowledges_nothing(self, mock_hook, caplog):
+        """A filter that could not be evaluated is not a miss: the message stays."""
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1),
+            _make_raw_msg(body="b", delivery_tag=2),
+        ]
+
+        def _boom(props, body):
+            raise RuntimeError("filter service is down")
+
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1,
+            filter_callable=_boom, ack_unmatched=True,
+        )
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is False
+
+        hook.ack.assert_not_called()
+        assert [c.args[0] for c in hook.nack.call_args_list] == [1, 2]
+        first = _lines(caplog, _ERROR_TEXT)
+        assert len(first) == 1
+        assert "RuntimeError: filter service is down" in first[0].getMessage()
+
+    def test_non_bool_is_rejected(self):
+        with pytest.raises(ValueError, match="ack_unmatched"):
+            RMQSensor(task_id="t", queue_name="q", poke_interval=1, ack_unmatched="false")
+
+    def test_deferrable_carries_the_value_into_the_trigger(self):
+        from airflow_provider_rmq.triggers.rmq import RMQTrigger
+
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1,
+            deferrable=True, ack_unmatched=True,
+        )
+        with patch.object(sensor, "defer") as mock_defer:
+            sensor._defer()
+
+        trigger = mock_defer.call_args.kwargs["trigger"]
+        assert isinstance(trigger, RMQTrigger)
+        assert trigger.ack_unmatched is True
+
+    def test_deferrable_default_reaches_the_trigger_as_false(self):
+        sensor = RMQSensor(task_id="t", queue_name="q", poke_interval=1, deferrable=True)
+        with patch.object(sensor, "defer") as mock_defer:
+            sensor._defer()
+        assert mock_defer.call_args.kwargs["trigger"].ack_unmatched is False
+
+    def test_the_base_sensor_mode_is_untouched(self):
+        """``mode`` keeps whatever it had; ``ack_unmatched`` does not reach it."""
+        assert RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1, ack_unmatched=True,
+        ).mode == "pull"
+        assert RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1,
+            mode="reschedule", ack_unmatched=True,
+        ).mode == "reschedule"
+
+    def test_the_streak_outlives_a_poke(self, mock_hook, caplog):
+        """``execute`` reuses the instance, so a hundred single-message pokes reach 100."""
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+        ]
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1,
+            filter_headers={"x-type": "order"}, poke_batch_size=1,
+        )
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                assert sensor.poke(context={}) is False
+
+        assert sensor._miss_state.streak == 100
+        streak_lines = _lines(caplog, _STREAK_TEXT)
+        assert len(streak_lines) == 1
+        assert streak_lines[0].getMessage().startswith("100 ")
+        assert streak_lines[0].name == "airflow.task"
+
+    def test_a_hundred_pokes_report_no_batch_line(self, mock_hook, caplog):
+        """``on_batch_done`` is the operator's: a line per poke is the noise the threshold avoids."""
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+        ]
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1,
+            filter_headers={"x-type": "order"}, poke_batch_size=1,
+            ack_unmatched=True,
+        )
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                sensor.poke(context={})
+
+        assert _lines(caplog, _EMPTY_BATCH_TEXT) == []
+        assert _lines(caplog, _BATCH_DROPPED_TEXT) == []
+        assert len(_lines(caplog, _STREAK_TEXT)) == 1
+        assert len(_lines(caplog, _DROPPED_TEXT)) == 1
