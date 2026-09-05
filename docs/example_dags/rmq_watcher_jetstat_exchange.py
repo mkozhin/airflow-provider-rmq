@@ -68,9 +68,11 @@ Gotcha: literal arguments only
 whenever the reconcile loop re-scans the file (mtime-gated — unchanged
 files are not re-parsed on every cycle, only when their mtime changes) —
 only literal values are recognised. Referencing a module-level variable
-(e.g. a ``REPORT_ID`` constant) for ``routing_key_ids`` is silently ignored
-and the subscription is skipped. Write the report id directly as a string
-literal in the decorator call, as below.
+(e.g. a ``REPORT_ID`` constant) for ``routing_key_ids`` is ignored with a
+WARNING in the Scheduler log naming the DAG, the queue and the parameter, and
+the subscription is skipped — an ``exchange`` with no readable routing keys
+does not build. Write the report id directly as a string literal in the
+decorator call, as below.
 
 Note this literal-only restriction applies to the arguments of
 ``@rmq_trigger(...)`` itself, not to ``dag_id`` in ``@dag(...)``: ``dag_id``

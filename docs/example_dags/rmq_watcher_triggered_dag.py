@@ -115,7 +115,10 @@ log = logging.getLogger(__name__)
     queue="watcher-demo",
     conn_id="rmq_default",
     # Only messages that carry the AMQP header ``event: trigger`` will start
-    # this DAG; all others are NACKed with requeue=True.
+    # this DAG; all others are NACKed with requeue=True, which is what the
+    # default ``ack_unmatched=False`` asks for. With ``ack_unmatched=True``
+    # they are acknowledged and gone instead — use that only on a queue this
+    # subscription owns.
     filter_data={"filter_headers": {"event": "trigger"}},
 )
 @dag(

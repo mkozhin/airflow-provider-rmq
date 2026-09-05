@@ -50,7 +50,12 @@ whenever the reconcile loop re-scans the file (mtime-gated — unchanged
 files are not re-parsed on every cycle, only when their mtime changes) —
 only literal values (strings, ints, lists of literals, ...) are recognised.
 Referencing a module-level variable or constant in the decorator call is
-silently ignored, and the subscription is skipped. Always write the queue
+ignored with a WARNING in the Scheduler log naming the DAG, the queue and the
+parameter. What happens next depends on which argument was lost: an
+unreadable ``queue``/``queues``/``exchange``, or a set the subscription
+builder refuses, skips the subscription; an unreadable ``cooldown`` or
+``ack_unmatched`` leaves a working subscription running on that parameter's
+default, against what this file declares. Always write the queue
 names/cooldown value directly in the decorator call, as below.
 
 Note this literal-only restriction applies to the arguments of

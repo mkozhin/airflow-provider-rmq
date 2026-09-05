@@ -238,7 +238,7 @@ RMQPublishOperator(
 
 **Import:** `from airflow_provider_rmq.operators.rmq_consume import RMQConsumeOperator`
 
-Consumes messages from a RabbitMQ queue. Matching messages are ACKed and returned via XCom. Non-matching messages are NACKed with `requeue=True`.
+Consumes messages from a RabbitMQ queue. Matching messages are ACKed and returned via XCom. A message the filter read and rejected is NACKed with `requeue=True` by default, or ACKed and gone for good when `ack_unmatched=True`; a message the filter could not be evaluated on is returned to the queue whatever the parameter says. See [Filter misses and `ack_unmatched`](#filter-misses-and-ack_unmatched).
 
 #### Parameters
 
@@ -250,10 +250,15 @@ Consumes messages from a RabbitMQ queue. Matching messages are ACKed and returne
 | `filter_headers` | `dict[str, Any] \| None` | `None` | No | Dict of AMQP headers that a message must match. Supports `body.*` keys for JSON body filtering (e.g., `{"body.data.status": "active"}`) |
 | `filter_callable` | `Callable[[Any, str], bool] \| None` | `None` | No | Custom filter function `(properties, body_str) -> bool` |
 | `qos` | `dict \| None` | `None` | No | QoS settings: `{"prefetch_count": 10}` |
+| `ack_unmatched` | `bool` | `False` | No | ACK a message the filter rejected instead of returning it to the queue. The message leaves the broker for good — DLX does not fire on an acknowledgement. Must be a `bool` |
 
 **Template fields:** `queue_name`
 
 **Returns:** `list[dict]` — list of matched messages, each with keys: `body`, `headers`, `routing_key`, `exchange`
+
+> **`ack_unmatched=True` deletes other consumers' messages.** On a queue a watcher subscription or any other consumer also reads, every message this task's filter rejects is acknowledged and gone: the neighbour keeps saying `listening`, reports no error, and its DAG simply never runs. The Subscriptions page badges a queue two subscriptions share, but it knows nothing about operators and sensors — on their side this paragraph is the only guard. Turn the parameter on only for a queue this task owns.
+
+**One batch per task run.** `execute()` makes exactly one `consume_messages` call, so the task sees at most `max_messages` messages from the head of the queue and nothing behind them — with `ack_unmatched=True` too. What the parameter changes is that the rejected ones leave the queue for good: the next run reads the next batch, and a message sitting behind 150 foreign ones is found after two or three runs instead of never. The miss counters live for one run and therefore for one batch, so the threshold of a hundred consecutive misses is out of reach whenever `max_messages` is smaller; the operator gets two batch-level WARNINGs instead — one when the whole batch was read and nothing matched, one naming how many messages of the batch were dropped.
 
 #### Usage Example
 
@@ -415,6 +420,7 @@ Waits for a message in a RabbitMQ queue that matches optional filter conditions.
 | `timeout` | `float` | `604800` | No | Max seconds to wait before failing (inherited from BaseSensorOperator) |
 | `mode` | `Literal["pull", "push"]` | `"pull"` | No | Trigger delivery mode when `deferrable=True`: `"pull"` = periodic polling, `"push"` = broker-pushed via `basic_consume` |
 | `message_wait_timeout` | `float \| None` | `None` | No | Max seconds to wait for a matching message in push mode. `None` = no limit. Only valid with `mode="push"`. Supports Jinja templates and XCom |
+| `ack_unmatched` | `bool` | `False` | No | ACK a message the filter rejected instead of returning it to the queue. The message leaves the broker for good — DLX does not fire on an acknowledgement. Must be a `bool` |
 
 **Template fields:** `queue_name`, `message_wait_timeout`
 
@@ -439,7 +445,13 @@ The `mode` parameter (only relevant with `deferrable=True`) controls how the tri
 
 > **Timeout behaviour:** when `message_wait_timeout` expires, the sensor raises `AirflowSkipException` — the task is marked **SKIPPED** (not FAILED) and downstream tasks are skipped. No `on_failure_callback` is triggered. This makes it safe to use `message_wait_timeout` for planned stops (e.g., end of business hours) without generating false alerts.
 
-> **RabbitMQ 4.0+ quorum queue note:** non-matching messages are NACKed with `requeue=True`. Quorum queues enforce a default redelivery limit of 20 — after 20 redeliveries the message is dead-lettered or dropped. Applies to both pull and push modes.
+> **RabbitMQ 4.0+ quorum queue note:** with the default `ack_unmatched=False` a rejected message is NACKed with `requeue=True`. Quorum queues enforce a default redelivery limit of 20 — after 20 redeliveries the message is dead-lettered or dropped. Applies to both pull and push modes. With `ack_unmatched=True` the message is acknowledged instead and never redelivered, so the limit is out of the picture.
+
+> **The rest of the batch always goes back to the queue.** A poke reads up to `poke_batch_size` messages and stops at the first match. The messages behind it were never shown to the filter, so they are NACKed with `requeue=True` whatever `ack_unmatched` says, and the next poke sees them again.
+
+> **`ack_unmatched=True` deletes other consumers' messages.** On a queue a watcher subscription or any other consumer also reads, every message this sensor's filter rejects is acknowledged and gone: the neighbour keeps saying `listening`, reports no error, and its DAG simply never runs. The Subscriptions page badges a queue two subscriptions share, but it knows nothing about operators and sensors — on their side this paragraph is the only guard. Turn the parameter on only for a queue this task owns.
+
+**One batch per poke, and where a miss is visible.** Each poke reads one batch from the head of the queue and sees nothing behind it; with `ack_unmatched=True` the rejected messages leave the queue, so a message behind a large foreign backlog is reached after several pokes instead of never. The miss counters live on the sensor instance, which `BaseSensorOperator.execute` reuses across pokes, so a hundred consecutive misses produce a WARNING however small `poke_batch_size` is. In `reschedule` mode there is no such visibility at all: `AirflowRescheduleException` ends the task instance and the next poke runs on a fresh object. The `mode` parameter here is typed `Literal["pull", "push"]`, which does not close that door — `BaseSensorOperator.prepare_for_execution()` switches the sensor to `reschedule` by itself under `SequentialExecutor` and `DebugExecutor` (`docs/backlog/sensor-mode-shadows-base-parameter.md`).
 
 #### Usage Example
 
@@ -527,6 +539,7 @@ Async trigger for deferrable sensor mode. Uses `aio_pika` for non-blocking AMQP 
 | `poll_interval` | `float` | `5.0` | No | Seconds between polls when queue is empty (pull mode only) |
 | `mode` | `Literal["pull", "push"]` | `"pull"` | No | Delivery mode: `"pull"` = polling, `"push"` = `basic_consume` |
 | `message_wait_timeout` | `float \| None` | `None` | No | Max seconds to wait in push mode. Actual wait may slightly exceed this due to `basic_cancel` cleanup |
+| `ack_unmatched` | `bool` | `False` | No | ACK a message the filter rejected instead of returning it to the queue. The message leaves the broker for good — DLX does not fire on an acknowledgement. Must be a `bool` |
 
 ---
 
@@ -544,7 +557,53 @@ Evaluates whether a RabbitMQ message matches given filter conditions. Used inter
 
 2. **Callable filtering** (`filter_callable`): `fn(properties, body_str) -> bool`
 
-Both can be combined (AND logic: both must pass).
+Both can be combined (AND logic: both must pass), and they are evaluated in that order: the dict conditions first, and a callable only where the dict matched or is absent.
+
+> **Behaviour change for code that calls `MessageFilter.matches()` directly.** An exception out of `filter_callable` is still swallowed and still reads as a non-match, but its type, text and traceback now go to the **DEBUG** level instead of WARNING. Inside the provider the visible line is put by the miss counters of the consuming loop, which name the queue and throttle the series — see below. External code that relied on the WARNING should lower its level for `airflow_provider_rmq.utils.filters` or log the failure itself.
+
+---
+
+### Filter misses and `ack_unmatched`
+
+Every consuming loop in the provider — `RMQConsumeOperator`, `RMQSensor`, `RMQTrigger` and the watcher — reaches one of three verdicts on a message:
+
+| Verdict | What it means | What happens to the message |
+|---|---|---|
+| **match** | the filter accepted it | ACKed, and the message is handed on — returned via XCom or used to start the DAG |
+| **miss** | the filter read the message and rejected it | with `ack_unmatched=False` (default) NACKed with `requeue=True`; with `ack_unmatched=True` ACKed and gone |
+| **error** | the filter could not be evaluated: `filter_callable` raised, or a `body.*` key was asked for on a body that does not read as JSON | NACKed with `requeue=True` always, whatever `ack_unmatched` says |
+
+`ack_unmatched` is a `bool` defaulting to `False`, which is exactly the behaviour of every earlier release. It is available on `@rmq_trigger(...)`, on `RMQConsumeOperator`, on `RMQSensor`, on `RMQTrigger`, and as a checkbox on the Subscriptions page. Every one of those constructors rejects a non-`bool`: the string `"false"` is truthy, and the parameter destroys messages.
+
+```python
+@rmq_trigger(
+    queue="orders.airflow-trigger",       # a queue this subscription owns
+    filter_data={"filter_headers": {"event": "trigger"}},
+    ack_unmatched=True,                   # anything else is acknowledged and dropped
+)
+@dag(schedule=None)
+def orders_dag():
+    ...
+```
+
+**Why it exists.** With the default, a message no filter accepts never leaves the queue: the broker returns it to the head, the consumer sees it again, rejects it again, and the loop turns roughly ten times a second until the message's TTL expires — on the order of 300 000 redeliveries over an eight-hour TTL, measured on a live installation. `ack_unmatched=True` does not slow the loop down, it removes it: each message is delivered once.
+
+**An acknowledged message is not dead-lettered.** Dead-lettering follows a reject, a TTL expiry or an overflow, and an acknowledgement is none of those. A queue with `x-dead-letter-exchange` set keeps no copy of what `ack_unmatched` dropped — the message is gone from the broker entirely.
+
+**A failure to evaluate the filter is not a miss.** An exception out of `filter_callable`, and a body that `json.loads` refuses when the filter asks for a `body.*` key, both mean the message was never read — so it goes back to the queue and never reaches the acknowledging branch. A minute of an unreachable external service therefore costs redeliveries, not a batch of messages. Both failures are reachable in the operator and the sensor; in the watcher and the trigger a callable does not survive serialisation ([ADR 0001](docs/adr/0001-message-filter-two-instantiation-paths.md)), so an unreadable body is the only one there.
+
+**One queue, one subscription.** Two enabled subscriptions on the same `queue_name` and `conn_id` are two competing consumers, and the broker splits deliveries between them round-robin. A message that suits both filters — every message, when `filter_data` is empty — is acknowledged by whichever consumer received it, and the other subscription's DAG does not run. That is not new, and the unique key of a subscription row still allows it, so this is a recommendation rather than a prohibition: an installation whose filters are strictly disjoint works as it always did. With `ack_unmatched=True` the stakes are higher — a message only the neighbour's filter accepts is deleted the moment it lands on the acknowledging consumer, the neighbour stays `listening`, and nothing anywhere reports an error. The Subscriptions page badges any shared queue for that reason, with a harder text where one of the two acknowledges. Fan-out is built from separate queues and bindings, not from two subscriptions on one queue.
+
+**What a miss puts in the log.** Nothing per message: a filter miss is normal traffic, and a line on each one would be a line per foreign message. The counters of one consuming loop produce instead:
+
+- a WARNING on every power of ten of consecutive misses from a hundred up (100, 1 000, 10 000 …), naming the queue, saying whether the messages were returned or dropped, and suggesting a look at the filter. A match ends the run and clears it.
+- a WARNING on every power of ten of *dropped* messages from a hundred up, which nothing ever clears. A stream of ninety-nine misses and one match never reaches the first threshold while deleting ninety-nine messages out of every hundred, and this counter is what makes that visible.
+- a WARNING on the **first** failure to evaluate the filter and then on every power of ten from a hundred up, carrying the type and text of the exception behind it. A match does not clear that series — only a hundred outcomes in a row without a failure does. An error message returns to the queue whatever `ack_unmatched` says, so it comes back every 0.1 s, and a line per turn would put the redelivery loop itself into the log.
+- in the watcher only, the metric `rmq_watcher.filter_missed`. The operator, the sensor and the trigger have no metric wiring, and the `rmq_watcher` prefix would be untrue in them.
+
+How far a counter reaches depends on how long its owner lives: a consumer task in the watcher (across reconnects), one `run()` in the trigger, one task run in the operator, the sensor instance across its pokes. The two places where the threshold of a hundred is out of reach are named in the `RMQConsumeOperator` and `RMQSensor` sections above, together with what stands in for it.
+
+**What this does not change.** An operator or a sensor still reads one batch from the head of the queue per run, and still cannot look past it: reaching behind the head would mean holding foreign messages unacknowledged, which runs into the task's own `qos.prefetch_count` and hurts every other consumer of that queue. The answer for that case is `ack_unmatched=True` on a queue that belongs to the subscription or the task, not a larger batch.
 
 ---
 
@@ -563,6 +622,8 @@ A subscription key going missing from a scan is not an event in itself: the row 
 A scan that is not a statement about the code is not believed at all: the sync step is skipped whole, and no row counts a miss. That covers a DAG folder setting that is unreadable or empty, a folder that does not exist or cannot be listed, and a listing of which less than half of what the folder is known to have held comes back readable — an empty listing, and a listing that named files and read none of them, included. Which way a file refused takes no part in it: an aborted checkout leaves files truncated (they read, they do not parse), a storage backend losing access leaves them unstattable, and both say the same thing — what is on disk right now is not the code. One broken file among many is about the code and stays trusted. A listing that is not is distrusted for three cycles in a row and believed on the fourth — a folder that emptied for real, and a filesystem that is not coming back, both have to become the truth eventually. Believing the shrink is what brings the known count down to it, so a folder that legitimately lost most of its files is measured against its new size from then on, the next collapse meets the three cycles in full, and an installation whose DAG folder is empty for good is believed and left alone rather than reported every cycle. A folder whose files stopped reading altogether ends the same way: once that listing has been given in to, the same listing after it is the steady state already paid for, and the distrust starts over only when a file reads again. What the count is otherwise is a high-water mark: a folder unmounting a slice per cycle is compared with what it held, not with its own previous step. A folder-level outage in between produces no listing and leaves that budget exactly where it was — refilling it would let a folder alternating between unlistable and degraded hold the distrust for as long as it kept alternating, and the sync step would never run again. A process that has believed no listing yet has nothing to compare one against and takes what it is given, short of a listing with nothing readable in it: a scheduler starting into a half-mounted DAG volume has only the three-scan grace period between that start and the deletions. The reason goes to the log as an ERROR; the rest of the cycle — reading subscriptions, reconcile, the liveness check, the status rows — runs as usual, off the database, with one caveat: exchange metadata lives only in the scan, so a distrusted cycle reconciles from the last trusted scan, and on a scheduler that has not completed one yet there is no metadata at all — no sub-queue or binding provisioning, and no line in the log either: the orphan WARNING is written only for keys the process provisioned itself, so a consumer starts on `rmq_watcher.sub.{dag_id}` against a queue nobody declared and nothing reports it until the first trusted scan. A file whose content failed to parse, or gave no access at all, holds its previous parse for one cycle and then joins the ordinary miss count. A key that comes back after its row was deleted is reported with a WARNING naming it: what the scan recreates is a new row with the default `enabled` on it, so a subscription switched off before the deletion starts consuming again. The deletions a scheduler matches that line against are the ones it made itself and still holds in memory, so a restart in between — or another scheduler in HA recreating what this one deleted — leaves the recreation to the INFO lines of the miss counter alone.
 
 `dag_id` in `@dag(...)` (positional or keyword) must be a string literal, or a simple module-level string constant defined earlier in the file than the decorated function, for the AST scan of `dag_file` subscriptions to find it. If it isn't, the subscription simply does not appear on the Subscriptions page at all. This is the one case the `⚠ dag not found` badge (see [Subscription Management](#subscription-management)) cannot catch: there's no row to highlight, since the subscription never registers in the first place. The only signal is a WARNING in the Scheduler log, and only after a restart or when the file's mtime changes (not on every reconcile cycle — only when the file is actually re-scanned).
+
+The arguments of `@rmq_trigger(...)` itself must be literals for the same reason — the scan reads the file, it never executes it. A value the decorator computes (a module-level constant, an import, an f-string, a call) is invisible to it, and so is a `**opts` unpacking that hides every argument at once; the subscription is then registered with that parameter's default and runs against what the DAG file declares. Each such argument is named in a Scheduler WARNING carrying the `dag_id`, the queue and the parameter. Whether the subscription survives at all depends on which argument was lost: an unreadable `queue`/`queues`/`exchange`, or a set `build_subscriptions` refuses, skips the subscription, while an unreadable `cooldown` or `ack_unmatched` leaves a working subscription running on the default.
 
 ### Quick Start
 
@@ -770,6 +831,10 @@ Exchange-mode subscriptions show up in the UI like any other `dag_file` subscrip
 
 Any subscription whose `dag_id` doesn't correspond to an active Airflow DAG is marked on the page with a `⚠ dag not found` badge. This is a **one-sided** signal: its presence means a real problem — a matching message will be ACKed without triggering anything — but its **absence guarantees nothing**. Three reasons the badge can miss a broken subscription: `is_paused` is not checked, so a paused DAG never gets the badge even though a matching message is still ACKed without triggering a run, exactly like a missing DAG (see [ADR 0006](docs/adr/0006-badge-dag-lookup-not-unified-with-sync-trigger.md)); a just-added DAG may be badged for a short while until the Scheduler parses it; and a just-deleted or renamed DAG conversely stays un-badged for a while until `DagModel.is_active` catches up. The last two are expected lag, not bugs.
 
+A queue more than one **enabled** subscription of the same `conn_id` listens to is marked with a `⚠ shared queue` badge, and a grouped row names which of its queues are shared. The badge is on both rows of the pair, because either of them is equally affected. Where one of those subscriptions has `ack_unmatched` on, the badge reads `⚠ shared queue: … — messages deleted` and its tooltip says what that costs: a message only the neighbour's filter accepts is deleted the moment it lands on the acknowledging consumer, and the neighbour goes on saying `listening`. The `ack_unmatched` column of the table shows `on` for a subscription that acknowledges its misses.
+
+The same setting is a checkbox on the subscription form, available in all three of its flows — create, edit and edit-group — and it survives an edit-group save, which rewrites the rows of a group from scratch. Saving a subscription that shares its queue with another enabled one raises a `flash` warning naming the queue; so does toggling one on. The warning comes after the save rather than before it: the form renders its fields from the stored row and never reads back the submitted values, so a confirmation round trip would redraw the checkbox from the database and lose the very value being confirmed.
+
 ### Subscriptions Page Access
 
 The page and its menu entry belong to two roles: Admin and Op. Viewer and User see neither the entry nor the `RabbitMQ` category it hangs under, and a direct visit to `/rmq-watcher/subscriptions` is refused.
@@ -853,13 +918,14 @@ For subscriptions with `cooldown=0` the watcher acknowledges a delivery only **a
 - Deduplication rests on the producer. When the message carries an AMQP `message_id`, the run id is deterministic (`rmq__{queue}__{message_id}`, sanitized and truncated with a digest when it does not fit), so a redelivery lands on the run it already produced and is acknowledged as a duplicate. Two *different* messages sharing one `message_id` therefore collapse into a single DAG run. Without `message_id` the run id carries a timestamp instead and a redelivery starts the DAG again.
 - **Boundary of the guarantee:** a DAG that is paused, inactive or missing ends in a terminal ACK — the event is dropped on purpose, with a WARNING in the log. NACKing it would turn a paused DAG into an accumulator of redeliveries.
 - **Boundary of the silence:** each not-yet-serialized delivery spends one unit of the queue's `delivery-limit` — 20 by default on a quorum queue — so an event waiting out a long warmup can be dead-lettered or dropped by the broker before the streak reaches 25. The row goes on saying `listening`, nothing records that the event existed, and the WARNING on every tenth delivery is the only trace left (`docs/backlog/warmup-loses-the-message-invisibly.md`).
-- Messages that do not match the filter are NACKed with requeue (see [ADR 0002](docs/adr/0002-four-consume-loops-not-unified.md)) and go back to the head of the queue.
+- A message the subscription's filter rejects is NACKed with requeue and goes back to the head of the queue, unless the subscription asked for `ack_unmatched` — then it is acknowledged and gone (see [ADR 0002](docs/adr/0002-four-consume-loops-not-unified.md) and [Filter misses and `ack_unmatched`](#filter-misses-and-ack_unmatched)). A message the filter could not be evaluated on goes back to the queue either way.
 
-**`prefetch` is deliberately not set.** Because filter misses are requeued and return to the head of the queue, any finite prefetch window would eventually fill up with them and consumption would stop for good — while the status still read `connected`. The cost is accepted explicitly: the number of unacknowledged deliveries is unbounded, so a queue with a large backlog is read into scheduler memory, and the oldest delivery can hit the broker's `consumer_timeout` (30 minutes by default), after which RabbitMQ closes the channel with `PRECONDITION_FAILED` and returns the whole window to the queue. If large backlogs are expected on a watched queue, raise `consumer_timeout` in the RabbitMQ configuration.
+**`prefetch` is deliberately not set.** With the default `ack_unmatched=False` filter misses are requeued and return to the head of the queue, so any finite prefetch window would eventually fill up with them and consumption would stop for good — while the status still read `connected`. The window is not set at all rather than set for the subscriptions that acknowledge their misses, because the setting is per channel and the default is what a subscription has unless it says otherwise. The cost is accepted explicitly: the number of unacknowledged deliveries is unbounded, so a queue with a large backlog is read into scheduler memory, and the oldest delivery can hit the broker's `consumer_timeout` (30 minutes by default), after which RabbitMQ closes the channel with `PRECONDITION_FAILED` and returns the whole window to the queue. If large backlogs are expected on a watched queue, raise `consumer_timeout` in the RabbitMQ configuration.
 
 ### Best Practices
 
 - Use a **dedicated queue** per DAG trigger (e.g. `orders.airflow-trigger` separate from `orders`). Avoids NACK hot-loops on quorum queues and interference with other consumers.
+- **One queue, one subscription.** A queue that belongs to a single subscription is the configuration the provider is built for, and the one where `ack_unmatched=True` is safe. Two enabled subscriptions on the same `queue_name` and `conn_id` compete for deliveries and are badged on the Subscriptions page — see [Filter misses and `ack_unmatched`](#filter-misses-and-ack_unmatched).
 - To pause message consumption without stopping the DAG: **toggle the subscription off** in the UI rather than pausing the DAG. Pausing the DAG acks messages silently.
 - In **multi-scheduler HA** deployments each active scheduler runs its own consumer, which may cause duplicate runs. Each of them also runs its own reconcile cycle, and the miss counter of a `dag_file` subscription is shared: N schedulers spend the three-scan grace N times faster, so with three or more of them a subscription can be deleted within a single reconcile interval of going missing. What one scheduler cannot do is undo another's work: every write the counter makes — the miss it records, and the deletion the count leads to — is matched on the value the row was read as, so a scheduler holding a value another has already moved on writes nothing at all. The protection is a deterministic `run_id`: subscriptions with `cooldown > 0` always have one (`rmq_cooldown__{dag_id}__{message_id}`), and immediate ones have it whenever the producer sets an AMQP `message_id` (`rmq__{queue}__{message_id}`) — in both cases the second replica's trigger lands on the DAG run the first one already created. Without a `message_id` an immediate run id carries a timestamp instead and both replicas start the DAG; set `max_active_runs=1` as a lightweight mitigation there.
 
