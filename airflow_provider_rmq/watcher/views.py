@@ -63,6 +63,12 @@ class SubscriptionGroup:
     #: by OR, unlike `enabled`: the group's row has to name the setting as soon as a
     #: single queue of it deletes messages
     ack_unmatched: bool = False
+    #: Queues of this group another enabled subscription of the same conn_id also
+    #: listens to. The badge names them, so the list is built here rather than in the
+    #: template
+    shared_queue_names: list[str] = field(default_factory=list)
+    #: True when a subscription on one of those shared queues acknowledges its misses
+    shared_acking: bool = False
     statuses: list[str] = field(default_factory=list)
     last_error: str | None = None
     is_group: bool = field(default=True, init=False)
@@ -84,12 +90,19 @@ def _group_subscriptions(subs: list[RMQSubscription]) -> list[Any]:
     """Group subscriptions by group_key where applicable.
 
     Returns a mixed list of SubscriptionGroup (for grouped) and
-    RMQSubscription (for ungrouped, i.e. group_key is NULL).
+    RMQSubscription (for ungrouped, i.e. group_key is NULL). Every item carries
+    ``shared_queue_names`` and ``shared_acking``, so the template asks a row whether
+    it is on a shared queue instead of computing the answer itself.
     """
+    shared, acking = _queue_sharing(subs)
     grouped: dict[str, SubscriptionGroup] = {}
     ungrouped: list[RMQSubscription] = []
 
     for sub in subs:
+        pair = (sub.queue_name, sub.conn_id)
+        # A disabled row runs no consumer, so it competes for nothing — the badge
+        # belongs to the rows that are actually on the queue.
+        is_shared = bool(sub.enabled) and pair in shared
         if sub.group_key:
             key = sub.group_key
             if key not in grouped:
@@ -110,10 +123,16 @@ def _group_subscriptions(subs: list[RMQSubscription]) -> list[Any]:
             # Propagate: group acknowledges unmatched if any sub does
             if sub.ack_unmatched:
                 g.ack_unmatched = True
+            if is_shared:
+                g.shared_queue_names.append(sub.queue_name)
+                if pair in acking:
+                    g.shared_acking = True
             # First non-null last_error
             if g.last_error is None and sub.last_error:
                 g.last_error = sub.last_error
         else:
+            sub.shared_queue_names = [sub.queue_name] if is_shared else []
+            sub.shared_acking = is_shared and pair in acking
             ungrouped.append(sub)
 
     result: list[Any] = []
@@ -377,7 +396,6 @@ class RMQWatcherView(BaseView):
                 )
                 conn_statuses = None
             rows = _group_subscriptions(subs)
-            shared_queues, ack_unmatched_queues = _queue_sharing(subs)
 
         conn_status_error = None
         conn_status_rows: list[ConnStatusRow] = []
@@ -413,8 +431,8 @@ class RMQWatcherView(BaseView):
             conn_status_error=conn_status_error,
             stale_after_display=format_duration(stale_seconds),
             active_dag_ids=active_dag_ids,
-            shared_queues=shared_queues,
-            ack_unmatched_queues=ack_unmatched_queues,
+            shared_queue_warning=SHARED_QUEUE_WARNING,
+            shared_queue_ack_warning=SHARED_QUEUE_ACK_WARNING,
         )
 
     @expose("/subscriptions/create", methods=["GET", "POST"])

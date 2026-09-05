@@ -3259,6 +3259,7 @@ class RMQConsumerManager:
                                         # message goes back to the queue whatever
                                         # ``ack_unmatched`` says, so a filter that
                                         # cannot read a body never deletes it.
+                                        incr("rmq_watcher.filter_error")
                                         miss_state.on_error(reason)
                                         await nack_and_sleep(message)
                                         continue

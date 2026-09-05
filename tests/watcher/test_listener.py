@@ -2809,6 +2809,48 @@ class TestParseRmqTriggerDecorator:
         assert "my_dag" in caplog.text
         assert "orders" in caplog.text
 
+    def test_a_registered_subscription_is_named_as_such_in_the_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator(
+                "rmq_trigger(queue='orders', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
+            )
+        assert "registered with that parameter's default" in caplog.text
+
+    def test_a_lost_queue_selector_says_no_subscription_is_registered(self, caplog):
+        """The two outcomes are not the same one: readme documents the difference, and
+        a line about a working subscription would point at one that does not exist."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(queue=QUEUE_CONST)", dag_id="my_dag")
+        assert result == []
+        assert "no subscription is registered" in caplog.text
+        assert "registered with that parameter's default" not in caplog.text
+
+    def test_dict_unpacking_alone_says_no_subscription_is_registered(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
+        assert result == []
+        assert "no subscription is registered" in caplog.text
+
+    def test_a_non_literal_positional_queue_is_warned_about(self, caplog):
+        """``@rmq_trigger(QUEUE_CONST)`` drops the subscription as silently as any
+        keyword did before the diagnostic covered it."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(QUEUE_CONST)", dag_id="my_dag")
+        assert result == []
+        assert "my_dag" in caplog.text
+        assert "'queue'" in caplog.text
+        assert "no subscription is registered" in caplog.text
+
+    def test_a_queues_argument_that_is_not_a_list_does_not_break_the_warning(self, caplog):
+        """``queues=5`` passes ``literal_eval`` and is not iterable — the label falls
+        back rather than raising a TypeError that would demote the whole file."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator(
+                "rmq_trigger(queues=5, cooldown=COOLDOWN)", dag_id="my_dag"
+            )
+        assert result == []
+        assert "<unresolved>" in caplog.text
+
     def test_non_literal_cooldown_is_warned_about_too(self, caplog):
         with caplog.at_level(logging.WARNING):
             result = _parse_decorator("rmq_trigger(queue='q', cooldown=COOLDOWN)")

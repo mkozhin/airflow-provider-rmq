@@ -26,11 +26,11 @@ from pika.adapters.blocking_connection import BlockingChannel
 #: Environment variable holding the AMQP URL of the test broker.
 URL_ENV = "RMQ_TEST_URL"
 
-#: Environment variable holding the base URL of the Management API.
-MANAGEMENT_URL_ENV = "RMQ_TEST_MANAGEMENT_URL"
-
-#: Dotenv-style file read for the two variables above, at the repository root.
+#: Dotenv-style file read for the variable above, at the repository root.
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+#: This directory. Only the items collected from it are gated and configured here.
+INTEGRATION_DIR = Path(__file__).resolve().parent
 
 #: Airflow connection id published by the :func:`rmq_conn_id` fixture.
 CONN_ID = "rmq_integration"
@@ -61,16 +61,14 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 
 def _load_env() -> None:
-    """Copy the suite's variables from the dotenv file into the environment.
+    """Copy the suite's variable from the dotenv file into the environment.
 
-    A variable already present in the environment wins, so a one-off run can
-    point the suite at another broker without editing the file.
+    A value already present in the environment wins, so a one-off run can point
+    the suite at another broker without editing the file.
     """
-    from_file = _read_env_file(ENV_FILE)
-    for key in (URL_ENV, MANAGEMENT_URL_ENV):
-        value = from_file.get(key)
-        if value and not os.environ.get(key):
-            os.environ[key] = value
+    value = _read_env_file(ENV_FILE).get(URL_ENV)
+    if value and not os.environ.get(URL_ENV):
+        os.environ[URL_ENV] = value
 
 
 def vhost_of(url: str) -> str:
@@ -96,37 +94,32 @@ def _require_dedicated_vhost(url: str) -> str:
     return vhost
 
 
-def pytest_configure(config: pytest.Config) -> None:
-    """Load the dotenv file and abort the run on an unusable vhost."""
-    _load_env()
-    url = os.environ.get(URL_ENV)
-    if url:
-        _require_dedicated_vhost(url)
+def _is_mine(item: pytest.Item) -> bool:
+    """Tell whether *item* was collected from this directory."""
+    path = getattr(item, "path", None)
+    return path is not None and INTEGRATION_DIR in Path(path).resolve().parents
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip the whole directory when no broker is configured."""
-    if os.environ.get(URL_ENV):
-        return
-    skip = pytest.mark.skip(reason=SKIP_REASON)
-    for item in items:
-        item.add_marker(skip)
+    """Read the dotenv file, skip this directory without a broker, refuse a shared vhost.
 
-
-def queue_depth(connection: pika.BlockingConnection, queue: str) -> int:
-    """Return the number of ready messages in *queue*.
-
-    Measured with a passive ``queue_declare``: the ``messages`` field of the
-    Management API lags behind by the statistics collection interval, so it
-    cannot carry an assertion. The declare runs on a channel of its own —
-    a passive declare of a missing queue closes the channel it runs on.
+    A directory-level hook is handed the whole session's items, so everything here
+    is decided on this directory's own items: ``pytest tests integration`` without a
+    broker has to skip the integration tests and run the unit suite, not skip both.
+    The dotenv file is read, and the vhost refused, only when there is something here
+    to run.
     """
-    channel = connection.channel()
-    try:
-        return channel.queue_declare(queue=queue, passive=True).method.message_count
-    finally:
-        if channel.is_open:
-            channel.close()
+    mine = [item for item in items if _is_mine(item)]
+    if not mine:
+        return
+    _load_env()
+    url = os.environ.get(URL_ENV)
+    if not url:
+        skip = pytest.mark.skip(reason=SKIP_REASON)
+        for item in mine:
+            item.add_marker(skip)
+        return
+    _require_dedicated_vhost(url)
 
 
 class BrokerScratch:
@@ -136,12 +129,10 @@ class BrokerScratch:
     rejected, so a typo cannot reach a queue the suite did not create.
     """
 
-    def __init__(self, prefix: str, url: str, connection: pika.BlockingConnection) -> None:
+    def __init__(self, prefix: str, connection: pika.BlockingConnection) -> None:
         self.prefix = prefix
-        self.url = url
         self._connection = connection
         self._queues: list[str] = []
-        self._exchanges: list[str] = []
 
     # --- names ---
 
@@ -159,13 +150,6 @@ class BrokerScratch:
         self._guard(name)
         if name not in self._queues:
             self._queues.append(name)
-        return name
-
-    def register_exchange(self, name: str) -> str:
-        """Record an exchange declared elsewhere for teardown."""
-        self._guard(name)
-        if name not in self._exchanges:
-            self._exchanges.append(name)
         return name
 
     # --- topology ---
@@ -187,17 +171,6 @@ class BrokerScratch:
                 channel.close()
         return name
 
-    def declare_exchange(self, suffix: str, exchange_type: str = "topic", *, durable: bool = False) -> str:
-        """Declare an exchange named after *suffix* and return its full name."""
-        name = self.register_exchange(self.name(suffix))
-        channel = self._connection.channel()
-        try:
-            channel.exchange_declare(exchange=name, exchange_type=exchange_type, durable=durable)
-        finally:
-            if channel.is_open:
-                channel.close()
-        return name
-
     def publish(self, queue: str, body: bytes, headers: dict[str, Any] | None = None) -> None:
         """Publish one message straight to *queue* via the default exchange."""
         self._guard(queue)
@@ -214,46 +187,35 @@ class BrokerScratch:
                 channel.close()
 
     def depth(self, queue: str) -> int:
-        """Return the number of ready messages in *queue*."""
-        return queue_depth(self._connection, self._guard(queue))
+        """Return the number of ready messages in *queue*.
+
+        Measured with a passive ``queue_declare``: the ``messages`` field of the
+        Management API lags behind by the statistics collection interval, so it
+        cannot carry an assertion. The declare runs on a channel of its own —
+        a passive declare of a missing queue closes the channel it runs on.
+        """
+        self._guard(queue)
+        channel = self._connection.channel()
+        try:
+            return channel.queue_declare(queue=queue, passive=True).method.message_count
+        finally:
+            if channel.is_open:
+                channel.close()
 
     # --- teardown ---
 
     def teardown(self) -> None:
-        """Delete every queue and exchange this run declared."""
-        connection = self._connection
-        opened_here = False
-        if connection.is_closed:
-            connection = pika.BlockingConnection(pika.URLParameters(self.url))
-            opened_here = True
+        """Delete every queue this run declared, each on a channel of its own."""
         try:
             for queue in self._queues:
-                self._delete(connection, queue_name=queue)
-            for exchange in self._exchanges:
-                self._delete(connection, exchange_name=exchange)
+                channel = self._connection.channel()
+                try:
+                    channel.queue_delete(queue=queue)
+                finally:
+                    if channel.is_open:
+                        channel.close()
         finally:
             self._queues.clear()
-            self._exchanges.clear()
-            if opened_here and connection.is_open:
-                connection.close()
-
-    @staticmethod
-    def _delete(
-        connection: pika.BlockingConnection,
-        *,
-        queue_name: str | None = None,
-        exchange_name: str | None = None,
-    ) -> None:
-        """Delete one object, on a channel of its own so a failure is contained."""
-        channel = connection.channel()
-        try:
-            if queue_name is not None:
-                channel.queue_delete(queue=queue_name)
-            else:
-                channel.exchange_delete(exchange=exchange_name)
-        finally:
-            if channel.is_open:
-                channel.close()
 
 
 # --- broker coordinates ---
@@ -266,21 +228,6 @@ def rmq_url() -> str:
     if not url:
         pytest.skip(SKIP_REASON)
     _require_dedicated_vhost(url)
-    return url
-
-
-@pytest.fixture(scope="session")
-def rmq_vhost(rmq_url: str) -> str:
-    """Vhost the suite is confined to."""
-    return vhost_of(rmq_url)
-
-
-@pytest.fixture(scope="session")
-def rmq_management_url() -> str:
-    """Base URL of the Management API; skips the test when it is not configured."""
-    url = os.environ.get(MANAGEMENT_URL_ENV)
-    if not url:
-        pytest.skip(f"{MANAGEMENT_URL_ENV} is not set")
     return url
 
 
@@ -361,9 +308,12 @@ def rmq_prefix() -> str:
 
 
 @pytest.fixture
-def scratch(pika_connection: pika.BlockingConnection, rmq_prefix: str, rmq_url: str) -> Iterator[BrokerScratch]:
-    """Namespace for the queues and exchanges of one test, deleted afterwards."""
-    namespace = BrokerScratch(prefix=rmq_prefix, url=rmq_url, connection=pika_connection)
+def scratch(pika_connection: pika.BlockingConnection, rmq_prefix: str) -> Iterator[BrokerScratch]:
+    """Namespace for the queues of one test, deleted afterwards.
+
+    Finalized before ``pika_connection``, so the teardown runs on an open connection.
+    """
+    namespace = BrokerScratch(prefix=rmq_prefix, connection=pika_connection)
     try:
         yield namespace
     finally:

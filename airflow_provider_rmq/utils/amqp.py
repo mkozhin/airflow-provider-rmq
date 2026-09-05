@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -275,7 +276,6 @@ def match(message: Any, msg_filter: MessageFilter) -> tuple[FilterVerdict, str |
     return msg_filter.evaluate(props, body_str)
 
 
-
 #: Smallest ``streak`` and ``dropped`` value worth a WARNING. Missing the filter is a
 #: normal mode of operation — a line per stray message would cost one log record per
 #: delivery — so the thresholds start here and then follow the powers of ten.
@@ -284,9 +284,9 @@ _MISS_WARN_FLOOR = 100
 _ERROR_STREAK_RESET_RUN = 100
 
 
-def _is_threshold(value: int, floor: int = _MISS_WARN_FLOOR) -> bool:
-    """Tell whether ``value`` is a power of ten at or above ``floor``."""
-    if value < floor:
+def _is_threshold(value: int) -> bool:
+    """Tell whether ``value`` is a power of ten at or above :data:`_MISS_WARN_FLOOR`."""
+    if value < _MISS_WARN_FLOOR:
         return False
     while value % 10 == 0:
         value //= 10
@@ -342,9 +342,16 @@ class FilterMissState:
         self._count_clean_outcome()
 
     def on_miss(self) -> None:
-        """Record a message the filter read and rejected."""
+        """Record a message the filter read and rejected, once it has been disposed of.
+
+        The call comes after the ACK or the NACK, so ``dropped`` counts deletions the
+        broker confirmed: an ``ack()`` that raises on a closed channel leaves the
+        message in the queue, and a line saying it was deleted would be untrue.
+        """
         self.streak += 1
         self._count_clean_outcome()
+        if self.ack_unmatched:
+            self.dropped += 1
         if _is_threshold(self.streak):
             if self.ack_unmatched:
                 self.log.warning(
@@ -358,14 +365,15 @@ class FilterMissState:
                     "the queue — check filter_data",
                     self.streak, self.queue_name,
                 )
-        if self.ack_unmatched:
-            self.dropped += 1
-            if _is_threshold(self.dropped):
-                self.log.warning(
-                    "%d messages that did not pass the filter have been dropped on queue %r "
-                    "(ack_unmatched is on) — check filter_data",
-                    self.dropped, self.queue_name,
-                )
+        # An equal `dropped` says exactly what the line above already said, in the same
+        # number: every miss of this state's lifetime is in that run and every one of
+        # them was deleted. The totals part ways as soon as a match breaks the run.
+        if self.ack_unmatched and _is_threshold(self.dropped) and self.dropped != self.streak:
+            self.log.warning(
+                "%d messages that did not pass the filter have been dropped on queue %r "
+                "(ack_unmatched is on) — check filter_data",
+                self.dropped, self.queue_name,
+            )
 
     def on_error(self, reason: str | None) -> None:
         """Record a message the filter could not be evaluated on.
@@ -398,14 +406,23 @@ class FilterMissState:
 
         A batch is the operator's whole task run, so a line here comes out at most once
         per run and needs no threshold: it carries the visibility ``streak`` cannot give
-        to a counter that never outlives a single ``max_messages`` batch.
+        to a counter that never outlives a single ``max_messages`` batch. A batch that
+        matched nothing and dropped everything is one line and not two.
         """
         if evaluated > 0 and matched == 0:
-            self.log.warning(
-                "None of the %d messages read from queue %r passed the filter — check filter_data",
-                evaluated, self.queue_name,
-            )
-        if dropped_in_batch > 0:
+            if dropped_in_batch > 0:
+                self.log.warning(
+                    "None of the %d messages read from queue %r passed the filter, and %d "
+                    "of them were acknowledged and dropped — check filter_data",
+                    evaluated, self.queue_name, dropped_in_batch,
+                )
+            else:
+                self.log.warning(
+                    "None of the %d messages read from queue %r passed the filter — "
+                    "check filter_data",
+                    evaluated, self.queue_name,
+                )
+        elif dropped_in_batch > 0:
             self.log.warning(
                 "%d of the %d messages read from queue %r did not pass the filter and were "
                 "dropped (ack_unmatched is on) — check filter_data",
@@ -443,12 +460,39 @@ async def handle_miss(message: Any, miss_state: FilterMissState) -> None:
     With ``ack_unmatched`` off the message is returned to the queue after the usual
     0.1 s pause. With it on the message is acknowledged and gone for good: dead-lettering
     follows a reject and not an acknowledgement, so no copy is kept anywhere.
+
+    The counters are told after the broker call, so a deletion that did not go through
+    is not counted as one.
     """
-    miss_state.on_miss()
     if miss_state.ack_unmatched:
         await message.ack()
     else:
         await nack_and_sleep(message)
+    miss_state.on_miss()
+
+
+def dispose_miss(
+    miss_state: FilterMissState,
+    ack: Callable[[], None],
+    nack: Callable[[], None],
+) -> None:
+    """Dispose of a rejected message on a synchronous path and count it.
+
+    :param miss_state: Counters of the consuming loop; its ``ack_unmatched`` decides
+        between the two callables.
+    :param ack: Acknowledges the message, deleting it from the broker.
+    :param nack: Returns the message to the queue.
+
+    The synchronous counterpart of :func:`handle_miss`, which the operator and the
+    sensor share so the decision behind an acknowledged miss lives in one place. There
+    is no pause here: a blocking loop reads one batch per fetch and does not come back
+    to the same message inside it.
+    """
+    if miss_state.ack_unmatched:
+        ack()
+    else:
+        nack()
+    miss_state.on_miss()
 
 
 async def match_and_ack(

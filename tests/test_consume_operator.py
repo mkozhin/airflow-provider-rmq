@@ -277,6 +277,9 @@ class TestAckUnmatched:
         first = _lines(caplog, _ERROR_TEXT)
         assert len(first) == 1
         assert "RuntimeError: filter service is down" in first[0].getMessage()
+        # The filter reached no verdict on either message, so the batch line — whose
+        # advice is to look at filter_data — has nothing to say about this batch.
+        assert _lines(caplog, _EMPTY_BATCH_TEXT) == []
 
     def test_non_bool_is_rejected(self):
         with pytest.raises(ValueError, match="ack_unmatched"):

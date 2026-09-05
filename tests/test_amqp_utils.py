@@ -446,16 +446,50 @@ class TestFilterMissState:
                 state.on_miss()
         assert _lines(caplog, _STREAK_TEXT) == []
 
-    def test_streak_text_tells_requeue_from_acknowledgement(self, caplog):
+    def test_the_requeueing_streak_says_the_messages_came_back(self, caplog):
+        state = _make_miss_state()
         with caplog.at_level(logging.WARNING):
-            requeueing = _make_miss_state()
-            acknowledging = _make_miss_state(ack_unmatched=True)
             for _ in range(100):
-                requeueing.on_miss()
-                acknowledging.on_miss()
+                state.on_miss()
         texts = [r.getMessage() for r in _lines(caplog, _STREAK_TEXT)]
-        assert any("returned to the queue" in t for t in texts)
-        assert any("acknowledged and dropped" in t for t in texts)
+        assert len(texts) == 1
+        assert "returned to the queue" in texts[0]
+        assert "acknowledged and dropped" not in texts[0]
+
+    def test_the_acknowledging_streak_says_the_messages_are_gone(self, caplog):
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                state.on_miss()
+        texts = [r.getMessage() for r in _lines(caplog, _STREAK_TEXT)]
+        assert len(texts) == 1
+        assert "acknowledged and dropped" in texts[0]
+        assert "returned to the queue" not in texts[0]
+
+    def test_a_run_equal_to_the_total_does_not_say_it_twice(self, caplog):
+        """Both counters reach a hundred on the same miss; the run's line already
+        carries the total, so the second line would only repeat the number."""
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                state.on_miss()
+        assert state.dropped == 100
+        assert _lines(caplog, _DROPPED_TEXT) == []
+
+    def test_a_total_out_of_step_with_the_run_gets_its_own_line(self, caplog):
+        """A match resets the run and leaves the total behind, so the two numbers
+        part ways and the total needs saying."""
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(50):
+                state.on_miss()
+            state.on_match()
+            for _ in range(50):
+                state.on_miss()
+        assert state.dropped == 100
+        assert state.streak == 50
+        assert len(_lines(caplog, _DROPPED_TEXT)) == 1
+        assert _lines(caplog, _STREAK_TEXT) == []
 
     def test_error_warns_on_the_first_failure_then_throttles(self, caplog):
         state = _make_miss_state()
@@ -530,6 +564,16 @@ class TestFilterMissState:
         with caplog.at_level(logging.WARNING):
             state.on_batch_done(matched=0, evaluated=5, dropped_in_batch=0)
         assert len(_lines(caplog, "passed the filter")) == 1
+
+    def test_a_batch_that_matched_nothing_and_dropped_all_is_one_line(self, caplog):
+        """The two conditions of the batch line describe one batch, so they share a line."""
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            state.on_batch_done(matched=0, evaluated=5, dropped_in_batch=5)
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        assert "None of the 5 messages" in message
+        assert "5 of them were acknowledged and dropped" in message
 
     def test_batch_done_is_silent_on_a_match_and_on_an_empty_batch(self, caplog):
         state = _make_miss_state()

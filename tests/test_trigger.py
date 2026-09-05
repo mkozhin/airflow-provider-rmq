@@ -863,7 +863,7 @@ class TestFilterMissState:
         reading the message alone stays green whatever logger the line came from.
         """
         trigger = RMQTrigger(
-            rmq_conn_id="conn", queue_name="q",
+            rmq_conn_id="conn", queue_name="stray_orders",
             filter_data={"filter_headers": {"x-type": "order"}},
             mode="push",
             ack_unmatched=True,
@@ -884,7 +884,9 @@ class TestFilterMissState:
         ]
         assert [r.getMessage().split()[0] for r in streak_lines] == ["100", "1000"]
         assert [r.name for r in streak_lines] == ["airflow.task", "airflow.task"]
-        assert all("q" in r.getMessage() for r in streak_lines)
+        # A name of its own: "q" is a substring of "queue" and would be found in any
+        # wording of the line.
+        assert all("stray_orders" in r.getMessage() for r in streak_lines)
 
     @pytest.mark.asyncio
     async def test_push_mode_shares_the_same_state(self):

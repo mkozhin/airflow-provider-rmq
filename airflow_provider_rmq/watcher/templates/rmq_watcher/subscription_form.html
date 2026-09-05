@@ -150,6 +150,11 @@
                 instead of being returned to the queue. Dead-lettering does not apply
                 to an acknowledgement, so the message simply disappears — turn this on
                 only for a queue this subscription owns.
+                {% if group_subs and group_subs | length > 1 %}
+                  The box stands for the whole group: it is drawn from the first queue
+                  by name, and saving writes it to every row. A group whose rows
+                  disagree today is levelled to what you see here.
+                {% endif %}
               {% endif %}
             </p>
           </div>

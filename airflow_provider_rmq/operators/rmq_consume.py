@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Any, Callable, Sequence
 
 import pika.exceptions
 from airflow.models import BaseOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
-from airflow_provider_rmq.utils.amqp import FilterMissState
+from airflow_provider_rmq.utils.amqp import FilterMissState, dispose_miss
 from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
@@ -85,7 +86,7 @@ class RMQConsumeOperator(BaseOperator):
             ack_unmatched=self.ack_unmatched,
         )
         matched_messages: list[dict[str, Any]] = []
-        dropped_in_batch = 0
+        errors = 0
 
         with RMQHook(rmq_conn_id=self.rmq_conn_id, qos=self.qos) as hook:
             try:
@@ -114,20 +115,25 @@ class RMQConsumeOperator(BaseOperator):
                         "exchange": msg["method"].exchange or "",
                     })
                 elif verdict is FilterVerdict.ERROR:
+                    errors += 1
                     miss_state.on_error(reason)
                     hook.nack(msg["method"].delivery_tag, requeue=True)
                 else:
-                    miss_state.on_miss()
-                    if self.ack_unmatched:
-                        hook.ack(msg["method"].delivery_tag)
-                        dropped_in_batch += 1
-                    else:
-                        hook.nack(msg["method"].delivery_tag, requeue=True)
+                    tag = msg["method"].delivery_tag
+                    dispose_miss(
+                        miss_state,
+                        partial(hook.ack, tag),
+                        partial(hook.nack, tag, requeue=True),
+                    )
 
+            # `evaluated` is what the filter reached a verdict on: a body it could not
+            # read is not evidence about filter_data, and counting it would point the
+            # batch line at the wrong thing. `miss_state.dropped` is the batch total
+            # too — the state lives exactly one execute(), and execute() reads one batch.
             miss_state.on_batch_done(
                 matched=len(matched_messages),
-                evaluated=len(raw_messages),
-                dropped_in_batch=dropped_in_batch,
+                evaluated=len(raw_messages) - errors,
+                dropped_in_batch=miss_state.dropped,
             )
 
         log.info(

@@ -48,7 +48,6 @@ from airflow_provider_rmq.watcher.views import (  # noqa: E402
     SubscriptionGroup,
     _build_conn_status_rows,
     _group_subscriptions,
-    _queue_sharing,
     _reconcile_interval,
     _stale_after,
 )
@@ -1704,14 +1703,13 @@ def _warning_flashes(mock_flash) -> list[str]:
 
 
 def _render_rows_with_sharing(rows, **ctx):
-    """Render the page the way subscriptions() builds it — the sharing sets come
-    from _queue_sharing over the very rows being rendered, so a test cannot pass a
-    hand-written context the view would never produce."""
-    shared, acking = _queue_sharing(rows)
+    """Render the page the way subscriptions() builds it — the badge is decided in
+    _group_subscriptions over the very rows being rendered, so a test cannot hand the
+    template a context the view would never produce."""
     return _render_subscriptions_html(
         _group_subscriptions(rows),
-        shared_queues=shared,
-        ack_unmatched_queues=acking,
+        shared_queue_warning=SHARED_QUEUE_WARNING,
+        shared_queue_ack_warning=SHARED_QUEUE_ACK_WARNING,
         **ctx,
     )
 
@@ -1995,15 +1993,30 @@ class TestSharedQueueBadge:
         badges = _shared_queue_badges(_render_rows_with_sharing(rows))
         assert badges == ["⚠ shared queue", "⚠ shared queue: q2"]
 
-    def test_a_context_without_the_sharing_sets_renders_without_badges(self):
-        """Guard for the `is defined` checks: Undefined raises on `in`, so a
-        context missing the keys would break the page rather than drop the badge."""
+    def test_a_disabled_row_on_a_shared_queue_is_not_badged(self):
+        """A disabled row runs no consumer, so it competes with nobody — only the two
+        enabled rows of the pair are on the queue."""
+        rows = [
+            _make_single_row(id=1, dag_id="a", queue_name="shared_q"),
+            _make_single_row(id=2, dag_id="b", queue_name="shared_q"),
+            _make_single_row(id=3, dag_id="c", queue_name="shared_q", enabled=False),
+        ]
+        assert _shared_queue_badges(_render_rows_with_sharing(rows)) == [
+            "⚠ shared queue",
+            "⚠ shared queue",
+        ]
+
+    def test_a_row_the_view_did_not_annotate_renders_without_a_badge(self):
+        """The badge reads an attribute the row may not carry — a template rendered
+        outside subscriptions() has to drop the badge rather than break the page."""
         rows = [_make_single_row(id=1, dag_id="a", queue_name="q")]
         grouped = _make_group(dag_id="dag_g", group_key="dag_g")
         html = _render_subscriptions_html([grouped] + rows)
         assert _shared_queue_badges(html) == []
 
-    def test_the_view_passes_the_sharing_sets_to_the_template(self, app, view):
+    def test_the_view_passes_the_badge_wordings_to_the_template(self, app, view):
+        """The badge and the flash say the same thing because they are the same two
+        constants, handed to the template rather than copied into it."""
         rows = [
             _make_single_row(id=1, dag_id="a", queue_name="shared_q", ack_unmatched=True),
             _make_single_row(id=2, dag_id="b", queue_name="shared_q"),
@@ -2016,8 +2029,13 @@ class TestSharedQueueBadge:
             view.subscriptions()
 
         kwargs = view.render_template.call_args.kwargs
-        assert kwargs["shared_queues"] == {("shared_q", "rmq_default")}
-        assert kwargs["ack_unmatched_queues"] == {("shared_q", "rmq_default")}
+        assert kwargs["shared_queue_warning"] == SHARED_QUEUE_WARNING
+        assert kwargs["shared_queue_ack_warning"] == SHARED_QUEUE_ACK_WARNING
+        assert [row.shared_queue_names for row in kwargs["subscriptions"]] == [
+            ["shared_q"],
+            ["shared_q"],
+        ]
+        assert all(row.shared_acking for row in kwargs["subscriptions"])
 
 
 class TestSharedQueueFlash:
@@ -2049,9 +2067,15 @@ class TestSharedQueueFlash:
         assert SHARED_QUEUE_ACK_WARNING in warnings[0]
 
     def test_toggle_off_does_not_warn(self, app, view):
+        """Two enabled rows on the queue, so the query behind the warning does report
+        sharing — what keeps the flash away is the guard on the direction of the toggle,
+        and nothing else."""
         sub = _make_sub(id=1, dag_id="b", queue_name="shared_q", enabled=True)
-        neighbour = _make_sub(id=2, dag_id="a", queue_name="shared_q")
-        ctx, _ = _session_ctx_for_sharing(first_sub=sub, enabled_rows=[neighbour])
+        neighbours = [
+            _make_sub(id=2, dag_id="a", queue_name="shared_q"),
+            _make_sub(id=3, dag_id="c", queue_name="shared_q"),
+        ]
+        ctx, _ = _session_ctx_for_sharing(first_sub=sub, enabled_rows=neighbours)
         mock_flash = MagicMock()
         with app.test_request_context("/subscriptions/1/toggle", method="POST"), \
              patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
@@ -2086,6 +2110,32 @@ class TestSharedQueueFlash:
         assert "q2" in warnings[0]
         assert SHARED_QUEUE_ACK_WARNING in warnings[0]
 
+    def test_toggle_group_off_does_not_warn(self, app, view):
+        """Disabling a group takes its queues off the broker; the rows the query still
+        reports as shared are not a reason to warn about the save that removed them."""
+        sub1 = _make_sub(
+            id=1, dag_id="dag_g", queue_name="q1", enabled=True, group_key="dag_g"
+        )
+        sub2 = _make_sub(
+            id=2, dag_id="dag_g", queue_name="q2", enabled=True, group_key="dag_g"
+        )
+        neighbours = [
+            _make_sub(id=3, dag_id="a", queue_name="q2", ack_unmatched=True),
+            _make_sub(id=4, dag_id="c", queue_name="q2"),
+        ]
+        ctx, _ = _session_ctx_for_sharing(
+            group_subs=[sub1, sub2], enabled_rows=neighbours
+        )
+        mock_flash = MagicMock()
+        with app.test_request_context("/subscriptions/group/dag_g/toggle", method="POST"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.flash", mock_flash), \
+             patch("airflow_provider_rmq.watcher.views.redirect", return_value="redirect"), \
+             patch("airflow_provider_rmq.watcher.views.url_for", return_value="/subs"):
+            view.toggle_group("dag_g")
+
+        assert _warning_flashes(mock_flash) == []
+
     def test_create_warns_on_a_queue_a_neighbour_already_listens_to(self, app, view):
         existing = _make_sub(id=1, dag_id="a", queue_name="shared_q")
         created = _make_sub(id=2, dag_id="b", queue_name="shared_q")
@@ -2112,6 +2162,27 @@ class TestSharedQueueFlash:
         assert len(warnings) == 1
         assert "shared_q" in warnings[0]
         assert SHARED_QUEUE_ACK_WARNING not in warnings[0]
+
+    def test_create_of_a_disabled_subscription_does_not_warn(self, app, view):
+        """A row saved disabled starts no consumer, so it takes nothing from the
+        neighbour — even though the queue is shared by the rows the query returns."""
+        existing = _make_sub(id=1, dag_id="a", queue_name="shared_q")
+        created = _make_sub(id=2, dag_id="b", queue_name="shared_q")
+        ctx, _ = _session_ctx_for_sharing(enabled_rows=[existing, created])
+        mock_flash = MagicMock()
+        with app.test_request_context(
+            "/subscriptions/create",
+            method="POST",
+            data={"dag_id": "b", "queue_name": "shared_q", "conn_id": "rmq_default"},
+        ), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.upsert_subscription"), \
+             patch("airflow_provider_rmq.watcher.views.flash", mock_flash), \
+             patch("airflow_provider_rmq.watcher.views.redirect", return_value="redirect"), \
+             patch("airflow_provider_rmq.watcher.views.url_for", return_value="/subs"):
+            view.create()
+
+        assert _warning_flashes(mock_flash) == []
 
     def test_edit_warns_on_a_queue_a_neighbour_already_listens_to(self, app, view):
         sub = _make_sub(id=1, dag_id="b", queue_name="shared_q", source="ui")
@@ -2169,6 +2240,91 @@ class TestSharedQueueFlash:
         assert len(warnings) == 1
         assert "q1" in warnings[0]
 
+    def test_edit_group_saved_disabled_does_not_warn(self, app, view):
+        sub1 = _make_sub(id=1, dag_id="dag_g", queue_name="q1", source="ui", group_key="dag_g")
+        sub2 = _make_sub(id=2, dag_id="dag_g", queue_name="q2", source="ui", group_key="dag_g")
+        neighbour = _make_sub(id=3, dag_id="a", queue_name="q1")
+        ctx, _ = _session_ctx_for_sharing(
+            group_subs=[sub1, sub2], enabled_rows=[sub1, sub2, neighbour]
+        )
+        mock_flash = MagicMock()
+        with app.test_request_context(
+            "/subscriptions/group/dag_g/edit",
+            method="POST",
+            data={
+                "dag_id": "dag_g",
+                "queue_name": ["q1", "q2"],
+                "conn_id": "rmq_default",
+                "cooldown": "300",
+            },
+        ), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.upsert_subscription"), \
+             patch("airflow_provider_rmq.watcher.views.flash", mock_flash), \
+             patch("airflow_provider_rmq.watcher.views.redirect", return_value="redirect"), \
+             patch("airflow_provider_rmq.watcher.views.url_for", return_value="/subs"):
+            view.edit_group("dag_g")
+
+        assert _warning_flashes(mock_flash) == []
+
+    def test_edit_group_of_a_dag_file_group_warns_too(self, app, view):
+        """A dag_file group is saved through the branch that only flips `enabled`;
+        enabling it puts the queue back on the broker just as the UI branch does."""
+        sub1 = _make_sub(
+            id=1, dag_id="dag_g", queue_name="q1", source="dag_file",
+            group_key="dag_g", enabled=False,
+        )
+        sub2 = _make_sub(
+            id=2, dag_id="dag_g", queue_name="q2", source="dag_file",
+            group_key="dag_g", enabled=False,
+        )
+        neighbour = _make_sub(id=3, dag_id="a", queue_name="q1", ack_unmatched=True)
+        ctx, _ = _session_ctx_for_sharing(
+            group_subs=[sub1, sub2], enabled_rows=[sub1, sub2, neighbour]
+        )
+        mock_flash = MagicMock()
+        with app.test_request_context(
+            "/subscriptions/group/dag_g/edit",
+            method="POST",
+            data={"enabled": "on"},
+        ), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.flash", mock_flash), \
+             patch("airflow_provider_rmq.watcher.views.redirect", return_value="redirect"), \
+             patch("airflow_provider_rmq.watcher.views.url_for", return_value="/subs"):
+            view.edit_group("dag_g")
+
+        warnings = _warning_flashes(mock_flash)
+        assert len(warnings) == 1
+        assert "q1" in warnings[0]
+        assert SHARED_QUEUE_ACK_WARNING in warnings[0]
+
+    def test_edit_group_of_a_dag_file_group_saved_off_does_not_warn(self, app, view):
+        sub1 = _make_sub(
+            id=1, dag_id="dag_g", queue_name="q1", source="dag_file", group_key="dag_g"
+        )
+        sub2 = _make_sub(
+            id=2, dag_id="dag_g", queue_name="q2", source="dag_file", group_key="dag_g"
+        )
+        neighbours = [
+            _make_sub(id=3, dag_id="a", queue_name="q1"),
+            _make_sub(id=4, dag_id="c", queue_name="q1"),
+        ]
+        ctx, _ = _session_ctx_for_sharing(
+            group_subs=[sub1, sub2], enabled_rows=neighbours
+        )
+        mock_flash = MagicMock()
+        with app.test_request_context(
+            "/subscriptions/group/dag_g/edit", method="POST", data={},
+        ), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.flash", mock_flash), \
+             patch("airflow_provider_rmq.watcher.views.redirect", return_value="redirect"), \
+             patch("airflow_provider_rmq.watcher.views.url_for", return_value="/subs"):
+            view.edit_group("dag_g")
+
+        assert _warning_flashes(mock_flash) == []
+
 
 class TestAckUnmatchedFormTemplate:
     def test_the_checkbox_is_editable_on_a_ui_row(self):
@@ -2184,6 +2340,21 @@ class TestAckUnmatchedFormTemplate:
             sub=_make_single_row(ack_unmatched=False), is_dag_file=False
         )
         assert "checked" not in _form_field(html, "ack_unmatched")
+
+    def test_a_group_form_says_the_value_is_levelled(self):
+        """The box is the representative row's and the save writes it to every row —
+        the form has to say so, because a mixed group has no mixed state to show."""
+        rows = [_make_single_row(id=1, queue_name="q1"), _make_single_row(id=2, queue_name="q2")]
+        html = _render_subscription_form_html(
+            sub=rows[0], is_dag_file=False, group_subs=rows
+        )
+        assert "stands for the whole group" in html
+
+    def test_a_single_row_form_does_not_mention_the_group(self):
+        html = _render_subscription_form_html(
+            sub=_make_single_row(), is_dag_file=False
+        )
+        assert "stands for the whole group" not in html
 
     def test_the_checkbox_is_disabled_on_a_dag_file_row(self):
         """The value belongs to the decorator there, and a disabled checkbox is

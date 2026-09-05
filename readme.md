@@ -258,7 +258,7 @@ Consumes messages from a RabbitMQ queue. Matching messages are ACKed and returne
 
 > **`ack_unmatched=True` deletes other consumers' messages.** On a queue a watcher subscription or any other consumer also reads, every message this task's filter rejects is acknowledged and gone: the neighbour keeps saying `listening`, reports no error, and its DAG simply never runs. The Subscriptions page badges a queue two subscriptions share, but it knows nothing about operators and sensors — on their side this paragraph is the only guard. Turn the parameter on only for a queue this task owns.
 
-**One batch per task run.** `execute()` makes exactly one `consume_messages` call, so the task sees at most `max_messages` messages from the head of the queue and nothing behind them — with `ack_unmatched=True` too. What the parameter changes is that the rejected ones leave the queue for good: the next run reads the next batch, and a message sitting behind 150 foreign ones is found after two or three runs instead of never. The miss counters live for one run and therefore for one batch, so the threshold of a hundred consecutive misses is out of reach whenever `max_messages` is smaller; the operator gets two batch-level WARNINGs instead — one when the whole batch was read and nothing matched, one naming how many messages of the batch were dropped.
+**One batch per task run.** `execute()` makes exactly one `consume_messages` call, so the task sees at most `max_messages` messages from the head of the queue and nothing behind them — with `ack_unmatched=True` too. What the parameter changes is that the rejected ones leave the queue for good: the next run reads the next batch, and a message sitting behind 150 foreign ones is found after two or three runs instead of never. The miss counters live for one run and therefore for one batch, so the threshold of a hundred consecutive misses is out of reach whenever `max_messages` is smaller; the operator gets a batch-level WARNING instead — that nothing in the batch matched, how many of it were dropped, or both in the same line. Only what the filter reached a verdict on is counted there: a body it could not read says nothing about `filter_data`.
 
 #### Usage Example
 
@@ -559,7 +559,9 @@ Evaluates whether a RabbitMQ message matches given filter conditions. Used inter
 
 Both can be combined (AND logic: both must pass), and they are evaluated in that order: the dict conditions first, and a callable only where the dict matched or is absent.
 
-> **Behaviour change for code that calls `MessageFilter.matches()` directly.** An exception out of `filter_callable` is still swallowed and still reads as a non-match, but its type, text and traceback now go to the **DEBUG** level instead of WARNING. Inside the provider the visible line is put by the miss counters of the consuming loop, which name the queue and throttle the series — see below. External code that relied on the WARNING should lower its level for `airflow_provider_rmq.utils.filters` or log the failure itself.
+`matches(properties, body) -> bool` answers the yes/no question. Code that needs to tell a rejection apart from a failure to evaluate calls `evaluate(properties, body) -> tuple[FilterVerdict, str | None]` instead: the verdict is one of `FilterVerdict.MATCH`, `MISS` and `ERROR` (`from airflow_provider_rmq.utils.filters import FilterVerdict`), and the second element carries the type and text of the exception behind an `ERROR` and is `None` otherwise. The three verdicts are what the table below is about.
+
+> **Behaviour change for code that calls `MessageFilter.matches()` directly.** An exception out of `filter_callable` is still swallowed and still reads as a non-match, but its type, text and traceback now go to the **DEBUG** level instead of WARNING. Inside the provider the visible line is put by the miss counters of the consuming loop, which name the queue and throttle the series — see below. External code that relied on the WARNING should log the failure itself inside `filter_callable`; the records go to the `airflow.task` logger, so lowering that one to DEBUG brings them back at the price of every other task log record.
 
 ---
 
@@ -597,9 +599,9 @@ def orders_dag():
 **What a miss puts in the log.** Nothing per message: a filter miss is normal traffic, and a line on each one would be a line per foreign message. The counters of one consuming loop produce instead:
 
 - a WARNING on every power of ten of consecutive misses from a hundred up (100, 1 000, 10 000 …), naming the queue, saying whether the messages were returned or dropped, and suggesting a look at the filter. A match ends the run and clears it.
-- a WARNING on every power of ten of *dropped* messages from a hundred up, which nothing ever clears. A stream of ninety-nine misses and one match never reaches the first threshold while deleting ninety-nine messages out of every hundred, and this counter is what makes that visible.
+- a WARNING on every power of ten of *dropped* messages from a hundred up, which nothing ever clears. A stream of ninety-nine misses and one match never reaches the first threshold while deleting ninety-nine messages out of every hundred, and this counter is what makes that visible. Where the two counters hit the same number on the same message, the line above already carries it and this one is not repeated.
 - a WARNING on the **first** failure to evaluate the filter and then on every power of ten from a hundred up, carrying the type and text of the exception behind it. A match does not clear that series — only a hundred outcomes in a row without a failure does. An error message returns to the queue whatever `ack_unmatched` says, so it comes back every 0.1 s, and a line per turn would put the redelivery loop itself into the log.
-- in the watcher only, the metric `rmq_watcher.filter_missed`. The operator, the sensor and the trigger have no metric wiring, and the `rmq_watcher` prefix would be untrue in them.
+- in the watcher only, the metrics `rmq_watcher.filter_missed` and `rmq_watcher.filter_error`, one per verdict. The operator, the sensor and the trigger have no metric wiring, and the `rmq_watcher` prefix would be untrue in them.
 
 How far a counter reaches depends on how long its owner lives: a consumer task in the watcher (across reconnects), one `run()` in the trigger, one task run in the operator, the sensor instance across its pokes. The two places where the threshold of a hundred is out of reach are named in the `RMQConsumeOperator` and `RMQSensor` sections above, together with what stands in for it.
 
@@ -623,7 +625,7 @@ A scan that is not a statement about the code is not believed at all: the sync s
 
 `dag_id` in `@dag(...)` (positional or keyword) must be a string literal, or a simple module-level string constant defined earlier in the file than the decorated function, for the AST scan of `dag_file` subscriptions to find it. If it isn't, the subscription simply does not appear on the Subscriptions page at all. This is the one case the `⚠ dag not found` badge (see [Subscription Management](#subscription-management)) cannot catch: there's no row to highlight, since the subscription never registers in the first place. The only signal is a WARNING in the Scheduler log, and only after a restart or when the file's mtime changes (not on every reconcile cycle — only when the file is actually re-scanned).
 
-The arguments of `@rmq_trigger(...)` itself must be literals for the same reason — the scan reads the file, it never executes it. A value the decorator computes (a module-level constant, an import, an f-string, a call) is invisible to it, and so is a `**opts` unpacking that hides every argument at once; the subscription is then registered with that parameter's default and runs against what the DAG file declares. Each such argument is named in a Scheduler WARNING carrying the `dag_id`, the queue and the parameter. Whether the subscription survives at all depends on which argument was lost: an unreadable `queue`/`queues`/`exchange`, or a set `build_subscriptions` refuses, skips the subscription, while an unreadable `cooldown` or `ack_unmatched` leaves a working subscription running on the default.
+The arguments of `@rmq_trigger(...)` itself must be literals for the same reason — the scan reads the file, it never executes it. A value the decorator computes (a module-level constant, an import, an f-string, a call) is invisible to it, and so is a `**opts` unpacking that hides every argument at once; the subscription is then registered with that parameter's default and runs against what the DAG file declares. Each such argument — the positional queue name included — is named in a Scheduler WARNING carrying the `dag_id`, the queue and the parameter. Whether the subscription survives at all depends on which argument was lost: an unreadable `queue`/`queues`/`exchange`, or a set `build_subscriptions` refuses, skips the subscription, while an unreadable `cooldown` or `ack_unmatched` leaves a working subscription running on the default. The WARNING says which of the two it is, so a line about a subscription that was never registered does not read as a line about a working one.
 
 ### Quick Start
 
@@ -831,7 +833,7 @@ Exchange-mode subscriptions show up in the UI like any other `dag_file` subscrip
 
 Any subscription whose `dag_id` doesn't correspond to an active Airflow DAG is marked on the page with a `⚠ dag not found` badge. This is a **one-sided** signal: its presence means a real problem — a matching message will be ACKed without triggering anything — but its **absence guarantees nothing**. Three reasons the badge can miss a broken subscription: `is_paused` is not checked, so a paused DAG never gets the badge even though a matching message is still ACKed without triggering a run, exactly like a missing DAG (see [ADR 0006](docs/adr/0006-badge-dag-lookup-not-unified-with-sync-trigger.md)); a just-added DAG may be badged for a short while until the Scheduler parses it; and a just-deleted or renamed DAG conversely stays un-badged for a while until `DagModel.is_active` catches up. The last two are expected lag, not bugs.
 
-A queue more than one **enabled** subscription of the same `conn_id` listens to is marked with a `⚠ shared queue` badge, and a grouped row names which of its queues are shared. The badge is on both rows of the pair, because either of them is equally affected. Where one of those subscriptions has `ack_unmatched` on, the badge reads `⚠ shared queue: … — messages deleted` and its tooltip says what that costs: a message only the neighbour's filter accepts is deleted the moment it lands on the acknowledging consumer, and the neighbour goes on saying `listening`. The `ack_unmatched` column of the table shows `on` for a subscription that acknowledges its misses.
+A queue more than one **enabled** subscription of the same `conn_id` listens to is marked with a `⚠ shared queue` badge; a grouped row names which of its queues are shared and reads `⚠ shared queue: q1, q2`. A disabled row runs no consumer and is never badged. The badge is on both rows of the pair, because either of them is equally affected. Where one of those subscriptions has `ack_unmatched` on, the badge gains ` — messages deleted` and its tooltip says what that costs: a message only the neighbour's filter accepts is deleted the moment it lands on the acknowledging consumer, and the neighbour goes on saying `listening`. The `ack_unmatched` column of the table shows `on` for a subscription that acknowledges its misses.
 
 The same setting is a checkbox on the subscription form, available in all three of its flows — create, edit and edit-group — and it survives an edit-group save, which rewrites the rows of a group from scratch. Saving a subscription that shares its queue with another enabled one raises a `flash` warning naming the queue; so does toggling one on. The warning comes after the save rather than before it: the form renders its fields from the stored row and never reads back the submitted values, so a confirmation round trip would redraw the checkbox from the database and lose the very value being confirmed.
 
@@ -967,9 +969,9 @@ airflow-provider-rmq/
 │   ├── triggers/
 │   │   └── rmq.py                   # RMQTrigger
 │   ├── utils/
-│   │   ├── amqp.py                  # build_amqp_connection(), get_amqp_timeouts(), call_with_timeout()
+│   │   ├── amqp.py                  # build_amqp_connection(), get_amqp_timeouts(), call_with_timeout(), FilterMissState, handle_miss(), match_and_ack()
 │   │   ├── executor.py              # BoundedExecutor (thread pool for blocking calls)
-│   │   ├── filters.py               # MessageFilter
+│   │   ├── filters.py               # MessageFilter, FilterVerdict
 │   │   ├── management.py            # Management HTTP API client (bindings, queue consumers)
 │   │   ├── metrics.py               # Stats counters, no-op without statsd
 │   │   └── ssl.py                   # build_ssl_context()
@@ -988,6 +990,7 @@ airflow-provider-rmq/
 │   ├── adr/                         # Architecture decision records
 │   └── example_dags/                # Example DAGs
 ├── tests/                           # Unit tests
+├── integration/                     # Live-broker tests (opt-in, outside testpaths)
 ├── CHANGELOG.md
 ├── pyproject.toml
 └── readme.md
@@ -1007,6 +1010,13 @@ pytest tests/
 # Run specific test module
 pytest tests/test_trigger.py -v
 ```
+
+```bash
+# Integration tests against a live broker (opt-in)
+pytest integration/ -q
+```
+
+The `integration/` directory sits outside `testpaths`, so no ordinary run — `pytest`, `pytest tests/`, or CI — ever touches a broker. It runs only when named explicitly, skips entirely without `RMQ_TEST_URL`, and refuses to run at all unless that URL names a dedicated vhost — never the default `/`. Everything it creates carries a per-run `rmqtest.{pid}.{uuid8}.` prefix and is deleted in teardown. See [integration/README.md](integration/README.md) for the variables, the fixtures and the safety rules.
 
 ---
 

@@ -19,12 +19,13 @@ from typing import Any
 
 import aio_pika
 import pika
-from conftest import BrokerScratch
 
 from airflow_provider_rmq.operators.rmq_consume import RMQConsumeOperator
 from airflow_provider_rmq.sensors.rmq import RMQSensor
 from airflow_provider_rmq.utils.amqp import FilterMissState, match_and_ack
 from airflow_provider_rmq.utils.filters import MessageFilter
+
+from .conftest import BrokerScratch
 
 log = logging.getLogger(__name__)
 
@@ -70,13 +71,6 @@ def publish_many(
         channel.basic_publish(exchange="", routing_key=queue, body=body, properties=properties)
 
 
-async def open_queue(
-    channel: aio_pika.abc.AbstractChannel, name: str
-) -> aio_pika.abc.AbstractQueue:
-    """Return the existing queue *name* without redeclaring its arguments."""
-    return await channel.declare_queue(name, passive=True)
-
-
 async def consume_once(
     queue: aio_pika.abc.AbstractQueue,
     msg_filter: MessageFilter,
@@ -98,7 +92,7 @@ async def test_ack_unmatched_takes_the_message_out_of_the_queue(
     """With the parameter on, a rejected message is gone and never comes back."""
     name = scratch.declare_queue("ack-unmatched")
     scratch.publish(name, b"stray", headers=STRAY)
-    queue = await open_queue(aio_channel, name)
+    queue = await aio_channel.declare_queue(name, passive=True)
 
     miss_state = FilterMissState(name, log, ack_unmatched=True)
     assert await consume_once(queue, MessageFilter(filter_headers=WANTED), miss_state) is False
@@ -125,7 +119,7 @@ async def test_ack_unmatched_does_not_dead_letter(
         arguments={"x-dead-letter-exchange": "", "x-dead-letter-routing-key": dead},
     )
     scratch.publish(source, b"stray", headers=STRAY)
-    queue = await open_queue(aio_channel, source)
+    queue = await aio_channel.declare_queue(source, passive=True)
 
     miss_state = FilterMissState(source, log, ack_unmatched=True)
     assert await consume_once(queue, MessageFilter(filter_headers=WANTED), miss_state) is False
@@ -154,7 +148,7 @@ async def test_default_requeues_and_paces_the_redeliveries(
     """
     name = scratch.declare_queue("requeue-loop")
     scratch.publish(name, b"stray", headers=STRAY)
-    queue = await open_queue(aio_channel, name)
+    queue = await aio_channel.declare_queue(name, passive=True)
 
     msg_filter = MessageFilter(filter_headers=WANTED)
     miss_state = FilterMissState(name, log, ack_unmatched=False)
@@ -175,6 +169,37 @@ async def test_default_requeues_and_paces_the_redeliveries(
     # The pause sits between deliveries, so the first one is not preceded by it.
     assert deliveries <= 10 * elapsed + 1
     assert miss_state.streak == deliveries
+    assert miss_state.dropped == 0
+    assert wait_for_depth(scratch, name, 1) == 1
+
+
+async def test_a_body_that_does_not_read_stays_in_the_queue(
+    scratch: BrokerScratch, aio_channel: aio_pika.abc.AbstractChannel
+) -> None:
+    """An ERROR is not a miss: the broker still holds the message with the parameter on.
+
+    This is the decision where being wrong destroys data, so it is asserted against a
+    real queue and not only against a mocked ``nack``: the filter asks for a ``body.*``
+    key on a body that is not JSON, and the depth has to stay at one however many turns
+    the loop takes.
+    """
+    name = scratch.declare_queue("unreadable-body")
+    scratch.publish(name, b"not json at all", headers=WANTED)
+    queue = await aio_channel.declare_queue(name, passive=True)
+
+    msg_filter = MessageFilter(filter_headers={"body.status": "ok"})
+    miss_state = FilterMissState(name, log, ack_unmatched=True)
+    turns = 0
+    while turns < 3:
+        outcome = await consume_once(queue, msg_filter, miss_state)
+        if outcome is None:
+            # The message is on its way back to the queue; this is not a turn.
+            await asyncio.sleep(0.05)
+            continue
+        assert outcome is False
+        turns += 1
+
+    assert miss_state.error_streak == 3
     assert miss_state.dropped == 0
     assert wait_for_depth(scratch, name, 1) == 1
 

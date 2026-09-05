@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Any, Callable, Literal, Sequence
 
 import pika.exceptions
@@ -8,7 +9,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.sensors.base import BaseSensorOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
-from airflow_provider_rmq.utils.amqp import FilterMissState
+from airflow_provider_rmq.utils.amqp import FilterMissState, dispose_miss
 from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
@@ -199,11 +200,12 @@ class RMQSensor(BaseSensorOperator):
                     miss_state.on_error(reason)
                     hook.nack(msg["method"].delivery_tag, requeue=True)
                 else:
-                    miss_state.on_miss()
-                    if self.ack_unmatched:
-                        hook.ack(msg["method"].delivery_tag)
-                    else:
-                        hook.nack(msg["method"].delivery_tag, requeue=True)
+                    tag = msg["method"].delivery_tag
+                    dispose_miss(
+                        miss_state,
+                        partial(hook.ack, tag),
+                        partial(hook.nack, tag, requeue=True),
+                    )
             return False
         finally:
             hook.close()

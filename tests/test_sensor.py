@@ -542,14 +542,37 @@ class TestAckUnmatched:
             for _ in range(100):
                 assert sensor.poke(context={}) is False
 
-        assert sensor._miss_state.streak == 100
         streak_lines = _lines(caplog, _STREAK_TEXT)
         assert len(streak_lines) == 1
         assert streak_lines[0].getMessage().startswith("100 ")
         assert streak_lines[0].name == "airflow.task"
 
+    def test_reschedule_never_reaches_the_threshold(self, mock_hook, caplog):
+        """``AirflowRescheduleException`` ends the task instance, so the next poke runs
+        on a new object and the run of misses starts over. The visibility of a miss is
+        absent in that mode — see the readme and the backlog item on the shadowed
+        ``mode`` parameter."""
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+        ]
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                sensor = RMQSensor(
+                    task_id="t", queue_name="q", poke_interval=1, mode="reschedule",
+                    filter_headers={"x-type": "order"}, poke_batch_size=1,
+                )
+                assert sensor.poke(context={}) is False
+                assert sensor._miss_state.streak == 1
+
+        assert _lines(caplog, _STREAK_TEXT) == []
+
     def test_a_hundred_pokes_report_no_batch_line(self, mock_hook, caplog):
-        """``on_batch_done`` is the operator's: a line per poke is the noise the threshold avoids."""
+        """``on_batch_done`` is the operator's: a line per poke is the noise the threshold avoids.
+
+        The run and the total are the same hundred here, so they are one line — the run's,
+        which already says the messages were acknowledged and dropped.
+        """
         _, hook = mock_hook
         hook.consume_messages.return_value = [
             _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
@@ -565,5 +588,7 @@ class TestAckUnmatched:
 
         assert _lines(caplog, _EMPTY_BATCH_TEXT) == []
         assert _lines(caplog, _BATCH_DROPPED_TEXT) == []
-        assert len(_lines(caplog, _STREAK_TEXT)) == 1
-        assert len(_lines(caplog, _DROPPED_TEXT)) == 1
+        streak_lines = _lines(caplog, _STREAK_TEXT)
+        assert len(streak_lines) == 1
+        assert "acknowledged and dropped" in streak_lines[0].getMessage()
+        assert _lines(caplog, _DROPPED_TEXT) == []

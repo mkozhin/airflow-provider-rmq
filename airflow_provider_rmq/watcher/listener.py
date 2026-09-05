@@ -511,38 +511,48 @@ def _scanned_queue_label(kwargs: dict) -> str:
     """
     if "queue" in kwargs:
         return str(kwargs["queue"])
-    if "queues" in kwargs:
+    if isinstance(kwargs.get("queues"), (list, tuple)):
         return ",".join(str(q) for q in kwargs["queues"])
     if "exchange" in kwargs:
         return f"exchange:{kwargs['exchange']}"
     return "<unresolved>"
 
 
-def _warn_unreadable_kwarg(dag_id: str, kwargs: dict, name: str | None) -> None:
+def _warn_unreadable_kwarg(
+    dag_id: str, kwargs: dict, name: str | None, *, registered: bool
+) -> None:
     """Report an ``@rmq_trigger`` argument the AST scan could not read.
 
-    The scan never executes the DAG file, so a value the decorator computes —
-    a module constant, an import, an f-string — is invisible to it and the
-    subscription is registered with the parameter's default. That is a working
-    subscription behaving against what the DAG declares, so it is named out
-    loud: the DAG, the queue and the parameter.
+    :param dag_id: DAG the decorator sits on.
+    :param kwargs: Arguments the scan did read, for naming the queue.
+    :param name: Parameter that could not be read, or ``None`` for a ``**`` unpacking
+        that hides every argument of the call.
+    :param registered: Whether the call still names a queue, so a subscription is
+        created from it. What the operator has to do differs: a registered
+        subscription runs with a default the DAG does not ask for, an unregistered
+        one does not run at all.
+
+    The scan never executes the DAG file, so a value the decorator computes — a
+    module constant, an import, an f-string — is invisible to it.
     """
-    if name is None:
-        log.warning(
-            "rmq_trigger: dag_id=%s queue=%s — the decorator unpacks a dict "
-            "(**kwargs), and the DAG file scan does not execute the file, so it "
-            "reads no parameter from this call; the subscription is registered "
-            "with the defaults. Write the arguments out as literals in the "
-            "decorator, or set the values on the Subscriptions page",
-            dag_id, _scanned_queue_label(kwargs),
-        )
-        return
+    what = (
+        "the decorator unpacks a dict (**kwargs), so the scan reads no parameter "
+        "from this call at all"
+        if name is None
+        else f"{name!r} is not a literal"
+    )
+    outcome = (
+        "the subscription is registered with that parameter's default instead of "
+        "what the decorator says"
+        if registered
+        else "the call is left without a queue selector and no subscription is "
+        "registered for it"
+    )
     log.warning(
-        "rmq_trigger: dag_id=%s queue=%s — %r is not a literal, and the DAG file "
-        "scan does not execute the file, so the subscription is registered with "
-        "that parameter's default instead of what the decorator says. Write a "
-        "literal in the decorator, or set the value on the Subscriptions page",
-        dag_id, _scanned_queue_label(kwargs), name,
+        "rmq_trigger: dag_id=%s queue=%s — %s, and the DAG file scan does not "
+        "execute the file, so %s. Write the arguments out as literals in the "
+        "decorator, or set the values on the Subscriptions page",
+        dag_id, _scanned_queue_label(kwargs), what, outcome,
     )
 
 
@@ -551,10 +561,11 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
 
     Handles both bare name ``rmq_trigger(...)`` and attribute access
     ``decorators.rmq_trigger(...)``.  Only literal argument values are extracted:
-    a non-literal expression, and a ``**`` unpacking that hides every argument,
-    are reported by ``_warn_unreadable_kwarg`` and leave the parameter at its
-    default.  A call whose ``queue``/``queues``/``exchange`` is the unreadable
-    one registers no subscription at all — it is created via the UI instead.
+    a non-literal expression — the positional queue name included — and a ``**``
+    unpacking that hides every argument are reported by ``_warn_unreadable_kwarg``
+    and leave the parameter at its default.  A call whose
+    ``queue``/``queues``/``exchange`` is the unreadable one registers no
+    subscription at all, and the warning says so — it is created via the UI instead.
 
     Validation/construction of the subscription dict is delegated to
     ``build_subscriptions()`` (``subscription_builder.py``) — this function is
@@ -583,6 +594,8 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
         val = node.args[0]
         if isinstance(val, ast.Constant) and isinstance(val.value, str):
             kwargs["queue"] = val.value
+        else:
+            unreadable.append("queue")
     # keyword arguments
     for kw in node.keywords:
         if kw.arg is None:
@@ -599,10 +612,11 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
             continue
         kwargs[kw.arg] = value
 
+    registered = "queue" in kwargs or "queues" in kwargs or "exchange" in kwargs
     for name in unreadable:
-        _warn_unreadable_kwarg(dag_id, kwargs, name)
+        _warn_unreadable_kwarg(dag_id, kwargs, name, registered=registered)
 
-    if "queue" not in kwargs and "queues" not in kwargs and "exchange" not in kwargs:
+    if not registered:
         return []
 
     try:

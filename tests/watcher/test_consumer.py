@@ -8293,8 +8293,11 @@ class TestAMessageThatMissedTheFilter:
         assert len(created) == 1, "the state is the consumer task's, not the attach's"
         assert created[0].streak == 101
         assert created[0].dropped == 101
+        # One line, not two: with every miss of the task's life in the same run and
+        # every one of them deleted, the run's line already carries the total.
         lines = self._filter_lines(mock_log)
-        assert [line[:3] for line in lines] == ["100", "100"], lines
+        assert [line[:3] for line in lines] == ["100"], lines
+        assert "acknowledged and dropped" in lines[0]
 
 
 class TestADagWithoutASerializedVersion:
