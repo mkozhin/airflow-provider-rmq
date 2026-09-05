@@ -2825,6 +2825,32 @@ class TestParseRmqTriggerDecorator:
         assert "no subscription is registered" in caplog.text
         assert "registered with that parameter's default" not in caplog.text
 
+    def test_a_build_the_builder_refuses_is_not_called_registered(self, caplog):
+        """The queue selector is readable, so the call names a queue — and the build
+        still produces no row, because an exchange with no routing keys does not
+        build. The operator diagnosing a DAG that never fires must not be told a
+        subscription is running on a default."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator(
+                "rmq_trigger(exchange='ex', routing_key_ids=REPORT_IDS)", dag_id="my_dag"
+            )
+        assert result == []
+        assert "registered with that parameter's default" not in caplog.text
+        assert "no subscription is registered" in caplog.text
+        assert "at least one of 'routing_keys' or 'routing_key_ids'" in caplog.text
+
+    def test_a_readable_exchange_call_that_builds_is_called_registered(self, caplog):
+        """The same call with the routing keys readable does build, so the unreadable
+        cooldown leaves a working subscription — the other half of the same split."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator(
+                "rmq_trigger(exchange='ex', routing_keys=['a.b'], cooldown=COOLDOWN)",
+                dag_id="my_dag",
+            )
+        assert len(result) == 1
+        assert "registered with that parameter's default" in caplog.text
+        assert "no subscription is registered" not in caplog.text
+
     def test_dict_unpacking_alone_says_no_subscription_is_registered(self, caplog):
         with caplog.at_level(logging.WARNING):
             result = _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")

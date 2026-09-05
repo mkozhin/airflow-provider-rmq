@@ -2624,6 +2624,43 @@ class TestAckUnmatchedFormTemplate:
         )
         assert "rows disagree today" in html
 
+    def test_a_mixed_group_with_the_box_ticked_is_told_what_the_save_turns_on(self):
+        """An error re-render redraws the box from what was submitted, so a mixed
+        group can be shown with the box on. The notice has to follow the box: saying
+        it is drawn off would promise the opposite of what the next save writes."""
+        rows = [
+            _make_single_row(id=1, queue_name="q1", ack_unmatched=False),
+            _make_single_row(id=2, queue_name="q2", ack_unmatched=True),
+        ]
+        html = _render_subscription_form_html(
+            sub=rows[0],
+            is_dag_file=False,
+            group_subs=rows,
+            ack_unmatched_checked=True,
+            ack_unmatched_mixed=True,
+        )
+        text = re.sub(r"\s+", " ", html)
+        assert "checked" in _form_field(html, "ack_unmatched")
+        assert "rows disagree today" in text
+        assert "the box is off" not in text
+        assert "switches permanent deletion on for every queue in the group" in text
+
+    def test_a_mixed_group_with_the_box_off_says_the_save_cannot_turn_it_on(self):
+        rows = [
+            _make_single_row(id=1, queue_name="q1", ack_unmatched=False),
+            _make_single_row(id=2, queue_name="q2", ack_unmatched=True),
+        ]
+        html = _render_subscription_form_html(
+            sub=rows[0],
+            is_dag_file=False,
+            group_subs=rows,
+            ack_unmatched_checked=False,
+            ack_unmatched_mixed=True,
+        )
+        text = re.sub(r"\s+", " ", html)
+        assert "cannot turn it on for a queue that runs without it" in text
+        assert "switches permanent deletion on for every queue in the group" not in text
+
     def test_an_agreeing_group_is_not_told_about_a_disagreement(self):
         rows = [
             _make_single_row(id=1, queue_name="q1", ack_unmatched=True),

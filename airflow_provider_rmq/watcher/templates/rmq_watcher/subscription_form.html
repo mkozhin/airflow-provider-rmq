@@ -154,12 +154,20 @@
                   The box stands for the whole group: it is on only when every queue in
                   the group acknowledges, and saving writes it to every row.
                   {% if ack_unmatched_mixed %}
-                    The rows disagree today, so the box is drawn off and a save cannot
-                    switch deletion on for a queue that runs without it. Saving levels
-                    the whole group to what you see here — tick the box only if every
-                    queue in the group may lose the messages its filter rejects. The
-                    Subscriptions page shows the group as acknowledging because at
-                    least one of its queues does.
+                    The rows disagree today, and the Subscriptions page shows the group
+                    as acknowledging because at least one of its queues does. Saving
+                    levels the whole group to what you see here —
+                    {% if ack_unmatched_checked %}
+                      the box is ticked, so the save switches permanent deletion on for
+                      every queue in the group, including the ones running without it
+                      today. Untick it unless every queue may lose the messages its
+                      filter rejects.
+                    {% else %}
+                      the box is off, so the save switches deletion off everywhere and
+                      cannot turn it on for a queue that runs without it. Tick it only
+                      if every queue in the group may lose the messages its filter
+                      rejects.
+                    {% endif %}
                   {% endif %}
                 {% endif %}
               {% endif %}

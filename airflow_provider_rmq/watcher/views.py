@@ -702,11 +702,13 @@ class RMQWatcherView(BaseView):
             is_dag_file = any(s.source == "dag_file" for s in subs)
             # Representative sub for display defaults
             rep = subs[0]
-            # A save writes one value to every row, so the box carries the value
-            # the whole group already agrees on: a group whose rows disagree is
-            # drawn off, and a save that only touched cooldown or filter_data
-            # cannot switch permanent deletion on for a row that runs without it.
-            # The disagreement itself is named under the checkbox.
+            # A save writes one value to every row, so the box drawn from storage
+            # carries the value the whole group already agrees on: a group whose
+            # rows disagree opens with the box off, and a save that only touched
+            # cooldown or filter_data cannot switch permanent deletion on for a row
+            # that runs without it. The disagreement itself is named under the
+            # checkbox, in wording that follows whichever value the box carries —
+            # an error re-render below redraws it from what was submitted.
             ack_unmatched_all = all(s.ack_unmatched for s in subs)
             ack_unmatched_mixed = (
                 any(s.ack_unmatched for s in subs) and not ack_unmatched_all
