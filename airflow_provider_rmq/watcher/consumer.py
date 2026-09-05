@@ -27,9 +27,11 @@ from sqlalchemy.exc import IntegrityError
 from airflow_provider_rmq.utils.amqp import (
     DEFAULT_RPC_TIMEOUT,
     AmqpTimeouts,
+    FilterMissState,
     build_amqp_connection,
     call_with_timeout,
     get_amqp_timeouts,
+    handle_miss,
     match,
     nack_and_sleep,
 )
@@ -183,9 +185,10 @@ _RUN_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.~:+-]")
 _RUN_ID_HASH_LEN = 32
 
 #: Backoff for a delivery whose trigger failed: doubling from the first second up to a
-#: minute, reset by the next success. The 0.1 s of ``nack_and_sleep`` guards against a
-#: hot loop of filter misses and is far too short here — ~10 redeliveries per second
-#: burn the default delivery-limit of 20 on a quorum queue in about two seconds, and the
+#: minute, reset by the next success. The 0.1 s of ``nack_and_sleep`` paces the return of
+#: a message the filter rejected while ``ack_unmatched`` is off, and of one it could not
+#: be evaluated on at all; it is far too short here — ~10 redeliveries per second burn
+#: the default delivery-limit of 20 on a quorum queue in about two seconds, and the
 #: message is dead-lettered by the very mechanism meant to keep it.
 _TRIGGER_BACKOFF_START = 1.0
 _TRIGGER_BACKOFF_MAX = 60.0
@@ -1695,6 +1698,7 @@ class RMQConsumerManager:
             or old.get("cooldown", 0) != new_sub.get("cooldown", 0)
             or old.get("filter_data") != new_sub.get("filter_data")
             or old.get("conn_id") != new_sub.get("conn_id")
+            or bool(old.get("ack_unmatched")) != bool(new_sub.get("ack_unmatched"))
         )
 
     async def _provision_cooldown(
@@ -3202,6 +3206,11 @@ class RMQConsumerManager:
         # will not accept a publish.
         trigger_backoff = _Backoff(_TRIGGER_BACKOFF_START, _TRIGGER_BACKOFF_MAX)
         publish_backoff = _Backoff(_PUBLISH_BACKOFF_START, _PUBLISH_BACKOFF_MAX)
+        # One per consumer task, for the same reason: the run of misses a subscription
+        # is living through outlasts the attach it started in. Named ``miss_state``
+        # because ``state`` above is the liveness of the task, a different thing owned
+        # by a different object.
+        miss_state = FilterMissState(queue_name, log, ack_unmatched=bool(sub.get("ack_unmatched")))
 
         while True:
             await state.write(_SUB_CONNECTING)
@@ -3214,11 +3223,13 @@ class RMQConsumerManager:
                         channel.declare_queue(queue_name, passive=True),
                         timeout=rpc_timeout,
                     )
-                    # No set_qos on purpose: messages that miss the filter are NACKed
-                    # with requeue (ADR-0002) and come back to the head of the queue, so
-                    # any finite prefetch window fills up with them and consumption stops
-                    # for good once the misses reach the window size. The unacked window
-                    # stays unbounded.
+                    # No set_qos on purpose: with ``ack_unmatched`` off a message that
+                    # misses the filter is NACKed with requeue (ADR-0002) and comes back
+                    # to the head of the queue, so any finite prefetch window fills up
+                    # with them and consumption stops for good once the misses reach the
+                    # window size. The same holds for a message the filter could not be
+                    # evaluated on, which goes back whatever the subscription asked for.
+                    # The unacked window stays unbounded.
                     consumer_tag = _consumer_tag(sub_id, _attach_nonce())
                     async with _attached(queue, consumer_tag, rpc_timeout) as q_iter:
                         state.consumer_tag = consumer_tag
@@ -3242,10 +3253,24 @@ class RMQConsumerManager:
                         try:
                             async for message in q_iter:
                                 try:
-                                    verdict, _reason = match(message, msg_filter)
-                                    if verdict is not FilterVerdict.MATCH:
+                                    verdict, reason = match(message, msg_filter)
+                                    if verdict is FilterVerdict.ERROR:
+                                        # A failure to evaluate is not a miss: the
+                                        # message goes back to the queue whatever
+                                        # ``ack_unmatched`` says, so a filter that
+                                        # cannot read a body never deletes it.
+                                        miss_state.on_error(reason)
                                         await nack_and_sleep(message)
                                         continue
+                                    if verdict is FilterVerdict.MISS:
+                                        incr("rmq_watcher.filter_missed")
+                                        await handle_miss(message, miss_state)
+                                        continue
+                                    # The watcher reaches its own delivery handlers
+                                    # rather than ``match_and_ack``, so the counter of
+                                    # the run of misses is cleared here, where the match
+                                    # is.
+                                    miss_state.on_match()
                                     if cooldown > 0:
                                         await self._handle_cooldown_delivery(
                                             conn_id, dag_id, cooldown, message,

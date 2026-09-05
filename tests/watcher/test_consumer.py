@@ -12,6 +12,7 @@ import time
 from contextlib import ExitStack, suppress
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import uuid4
 
@@ -24,6 +25,7 @@ import pytest
 from airflow_provider_rmq.utils.amqp import (
     DEFAULT_RPC_TIMEOUT,
     AmqpTimeouts,
+    FilterMissState,
     call_with_timeout,
 )
 from airflow_provider_rmq.utils.executor import BoundedExecutor
@@ -213,6 +215,20 @@ def _make_push_queue(messages: list = ()):
     return queue
 
 
+def _recording(created: list):
+    """Build real :class:`FilterMissState` objects and hand every one of them to ``created``.
+
+    The test then asks how many were built, which is how "one per consumer task" is
+    told apart from "one per attach".
+    """
+    def build(*args, **kwargs):
+        state = FilterMissState(*args, **kwargs)
+        created.append(state)
+        return state
+
+    return build
+
+
 def _ending_queue():
     """Queue whose iterator ends at once, as it does when the broker cancels us."""
     queue = MagicMock()
@@ -341,6 +357,7 @@ def _sub(
     conn_id: str = "rmq_default",
     filter_data: dict | None = None,
     cooldown: int = 0,
+    ack_unmatched: bool = False,
 ) -> dict:
     return {
         "id": id,
@@ -349,6 +366,7 @@ def _sub(
         "conn_id": conn_id,
         "filter_data": filter_data or {},
         "cooldown": cooldown,
+        "ack_unmatched": ack_unmatched,
     }
 
 
@@ -1689,6 +1707,24 @@ class TestSubsChanged:
         manager = _make_manager()
         assert manager._subs_changed(999, _sub(id=999)) is True
 
+    @pytest.mark.parametrize("was,now", [(False, True), (True, False)])
+    def test_ack_unmatched_change_returns_true(self, was, now):
+        """The checkbox decides whether a stray message is deleted or returned, so a
+        running task has to be restarted on it in both directions."""
+        manager = _make_manager()
+        old_sub = _sub(id=1, ack_unmatched=was)
+        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub.copy(), state=_ConsumerState(1, _test_pool()))
+        assert manager._subs_changed(1, _sub(id=1, ack_unmatched=now)) is True
+
+    def test_absent_ack_unmatched_reads_as_off(self):
+        """A row written before the column existed reads as ``False``, and comparing it
+        against an explicit ``False`` must not restart the task on every cycle."""
+        manager = _make_manager()
+        old_sub = _sub(id=1)
+        old_sub.pop("ack_unmatched")
+        manager._active[1] = _ActiveSub(task=MagicMock(), sub=old_sub, state=_ConsumerState(1, _test_pool()))
+        assert manager._subs_changed(1, _sub(id=1, ack_unmatched=False)) is False
+
     def test_exchange_and_routing_keys_change_does_not_restart_task(self):
         """Changing exchange=/routing_keys= with queue_name/dag_id/cooldown/filter_data/conn_id
         unchanged must NOT be treated as a change — only bind-diff in
@@ -1791,6 +1827,34 @@ class TestHotReload:
 
             assert old_task is not new_task
             assert old_task.done()
+            new_task.cancel()
+            await asyncio.gather(new_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("was,now", [(False, True), (True, False)])
+    async def test_ack_unmatched_change_restarts_task(self, was, now):
+        """A running task reads its subscription once and lives on, so a checkbox the
+        reconcile cycle does not act on stays without effect until a reconnect."""
+        manager = _make_manager()
+        seen = []
+
+        async def blocking_consume(sub):
+            seen.append(sub.get("ack_unmatched"))
+            await asyncio.Future()
+
+        with patch.object(manager, "_consume_subscription", side_effect=blocking_consume), \
+             patch.object(manager, "_update_all_conn_counts"), \
+             patch.object(manager, "_provision_cooldown"):
+            await manager.reconcile([_sub(id=1, ack_unmatched=was)])
+            old_task = manager._active[1].task
+            await _wait_for(lambda: seen == [was])
+
+            await manager.reconcile([_sub(id=1, ack_unmatched=now)])
+            new_task = manager._active[1].task
+
+            assert old_task is not new_task
+            assert old_task.done()
+            assert seen == [was, now]
             new_task.cancel()
             await asyncio.gather(new_task, return_exceptions=True)
 
@@ -8033,6 +8097,204 @@ class TestImmediateDeliveryAcknowledgement:
         await _consume_until(manager, _sub(queue_name="orders"), [msg], done)
 
         assert captured["run_id"] == "rmq__orders__msg-42"
+
+
+def _reattaching_queue(batches: list[list]):
+    """Queue whose iterator ends after every batch but the last, as a cancelled consumer does.
+
+    The last batch blocks after its messages instead of ending, so the loop waits there
+    for a delivery that never comes rather than attaching once more.
+    """
+    iterators = [_QueueIterCtx(batch, ends=True) for batch in batches[:-1]]
+    iterators.append(_QueueIterCtx(batches[-1]))
+    queue = MagicMock()
+    queue.iterator.side_effect = iterators
+    return queue
+
+
+class TestAMessageThatMissedTheFilter:
+    """What the watcher does with a delivery its subscription did not ask for.
+
+    With ``ack_unmatched`` off the message goes back to the queue and comes round again,
+    which is what makes the run of misses worth counting. With it on the message is
+    acknowledged and gone, and the run of misses measures what has been deleted. A body
+    the filter could not read is neither: it goes back whatever the subscription asked
+    for, because a filter that cannot reach a verdict must not delete anything.
+    """
+
+    #: Filter every message in this class either matches on its ``type`` header or misses.
+    _BY_HEADER: ClassVar[dict] = {"filter_headers": {"type": "order"}}
+    #: Filter that has to read the body, so a body that is not JSON fails to evaluate.
+    _BY_BODY: ClassVar[dict] = {"filter_headers": {"body.status": "ok"}}
+
+    @staticmethod
+    def _miss(i: int = 0):
+        return _make_fake_message(b"noise", headers={"type": "other"}, message_id=f"n{i}")
+
+    @staticmethod
+    def _filter_lines(mock_log) -> list[str]:
+        """Rendered WARNINGs the filter counters wrote, ignoring every other line."""
+        return [
+            c.args[0] % c.args[1:]
+            for c in mock_log.warning.call_args_list
+            if "filter" in c.args[0].lower()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_miss_is_acknowledged_when_the_subscription_asked(self, manager):
+        """The message leaves the queue for good — there is no redelivery to come back."""
+        done = asyncio.Event()
+        msg = self._miss()
+        msg.ack = AsyncMock(side_effect=lambda: done.set())
+
+        await _consume_until(
+            manager,
+            _sub(filter_data=self._BY_HEADER, ack_unmatched=True),
+            [msg],
+            done,
+        )
+
+        msg.ack.assert_awaited_once()
+        msg.nack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_miss_goes_back_to_the_queue_by_default(self, manager):
+        """The default decides nothing differently from what the watcher did before."""
+        done = asyncio.Event()
+        msg = self._miss()
+        msg.nack = AsyncMock(side_effect=lambda **kw: done.set())
+
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            await _consume_until(manager, _sub(filter_data=self._BY_HEADER), [msg], done)
+
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_body_that_does_not_read_goes_back_even_with_acknowledgement_on(
+        self, manager
+    ):
+        """A failure to evaluate is not a miss, so the acknowledging branch is not its own.
+
+        A minute of a broken body must not cost the messages behind it: the filter never
+        reached a verdict on them, and only a verdict may delete anything.
+        """
+        done = asyncio.Event()
+        msg = _make_fake_message(b"not json at all", message_id="e1")
+        msg.nack = AsyncMock(side_effect=lambda **kw: done.set())
+
+        with patch(f"{_CONSUMER_MODULE}.log") as mock_log, \
+             patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            await _consume_until(
+                manager,
+                _sub(filter_data=self._BY_BODY, ack_unmatched=True),
+                [msg],
+                done,
+            )
+
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+        lines = self._filter_lines(mock_log)
+        assert len(lines) == 1, lines
+        assert "could not be evaluated" in lines[0]
+        assert "JSONDecodeError" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_the_hundredth_miss_in_a_row_is_the_one_that_warns(self, manager):
+        """One line per stray message would be a line per delivery, so the threshold is a
+        hundred — and the misses on either side of it stay silent."""
+        misses = [self._miss(i) for i in range(101)]
+        done = asyncio.Event()
+        misses[-1].nack = AsyncMock(side_effect=lambda **kw: done.set())
+
+        with patch(f"{_CONSUMER_MODULE}.log") as mock_log, \
+             patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            await _consume_until(
+                manager, _sub(queue_name="orders", filter_data=self._BY_HEADER), misses, done
+            )
+
+        lines = self._filter_lines(mock_log)
+        assert len(lines) == 1, lines
+        assert lines[0].startswith("100 messages in a row")
+        assert "orders" in lines[0]
+        assert "returned to the queue" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_every_miss_is_counted(self, manager):
+        """The metric is what tells a filter eating a queue from a queue that is quiet."""
+        misses = [self._miss(i) for i in range(3)]
+        done = asyncio.Event()
+        misses[-1].ack = AsyncMock(side_effect=lambda: done.set())
+        reported: list = []
+
+        with patch(f"{_CONSUMER_MODULE}.incr", side_effect=reported.append):
+            await _consume_until(
+                manager,
+                _sub(filter_data=self._BY_HEADER, ack_unmatched=True),
+                misses,
+                done,
+            )
+
+        assert reported.count("rmq_watcher.filter_missed") == 3
+
+    @pytest.mark.asyncio
+    async def test_a_match_ends_the_run_of_misses(self, manager):
+        """The watcher reaches its delivery handlers without going through
+        ``match_and_ack``, so nothing else is in a position to clear the counter."""
+        created: list = []
+        hit = _make_fake_message(b"order", headers={"type": "order"}, message_id="m1")
+        done = asyncio.Event()
+        hit.ack = AsyncMock(side_effect=lambda: done.set())
+
+        async def handler(fn, *args):
+            return _OUTCOME_TRIGGERED
+
+        manager._executor = _FakeExecutor(handler)
+        with patch(f"{_CONSUMER_MODULE}.FilterMissState", side_effect=_recording(created)):
+            await _consume_until(
+                manager,
+                _sub(filter_data=self._BY_HEADER, ack_unmatched=True),
+                [self._miss(0), self._miss(1), hit],
+                done,
+            )
+
+        assert len(created) == 1
+        assert created[0].streak == 0
+        assert created[0].dropped == 2
+
+    @pytest.mark.asyncio
+    async def test_the_counters_survive_a_reattach(self, manager):
+        """The run of misses belongs to the consumer task, not to the attach: a broker
+        cancelling the consumer every minute would otherwise keep the threshold out of
+        reach for good."""
+        created: list = []
+        batches = [[self._miss(i) for i in range(60)], [self._miss(i) for i in range(60, 101)]]
+        done = asyncio.Event()
+        batches[-1][-1].ack = AsyncMock(side_effect=lambda: done.set())
+        connection = _make_live_connection(queue=_reattaching_queue(batches))
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch(f"{_CONSUMER_MODULE}._ConsumerState.write"), \
+             patch(f"{_CONSUMER_MODULE}._RECONNECT_DELAY", 0.01), \
+             patch(f"{_CONSUMER_MODULE}.log") as mock_log, \
+             patch(f"{_CONSUMER_MODULE}.FilterMissState", side_effect=_recording(created)):
+            task = asyncio.create_task(
+                manager._consume_subscription(
+                    _sub(filter_data=self._BY_HEADER, ack_unmatched=True)
+                )
+            )
+            try:
+                await asyncio.wait_for(done.wait(), timeout=5.0)
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        assert len(created) == 1, "the state is the consumer task's, not the attach's"
+        assert created[0].streak == 101
+        assert created[0].dropped == 101
+        lines = self._filter_lines(mock_log)
+        assert [line[:3] for line in lines] == ["100", "100"], lines
 
 
 class TestADagWithoutASerializedVersion:
