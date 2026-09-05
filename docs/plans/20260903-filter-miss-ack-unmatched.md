@@ -1207,25 +1207,25 @@ CHANGELOG и readme число называется как «порядка 300 
 - Create: `integration/README.md`
 - Modify: `.env`
 
-- [ ] создать `integration/` в корне; `testpaths` в `pyproject.toml` **не менять**
-- [ ] `integration/conftest.py` читает `.env` и гейтит набор на `RMQ_TEST_URL`:
+- [x] создать `integration/` в корне; `testpaths` в `pyproject.toml` **не менять**
+- [x] `integration/conftest.py` читает `.env` и гейтит набор на `RMQ_TEST_URL`:
       без переменной — skip всего каталога с внятной причиной
-- [ ] `.env` разбирается своим кодом в `conftest.py`: `python-dotenv` в
+- [x] `.env` разбирается своим кодом в `conftest.py`: `python-dotenv` в
       зависимости не добавляется, и в `.venv` его нет
-- [ ] привести шапку `.env` к выбранному пути — она называет `tests/integration`,
+- [x] привести шапку `.env` к выбранному пути — она называет `tests/integration`,
       а каталог создаётся в корне. Сам `.env` в `.gitignore`, и его шапка —
       единственная запись о том, где живёт набор
-- [ ] набор отказывается запускаться, если в `RMQ_TEST_URL` не указан vhost или
+- [x] набор отказывается запускаться, если в `RMQ_TEST_URL` не указан vhost или
       указан `/`
-- [ ] фикстура уникального префикса `rmqtest.{pid}.{uuid8}.` и teardown, снимающий
+- [x] фикстура уникального префикса `rmqtest.{pid}.{uuid8}.` и teardown, снимающий
       всё созданное прогоном
-- [ ] хелпер глубины очереди через пассивный `queue_declare`
-- [ ] фикстуры соединения: sync pika для оператора и сенсора, aio_pika для
+- [x] хелпер глубины очереди через пассивный `queue_declare`
+- [x] фикстуры соединения: sync pika для оператора и сенсора, aio_pika для
       watcher'а и триггера
-- [ ] `integration/README.md`: что нужно на брокере, какие переменные, как
+- [x] `integration/README.md`: что нужно на брокере, какие переменные, как
       запускать, почему каталог вне `testpaths`
-- [ ] проверить, что `.venv/bin/pytest tests/ -q` не собирает `integration/`
-- [ ] проверить, что `.venv/bin/pytest integration/ -q` без `RMQ_TEST_URL`
+- [x] проверить, что `.venv/bin/pytest tests/ -q` не собирает `integration/`
+- [x] проверить, что `.venv/bin/pytest integration/ -q` без `RMQ_TEST_URL`
       скипается, а не падает
 
 ### Task 12 ⛁: Интеграционные тесты пути промаха
