@@ -832,6 +832,38 @@ class TestConsumeSubscription:
         mock_td.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_unreadable_body_nacked(self, manager):
+        """A body the filter could not read is returned to the queue and triggers nothing."""
+        msg = _make_fake_message(b"not json at all", headers={})
+        queue = _make_push_queue([msg])
+        connection = _make_live_connection(queue=queue)
+
+        nacked = asyncio.Event()
+
+        async def capture_nack(*args, **kwargs):
+            nacked.set()
+
+        msg.nack = capture_nack
+
+        with patch.object(manager, "_get_or_create_connection", return_value=connection), \
+             patch.object(manager, "_trigger_dag") as mock_td, \
+             patch("airflow_provider_rmq.watcher.consumer._ConsumerState.write"), \
+             patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            task = asyncio.create_task(
+                manager._consume_subscription(
+                    _sub(filter_data={"filter_headers": {"body.status": "ok"}})
+                )
+            )
+            await asyncio.wait_for(nacked.wait(), timeout=2.0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_td.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_multiple_messages_only_matching_triggers(self, manager):
         """3 messages, only the one with matching header triggers DAG."""
         msg1 = _make_fake_message(b"p1", headers={"type": "payment"})

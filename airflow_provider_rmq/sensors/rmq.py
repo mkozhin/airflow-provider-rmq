@@ -8,7 +8,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.sensors.base import BaseSensorOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
-from airflow_provider_rmq.utils.filters import MessageFilter
+from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
 
@@ -144,7 +144,8 @@ class RMQSensor(BaseSensorOperator):
                 return False
 
             for i, msg in enumerate(messages):
-                if msg_filter.matches(msg["properties"], msg["body"]):
+                verdict, _reason = msg_filter.evaluate(msg["properties"], msg["body"])
+                if verdict is FilterVerdict.MATCH:
                     hook.ack(msg["method"].delivery_tag)
                     self._return_value = {
                         "body": msg["body"],

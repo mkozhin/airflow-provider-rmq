@@ -22,7 +22,7 @@ from airflow_provider_rmq.utils.amqp import (
     get_amqp_timeouts,
     match_and_ack,
 )
-from airflow_provider_rmq.utils.filters import MessageFilter
+from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 from tests.conftest import FakeAirflowConnection
 
 
@@ -304,6 +304,17 @@ class TestMatchAndAck:
         msg.ack.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_error_message_nacked(self):
+        """A body the filter could not read is returned to the queue, never acknowledged."""
+        msg = _make_aio_message(body=b"not json at all")
+        f = MessageFilter(filter_headers={"body.status": "ok"})
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            result = await match_and_ack(msg, f)
+        assert result is False
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_nack_includes_sleep(self):
         msg = _make_aio_message(headers={"type": "other"})
         f = MessageFilter(filter_headers={"type": "order"})
@@ -325,20 +336,24 @@ class TestMatchAndAck:
 # ---------------------------------------------------------------------------
 
 class TestMatch:
-    def test_match_returns_true_when_no_filters(self):
+    def test_match_returns_match_when_no_filters(self):
         msg = _make_aio_message(body=b"any")
-        result = _match(msg, MessageFilter())
-        assert result is True
+        assert _match(msg, MessageFilter()) == (FilterVerdict.MATCH, None)
 
-    def test_match_returns_true_when_headers_match(self):
+    def test_match_returns_match_when_headers_match(self):
         msg = _make_aio_message(headers={"type": "order"})
-        result = _match(msg, MessageFilter(filter_headers={"type": "order"}))
-        assert result is True
+        assert _match(msg, MessageFilter(filter_headers={"type": "order"})) == (FilterVerdict.MATCH, None)
 
-    def test_match_returns_false_when_headers_differ(self):
+    def test_match_returns_miss_when_headers_differ(self):
         msg = _make_aio_message(headers={"type": "payment"})
-        result = _match(msg, MessageFilter(filter_headers={"type": "order"}))
-        assert result is False
+        assert _match(msg, MessageFilter(filter_headers={"type": "order"})) == (FilterVerdict.MISS, None)
+
+    def test_match_returns_error_when_body_is_not_json(self):
+        """A body that does not read as JSON is a failure to evaluate, not a miss."""
+        msg = _make_aio_message(body=b"not json at all")
+        verdict, reason = _match(msg, MessageFilter(filter_headers={"body.status": "ok"}))
+        assert verdict is FilterVerdict.ERROR
+        assert "JSONDecodeError" in reason
 
     def test_match_does_not_call_ack(self):
         msg = _make_aio_message(headers={"type": "order"})
@@ -356,9 +371,8 @@ class TestMatch:
         """Non-UTF-8 binary body must not raise UnicodeDecodeError (errors='replace')."""
         binary_body = b"\xff\xfe\x00invalid utf-8 \x80\x81\x82"
         msg = _make_aio_message(body=binary_body)
-        # Should not raise — filter has no body filter so result is True regardless
-        result = _match(msg, MessageFilter())
-        assert result is True
+        # Should not raise — filter has no body filter so the verdict is MATCH regardless
+        assert _match(msg, MessageFilter()) == (FilterVerdict.MATCH, None)
 
     def test_match_binary_body_with_callable_filter_does_not_raise(self):
         """Binary body with a callable filter — replacement chars used, no exception."""
@@ -366,7 +380,7 @@ class TestMatch:
         msg = _make_aio_message(body=binary_body)
         # Callable checks body text; body contains replacement chars, not "hello"
         result = _match(msg, MessageFilter(filter_callable=lambda props, body: "hello" in body))
-        assert result is False
+        assert result == (FilterVerdict.MISS, None)
 
 
 # ---------------------------------------------------------------------------

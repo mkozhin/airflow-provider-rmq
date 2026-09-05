@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
 
-from airflow_provider_rmq.utils.filters import MessageFilter
+from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 from airflow_provider_rmq.utils.ssl import build_ssl_context
 
 log = logging.getLogger(__name__)
@@ -257,19 +257,22 @@ def build_amqp_connection(
     return url, ssl_context
 
 
-def match(message: Any, msg_filter: MessageFilter) -> bool:
+def match(message: Any, msg_filter: MessageFilter) -> tuple[FilterVerdict, str | None]:
     """Evaluate message body and headers against filter without any ACK/NACK side-effects.
 
     :param message: An ``aio_pika`` message (must have ``.body`` and ``.headers``).
     :param msg_filter: Pre-built :class:`~airflow_provider_rmq.utils.filters.MessageFilter`.
-    :returns: ``True`` if the message matches (or there are no filters), ``False`` otherwise.
+    :returns: ``(verdict, reason)`` as returned by
+        :meth:`~airflow_provider_rmq.utils.filters.MessageFilter.evaluate` — a
+        :class:`~airflow_provider_rmq.utils.filters.FilterVerdict` and, for ``ERROR``,
+        the type and text of the exception behind it.
 
     Non-UTF-8 bytes in the body are replaced with the Unicode replacement character
     (``errors="replace"``) so binary payloads never raise :exc:`UnicodeDecodeError`.
     """
     body_str = message.body.decode("utf-8", errors="replace")
     props = _PropsShim(dict(message.headers or {}))
-    return not msg_filter.has_filters or msg_filter.matches(props, body_str)
+    return msg_filter.evaluate(props, body_str)
 
 
 
@@ -298,7 +301,8 @@ async def match_and_ack(message: Any, msg_filter: MessageFilter) -> bool:
         of 20 by default — non-matching messages are dead-lettered after 20 redeliveries.
         Use dedicated queues per DAG to avoid unintended message loss.
     """
-    if match(message, msg_filter):
+    verdict, _reason = match(message, msg_filter)
+    if verdict is FilterVerdict.MATCH:
         await message.ack()
         return True
     await nack_and_sleep(message)

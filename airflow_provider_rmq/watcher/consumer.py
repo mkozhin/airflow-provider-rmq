@@ -35,7 +35,7 @@ from airflow_provider_rmq.utils.amqp import (
 )
 from airflow_provider_rmq.utils.backoff import next_backoff
 from airflow_provider_rmq.utils.executor import BoundedExecutor
-from airflow_provider_rmq.utils.filters import MessageFilter
+from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 from airflow_provider_rmq.utils.management import (
     get_current_bindings,
     get_management_url,
@@ -3242,7 +3242,8 @@ class RMQConsumerManager:
                         try:
                             async for message in q_iter:
                                 try:
-                                    if not match(message, msg_filter):
+                                    verdict, _reason = match(message, msg_filter)
+                                    if verdict is not FilterVerdict.MATCH:
                                         await nack_and_sleep(message)
                                         continue
                                     if cooldown > 0:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
-from airflow_provider_rmq.utils.filters import MessageFilter
+from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 
 @dataclass
@@ -226,3 +228,125 @@ class TestSerializeDeserialize:
         restored = MessageFilter.deserialize(original.serialize())
         assert not restored.has_filters
         assert restored.matches(FakeProperties(), "anything")
+
+# ---------------------------------------------------------------------------
+# FilterVerdict — a rejection told apart from a failure to evaluate
+# ---------------------------------------------------------------------------
+class TestEvaluateVerdicts:
+    def test_match_has_no_reason(self):
+        mf = MessageFilter(filter_headers={"x-type": "order"})
+        props = FakeProperties(headers={"x-type": "order"})
+        assert mf.evaluate(props, "body") == (FilterVerdict.MATCH, None)
+
+    def test_miss_has_no_reason(self):
+        mf = MessageFilter(filter_headers={"x-type": "order"})
+        props = FakeProperties(headers={"x-type": "invoice"})
+        assert mf.evaluate(props, "body") == (FilterVerdict.MISS, None)
+
+    def test_no_filters_is_match(self):
+        assert MessageFilter().evaluate(FakeProperties(), "any body") == (FilterVerdict.MATCH, None)
+
+    def test_raising_callable_is_error_not_miss(self):
+        def bad_filter(props, body):
+            raise ValueError("boom")
+
+        verdict, _reason = MessageFilter(filter_callable=bad_filter).evaluate(FakeProperties(), "body")
+        assert verdict is FilterVerdict.ERROR
+
+    def test_error_reason_carries_exception_type_and_text(self):
+        def bad_filter(props, body):
+            raise RuntimeError("external service is down")
+
+        _verdict, reason = MessageFilter(filter_callable=bad_filter).evaluate(FakeProperties(), "body")
+        assert "RuntimeError" in reason
+        assert "external service is down" in reason
+
+    def test_unreadable_body_is_error(self):
+        mf = MessageFilter(filter_headers={"body.status": "ok"})
+        verdict, reason = mf.evaluate(FakeProperties(), "not json at all")
+        assert verdict is FilterVerdict.ERROR
+        assert "JSONDecodeError" in reason
+
+    def test_body_of_wrong_type_is_error(self):
+        mf = MessageFilter(filter_headers={"body.status": "ok"})
+        verdict, reason = mf.evaluate(FakeProperties(), None)
+        assert verdict is FilterVerdict.ERROR
+        assert "TypeError" in reason
+
+    def test_parsed_body_without_key_is_miss(self):
+        mf = MessageFilter(filter_headers={"body.status": "ok"})
+        assert mf.evaluate(FakeProperties(), json.dumps({"other": 1})) == (FilterVerdict.MISS, None)
+
+    def test_body_parsed_into_a_list_is_miss(self):
+        """The filter read the body and rejected it — a list is a miss, not a failure."""
+        mf = MessageFilter(filter_headers={"body.status": "ok"})
+        assert mf.evaluate(FakeProperties(), json.dumps(["ok"])) == (FilterVerdict.MISS, None)
+
+    def test_integer_over_conversion_limit_still_raises(self):
+        """The catch stays exactly where it is: a plain ValueError keeps flying out."""
+        mf = MessageFilter(filter_headers={"body.status": "ok"})
+        with pytest.raises(ValueError, match="Exceeds the limit"):
+            mf.evaluate(FakeProperties(), "1" * 4400)
+
+
+# ---------------------------------------------------------------------------
+# Phases: headers in full first, body once and only after
+# ---------------------------------------------------------------------------
+class TestEvaluationPhases:
+    @pytest.mark.parametrize("filter_headers", [
+        {"type": "other", "body.x": 1},
+        {"body.x": 1, "type": "other"},
+    ])
+    def test_header_miss_wins_over_unreadable_body_in_any_key_order(self, filter_headers):
+        mf = MessageFilter(filter_headers=filter_headers)
+        props = FakeProperties(headers={"type": "order"})
+        with patch("airflow_provider_rmq.utils.filters.json.loads") as mock_loads:
+            assert mf.evaluate(props, "not json at all") == (FilterVerdict.MISS, None)
+        mock_loads.assert_not_called()
+
+    def test_dict_miss_does_not_call_the_callable(self):
+        calls = []
+
+        def bad_filter(props, body):
+            calls.append(body)
+            raise ValueError("boom")
+
+        mf = MessageFilter(filter_headers={"x-type": "order"}, filter_callable=bad_filter)
+        props = FakeProperties(headers={"x-type": "invoice"})
+        assert mf.evaluate(props, "body") == (FilterVerdict.MISS, None)
+        assert calls == []
+
+    def test_body_parsed_once_for_several_body_keys(self):
+        body = json.dumps({"a": 1, "b": 2})
+        mf = MessageFilter(filter_headers={"body.a": 1, "body.b": 2})
+        with patch("airflow_provider_rmq.utils.filters.json.loads", wraps=json.loads) as mock_loads:
+            assert mf.evaluate(FakeProperties(), body) == (FilterVerdict.MATCH, None)
+        assert mock_loads.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# matches() keeps its boolean contract on all three outcomes
+# ---------------------------------------------------------------------------
+class TestMatchesOverEvaluate:
+    def test_match_is_true(self):
+        mf = MessageFilter(filter_headers={"x-type": "order"})
+        assert mf.matches(FakeProperties(headers={"x-type": "order"}), "body") is True
+
+    def test_miss_is_false(self):
+        mf = MessageFilter(filter_headers={"x-type": "order"})
+        assert mf.matches(FakeProperties(headers={"x-type": "invoice"}), "body") is False
+
+    def test_error_is_false(self):
+        def bad_filter(props, body):
+            raise ValueError("boom")
+
+        assert MessageFilter(filter_callable=bad_filter).matches(FakeProperties(), "body") is False
+
+    def test_error_reason_goes_to_debug_not_warning(self, caplog):
+        def bad_filter(props, body):
+            raise ValueError("boom")
+
+        with caplog.at_level(logging.DEBUG, logger="airflow.task"):
+            MessageFilter(filter_callable=bad_filter).matches(FakeProperties(), "body")
+        levels = {rec.levelname for rec in caplog.records if rec.name == "airflow.task"}
+        assert levels == {"DEBUG"}

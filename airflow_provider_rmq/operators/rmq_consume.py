@@ -7,7 +7,7 @@ import pika.exceptions
 from airflow.models import BaseOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
-from airflow_provider_rmq.utils.filters import MessageFilter
+from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
 
@@ -80,7 +80,8 @@ class RMQConsumeOperator(BaseOperator):
                 return []
 
             for msg in raw_messages:
-                if msg_filter.matches(msg["properties"], msg["body"]):
+                verdict, _reason = msg_filter.evaluate(msg["properties"], msg["body"])
+                if verdict is FilterVerdict.MATCH:
                     hook.ack(msg["method"].delivery_tag)
                     matched_messages.append({
                         "body": msg["body"],
