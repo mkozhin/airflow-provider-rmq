@@ -37,5 +37,5 @@ def parse_filter_data(raw: str) -> dict:
     except json.JSONDecodeError as exc:
         raise ValueError("filter_data must be valid JSON") from exc
     if not isinstance(result, dict):
-        raise ValueError("filter_data JSON must decode to an object/dict.")
+        raise ValueError("filter_data JSON must decode to an object/dict.")  # noqa: TRY004
     return result

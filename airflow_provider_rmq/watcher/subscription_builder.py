@@ -21,7 +21,7 @@ def _normalize_status(routing_key_status: str | list[str]) -> list[str]:
     if isinstance(routing_key_status, str):
         return [routing_key_status]
     if not isinstance(routing_key_status, list):
-        raise ValueError("'routing_key_status' must be a string or a list of strings.")
+        raise ValueError("'routing_key_status' must be a string or a list of strings.")  # noqa: TRY004
     return list(routing_key_status)
 
 
@@ -53,10 +53,10 @@ def build_subscriptions(
     entries are not subject to that check (dots there are an intentionally
     written topic pattern) but must still be non-empty strings.
 
-    :param ack_unmatched: ``True`` acknowledges a message the filter rejected
-        instead of returning it to the queue, so the message leaves the broker
-        for good. Must be a ``bool``: a string would reach ``Column(Boolean)``
-        as-is and read back as truth on SQLite.
+    ``ack_unmatched=True`` acknowledges a message the filter rejected instead of
+    returning it to the queue, so the message leaves the broker for good. It must
+    be a ``bool``: a string would reach ``Column(Boolean)`` as-is and read back as
+    truth on SQLite.
 
     Returns a list of dicts with keys ``{"queue_name", "conn_id",
     "filter_data", "cooldown", "ack_unmatched"}`` (plus ``{"exchange",
@@ -68,7 +68,7 @@ def build_subscriptions(
         raise ValueError("Specify exactly one of 'queue', 'queues', or 'exchange'.")
 
     if not isinstance(cooldown, int) or isinstance(cooldown, bool):
-        raise ValueError("'cooldown' must be an int.")
+        raise ValueError("'cooldown' must be an int.")  # noqa: TRY004
     if cooldown < 0:
         raise ValueError("'cooldown' must be >= 0.")
 

@@ -7,7 +7,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from airflow_provider_rmq.operators.rmq_consume import RMQConsumeOperator
-from tests.conftest import make_method_frame, make_properties
+from tests.conftest import (
+    BATCH_DROPPED_TEXT,
+    DROPPED_TEXT,
+    EMPTY_BATCH_TEXT,
+    ERROR_TEXT,
+    STREAK_TEXT,
+    log_lines,
+    make_method_frame,
+    make_properties,
+)
 
 
 HOOK_PATH = "airflow_provider_rmq.operators.rmq_consume.RMQHook"
@@ -206,21 +215,11 @@ class TestConnectionId:
 # ack_unmatched
 # ---------------------------------------------------------------------------
 
-_STREAK_TEXT = "in a row missed the filter"
-_DROPPED_TEXT = "have been dropped on queue"
-_ERROR_TEXT = "Filter could not be evaluated"
-_EMPTY_BATCH_TEXT = "passed the filter — check filter_data"
-_BATCH_DROPPED_TEXT = "did not pass the filter and were dropped"
-
-
-def _lines(caplog, text):
-    """Records whose message contains ``text``."""
-    return [r for r in caplog.records if text in r.getMessage()]
 
 
 def _filter_lines(caplog):
     """Records the filter-miss counters produced, whatever the threshold behind them."""
-    texts = (_STREAK_TEXT, _DROPPED_TEXT, _ERROR_TEXT, _EMPTY_BATCH_TEXT, _BATCH_DROPPED_TEXT)
+    texts = (STREAK_TEXT, DROPPED_TEXT, ERROR_TEXT, EMPTY_BATCH_TEXT, BATCH_DROPPED_TEXT)
     return [r for r in caplog.records if any(t in r.getMessage() for t in texts)]
 
 
@@ -274,12 +273,12 @@ class TestAckUnmatched:
         assert result == []
         hook.ack.assert_not_called()
         assert [c.args[0] for c in hook.nack.call_args_list] == [1, 2]
-        first = _lines(caplog, _ERROR_TEXT)
+        first = log_lines(caplog, ERROR_TEXT)
         assert len(first) == 1
         assert "RuntimeError: filter service is down" in first[0].getMessage()
         # The filter reached no verdict on either message, so the batch line — whose
         # advice is to look at filter_data — has nothing to say about this batch.
-        assert _lines(caplog, _EMPTY_BATCH_TEXT) == []
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
 
     def test_non_bool_is_rejected(self):
         with pytest.raises(ValueError, match="ack_unmatched"):
@@ -297,7 +296,7 @@ class TestAckUnmatched:
         )
         with caplog.at_level(logging.WARNING):
             op.execute(context={})
-        streak_lines = _lines(caplog, _STREAK_TEXT)
+        streak_lines = log_lines(caplog, STREAK_TEXT)
         assert len(streak_lines) == 1
         assert streak_lines[0].getMessage().startswith("100 ")
 
@@ -314,8 +313,8 @@ class TestAckUnmatched:
         )
         with caplog.at_level(logging.WARNING):
             op.execute(context={})
-        assert _lines(caplog, _STREAK_TEXT) == []
-        assert len(_lines(caplog, _EMPTY_BATCH_TEXT)) == 1
+        assert log_lines(caplog, STREAK_TEXT) == []
+        assert len(log_lines(caplog, EMPTY_BATCH_TEXT)) == 1
 
     def test_a_single_match_does_not_silence_the_dropped_line(self, mock_hook, caplog):
         """One match clears the streak and ninety-nine drops never reach the ``dropped`` floor."""
@@ -333,10 +332,10 @@ class TestAckUnmatched:
         with caplog.at_level(logging.WARNING):
             result = op.execute(context={})
         assert len(result) == 1
-        assert _lines(caplog, _STREAK_TEXT) == []
-        assert _lines(caplog, _DROPPED_TEXT) == []
-        assert _lines(caplog, _EMPTY_BATCH_TEXT) == []
-        dropped_lines = _lines(caplog, _BATCH_DROPPED_TEXT)
+        assert log_lines(caplog, STREAK_TEXT) == []
+        assert log_lines(caplog, DROPPED_TEXT) == []
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+        dropped_lines = log_lines(caplog, BATCH_DROPPED_TEXT)
         assert len(dropped_lines) == 1
         assert dropped_lines[0].getMessage().startswith("99 of the 100 ")
 
@@ -352,8 +351,8 @@ class TestAckUnmatched:
         )
         with caplog.at_level(logging.WARNING):
             op.execute(context={})
-        assert _lines(caplog, _DROPPED_TEXT) == []
-        assert _lines(caplog, _BATCH_DROPPED_TEXT) == []
+        assert log_lines(caplog, DROPPED_TEXT) == []
+        assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
 
     def test_threshold_records_go_to_the_task_logger(self, mock_hook, caplog):
         """``FileTaskHandler`` hangs off ``airflow.task``: another logger misses the task log."""
@@ -368,8 +367,8 @@ class TestAckUnmatched:
         )
         with caplog.at_level(logging.WARNING):
             op.execute(context={})
-        assert [r.name for r in _lines(caplog, _STREAK_TEXT)] == ["airflow.task"]
-        assert [r.name for r in _lines(caplog, _EMPTY_BATCH_TEXT)] == ["airflow.task"]
+        assert [r.name for r in log_lines(caplog, STREAK_TEXT)] == ["airflow.task"]
+        assert [r.name for r in log_lines(caplog, EMPTY_BATCH_TEXT)] == ["airflow.task"]
 
     def test_an_empty_queue_reports_nothing(self, mock_hook, caplog):
         _, hook = mock_hook
@@ -389,6 +388,6 @@ class TestAckUnmatched:
         with caplog.at_level(logging.WARNING):
             assert op.execute(context={}) == []
         assert _filter_lines(caplog) == []
-        assert _lines(caplog, "is not available") != []
+        assert log_lines(caplog, "is not available") != []
         hook.ack.assert_not_called()
         hook.nack.assert_not_called()

@@ -8,7 +8,7 @@ import pytest
 
 from airflow_provider_rmq.triggers.rmq import RMQTrigger
 from airflow_provider_rmq.utils.amqp import DEFAULT_HEARTBEAT, match_and_ack
-from tests.conftest import FakeAirflowConnection
+from tests.conftest import STREAK_TEXT, FakeAirflowConnection, log_lines
 
 
 # ---------------------------------------------------------------------------
@@ -879,9 +879,7 @@ class TestFilterMissState:
             events = await _run_against(trigger, fake_queue)
 
         assert events[0]["status"] == "success"
-        streak_lines = [
-            r for r in caplog.records if "in a row missed the filter" in r.getMessage()
-        ]
+        streak_lines = log_lines(caplog, STREAK_TEXT)
         assert [r.getMessage().split()[0] for r in streak_lines] == ["100", "1000"]
         assert [r.name for r in streak_lines] == ["airflow.task", "airflow.task"]
         # A name of its own: "q" is a substring of "queue" and would be found in any

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import logging
-from functools import partial
 from typing import Any, Callable, Sequence
 
 import pika.exceptions
 from airflow.models import BaseOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
-from airflow_provider_rmq.utils.amqp import FilterMissState, dispose_miss
+from airflow_provider_rmq.utils.amqp import FilterMissState, handle_miss_sync
 from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
@@ -69,10 +68,10 @@ class RMQConsumeOperator(BaseOperator):
         self.filter_headers = filter_headers
         self.filter_callable = filter_callable
         self.qos = qos
+        self.ack_unmatched = ack_unmatched
 
         if not isinstance(ack_unmatched, bool):
             raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
-        self.ack_unmatched = ack_unmatched
 
     def execute(self, context: Any) -> list[dict[str, Any]]:
         msg_filter = MessageFilter(
@@ -80,11 +79,7 @@ class RMQConsumeOperator(BaseOperator):
             filter_callable=self.filter_callable,
         )
 
-        miss_state = FilterMissState(
-            queue_name=self.queue_name,
-            log=log,
-            ack_unmatched=self.ack_unmatched,
-        )
+        miss_state = FilterMissState(self.queue_name, log, ack_unmatched=self.ack_unmatched)
         matched_messages: list[dict[str, Any]] = []
         errors = 0
 
@@ -119,12 +114,7 @@ class RMQConsumeOperator(BaseOperator):
                     miss_state.on_error(reason)
                     hook.nack(msg["method"].delivery_tag, requeue=True)
                 else:
-                    tag = msg["method"].delivery_tag
-                    dispose_miss(
-                        miss_state,
-                        partial(hook.ack, tag),
-                        partial(hook.nack, tag, requeue=True),
-                    )
+                    handle_miss_sync(hook, msg["method"].delivery_tag, miss_state)
 
             # `evaluated` is what the filter reached a verdict on: a body it could not
             # read is not evidence about filter_data, and counting it would point the

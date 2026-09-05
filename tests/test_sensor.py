@@ -7,7 +7,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from airflow_provider_rmq.sensors.rmq import RMQSensor
-from tests.conftest import make_method_frame, make_properties
+from tests.conftest import (
+    BATCH_DROPPED_TEXT,
+    DROPPED_TEXT,
+    EMPTY_BATCH_TEXT,
+    ERROR_TEXT,
+    STREAK_TEXT,
+    log_lines,
+    make_method_frame,
+    make_properties,
+)
 
 
 HOOK_PATH = "airflow_provider_rmq.sensors.rmq.RMQHook"
@@ -412,16 +421,6 @@ class TestTemplateFields:
 # ack_unmatched
 # ---------------------------------------------------------------------------
 
-_STREAK_TEXT = "in a row missed the filter"
-_DROPPED_TEXT = "have been dropped on queue"
-_ERROR_TEXT = "Filter could not be evaluated"
-_EMPTY_BATCH_TEXT = "passed the filter — check filter_data"
-_BATCH_DROPPED_TEXT = "did not pass the filter and were dropped"
-
-
-def _lines(caplog, text):
-    """Records whose message contains ``text``."""
-    return [r for r in caplog.records if text in r.getMessage()]
 
 
 class TestAckUnmatched:
@@ -490,7 +489,7 @@ class TestAckUnmatched:
 
         hook.ack.assert_not_called()
         assert [c.args[0] for c in hook.nack.call_args_list] == [1, 2]
-        first = _lines(caplog, _ERROR_TEXT)
+        first = log_lines(caplog, ERROR_TEXT)
         assert len(first) == 1
         assert "RuntimeError: filter service is down" in first[0].getMessage()
 
@@ -542,7 +541,7 @@ class TestAckUnmatched:
             for _ in range(100):
                 assert sensor.poke(context={}) is False
 
-        streak_lines = _lines(caplog, _STREAK_TEXT)
+        streak_lines = log_lines(caplog, STREAK_TEXT)
         assert len(streak_lines) == 1
         assert streak_lines[0].getMessage().startswith("100 ")
         assert streak_lines[0].name == "airflow.task"
@@ -565,7 +564,7 @@ class TestAckUnmatched:
                 assert sensor.poke(context={}) is False
                 assert sensor._miss_state.streak == 1
 
-        assert _lines(caplog, _STREAK_TEXT) == []
+        assert log_lines(caplog, STREAK_TEXT) == []
 
     def test_a_hundred_pokes_report_no_batch_line(self, mock_hook, caplog):
         """``on_batch_done`` is the operator's: a line per poke is the noise the threshold avoids.
@@ -586,9 +585,9 @@ class TestAckUnmatched:
             for _ in range(100):
                 sensor.poke(context={})
 
-        assert _lines(caplog, _EMPTY_BATCH_TEXT) == []
-        assert _lines(caplog, _BATCH_DROPPED_TEXT) == []
-        streak_lines = _lines(caplog, _STREAK_TEXT)
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+        assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
+        streak_lines = log_lines(caplog, STREAK_TEXT)
         assert len(streak_lines) == 1
         assert "acknowledged and dropped" in streak_lines[0].getMessage()
-        assert _lines(caplog, _DROPPED_TEXT) == []
+        assert log_lines(caplog, DROPPED_TEXT) == []

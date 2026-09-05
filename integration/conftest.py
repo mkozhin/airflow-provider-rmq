@@ -24,7 +24,7 @@ import pika
 import pytest
 from pika.adapters.blocking_connection import BlockingChannel
 
-LOG = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 #: Environment variable holding the AMQP URL of the test broker.
 URL_ENV = "RMQ_TEST_URL"
@@ -232,7 +232,7 @@ class BrokerScratch:
                         channel.close()
             except Exception as exc:  # noqa: BLE001 - every queue is attempted
                 failures.append((queue, exc))
-                LOG.error("failed to delete test queue %s: %r", queue, exc)
+                log.error("failed to delete test queue %s: %r", queue, exc)
             else:
                 self._queues.remove(queue)
         if failures:

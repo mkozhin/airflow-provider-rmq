@@ -234,6 +234,25 @@ class TestAckUnmatched:
         assert bool(row.ack_unmatched) is False
 
 
+class TestSharedQueueDisplayFields:
+    """Поля, которые страница Subscriptions раздаёт строке перед рендером."""
+
+    def test_a_row_read_from_the_database_carries_them_empty(self, session):
+        """Строка, не прошедшая через группировку, читается шаблоном без AttributeError."""
+        upsert_subscription(session, dag_id="d", queue_name="q")
+        session.commit()
+
+        row = session.query(RMQSubscription).one()
+        assert list(row.shared_queue_names) == []
+        assert row.shared_acking is False
+
+    def test_they_are_not_columns(self):
+        """Оба имени объявлены мимо таблицы: миграция их не добавляет."""
+        columns = {c.name for c in RMQSubscription.__table__.columns}
+        assert "shared_queue_names" not in columns
+        assert "shared_acking" not in columns
+
+
 class TestGetEnabled:
     def test_get_enabled_subscriptions_filters_disabled(self, session):
         upsert_subscription(session, dag_id="d1", queue_name="q1", enabled=True)

@@ -10,6 +10,7 @@ from typing import Any
 from flask import flash, redirect, request, url_for
 from flask_appbuilder import BaseView, expose
 from flask_appbuilder.security.decorators import has_access
+from sqlalchemy.orm import Session
 
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -186,7 +187,7 @@ def _queue_sharing(
     return shared, acking
 
 
-def _flash_shared_queues(session, pairs: Iterable[tuple[str, str]]) -> None:
+def _flash_shared_queues(session: Session, pairs: Iterable[tuple[str, str]]) -> None:
     """Warn about every pair among ``pairs`` that more than one enabled subscription
     now listens to.
 

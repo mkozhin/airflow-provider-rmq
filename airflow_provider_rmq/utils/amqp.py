@@ -4,7 +4,6 @@ import asyncio
 import logging
 import math
 import ssl
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -302,9 +301,10 @@ class FilterMissState:
     trigger, one task run in the operator, the sensor instance across its ``poke`` calls.
 
     :param queue_name: Queue the counters belong to; it names the queue in every line.
-    :param log: Logger the WARNING goes to. It is the owner's, because ``FileTaskHandler``
-        is attached to ``airflow.task`` rather than to the root: a module logger would
-        keep the line out of the task log everywhere but the watcher.
+    :param logger: Logger the WARNING goes to, kept on the object as ``log``. It is the
+        owner's, because ``FileTaskHandler`` is attached to ``airflow.task`` rather than
+        to the root: a module logger would keep the line out of the task log everywhere
+        but the watcher.
     :param ack_unmatched: ``True`` when a message the filter rejected is acknowledged
         and gone, ``False`` when it is returned to the queue.
 
@@ -327,9 +327,9 @@ class FilterMissState:
         "streak",
     )
 
-    def __init__(self, queue_name: str, log: logging.Logger, ack_unmatched: bool = False):
+    def __init__(self, queue_name: str, logger: logging.Logger, ack_unmatched: bool = False):
         self.queue_name = queue_name
-        self.log = log
+        self.log = logger
         self.ack_unmatched = ack_unmatched
         self.streak = 0
         self.dropped = 0
@@ -353,18 +353,14 @@ class FilterMissState:
         if self.ack_unmatched:
             self.dropped += 1
         if _is_threshold(self.streak):
-            if self.ack_unmatched:
-                self.log.warning(
-                    "%d messages in a row missed the filter on queue %r and were acknowledged "
-                    "and dropped — check filter_data",
-                    self.streak, self.queue_name,
-                )
-            else:
-                self.log.warning(
-                    "%d messages in a row missed the filter on queue %r and were returned to "
-                    "the queue — check filter_data",
-                    self.streak, self.queue_name,
-                )
+            disposition = (
+                "were acknowledged and dropped" if self.ack_unmatched
+                else "were returned to the queue"
+            )
+            self.log.warning(
+                "%d messages in a row missed the filter on queue %r and %s — check filter_data",
+                self.streak, self.queue_name, disposition,
+            )
         # An equal `dropped` says exactly what the line above already said, in the same
         # number: every miss of this state's lifetime is in that run and every one of
         # them was deleted. The totals part ways as soon as a match breaks the run.
@@ -410,18 +406,15 @@ class FilterMissState:
         matched nothing and dropped everything is one line and not two.
         """
         if evaluated > 0 and matched == 0:
-            if dropped_in_batch > 0:
-                self.log.warning(
-                    "None of the %d messages read from queue %r passed the filter, and %d "
-                    "of them were acknowledged and dropped — check filter_data",
-                    evaluated, self.queue_name, dropped_in_batch,
-                )
-            else:
-                self.log.warning(
-                    "None of the %d messages read from queue %r passed the filter — "
-                    "check filter_data",
-                    evaluated, self.queue_name,
-                )
+            dropped_clause = (
+                f", and {dropped_in_batch} of them were acknowledged and dropped"
+                if dropped_in_batch > 0 else ""
+            )
+            self.log.warning(
+                "None of the %d messages read from queue %r passed the filter%s — "
+                "check filter_data",
+                evaluated, self.queue_name, dropped_clause,
+            )
         elif dropped_in_batch > 0:
             self.log.warning(
                 "%d of the %d messages read from queue %r did not pass the filter and were "
@@ -471,27 +464,27 @@ async def handle_miss(message: Any, miss_state: FilterMissState) -> None:
     miss_state.on_miss()
 
 
-def dispose_miss(
-    miss_state: FilterMissState,
-    ack: Callable[[], None],
-    nack: Callable[[], None],
-) -> None:
-    """Dispose of a rejected message on a synchronous path and count it.
+def handle_miss_sync(hook: Any, delivery_tag: int, miss_state: FilterMissState) -> None:
+    """Dispose of a message the filter read and rejected, on a blocking path.
 
+    :param hook: Anything with ``ack(delivery_tag)`` and ``nack(delivery_tag, requeue=)``
+        — an :class:`~airflow_provider_rmq.hooks.rmq.RMQHook` in the operator and in the
+        sensor. Duck-typed, so the AMQP helpers stay free of a hook import.
+    :param delivery_tag: Tag of the delivery to dispose of.
     :param miss_state: Counters of the consuming loop; its ``ack_unmatched`` decides
-        between the two callables.
-    :param ack: Acknowledges the message, deleting it from the broker.
-    :param nack: Returns the message to the queue.
+        between acknowledging the message and returning it to the queue.
 
-    The synchronous counterpart of :func:`handle_miss`, which the operator and the
-    sensor share so the decision behind an acknowledged miss lives in one place. There
-    is no pause here: a blocking loop reads one batch per fetch and does not come back
-    to the same message inside it.
+    The operator and the sensor share it so the decision behind an acknowledged miss
+    lives in one place. There is no pause here: a blocking loop reads one batch per
+    fetch and does not come back to the same message inside it.
+
+    The counters are told after the broker call, so a deletion that did not go through
+    is not counted as one.
     """
     if miss_state.ack_unmatched:
-        ack()
+        hook.ack(delivery_tag)
     else:
-        nack()
+        hook.nack(delivery_tag, requeue=True)
     miss_state.on_miss()
 
 

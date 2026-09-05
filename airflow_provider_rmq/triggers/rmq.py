@@ -153,9 +153,7 @@ class RMQTrigger(BaseTrigger):
         # One state per run(): the run of misses spans every delivery this trigger
         # sees, in either mode, so the threshold is reached by a queue full of stray
         # messages and not only by a single batch of them.
-        miss_state = FilterMissState(
-            self.queue_name, log, ack_unmatched=self.ack_unmatched
-        )
+        miss_state = FilterMissState(self.queue_name, log, ack_unmatched=self.ack_unmatched)
 
         try:
             conn_info = await asyncio.get_running_loop().run_in_executor(

@@ -84,7 +84,7 @@
 4. **Метрики statsd**, если подключён: `rmq_watcher.consumer_attached`,
    `consumer_restarted`, `dag_triggered`, `cycle_timed_out`,
    `cycle_step_timed_out`, `cycle_step_skipped`, `tasks_abandoned`,
-   `filter_missed`, `filter_error`.
+   `filter_missed`, `filter_errored`.
 
 Главный приём всей проверки: **сравнивать окно 1 с окном 3**. Расхождение между
 тем, что показывает страница, и тем, что отвечает `rabbitmqctl list_consumers`, —

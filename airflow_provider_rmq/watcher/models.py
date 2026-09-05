@@ -55,6 +55,13 @@ class RMQSubscription(WatcherBase):
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
+    # Display-only, not columns: the Subscriptions page fills them per row before
+    # handing the row to its template, which reads the same two names off a grouped
+    # row and off a single one. Declared here so the shape holds for a row the page
+    # renders by any other path, where the values are simply the empty ones.
+    shared_queue_names = ()
+    shared_acking = False
+
 
 class RMQConnStatus(WatcherBase):
     """Connection-level status — one row per conn_id."""

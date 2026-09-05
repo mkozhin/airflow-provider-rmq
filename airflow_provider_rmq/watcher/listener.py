@@ -518,8 +518,30 @@ def _scanned_queue_label(kwargs: dict) -> str:
     return "<unresolved>"
 
 
+#: What the build made of an ``@rmq_trigger`` call whose arguments the scan could not
+#: read fully, and the sentence each outcome puts into the warning. What the operator
+#: has to do differs per outcome: a registered subscription runs with a default the DAG
+#: does not ask for, while the other two do not run at all — one because the call named
+#: a queue the builder refused, the other because no queue selector survived the scan.
+_UNREADABLE_KWARG_OUTCOMES = {
+    "registered": (
+        "the subscription is registered with that parameter's default instead "
+        "of what the decorator says"
+    ),
+    "refused": (
+        "the arguments the scan did read do not build a subscription and no "
+        "subscription is registered for it — see the line below for what the "
+        "build refused"
+    ),
+    "no_selector": (
+        "the call is left without a queue selector and no subscription is "
+        "registered for it"
+    ),
+}
+
+
 def _warn_unreadable_kwarg(
-    dag_id: str, kwargs: dict, name: str | None, *, registered: bool, refused: bool
+    dag_id: str, kwargs: dict, name: str | None, *, outcome: str
 ) -> None:
     """Report an ``@rmq_trigger`` argument the AST scan could not read.
 
@@ -527,16 +549,10 @@ def _warn_unreadable_kwarg(
     :param kwargs: Arguments the scan did read, for naming the queue.
     :param name: Parameter that could not be read, or ``None`` for a ``**`` unpacking
         that hides every argument of the call.
-    :param registered: Whether the call actually produced subscription rows. What
-        the operator has to do differs: a registered subscription runs with a
-        default the DAG does not ask for, an unregistered one does not run at all.
-        The caller establishes this by attempting the build first, so a call that
-        names a queue but is refused by ``build_subscriptions`` is reported as the
-        unregistered one it is.
-    :param refused: Whether that build was attempted and rejected. It splits the
-        unregistered outcome in two: a call with no queue selector never reached
-        the builder, while a refused one named a queue and still produced no row.
-        The refusal itself is logged on its own line by the caller.
+    :param outcome: Key of :data:`_UNREADABLE_KWARG_OUTCOMES` — what the build made of
+        the call. The caller establishes it by attempting the build first, so a call
+        that names a queue but is refused by ``build_subscriptions`` is reported as the
+        unregistered one it is, and the refusal itself is logged on its own line there.
 
     The scan never executes the DAG file, so a value the decorator computes — a
     module constant, an import, an f-string — is invisible to it.
@@ -547,27 +563,11 @@ def _warn_unreadable_kwarg(
         if name is None
         else f"{name!r} is not a literal"
     )
-    if registered:
-        outcome = (
-            "the subscription is registered with that parameter's default instead "
-            "of what the decorator says"
-        )
-    elif refused:
-        outcome = (
-            "the arguments the scan did read do not build a subscription and no "
-            "subscription is registered for it — see the line below for what the "
-            "build refused"
-        )
-    else:
-        outcome = (
-            "the call is left without a queue selector and no subscription is "
-            "registered for it"
-        )
     log.warning(
         "rmq_trigger: dag_id=%s queue=%s — %s, and the DAG file scan does not "
         "execute the file, so %s. Write the arguments out as literals in the "
         "decorator, or set the values on the Subscriptions page",
-        dag_id, _scanned_queue_label(kwargs), what, outcome,
+        dag_id, _scanned_queue_label(kwargs), what, _UNREADABLE_KWARG_OUTCOMES[outcome],
     )
 
 
@@ -638,11 +638,14 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
         except ValueError as exc:
             refusal = str(exc)
 
+    if subscriptions:
+        outcome = "registered"
+    elif refusal is not None:
+        outcome = "refused"
+    else:
+        outcome = "no_selector"
     for name in unreadable:
-        _warn_unreadable_kwarg(
-            dag_id, kwargs, name,
-            registered=bool(subscriptions), refused=refusal is not None,
-        )
+        _warn_unreadable_kwarg(dag_id, kwargs, name, outcome=outcome)
 
     if refusal is not None:
         log.warning(

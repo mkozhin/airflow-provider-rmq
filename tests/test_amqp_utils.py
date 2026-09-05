@@ -25,7 +25,15 @@ from airflow_provider_rmq.utils.amqp import (
     match_and_ack,
 )
 from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
-from tests.conftest import FakeAirflowConnection
+from tests.conftest import (
+    BATCH_DROPPED_TEXT,
+    DROPPED_TEXT,
+    EMPTY_BATCH_TEXT,
+    ERROR_TEXT,
+    STREAK_TEXT,
+    FakeAirflowConnection,
+    log_lines,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -414,13 +422,6 @@ class TestHandleMiss:
 # FilterMissState
 # ---------------------------------------------------------------------------
 
-_STREAK_TEXT = "in a row missed the filter"
-_DROPPED_TEXT = "have been dropped on queue"
-_ERROR_TEXT = "Filter could not be evaluated"
-
-
-def _lines(caplog, text):
-    return [r for r in caplog.records if text in r.getMessage()]
 
 
 class TestFilterMissState:
@@ -437,21 +438,21 @@ class TestFilterMissState:
         with caplog.at_level(logging.WARNING):
             for _ in range(1000):
                 state.on_miss()
-        assert [r.getMessage().split()[0] for r in _lines(caplog, _STREAK_TEXT)] == ["100", "1000"]
+        assert [r.getMessage().split()[0] for r in log_lines(caplog, STREAK_TEXT)] == ["100", "1000"]
 
     def test_streak_is_silent_below_a_hundred(self, caplog):
         state = _make_miss_state()
         with caplog.at_level(logging.WARNING):
             for _ in range(99):
                 state.on_miss()
-        assert _lines(caplog, _STREAK_TEXT) == []
+        assert log_lines(caplog, STREAK_TEXT) == []
 
     def test_the_requeueing_streak_says_the_messages_came_back(self, caplog):
         state = _make_miss_state()
         with caplog.at_level(logging.WARNING):
             for _ in range(100):
                 state.on_miss()
-        texts = [r.getMessage() for r in _lines(caplog, _STREAK_TEXT)]
+        texts = [r.getMessage() for r in log_lines(caplog, STREAK_TEXT)]
         assert len(texts) == 1
         assert "returned to the queue" in texts[0]
         assert "acknowledged and dropped" not in texts[0]
@@ -461,7 +462,7 @@ class TestFilterMissState:
         with caplog.at_level(logging.WARNING):
             for _ in range(100):
                 state.on_miss()
-        texts = [r.getMessage() for r in _lines(caplog, _STREAK_TEXT)]
+        texts = [r.getMessage() for r in log_lines(caplog, STREAK_TEXT)]
         assert len(texts) == 1
         assert "acknowledged and dropped" in texts[0]
         assert "returned to the queue" not in texts[0]
@@ -474,7 +475,7 @@ class TestFilterMissState:
             for _ in range(100):
                 state.on_miss()
         assert state.dropped == 100
-        assert _lines(caplog, _DROPPED_TEXT) == []
+        assert log_lines(caplog, DROPPED_TEXT) == []
 
     def test_a_total_out_of_step_with_the_run_gets_its_own_line(self, caplog):
         """A match resets the run and leaves the total behind, so the two numbers
@@ -488,23 +489,23 @@ class TestFilterMissState:
                 state.on_miss()
         assert state.dropped == 100
         assert state.streak == 50
-        assert len(_lines(caplog, _DROPPED_TEXT)) == 1
-        assert _lines(caplog, _STREAK_TEXT) == []
+        assert len(log_lines(caplog, DROPPED_TEXT)) == 1
+        assert log_lines(caplog, STREAK_TEXT) == []
 
     def test_error_warns_on_the_first_failure_then_throttles(self, caplog):
         state = _make_miss_state()
         with caplog.at_level(logging.WARNING):
             for _ in range(100):
                 state.on_error("ValueError: boom")
-        assert [r.getMessage() for r in _lines(caplog, _ERROR_TEXT)] != []
-        numbers = [int(r.getMessage().split("(")[1].split()[0]) for r in _lines(caplog, _ERROR_TEXT)]
+        assert [r.getMessage() for r in log_lines(caplog, ERROR_TEXT)] != []
+        numbers = [int(r.getMessage().split("(")[1].split()[0]) for r in log_lines(caplog, ERROR_TEXT)]
         assert numbers == [1, 100]
 
     def test_error_warning_carries_the_reason(self, caplog):
         state = _make_miss_state()
         with caplog.at_level(logging.WARNING):
             state.on_error("JSONDecodeError: Expecting value: line 1 column 1 (char 0)")
-        assert "JSONDecodeError: Expecting value" in _lines(caplog, _ERROR_TEXT)[0].getMessage()
+        assert "JSONDecodeError: Expecting value" in log_lines(caplog, ERROR_TEXT)[0].getMessage()
 
     def test_miss_does_not_reset_the_error_streak(self, caplog):
         """Alternating MISS and ERROR grows both counters and warns once on the failures."""
@@ -515,7 +516,7 @@ class TestFilterMissState:
                 state.on_error("ValueError: boom")
         assert state.streak == 20
         assert state.error_streak == 20
-        assert len(_lines(caplog, _ERROR_TEXT)) == 1
+        assert len(log_lines(caplog, ERROR_TEXT)) == 1
 
     def test_match_does_not_reset_the_error_streak(self, caplog):
         state = _make_miss_state()
@@ -524,7 +525,7 @@ class TestFilterMissState:
                 state.on_match()
                 state.on_error("ValueError: boom")
         assert state.error_streak == 20
-        assert len(_lines(caplog, _ERROR_TEXT)) == 1
+        assert len(log_lines(caplog, ERROR_TEXT)) == 1
 
     def test_error_streak_is_cleared_by_a_hundred_clean_outcomes(self, caplog):
         state = _make_miss_state()
@@ -537,7 +538,7 @@ class TestFilterMissState:
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             state.on_error("ValueError: boom")
-        assert len(_lines(caplog, _ERROR_TEXT)) == 1
+        assert len(log_lines(caplog, ERROR_TEXT)) == 1
 
     def test_dropped_counts_what_acknowledgement_deleted(self, caplog):
         """Ninety-nine misses and one match never reach the streak threshold."""
@@ -547,9 +548,9 @@ class TestFilterMissState:
                 for _ in range(99):
                     state.on_miss()
                 state.on_match()
-        assert _lines(caplog, _STREAK_TEXT) == []
+        assert log_lines(caplog, STREAK_TEXT) == []
         assert state.dropped == 198
-        assert len(_lines(caplog, _DROPPED_TEXT)) == 1
+        assert len(log_lines(caplog, DROPPED_TEXT)) == 1
 
     def test_dropped_stays_at_zero_without_acknowledgement(self, caplog):
         state = _make_miss_state()
@@ -557,13 +558,13 @@ class TestFilterMissState:
             for _ in range(200):
                 state.on_miss()
         assert state.dropped == 0
-        assert _lines(caplog, _DROPPED_TEXT) == []
+        assert log_lines(caplog, DROPPED_TEXT) == []
 
     def test_batch_done_warns_when_nothing_matched(self, caplog):
         state = _make_miss_state()
         with caplog.at_level(logging.WARNING):
             state.on_batch_done(matched=0, evaluated=5, dropped_in_batch=0)
-        assert len(_lines(caplog, "passed the filter")) == 1
+        assert len(log_lines(caplog, EMPTY_BATCH_TEXT)) == 1
 
     def test_a_batch_that_matched_nothing_and_dropped_all_is_one_line(self, caplog):
         """The two conditions of the batch line describe one batch, so they share a line."""
@@ -586,14 +587,14 @@ class TestFilterMissState:
         state = _make_miss_state(ack_unmatched=True)
         with caplog.at_level(logging.WARNING):
             state.on_batch_done(matched=1, evaluated=100, dropped_in_batch=99)
-        assert len(_lines(caplog, "did not pass the filter and were dropped")) == 1
+        assert len(log_lines(caplog, BATCH_DROPPED_TEXT)) == 1
 
     def test_warning_goes_to_the_logger_it_was_given(self, caplog):
         state = _make_miss_state(logger_name="airflow.task")
         with caplog.at_level(logging.WARNING):
             for _ in range(100):
                 state.on_miss()
-        assert [r.name for r in _lines(caplog, _STREAK_TEXT)] == ["airflow.task"]
+        assert [r.name for r in log_lines(caplog, STREAK_TEXT)] == ["airflow.task"]
 
 
 # ---------------------------------------------------------------------------

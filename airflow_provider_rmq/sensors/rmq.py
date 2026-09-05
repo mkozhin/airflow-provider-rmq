@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from functools import partial
 from typing import Any, Callable, Literal, Sequence
 
 import pika.exceptions
@@ -9,7 +8,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.sensors.base import BaseSensorOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
-from airflow_provider_rmq.utils.amqp import FilterMissState, dispose_miss
+from airflow_provider_rmq.utils.amqp import FilterMissState, handle_miss_sync
 from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
@@ -92,16 +91,16 @@ class RMQSensor(BaseSensorOperator):
         self.poke_batch_size = poke_batch_size
         self.mode = mode
         self.message_wait_timeout = message_wait_timeout
-        self._return_value: dict | None = None
-
-        if not isinstance(ack_unmatched, bool):
-            raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
         self.ack_unmatched = ack_unmatched
+        self._return_value: dict | None = None
 
         # One state per sensor instance, and the instance is what BaseSensorOperator.execute
         # reuses across its poke calls: a streak of misses spanning many pokes reaches the
         # threshold, which a counter created inside poke never could past poke_batch_size.
         self._miss_state: FilterMissState | None = None
+
+        if not isinstance(ack_unmatched, bool):
+            raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
 
         if self.deferrable and self.filter_callable is not None:
             raise ValueError(
@@ -158,9 +157,7 @@ class RMQSensor(BaseSensorOperator):
 
         if self._miss_state is None:
             self._miss_state = FilterMissState(
-                queue_name=self.queue_name,
-                log=log,
-                ack_unmatched=self.ack_unmatched,
+                self.queue_name, log, ack_unmatched=self.ack_unmatched
             )
         miss_state = self._miss_state
 
@@ -200,12 +197,7 @@ class RMQSensor(BaseSensorOperator):
                     miss_state.on_error(reason)
                     hook.nack(msg["method"].delivery_tag, requeue=True)
                 else:
-                    tag = msg["method"].delivery_tag
-                    dispose_miss(
-                        miss_state,
-                        partial(hook.ack, tag),
-                        partial(hook.nack, tag, requeue=True),
-                    )
+                    handle_miss_sync(hook, msg["method"].delivery_tag, miss_state)
             return False
         finally:
             hook.close()
