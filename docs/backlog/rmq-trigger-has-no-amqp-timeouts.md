@@ -1,6 +1,6 @@
 ---
 worth: yes
-where: airflow_provider_rmq/triggers/rmq.py:141
+where: airflow_provider_rmq/triggers/rmq.py:167
 added: 2026-08-28
 ---
 # `RMQTrigger` подключается и вызывает AMQP без единой границы по времени

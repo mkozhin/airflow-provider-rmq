@@ -5,8 +5,10 @@ an acknowledged miss leaves the queue and is not dead-lettered, a requeued one c
 back at the pace of the pause, and the batch-oriented paths take exactly one batch per
 fetch.
 
-Every queue and exchange here is declared through the ``scratch`` fixture, so it
-carries the run's prefix and is deleted in teardown.
+Every queue here is declared through the ``scratch`` fixture, so it carries the run's
+prefix and is deleted in teardown. Dead-lettering is routed through the default
+exchange, which the broker owns: ``scratch`` keeps a register of queues only, so a
+test that needs an exchange of its own has to teach it to delete one first.
 """
 
 from __future__ import annotations

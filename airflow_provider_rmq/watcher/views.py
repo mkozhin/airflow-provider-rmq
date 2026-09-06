@@ -200,9 +200,19 @@ def _flash_shared_queues(session: Session, pairs: Iterable[tuple[str, str]]) -> 
     wanted = set(pairs)
     if not wanted:
         return
-    shared, acking = _queue_sharing(
-        session.query(RMQSubscription).filter_by(enabled=True).all()
-    )
+    try:
+        rows = session.query(RMQSubscription).filter_by(enabled=True).all()
+    except Exception:
+        # The save has already been committed, so a read that fails here costs the
+        # user an advisory warning, not the change they asked for. Raising would turn
+        # a landed save into a 500 and invite a retry that toggles the row back.
+        log.exception("failed to read subscriptions for the shared-queue warning")
+        flash(
+            "Could not check whether these queues are shared — see the Scheduler log",
+            "warning",
+        )
+        return
+    shared, acking = _queue_sharing(rows)
     for queue_name, conn_id in sorted(wanted & shared):
         message = (
             f"Queue '{queue_name}' on connection '{conn_id}' is listened to by more "
@@ -579,10 +589,15 @@ class RMQWatcherView(BaseView):
                     sub.group_key = dag_id if cooldown > 0 else None
                     sub.ack_unmatched = ack_unmatched
 
+                # Read off the row before the commit expires it: an attribute touched
+                # afterwards emits a refresh SELECT, which on a dropped connection
+                # would raise out of an endpoint whose save has already landed.
+                saved_enabled = sub.enabled
+                saved_pair = (sub.queue_name, sub.conn_id)
                 session.commit()
                 flash("Subscription updated", "success")
-                if sub.enabled:
-                    _flash_shared_queues(session, [(sub.queue_name, sub.conn_id)])
+                if saved_enabled:
+                    _flash_shared_queues(session, [saved_pair])
                 return redirect(url_for("RMQWatcherView.subscriptions"))
 
             return self.render_template(
@@ -625,9 +640,15 @@ class RMQWatcherView(BaseView):
                 return redirect(url_for("RMQWatcherView.subscriptions"))
 
             sub.enabled = not sub.enabled
+            # Read off the row before the commit expires it: an attribute touched
+            # afterwards emits a refresh SELECT, which on a dropped connection would
+            # raise out of an endpoint whose save has already landed, and the retry
+            # that invites would toggle the row straight back.
+            saved_enabled = sub.enabled
+            saved_pair = (sub.queue_name, sub.conn_id)
             session.commit()
-            if sub.enabled:
-                _flash_shared_queues(session, [(sub.queue_name, sub.conn_id)])
+            if saved_enabled:
+                _flash_shared_queues(session, [saved_pair])
 
         return redirect(url_for("RMQWatcherView.subscriptions"))
 
@@ -680,9 +701,13 @@ class RMQWatcherView(BaseView):
             all_enabled = all(s.enabled for s in subs)
             for sub in subs:
                 sub.enabled = not all_enabled
+            # Read off the rows before the commit expires them: an attribute touched
+            # afterwards emits a refresh SELECT per row, which on a dropped connection
+            # would raise out of an endpoint whose save has already landed.
+            saved_pairs = [(s.queue_name, s.conn_id) for s in subs]
             session.commit()
             if not all_enabled:
-                _flash_shared_queues(session, [(s.queue_name, s.conn_id) for s in subs])
+                _flash_shared_queues(session, saved_pairs)
 
         return redirect(url_for("RMQWatcherView.subscriptions"))
 
@@ -807,12 +832,15 @@ class RMQWatcherView(BaseView):
                 # dag_file: only toggle enabled
                 for sub in subs:
                     sub.enabled = enabled
+                # Read off the rows before the commit expires them: an attribute
+                # touched afterwards emits a refresh SELECT per row, which on a
+                # dropped connection would raise out of an endpoint whose save has
+                # already landed.
+                saved_pairs = [(s.queue_name, s.conn_id) for s in subs]
                 session.commit()
                 flash("Group updated", "success")
                 if enabled:
-                    _flash_shared_queues(
-                        session, [(s.queue_name, s.conn_id) for s in subs]
-                    )
+                    _flash_shared_queues(session, saved_pairs)
                 return redirect(url_for("RMQWatcherView.subscriptions"))
 
             return self.render_template(

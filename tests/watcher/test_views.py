@@ -19,6 +19,7 @@ import pytest
 from flask import Flask
 from jinja2 import ChoiceLoader, DictLoader, Environment, FileSystemLoader
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from airflow_provider_rmq.watcher.models import RMQSubscription, WatcherBase
@@ -2310,6 +2311,33 @@ class TestSharedQueueFlash:
             view.toggle(1)
 
         assert _warning_flashes(mock_flash) == []
+
+    def test_a_read_that_fails_after_the_commit_does_not_lose_the_save(self, app, view):
+        """The commit has landed by the time the warning is looked up, so a connection
+        that drops in between costs an advisory line, not the toggle. Raising here would
+        answer a saved change with a 500 and invite a retry that toggles it straight
+        back."""
+        sub = _make_sub(id=1, dag_id="b", queue_name="shared_q", enabled=False)
+        ctx, session = _session_ctx_for_sharing(first_sub=sub)
+
+        def _filter_by(**kwargs):
+            if kwargs.get("enabled") is True:
+                raise OperationalError("SELECT", {}, Exception("connection lost"))
+            result = MagicMock()
+            result.first.return_value = sub
+            return result
+
+        session.query.return_value.filter_by.side_effect = _filter_by
+        mock_flash = MagicMock()
+        with app.test_request_context("/subscriptions/1/toggle", method="POST"), \
+             patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             patch("airflow_provider_rmq.watcher.views.flash", mock_flash), \
+             patch("airflow_provider_rmq.watcher.views.redirect", return_value="redirect"), \
+             patch("airflow_provider_rmq.watcher.views.url_for", return_value="/subs"):
+            assert view.toggle(1) == "redirect"
+
+        session.commit.assert_called_once()
+        assert any("Could not check" in m for m in _warning_flashes(mock_flash))
 
     def test_toggle_group_warns_the_same_way(self, app, view):
         sub1 = _make_sub(

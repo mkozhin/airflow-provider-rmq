@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/consumer.py:3227
+where: airflow_provider_rmq/watcher/consumer.py:3238
 added: 2026-09-01
 ---
 # Переприцепление начинает счёт прогрева заново, и порог может не сработать никогда

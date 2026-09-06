@@ -2911,6 +2911,25 @@ class TestParseRmqTriggerDecorator:
         assert "orders" in caplog.text
         assert "**kwargs" in caplog.text
 
+    def test_unpacking_beside_a_literal_does_not_claim_nothing_was_read(self, caplog):
+        """The line names the queue it read, so it cannot also say it read nothing —
+        an operator told the call was unreadable whole goes looking for the wrong
+        cause. It also cannot say "that parameter's default": the unpacking names no
+        parameter for that to point at."""
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(queue='orders', **opts)", dag_id="my_dag")
+        assert "reads no parameter from this call at all" not in caplog.text
+        assert "that parameter's default" not in caplog.text
+        assert "cannot read the arguments it carries" in caplog.text
+        assert "every argument the dict carries" in caplog.text
+
+    def test_unpacking_alone_does_say_nothing_was_read(self, caplog):
+        """The other half of the same split: with no literal beside it the call really
+        is unreadable whole, and the wording says so."""
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
+        assert "reads no parameter from this call at all" in caplog.text
+
     def test_negative_cooldown_skipped_returns_empty(self):
         result = _parse_decorator("rmq_trigger(queue='q', cooldown=-1)")
         assert result == []

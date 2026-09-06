@@ -528,6 +528,12 @@ _UNREADABLE_KWARG_OUTCOMES = {
         "the subscription is registered with that parameter's default instead "
         "of what the decorator says"
     ),
+    # A ``**`` unpacking names no parameter, so the registered sentence cannot point
+    # at one: it says what happens to every argument the dict carries instead.
+    "registered_unpacking": (
+        "the subscription is registered with the default for every argument the "
+        "dict carries, and only the arguments written out beside it take effect"
+    ),
     "refused": (
         "the arguments the scan did read do not build a subscription and no "
         "subscription is registered for it — see the line below for what the "
@@ -556,18 +562,30 @@ def _warn_unreadable_kwarg(
 
     The scan never executes the DAG file, so a value the decorator computes — a
     module constant, an import, an f-string — is invisible to it.
+
+    A ``**`` unpacking hides only its own dict: literals written out beside it are
+    read normally, so the line says what the scan could not reach rather than
+    claiming the call was unreadable whole.
     """
-    what = (
-        "the decorator unpacks a dict (**kwargs), so the scan reads no parameter "
-        "from this call at all"
-        if name is None
-        else f"{name!r} is not a literal"
-    )
+    if name is not None:
+        what = f"{name!r} is not a literal"
+        sentence = _UNREADABLE_KWARG_OUTCOMES[outcome]
+    else:
+        what = (
+            "the decorator unpacks a dict (**kwargs), so the scan cannot read the "
+            "arguments it carries"
+            if kwargs
+            else "the decorator unpacks a dict (**kwargs), so the scan reads no "
+            "parameter from this call at all"
+        )
+        sentence = _UNREADABLE_KWARG_OUTCOMES[
+            "registered_unpacking" if outcome == "registered" else outcome
+        ]
     log.warning(
         "rmq_trigger: dag_id=%s queue=%s — %s, and the DAG file scan does not "
         "execute the file, so %s. Write the arguments out as literals in the "
         "decorator, or set the values on the Subscriptions page",
-        dag_id, _scanned_queue_label(kwargs), what, _UNREADABLE_KWARG_OUTCOMES[outcome],
+        dag_id, _scanned_queue_label(kwargs), what, sentence,
     )
 
 
@@ -616,7 +634,8 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
     for kw in node.keywords:
         if kw.arg is None:
             # `@rmq_trigger(**opts)` — the dict is built at import time, so the
-            # scan reads no parameter out of it at all.
+            # scan cannot read the arguments it carries. Literals written out
+            # beside the unpacking are still read by the loop below.
             unreadable.append(None)
             continue
         if kw.arg not in _RMQ_TRIGGER_KWARGS:

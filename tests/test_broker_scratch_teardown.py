@@ -5,13 +5,18 @@ of what the run has to clean up. These tests drive the teardown with a stand-in
 connection instead of the broker: they are about what happens when a delete
 fails, and a broker that fails a delete on demand is not something the suite can
 ask for.
+
+They live here rather than beside the class they cover, because they need no
+broker and the unit suite is what every automated pass runs: the guard against
+leaking queues into that vhost is worth checking on a machine that has no broker
+to leak into.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from .conftest import BrokerScratch
+from integration.conftest import BrokerScratch
 
 PREFIX = "rmqtest.0.deadbeef."
 

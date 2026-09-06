@@ -344,9 +344,14 @@ class FilterMissState:
     def on_miss(self) -> None:
         """Record a message the filter read and rejected, once it has been disposed of.
 
-        The call comes after the ACK or the NACK, so ``dropped`` counts deletions the
-        broker confirmed: an ``ack()`` that raises on a closed channel leaves the
-        message in the queue, and a line saying it was deleted would be untrue.
+        The call comes after the ACK or the NACK, so an ``ack()`` that raises on a
+        closed channel is not counted: the message stays in the queue, and a line
+        saying it was deleted would be untrue.
+
+        ``dropped`` counts acknowledgements the client handed over, not deletions the
+        broker confirmed. ``basic.ack`` has no reply in AMQP — both clients write the
+        frame to the socket and return — so a connection lost between that write and
+        the broker applying it redelivers a message this counter has already counted.
         """
         self.streak += 1
         self._count_clean_outcome()

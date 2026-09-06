@@ -1,6 +1,6 @@
 ---
 worth: yes
-where: airflow_provider_rmq/sensors/rmq.py:47
+where: airflow_provider_rmq/sensors/rmq.py:57
 added: 2026-09-02
 ---
 # `RMQSensor.mode` затеняет `mode` базового сенсора Airflow
