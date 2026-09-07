@@ -45,6 +45,29 @@ class TestBuildSubscriptionsCooldown:
         subs = build_subscriptions(dag_id="d", queue="q", cooldown=0)
         assert subs[0]["cooldown"] == 0
 
+    def test_default_ack_unmatched_is_false(self):
+        subs = build_subscriptions(dag_id="d", queue="q")
+        assert subs[0]["ack_unmatched"] is False
+
+    def test_ack_unmatched_true_propagated_to_every_queue(self):
+        subs = build_subscriptions(dag_id="d", queues=["a", "b"], ack_unmatched=True)
+        assert [sub["ack_unmatched"] for sub in subs] == [True, True]
+
+    def test_ack_unmatched_true_propagated_in_exchange_mode(self):
+        subs = build_subscriptions(
+            dag_id="d", exchange="ex", routing_keys=["a.b"], ack_unmatched=True
+        )
+        assert subs[0]["ack_unmatched"] is True
+
+    def test_string_ack_unmatched_raises_value_error(self):
+        # "yes" would reach Column(Boolean) as a string and read back as truth.
+        with pytest.raises(ValueError, match="ack_unmatched"):
+            build_subscriptions(dag_id="d", queue="q", ack_unmatched="yes")
+
+    def test_int_ack_unmatched_raises_value_error(self):
+        with pytest.raises(ValueError, match="ack_unmatched"):
+            build_subscriptions(dag_id="d", queue="q", ack_unmatched=1)
+
     def test_non_int_cooldown_string_raises_value_error(self):
         with pytest.raises(ValueError, match="cooldown"):
             build_subscriptions(dag_id="d", queue="q", cooldown="abc")
@@ -267,7 +290,13 @@ class TestBuildSubscriptionsQueueName:
 class TestBuildSubscriptionsShape:
     def test_queue_mode_shape(self):
         subs = build_subscriptions(dag_id="d", queue="q", conn_id="rmq_x", filter_data={"filter_headers": {}})
-        assert set(subs[0].keys()) == {"queue_name", "conn_id", "filter_data", "cooldown"}
+        assert set(subs[0].keys()) == {
+            "queue_name",
+            "conn_id",
+            "filter_data",
+            "cooldown",
+            "ack_unmatched",
+        }
 
     def test_exchange_mode_shape(self):
         subs = build_subscriptions(dag_id="d", exchange="ex", routing_keys=["a.b"])
@@ -276,6 +305,7 @@ class TestBuildSubscriptionsShape:
             "conn_id",
             "filter_data",
             "cooldown",
+            "ack_unmatched",
             "exchange",
             "routing_keys",
         }

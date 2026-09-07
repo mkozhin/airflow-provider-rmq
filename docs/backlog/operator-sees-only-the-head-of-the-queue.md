@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/operators/rmq_consume.py:69
+where: airflow_provider_rmq/operators/rmq_consume.py:88
 added: 2026-09-05
 ---
 # Оператор и сенсор видят только голову очереди: за прогон разбирается один батч

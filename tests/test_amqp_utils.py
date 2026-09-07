@@ -15,15 +15,25 @@ from airflow_provider_rmq.utils.amqp import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_HEARTBEAT,
     DEFAULT_RPC_TIMEOUT,
+    FilterMissState,
     call_with_timeout,
+    handle_miss,
     match as _match,
     nack_and_sleep as _nack_and_sleep,
     build_amqp_connection,
     get_amqp_timeouts,
     match_and_ack,
 )
-from airflow_provider_rmq.utils.filters import MessageFilter
-from tests.conftest import FakeAirflowConnection
+from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
+from tests.conftest import (
+    BATCH_DROPPED_TEXT,
+    DROPPED_TEXT,
+    EMPTY_BATCH_TEXT,
+    ERROR_TEXT,
+    STREAK_TEXT,
+    FakeAirflowConnection,
+    log_lines,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -276,12 +286,16 @@ def _make_aio_message(body: bytes = b"hello", headers: dict | None = None):
     return msg
 
 
+def _make_miss_state(ack_unmatched: bool = False, logger_name: str = "test.miss.state"):
+    return FilterMissState("q", logging.getLogger(logger_name), ack_unmatched=ack_unmatched)
+
+
 class TestMatchAndAck:
     @pytest.mark.asyncio
     async def test_matching_message_acked(self):
         msg = _make_aio_message(headers={"type": "order"})
         f = MessageFilter(filter_headers={"type": "order"})
-        result = await match_and_ack(msg, f)
+        result = await match_and_ack(msg, f, _make_miss_state())
         assert result is True
         msg.ack.assert_awaited_once()
         msg.nack.assert_not_awaited()
@@ -290,7 +304,7 @@ class TestMatchAndAck:
     async def test_non_matching_message_nacked(self):
         msg = _make_aio_message(headers={"type": "payment"})
         f = MessageFilter(filter_headers={"type": "order"})
-        result = await match_and_ack(msg, f)
+        result = await match_and_ack(msg, f, _make_miss_state())
         assert result is False
         msg.nack.assert_awaited_once_with(requeue=True)
         msg.ack.assert_not_awaited()
@@ -299,16 +313,64 @@ class TestMatchAndAck:
     async def test_no_filter_always_matches(self):
         msg = _make_aio_message()
         f = MessageFilter()
-        result = await match_and_ack(msg, f)
+        result = await match_and_ack(msg, f, _make_miss_state())
         assert result is True
         msg.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_error_message_nacked(self):
+        """A body the filter could not read is returned to the queue, never acknowledged."""
+        msg = _make_aio_message(body=b"not json at all")
+        f = MessageFilter(filter_headers={"body.status": "ok"})
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            result = await match_and_ack(msg, f, _make_miss_state())
+        assert result is False
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_error_message_nacked_even_when_ack_unmatched_is_on(self):
+        """A failure to evaluate never reaches the acknowledging branch."""
+        msg = _make_aio_message(body=b"not json at all")
+        f = MessageFilter(filter_headers={"body.status": "ok"})
+        state = _make_miss_state(ack_unmatched=True)
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            result = await match_and_ack(msg, f, state)
+        assert result is False
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+        assert state.dropped == 0
+        assert state.error_streak == 1
+
+    @pytest.mark.asyncio
+    async def test_miss_acked_when_ack_unmatched_is_on(self):
+        msg = _make_aio_message(headers={"type": "payment"})
+        f = MessageFilter(filter_headers={"type": "order"})
+        state = _make_miss_state(ack_unmatched=True)
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await match_and_ack(msg, f, state)
+        assert result is False
+        msg.ack.assert_awaited_once()
+        msg.nack.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
+        assert state.dropped == 1
+
+    @pytest.mark.asyncio
+    async def test_counters_follow_the_verdict(self):
+        f = MessageFilter(filter_headers={"type": "order"})
+        state = _make_miss_state()
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock):
+            await match_and_ack(_make_aio_message(headers={"type": "other"}), f, state)
+        assert state.streak == 1
+        await match_and_ack(_make_aio_message(headers={"type": "order"}), f, state)
+        assert state.streak == 0
 
     @pytest.mark.asyncio
     async def test_nack_includes_sleep(self):
         msg = _make_aio_message(headers={"type": "other"})
         f = MessageFilter(filter_headers={"type": "order"})
         with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            await match_and_ack(msg, f)
+            await match_and_ack(msg, f, _make_miss_state())
         mock_sleep.assert_awaited_once_with(0.1)
 
     @pytest.mark.asyncio
@@ -316,8 +378,223 @@ class TestMatchAndAck:
         msg = _make_aio_message(headers={"type": "order"})
         f = MessageFilter(filter_headers={"type": "order"})
         with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            await match_and_ack(msg, f)
+            await match_and_ack(msg, f, _make_miss_state())
         mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_miss_state_is_required(self):
+        """No default value: a caller that forgot the state must not keep the old path."""
+        with pytest.raises(TypeError):
+            await match_and_ack(_make_aio_message(), MessageFilter())
+
+
+class TestHandleMiss:
+    @pytest.mark.asyncio
+    async def test_requeues_and_sleeps_by_default(self):
+        msg = _make_aio_message()
+        state = _make_miss_state()
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await handle_miss(msg, state)
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+        mock_sleep.assert_awaited_once_with(0.1)
+        assert state.streak == 1
+        assert state.dropped == 0
+
+    @pytest.mark.asyncio
+    async def test_acknowledges_when_asked(self):
+        msg = _make_aio_message()
+        state = _make_miss_state(ack_unmatched=True)
+        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await handle_miss(msg, state)
+        msg.ack.assert_awaited_once()
+        msg.nack.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
+        assert state.dropped == 1
+
+    @pytest.mark.asyncio
+    async def test_miss_state_is_required(self):
+        with pytest.raises(TypeError):
+            await handle_miss(_make_aio_message())
+
+
+# ---------------------------------------------------------------------------
+# FilterMissState
+# ---------------------------------------------------------------------------
+
+
+
+class TestFilterMissState:
+    def test_streak_grows_and_a_match_resets_it(self):
+        state = _make_miss_state()
+        state.on_miss()
+        state.on_miss()
+        assert state.streak == 2
+        state.on_match()
+        assert state.streak == 0
+
+    def test_streak_warns_on_a_hundred_and_a_thousand_only(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(1000):
+                state.on_miss()
+        assert [r.getMessage().split()[0] for r in log_lines(caplog, STREAK_TEXT)] == ["100", "1000"]
+
+    def test_streak_is_silent_below_a_hundred(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(99):
+                state.on_miss()
+        assert log_lines(caplog, STREAK_TEXT) == []
+
+    def test_the_requeueing_streak_says_the_messages_came_back(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                state.on_miss()
+        texts = [r.getMessage() for r in log_lines(caplog, STREAK_TEXT)]
+        assert len(texts) == 1
+        assert "returned to the queue" in texts[0]
+        assert "acknowledged and dropped" not in texts[0]
+
+    def test_the_acknowledging_streak_says_the_messages_are_gone(self, caplog):
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                state.on_miss()
+        texts = [r.getMessage() for r in log_lines(caplog, STREAK_TEXT)]
+        assert len(texts) == 1
+        assert "acknowledged and dropped" in texts[0]
+        assert "returned to the queue" not in texts[0]
+
+    def test_a_run_equal_to_the_total_does_not_say_it_twice(self, caplog):
+        """Both counters reach a hundred on the same miss; the run's line already
+        carries the total, so the second line would only repeat the number."""
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                state.on_miss()
+        assert state.dropped == 100
+        assert log_lines(caplog, DROPPED_TEXT) == []
+
+    def test_a_total_out_of_step_with_the_run_gets_its_own_line(self, caplog):
+        """A match resets the run and leaves the total behind, so the two numbers
+        part ways and the total needs saying."""
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(50):
+                state.on_miss()
+            state.on_match()
+            for _ in range(50):
+                state.on_miss()
+        assert state.dropped == 100
+        assert state.streak == 50
+        assert len(log_lines(caplog, DROPPED_TEXT)) == 1
+        assert log_lines(caplog, STREAK_TEXT) == []
+
+    def test_error_warns_on_the_first_failure_then_throttles(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                state.on_error("ValueError: boom")
+        assert [r.getMessage() for r in log_lines(caplog, ERROR_TEXT)] != []
+        numbers = [int(r.getMessage().split("(")[1].split()[0]) for r in log_lines(caplog, ERROR_TEXT)]
+        assert numbers == [1, 100]
+
+    def test_error_warning_carries_the_reason(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            state.on_error("JSONDecodeError: Expecting value: line 1 column 1 (char 0)")
+        assert "JSONDecodeError: Expecting value" in log_lines(caplog, ERROR_TEXT)[0].getMessage()
+
+    def test_miss_does_not_reset_the_error_streak(self, caplog):
+        """Alternating MISS and ERROR grows both counters and warns once on the failures."""
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(20):
+                state.on_miss()
+                state.on_error("ValueError: boom")
+        assert state.streak == 20
+        assert state.error_streak == 20
+        assert len(log_lines(caplog, ERROR_TEXT)) == 1
+
+    def test_match_does_not_reset_the_error_streak(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(20):
+                state.on_match()
+                state.on_error("ValueError: boom")
+        assert state.error_streak == 20
+        assert len(log_lines(caplog, ERROR_TEXT)) == 1
+
+    def test_error_streak_is_cleared_by_a_hundred_clean_outcomes(self, caplog):
+        state = _make_miss_state()
+        state.on_error("ValueError: boom")
+        for _ in range(99):
+            state.on_match()
+        assert state.error_streak == 1
+        state.on_match()
+        assert state.error_streak == 0
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            state.on_error("ValueError: boom")
+        assert len(log_lines(caplog, ERROR_TEXT)) == 1
+
+    def test_dropped_counts_what_acknowledgement_deleted(self, caplog):
+        """Ninety-nine misses and one match never reach the streak threshold."""
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(2):
+                for _ in range(99):
+                    state.on_miss()
+                state.on_match()
+        assert log_lines(caplog, STREAK_TEXT) == []
+        assert state.dropped == 198
+        assert len(log_lines(caplog, DROPPED_TEXT)) == 1
+
+    def test_dropped_stays_at_zero_without_acknowledgement(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(200):
+                state.on_miss()
+        assert state.dropped == 0
+        assert log_lines(caplog, DROPPED_TEXT) == []
+
+    def test_batch_done_warns_when_nothing_matched(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            state.on_batch_done(matched=0, evaluated=5, dropped_in_batch=0)
+        assert len(log_lines(caplog, EMPTY_BATCH_TEXT)) == 1
+
+    def test_a_batch_that_matched_nothing_and_dropped_all_is_one_line(self, caplog):
+        """The two conditions of the batch line describe one batch, so they share a line."""
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            state.on_batch_done(matched=0, evaluated=5, dropped_in_batch=5)
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        assert "None of the 5 messages" in message
+        assert "5 of them were acknowledged and dropped" in message
+
+    def test_batch_done_is_silent_on_a_match_and_on_an_empty_batch(self, caplog):
+        state = _make_miss_state()
+        with caplog.at_level(logging.WARNING):
+            state.on_batch_done(matched=1, evaluated=5, dropped_in_batch=0)
+            state.on_batch_done(matched=0, evaluated=0, dropped_in_batch=0)
+        assert caplog.records == []
+
+    def test_batch_done_reports_dropped_even_when_something_matched(self, caplog):
+        state = _make_miss_state(ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            state.on_batch_done(matched=1, evaluated=100, dropped_in_batch=99)
+        assert len(log_lines(caplog, BATCH_DROPPED_TEXT)) == 1
+
+    def test_warning_goes_to_the_logger_it_was_given(self, caplog):
+        state = _make_miss_state(logger_name="airflow.task")
+        with caplog.at_level(logging.WARNING):
+            for _ in range(100):
+                state.on_miss()
+        assert [r.name for r in log_lines(caplog, STREAK_TEXT)] == ["airflow.task"]
 
 
 # ---------------------------------------------------------------------------
@@ -325,20 +602,24 @@ class TestMatchAndAck:
 # ---------------------------------------------------------------------------
 
 class TestMatch:
-    def test_match_returns_true_when_no_filters(self):
+    def test_match_returns_match_when_no_filters(self):
         msg = _make_aio_message(body=b"any")
-        result = _match(msg, MessageFilter())
-        assert result is True
+        assert _match(msg, MessageFilter()) == (FilterVerdict.MATCH, None)
 
-    def test_match_returns_true_when_headers_match(self):
+    def test_match_returns_match_when_headers_match(self):
         msg = _make_aio_message(headers={"type": "order"})
-        result = _match(msg, MessageFilter(filter_headers={"type": "order"}))
-        assert result is True
+        assert _match(msg, MessageFilter(filter_headers={"type": "order"})) == (FilterVerdict.MATCH, None)
 
-    def test_match_returns_false_when_headers_differ(self):
+    def test_match_returns_miss_when_headers_differ(self):
         msg = _make_aio_message(headers={"type": "payment"})
-        result = _match(msg, MessageFilter(filter_headers={"type": "order"}))
-        assert result is False
+        assert _match(msg, MessageFilter(filter_headers={"type": "order"})) == (FilterVerdict.MISS, None)
+
+    def test_match_returns_error_when_body_is_not_json(self):
+        """A body that does not read as JSON is a failure to evaluate, not a miss."""
+        msg = _make_aio_message(body=b"not json at all")
+        verdict, reason = _match(msg, MessageFilter(filter_headers={"body.status": "ok"}))
+        assert verdict is FilterVerdict.ERROR
+        assert "JSONDecodeError" in reason
 
     def test_match_does_not_call_ack(self):
         msg = _make_aio_message(headers={"type": "order"})
@@ -356,9 +637,8 @@ class TestMatch:
         """Non-UTF-8 binary body must not raise UnicodeDecodeError (errors='replace')."""
         binary_body = b"\xff\xfe\x00invalid utf-8 \x80\x81\x82"
         msg = _make_aio_message(body=binary_body)
-        # Should not raise — filter has no body filter so result is True regardless
-        result = _match(msg, MessageFilter())
-        assert result is True
+        # Should not raise — filter has no body filter so the verdict is MATCH regardless
+        assert _match(msg, MessageFilter()) == (FilterVerdict.MATCH, None)
 
     def test_match_binary_body_with_callable_filter_does_not_raise(self):
         """Binary body with a callable filter — replacement chars used, no exception."""
@@ -366,7 +646,7 @@ class TestMatch:
         msg = _make_aio_message(body=binary_body)
         # Callable checks body text; body contains replacement chars, not "hello"
         result = _match(msg, MessageFilter(filter_callable=lambda props, body: "hello" in body))
-        assert result is False
+        assert result == (FilterVerdict.MISS, None)
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -8,6 +10,7 @@ from typing import Any
 from flask import flash, redirect, request, url_for
 from flask_appbuilder import BaseView, expose
 from flask_appbuilder.security.decorators import has_access
+from sqlalchemy.orm import Session
 
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -57,6 +60,16 @@ class SubscriptionGroup:
     queue_names: list[str] = field(default_factory=list)
     sub_ids: list[int] = field(default_factory=list)
     enabled: bool = True
+    #: True when at least one member acknowledges what its filter rejected. Aggregated
+    #: by OR, unlike `enabled`: the group's row has to name the setting as soon as a
+    #: single queue of it deletes messages
+    ack_unmatched: bool = False
+    #: Queues of this group another enabled subscription of the same conn_id also
+    #: listens to. The badge names them, so the list is built here rather than in the
+    #: template
+    shared_queue_names: list[str] = field(default_factory=list)
+    #: True when a subscription on one of those shared queues acknowledges its misses
+    shared_acking: bool = False
     statuses: list[str] = field(default_factory=list)
     last_error: str | None = None
     is_group: bool = field(default=True, init=False)
@@ -78,12 +91,19 @@ def _group_subscriptions(subs: list[RMQSubscription]) -> list[Any]:
     """Group subscriptions by group_key where applicable.
 
     Returns a mixed list of SubscriptionGroup (for grouped) and
-    RMQSubscription (for ungrouped, i.e. group_key is NULL).
+    RMQSubscription (for ungrouped, i.e. group_key is NULL). Every item carries
+    ``shared_queue_names`` and ``shared_acking``, so the template asks a row whether
+    it is on a shared queue instead of computing the answer itself.
     """
+    shared, acking = _queue_sharing(subs)
     grouped: dict[str, SubscriptionGroup] = {}
     ungrouped: list[RMQSubscription] = []
 
     for sub in subs:
+        pair = (sub.queue_name, sub.conn_id)
+        # A disabled row runs no consumer, so it competes for nothing — the badge
+        # belongs to the rows that are actually on the queue.
+        is_shared = bool(sub.enabled) and pair in shared
         if sub.group_key:
             key = sub.group_key
             if key not in grouped:
@@ -101,10 +121,19 @@ def _group_subscriptions(subs: list[RMQSubscription]) -> list[Any]:
             # Propagate: group is disabled if any sub is disabled
             if not sub.enabled:
                 g.enabled = False
+            # Propagate: group acknowledges unmatched if any sub does
+            if sub.ack_unmatched:
+                g.ack_unmatched = True
+            if is_shared:
+                g.shared_queue_names.append(sub.queue_name)
+                if pair in acking:
+                    g.shared_acking = True
             # First non-null last_error
             if g.last_error is None and sub.last_error:
                 g.last_error = sub.last_error
         else:
+            sub.shared_queue_names = [sub.queue_name] if is_shared else []
+            sub.shared_acking = is_shared and pair in acking
             ungrouped.append(sub)
 
     result: list[Any] = []
@@ -112,6 +141,86 @@ def _group_subscriptions(subs: list[RMQSubscription]) -> list[Any]:
     result.extend(ungrouped)
     result.extend(grouped.values())
     return result
+
+
+# ------------------------------------------------------------------
+# Shared-queue helpers
+# ------------------------------------------------------------------
+
+#: Text of the page badge and of the flash for a queue carried by more than one
+#: enabled subscription on the same conn_id. Two subscriptions on one queue are safe
+#: only while their filters are strictly disjoint: the broker splits deliveries
+#: round-robin between the competing consumers, so a message suiting both — every
+#: message, when filter_data is empty — is acknowledged by whichever consumer got it
+#: and the other subscription's DAG does not run.
+SHARED_QUEUE_WARNING = (
+    "The broker splits deliveries round-robin between competing consumers, so a "
+    "message that suits both filters reaches only one of them and the other "
+    "subscription's DAG does not run. Fan-out is built from separate queues and "
+    "bindings, not from two subscriptions on one queue."
+)
+
+#: Added to the notice above when one of the subscriptions on the shared queue
+#: acknowledges what its filter rejected.
+SHARED_QUEUE_ACK_WARNING = (
+    "One of these subscriptions acknowledges unmatched messages: a message that only "
+    "the neighbour's filter accepts is deleted the moment it lands on the "
+    "acknowledging consumer. The neighbour stays listening and reports no error, and "
+    "its DAG never runs."
+)
+
+
+def _queue_sharing(
+    subs: Iterable[RMQSubscription],
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """Split enabled subscriptions into the ``(queue_name, conn_id)`` pairs that are
+    shared and the ones an acknowledging subscription listens to.
+
+    Severity belongs to the pair, not to the row it is shown on: a subscription with
+    the default setting is just as affected by an acknowledging neighbour as the
+    neighbour is by it, so both rows of a shared queue carry the same text.
+    """
+    enabled = [s for s in subs if s.enabled]
+    counts = Counter((s.queue_name, s.conn_id) for s in enabled)
+    shared = {pair for pair, n in counts.items() if n > 1}
+    acking = {(s.queue_name, s.conn_id) for s in enabled if s.ack_unmatched}
+    return shared, acking
+
+
+def _flash_shared_queues(session: Session, pairs: Iterable[tuple[str, str]]) -> None:
+    """Warn about every pair among ``pairs`` that more than one enabled subscription
+    now listens to.
+
+    Called after the commit, because the answer depends on the rows as they stand
+    once the save has landed. The form cannot ask beforehand: subscription_form.html
+    renders dag_id, the queue list, conn_id, cooldown and filter_data out of the row,
+    so a confirmation round trip would redraw them from the database and lose the very
+    input it is confirming — and toggle/toggle_group have no form at all.
+    """
+    wanted = set(pairs)
+    if not wanted:
+        return
+    try:
+        rows = session.query(RMQSubscription).filter_by(enabled=True).all()
+    except Exception:
+        # The save has already been committed, so a read that fails here costs the
+        # user an advisory warning, not the change they asked for. Raising would turn
+        # a landed save into a 500 and invite a retry that toggles the row back.
+        log.exception("failed to read subscriptions for the shared-queue warning")
+        flash(
+            "Could not check whether these queues are shared — see the Scheduler log",
+            "warning",
+        )
+        return
+    shared, acking = _queue_sharing(rows)
+    for queue_name, conn_id in sorted(wanted & shared):
+        message = (
+            f"Queue '{queue_name}' on connection '{conn_id}' is listened to by more "
+            f"than one enabled subscription. {SHARED_QUEUE_WARNING}"
+        )
+        if (queue_name, conn_id) in acking:
+            message = f"{message} {SHARED_QUEUE_ACK_WARNING}"
+        flash(message, "warning")
 
 
 # ------------------------------------------------------------------
@@ -333,6 +442,8 @@ class RMQWatcherView(BaseView):
             conn_status_error=conn_status_error,
             stale_after_display=format_duration(stale_seconds),
             active_dag_ids=active_dag_ids,
+            shared_queue_warning=SHARED_QUEUE_WARNING,
+            shared_queue_ack_warning=SHARED_QUEUE_ACK_WARNING,
         )
 
     @expose("/subscriptions/create", methods=["GET", "POST"])
@@ -345,12 +456,16 @@ class RMQWatcherView(BaseView):
             conn_id = request.form.get("conn_id", "rmq_default").strip() or "rmq_default"
             filter_data_raw = request.form.get("filter_data", "").strip()
             enabled = request.form.get("enabled") == "on"
+            ack_unmatched = request.form.get("ack_unmatched") == "on"
             cooldown_raw = request.form.get("cooldown", "0").strip()
 
             if not dag_id or not queue_names:
                 flash("dag_id and at least one queue_name are required", "error")
                 return self.render_template(
-                    "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
+                    "rmq_watcher/subscription_form.html",
+                    sub=None,
+                    is_dag_file=False,
+                    ack_unmatched_checked=ack_unmatched,
                 )
 
             try:
@@ -358,7 +473,10 @@ class RMQWatcherView(BaseView):
             except ValueError:
                 flash("cooldown must be a non-negative integer", "error")
                 return self.render_template(
-                    "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
+                    "rmq_watcher/subscription_form.html",
+                    sub=None,
+                    is_dag_file=False,
+                    ack_unmatched_checked=ack_unmatched,
                 )
 
             try:
@@ -366,7 +484,10 @@ class RMQWatcherView(BaseView):
             except ValueError:
                 flash("filter_data must be valid JSON", "error")
                 return self.render_template(
-                    "rmq_watcher/subscription_form.html", sub=None, is_dag_file=False
+                    "rmq_watcher/subscription_form.html",
+                    sub=None,
+                    is_dag_file=False,
+                    ack_unmatched_checked=ack_unmatched,
                 )
 
             group_key = dag_id if cooldown > 0 else None
@@ -383,13 +504,21 @@ class RMQWatcherView(BaseView):
                         enabled=enabled,
                         cooldown=cooldown if cooldown > 0 else None,
                         group_key=group_key,
+                        ack_unmatched=ack_unmatched,
                     )
                 session.commit()
+                flash(f"Subscription for DAG '{dag_id}' created", "success")
+                if enabled:
+                    _flash_shared_queues(session, [(q, conn_id) for q in queue_names])
 
-            flash(f"Subscription for DAG '{dag_id}' created", "success")
             return redirect(url_for("RMQWatcherView.subscriptions"))
 
-        return self.render_template("rmq_watcher/subscription_form.html", sub=None, is_dag_file=False)
+        return self.render_template(
+            "rmq_watcher/subscription_form.html",
+            sub=None,
+            is_dag_file=False,
+            ack_unmatched_checked=False,
+        )
 
     @expose("/subscriptions/<int:sub_id>/edit", methods=["GET", "POST"])
     @has_access
@@ -407,6 +536,15 @@ class RMQWatcherView(BaseView):
                 sub.enabled = enabled
 
                 if not is_dag_file:
+                    # ack_unmatched is assigned the way cooldown is, inside this
+                    # branch: for a dag_file row the value belongs to @rmq_trigger,
+                    # and a write from the form would be overwritten by the next scan.
+                    # enabled stands outside it because it is the one field the UI
+                    # owns on a dag_file row as well
+                    ack_unmatched = request.form.get("ack_unmatched") == "on"
+                    # the error paths below redraw the box from this value rather than
+                    # from the row: a save that trips on cooldown or filter_data must
+                    # not put permanent deletion back on for a user who cleared it
                     dag_id = request.form.get("dag_id", sub.dag_id).strip()
                     queue_name = request.form.get("queue_name", sub.queue_name).strip()
                     conn_id = (
@@ -418,7 +556,9 @@ class RMQWatcherView(BaseView):
                     if not dag_id or not queue_name:
                         flash("dag_id and queue_name are required", "error")
                         return self.render_template(
-                            "rmq_watcher/subscription_form.html", sub=sub
+                            "rmq_watcher/subscription_form.html",
+                            sub=sub,
+                            ack_unmatched_checked=ack_unmatched,
                         )
 
                     try:
@@ -426,7 +566,9 @@ class RMQWatcherView(BaseView):
                     except ValueError:
                         flash("cooldown must be a non-negative integer", "error")
                         return self.render_template(
-                            "rmq_watcher/subscription_form.html", sub=sub
+                            "rmq_watcher/subscription_form.html",
+                            sub=sub,
+                            ack_unmatched_checked=ack_unmatched,
                         )
 
                     try:
@@ -434,7 +576,9 @@ class RMQWatcherView(BaseView):
                     except ValueError:
                         flash("filter_data must be valid JSON", "error")
                         return self.render_template(
-                            "rmq_watcher/subscription_form.html", sub=sub
+                            "rmq_watcher/subscription_form.html",
+                            sub=sub,
+                            ack_unmatched_checked=ack_unmatched,
                         )
 
                     sub.dag_id = dag_id
@@ -443,15 +587,24 @@ class RMQWatcherView(BaseView):
                     sub.filter_data = filter_data
                     sub.cooldown = cooldown if cooldown > 0 else None
                     sub.group_key = dag_id if cooldown > 0 else None
+                    sub.ack_unmatched = ack_unmatched
 
+                # Read off the row before the commit expires it: an attribute touched
+                # afterwards emits a refresh SELECT, which on a dropped connection
+                # would raise out of an endpoint whose save has already landed.
+                saved_enabled = sub.enabled
+                saved_pair = (sub.queue_name, sub.conn_id)
                 session.commit()
                 flash("Subscription updated", "success")
+                if saved_enabled:
+                    _flash_shared_queues(session, [saved_pair])
                 return redirect(url_for("RMQWatcherView.subscriptions"))
 
             return self.render_template(
                 "rmq_watcher/subscription_form.html",
                 sub=sub,
                 is_dag_file=is_dag_file,
+                ack_unmatched_checked=bool(sub.ack_unmatched),
             )
 
     @expose("/subscriptions/<int:sub_id>/delete", methods=["POST"])
@@ -487,7 +640,15 @@ class RMQWatcherView(BaseView):
                 return redirect(url_for("RMQWatcherView.subscriptions"))
 
             sub.enabled = not sub.enabled
+            # Read off the row before the commit expires it: an attribute touched
+            # afterwards emits a refresh SELECT, which on a dropped connection would
+            # raise out of an endpoint whose save has already landed, and the retry
+            # that invites would toggle the row straight back.
+            saved_enabled = sub.enabled
+            saved_pair = (sub.queue_name, sub.conn_id)
             session.commit()
+            if saved_enabled:
+                _flash_shared_queues(session, [saved_pair])
 
         return redirect(url_for("RMQWatcherView.subscriptions"))
 
@@ -540,7 +701,13 @@ class RMQWatcherView(BaseView):
             all_enabled = all(s.enabled for s in subs)
             for sub in subs:
                 sub.enabled = not all_enabled
+            # Read off the rows before the commit expires them: an attribute touched
+            # afterwards emits a refresh SELECT per row, which on a dropped connection
+            # would raise out of an endpoint whose save has already landed.
+            saved_pairs = [(s.queue_name, s.conn_id) for s in subs]
             session.commit()
+            if not all_enabled:
+                _flash_shared_queues(session, saved_pairs)
 
         return redirect(url_for("RMQWatcherView.subscriptions"))
 
@@ -561,11 +728,28 @@ class RMQWatcherView(BaseView):
             is_dag_file = any(s.source == "dag_file" for s in subs)
             # Representative sub for display defaults
             rep = subs[0]
+            # A save writes one value to every row, so the box drawn from storage
+            # carries the value the whole group already agrees on: a group whose
+            # rows disagree opens with the box off, and a save that only touched
+            # cooldown or filter_data cannot switch permanent deletion on for a row
+            # that runs without it. The disagreement itself is named under the
+            # checkbox, in wording that follows whichever value the box carries —
+            # an error re-render below redraws it from what was submitted.
+            ack_unmatched_all = all(s.ack_unmatched for s in subs)
+            ack_unmatched_mixed = (
+                any(s.ack_unmatched for s in subs) and not ack_unmatched_all
+            )
 
             if request.method == "POST":
                 enabled = request.form.get("enabled") == "on"
 
                 if not is_dag_file:
+                    # the group is rewritten row by row through upsert_subscription,
+                    # which assigns ack_unmatched unconditionally — without passing it
+                    # here the save would clear the setting for the whole group. The
+                    # error paths below redraw the box from this value, so a save that
+                    # trips elsewhere keeps the setting the user submitted
+                    ack_unmatched = request.form.get("ack_unmatched") == "on"
                     dag_id = request.form.get("dag_id", rep.dag_id).strip()
                     queue_names_raw = request.form.getlist("queue_name")
                     queue_names = [q.strip() for q in queue_names_raw if q.strip()]
@@ -582,6 +766,8 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
+                            ack_unmatched_checked=ack_unmatched,
+                            ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
                     try:
@@ -593,6 +779,8 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
+                            ack_unmatched_checked=ack_unmatched,
+                            ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
                     try:
@@ -604,6 +792,8 @@ class RMQWatcherView(BaseView):
                             sub=rep,
                             is_dag_file=is_dag_file,
                             group_subs=subs,
+                            ack_unmatched_checked=ack_unmatched,
+                            ack_unmatched_mixed=ack_unmatched_mixed,
                         )
 
                     new_group_key = dag_id if cooldown > 0 else None
@@ -628,17 +818,29 @@ class RMQWatcherView(BaseView):
                             enabled=enabled,
                             cooldown=cooldown if cooldown > 0 else None,
                             group_key=new_group_key,
+                            ack_unmatched=ack_unmatched,
                         )
 
                     session.commit()
                     flash("Group updated", "success")
+                    if enabled:
+                        _flash_shared_queues(
+                            session, [(q, conn_id) for q in queue_names]
+                        )
                     return redirect(url_for("RMQWatcherView.subscriptions"))
 
                 # dag_file: only toggle enabled
                 for sub in subs:
                     sub.enabled = enabled
+                # Read off the rows before the commit expires them: an attribute
+                # touched afterwards emits a refresh SELECT per row, which on a
+                # dropped connection would raise out of an endpoint whose save has
+                # already landed.
+                saved_pairs = [(s.queue_name, s.conn_id) for s in subs]
                 session.commit()
                 flash("Group updated", "success")
+                if enabled:
+                    _flash_shared_queues(session, saved_pairs)
                 return redirect(url_for("RMQWatcherView.subscriptions"))
 
             return self.render_template(
@@ -646,4 +848,6 @@ class RMQWatcherView(BaseView):
                 sub=rep,
                 is_dag_file=is_dag_file,
                 group_subs=subs,
+                ack_unmatched_checked=ack_unmatched_all,
+                ack_unmatched_mixed=ack_unmatched_mixed,
             )

@@ -1,6 +1,6 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/views.py:326
+where: airflow_provider_rmq/watcher/views.py:435
 added: 2026-08-09
 ---
 # Сбой lookup'а для бейджа «dag not found» не виден в UI

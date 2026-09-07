@@ -20,6 +20,7 @@ def rmq_trigger(
     routing_keys: list[str] | None = None,
     routing_key_ids: list[str] | None = None,
     routing_key_status: str | list[str] = "*",
+    ack_unmatched: bool = False,
 ):
     """Attach an RMQ subscription to a DAG.
 
@@ -34,7 +35,8 @@ def rmq_trigger(
         ``exchange=`` keyword; there is no positional shortcut for it.
     :param queues: List of RabbitMQ queue names to watch.  One subscription entry
         is created per queue; all share the same ``conn_id``, ``filter_data``,
-        and ``cooldown``.  Mutually exclusive with ``queue``/``exchange``.
+        ``cooldown``, and ``ack_unmatched``.  Mutually exclusive with
+        ``queue``/``exchange``.
     :param conn_id: Airflow connection ID for the RabbitMQ broker
         (default: ``"rmq_default"``).
     :param filter_data: Optional message filter in the format returned by
@@ -82,6 +84,13 @@ def rmq_trigger(
     :param routing_key_status: Status segment(s) to cross with
         ``routing_key_ids``. A single ``str`` or a ``list[str]``. Defaults to
         ``"*"`` — the AMQP topic wildcard segment, matching any status.
+    :param ack_unmatched: What to do with a message the subscription's filter
+        rejected.  ``False`` (default) returns it to the queue, so another
+        consumer can take it and this one keeps seeing it again.  ``True``
+        acknowledges it instead: the message leaves the broker for good — it is
+        not dead-lettered, DLX does not fire on an acknowledgement.  Use it on
+        a queue that belongs to this subscription alone; on a queue shared with
+        another consumer it deletes messages meant for that consumer.
 
     Example (exchange-mode, Jetstat id × status cross-product)::
 
@@ -180,6 +189,7 @@ def rmq_trigger(
             conn_id=conn_id,
             filter_data=filter_data,
             cooldown=cooldown,
+            ack_unmatched=ack_unmatched,
         )
 
         if not hasattr(dag_obj, "_rmq_subscriptions"):

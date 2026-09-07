@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import enum
 import json
 import logging
 from typing import Any, Callable, Protocol
 
 log = logging.getLogger("airflow.task")
+
+
+class FilterVerdict(enum.Enum):
+    """Outcome of evaluating one message against a filter.
+
+    ``MISS`` means the filter read the message and rejected it; ``ERROR`` means the
+    filter could not be evaluated at all — a raising ``filter_callable`` or a body
+    that does not read as JSON. Only ``MISS`` may be acknowledged: an ``ERROR``
+    message is returned to the queue whatever the subscription asked for.
+    """
+
+    MATCH = "match"
+    MISS = "miss"
+    ERROR = "error"
 
 
 class HasHeaders(Protocol):
@@ -39,49 +54,74 @@ class MessageFilter:
 
     def matches(self, properties: HasHeaders, body: str) -> bool:
         """Return True if the message passes all configured filters."""
+        return self.evaluate(properties, body)[0] is FilterVerdict.MATCH
+
+    def evaluate(self, properties: HasHeaders, body: str) -> tuple[FilterVerdict, str | None]:
+        """Evaluate the message and tell a rejection apart from a failure to evaluate.
+
+        :returns: ``(verdict, reason)``. ``reason`` carries the type and text of the
+            exception behind an ``ERROR`` and is ``None`` for ``MATCH`` and ``MISS``.
+
+        The reason goes to DEBUG here; the throttled WARNING naming the queue is the
+        caller's, so that one series is not logged twice.
+        """
         if not self.has_filters:
-            return True
+            return FilterVerdict.MATCH, None
 
         if self._filter_headers is not None:
-            if not self._match_dict(properties, body):
-                return False
+            verdict, reason = self._evaluate_dict(properties, body)
+            if verdict is not FilterVerdict.MATCH:
+                return verdict, reason
 
         if self._filter_callable is not None:
             try:
                 if not self._filter_callable(properties, body):
-                    return False
-            except Exception:
-                log.warning("Filter callable raised an exception; treating as non-match", exc_info=True)
-                return False
+                    return FilterVerdict.MISS, None
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+                log.debug("Filter callable raised an exception: %s", reason, exc_info=True)
+                return FilterVerdict.ERROR, reason
 
-        return True
+        return FilterVerdict.MATCH, None
 
-    def _match_dict(self, properties: HasHeaders, body: str) -> bool:
-        """Evaluate dict-based filter."""
+    def _evaluate_dict(self, properties: HasHeaders, body: str) -> tuple[FilterVerdict, str | None]:
+        """Evaluate dict-based filter in two phases: headers first, body once and only after.
+
+        Header conditions are checked in full before the body is touched, so the verdict
+        does not depend on the order of the keys and the body of a message already
+        rejected by a header is never parsed.
+        """
         headers = properties.headers or {}
-        parsed_body: dict | None = None
+        body_conditions: list[tuple[str, Any]] = []
 
         for key, expected_value in self._filter_headers.items():
             if key.startswith("body."):
-                if parsed_body is None:
-                    try:
-                        parsed_body = json.loads(body)
-                    except (json.JSONDecodeError, TypeError):
-                        return False
-                # Navigate nested keys: "body.data.status" -> parsed_body["data"]["status"]
-                path = key[5:].split(".")
-                current = parsed_body
-                for part in path:
-                    if isinstance(current, dict) and part in current:
-                        current = current[part]
-                    else:
-                        return False
-                if current != expected_value:
-                    return False
-            else:
-                if headers.get(key) != expected_value:
-                    return False
-        return True
+                body_conditions.append((key, expected_value))
+            elif headers.get(key) != expected_value:
+                return FilterVerdict.MISS, None
+
+        if not body_conditions:
+            return FilterVerdict.MATCH, None
+
+        try:
+            parsed_body = json.loads(body)
+        except (json.JSONDecodeError, TypeError) as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            log.debug("Message body could not be read as JSON: %s", reason)
+            return FilterVerdict.ERROR, reason
+
+        for key, expected_value in body_conditions:
+            # Navigate nested keys: "body.data.status" -> parsed_body["data"]["status"]
+            path = key[5:].split(".")
+            current = parsed_body
+            for part in path:
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                else:
+                    return FilterVerdict.MISS, None
+            if current != expected_value:
+                return FilterVerdict.MISS, None
+        return FilterVerdict.MATCH, None
 
     def serialize(self) -> dict[str, Any]:
         """Serialize for use in Trigger (must be JSON-serializable).

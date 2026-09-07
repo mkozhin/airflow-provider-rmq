@@ -34,6 +34,7 @@ from airflow_provider_rmq.watcher.listener import (
     _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
     _parse_rmq_trigger_decorator,
+    _read_active_subs,
     _read_settings,
 )
 from airflow_provider_rmq.watcher.models import (
@@ -2088,6 +2089,34 @@ class TestSyncToDb:
         assert call_kwargs.kwargs["dag_id"] == "d"
         assert call_kwargs.kwargs["source"] == "dag_file"
 
+    def test_sync_to_db_passes_ack_unmatched_to_upsert(self):
+        listener = RMQWatcherListener()
+        scanned = [{
+            "dag_id": "d",
+            "queue_name": "q",
+            "conn_id": "c",
+            "filter_data": {},
+            "ack_unmatched": True,
+        }]
+
+        ctx, _session = _make_session_ctx(existing_subs=[])
+
+        with _sync_env(ctx, {"d"}) as mock_up:
+            listener._sync_to_db(scanned)
+
+        assert mock_up.call_args.kwargs["ack_unmatched"] is True
+
+    def test_sync_to_db_writes_false_when_the_scan_carries_no_value(self):
+        listener = RMQWatcherListener()
+        scanned = [{"dag_id": "d", "queue_name": "q", "conn_id": "c", "filter_data": {}}]
+
+        ctx, _session = _make_session_ctx(existing_subs=[])
+
+        with _sync_env(ctx, {"d"}) as mock_up:
+            listener._sync_to_db(scanned)
+
+        assert mock_up.call_args.kwargs["ack_unmatched"] is False
+
     def test_one_miss_on_active_dag_keeps_the_row_and_counts_it(self):
         listener = RMQWatcherListener()
         existing = _existing_sub(dag_id="old_dag")
@@ -2752,6 +2781,155 @@ class TestParseRmqTriggerDecorator:
         assert len(result) == 1
         assert result[0]["queue_name"] == "q"
 
+    def test_ack_unmatched_literal_true_parsed(self):
+        result = _parse_decorator("rmq_trigger(queue='q', ack_unmatched=True)")
+        assert result[0]["ack_unmatched"] is True
+
+    def test_ack_unmatched_literal_false_parsed(self):
+        result = _parse_decorator("rmq_trigger(queue='q', ack_unmatched=False)")
+        assert result[0]["ack_unmatched"] is False
+
+    def test_ack_unmatched_absent_is_false(self):
+        result = _parse_decorator("rmq_trigger(queue='q')")
+        assert result[0]["ack_unmatched"] is False
+
+    def test_non_literal_ack_unmatched_falls_back_to_the_default(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator(
+                "rmq_trigger(queue='q', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
+            )
+        assert result[0]["ack_unmatched"] is False
+
+    def test_non_literal_kwarg_is_warned_about_by_dag_queue_and_parameter(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator(
+                "rmq_trigger(queue='orders', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
+            )
+        assert "ack_unmatched" in caplog.text
+        assert "my_dag" in caplog.text
+        assert "orders" in caplog.text
+
+    def test_a_registered_subscription_is_named_as_such_in_the_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator(
+                "rmq_trigger(queue='orders', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
+            )
+        assert "registered with that parameter's default" in caplog.text
+
+    def test_a_lost_queue_selector_says_no_subscription_is_registered(self, caplog):
+        """The two outcomes are not the same one: readme documents the difference, and
+        a line about a working subscription would point at one that does not exist."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(queue=QUEUE_CONST)", dag_id="my_dag")
+        assert result == []
+        assert "no subscription is registered" in caplog.text
+        assert "registered with that parameter's default" not in caplog.text
+
+    def test_a_build_the_builder_refuses_is_not_called_registered(self, caplog):
+        """The queue selector is readable, so the call names a queue — and the build
+        still produces no row, because an exchange with no routing keys does not
+        build. The operator diagnosing a DAG that never fires must not be told a
+        subscription is running on a default."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator(
+                "rmq_trigger(exchange='ex', routing_key_ids=REPORT_IDS)", dag_id="my_dag"
+            )
+        assert result == []
+        assert "registered with that parameter's default" not in caplog.text
+        assert "no subscription is registered" in caplog.text
+        assert "at least one of 'routing_keys' or 'routing_key_ids'" in caplog.text
+
+    def test_a_readable_exchange_call_that_builds_is_called_registered(self, caplog):
+        """The same call with the routing keys readable does build, so the unreadable
+        cooldown leaves a working subscription — the other half of the same split."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator(
+                "rmq_trigger(exchange='ex', routing_keys=['a.b'], cooldown=COOLDOWN)",
+                dag_id="my_dag",
+            )
+        assert len(result) == 1
+        assert "registered with that parameter's default" in caplog.text
+        assert "no subscription is registered" not in caplog.text
+
+    def test_dict_unpacking_alone_says_no_subscription_is_registered(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
+        assert result == []
+        assert "no subscription is registered" in caplog.text
+
+    def test_a_non_literal_positional_queue_is_warned_about(self, caplog):
+        """``@rmq_trigger(QUEUE_CONST)`` drops the subscription as silently as any
+        keyword did before the diagnostic covered it."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(QUEUE_CONST)", dag_id="my_dag")
+        assert result == []
+        assert "my_dag" in caplog.text
+        assert "'queue'" in caplog.text
+        assert "no subscription is registered" in caplog.text
+
+    def test_a_queues_argument_that_is_not_a_list_does_not_break_the_warning(self, caplog):
+        """``queues=5`` passes ``literal_eval`` and is not iterable — the label falls
+        back rather than raising a TypeError that would demote the whole file."""
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator(
+                "rmq_trigger(queues=5, cooldown=COOLDOWN)", dag_id="my_dag"
+            )
+        assert result == []
+        assert "<unresolved>" in caplog.text
+
+    def test_non_literal_cooldown_is_warned_about_too(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(queue='q', cooldown=COOLDOWN)")
+        assert result[0]["cooldown"] == 0
+        assert "cooldown" in caplog.text
+
+    def test_literal_kwargs_produce_no_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(queue='q', cooldown=60, ack_unmatched=True)")
+        assert caplog.records == []
+
+    def test_non_bool_ack_unmatched_skipped_returns_empty(self):
+        result = _parse_decorator("rmq_trigger(queue='q', ack_unmatched='yes')")
+        assert result == []
+
+    def test_non_bool_ack_unmatched_logs_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(queue='q', ack_unmatched='yes')")
+        assert "ack_unmatched" in caplog.text
+
+    def test_dict_unpacking_returns_empty_and_warns(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
+        assert result == []
+        assert "my_dag" in caplog.text
+        assert "**kwargs" in caplog.text
+
+    def test_dict_unpacking_beside_a_literal_queue_warns_too(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = _parse_decorator("rmq_trigger(queue='orders', **opts)", dag_id="my_dag")
+        assert result[0]["ack_unmatched"] is False
+        assert "orders" in caplog.text
+        assert "**kwargs" in caplog.text
+
+    def test_unpacking_beside_a_literal_does_not_claim_nothing_was_read(self, caplog):
+        """The line names the queue it read, so it cannot also say it read nothing —
+        an operator told the call was unreadable whole goes looking for the wrong
+        cause. It also cannot say "that parameter's default": the unpacking names no
+        parameter for that to point at."""
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(queue='orders', **opts)", dag_id="my_dag")
+        assert "reads no parameter from this call at all" not in caplog.text
+        assert "that parameter's default" not in caplog.text
+        assert "cannot read the arguments it carries" in caplog.text
+        assert "every argument the dict carries" in caplog.text
+
+    def test_unpacking_alone_does_say_nothing_was_read(self, caplog):
+        """The other half of the same split: with no literal beside it the call really
+        is unreadable whole, and the wording says so."""
+        with caplog.at_level(logging.WARNING):
+            _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
+        assert "reads no parameter from this call at all" in caplog.text
+
     def test_negative_cooldown_skipped_returns_empty(self):
         result = _parse_decorator("rmq_trigger(queue='q', cooldown=-1)")
         assert result == []
@@ -3152,6 +3330,36 @@ def _make_db_sub(dag_id, queue_name, conn_id="rmq_default", cooldown=0, filter_d
     sub.filter_data = filter_data or {}
     sub.cooldown = cooldown
     return sub
+
+
+class TestReadActiveSubs:
+    """The projection `_read_active_subs` builds is the only dict a consumer sees —
+    a column missing from it never reaches the consumer task, whatever the row says."""
+
+    def _read(self, rows):
+        ctx, _session = _make_session_ctx()
+        with patch(
+            "airflow_provider_rmq.watcher.listener.WatcherSession", return_value=ctx
+        ), patch(
+            "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
+            return_value=rows,
+        ):
+            return _read_active_subs({})
+
+    def test_ack_unmatched_from_the_row_reaches_the_entry(self):
+        row = _make_db_sub("d", "q")
+        row.ack_unmatched = True
+        assert self._read([row])[0]["ack_unmatched"] is True
+
+    def test_row_without_a_value_reads_as_false(self):
+        row = _make_db_sub("d", "q")
+        row.ack_unmatched = None
+        assert self._read([row])[0]["ack_unmatched"] is False
+
+    def test_ack_unmatched_false_on_the_row_reaches_the_entry(self):
+        row = _make_db_sub("d", "q")
+        row.ack_unmatched = False
+        assert self._read([row])[0]["ack_unmatched"] is False
 
 
 class TestMainExchangeMetaMerge:

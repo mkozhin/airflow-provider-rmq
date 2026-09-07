@@ -24,7 +24,7 @@ from airflow_provider_rmq.watcher.models import (
     upsert_conn_status,
     upsert_subscription,
 )
-from tests.watcher.conftest import SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES
+from tests.watcher.conftest import SUBSCRIPTIONS_DDL_PRE_MIGRATION
 
 
 def _naive(stamp: str) -> datetime:
@@ -212,6 +212,45 @@ class TestAbsentCycles:
 
         row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
         assert row.absent_cycles is None
+
+
+class TestAckUnmatched:
+    def test_upsert_writes_and_updates_the_flag(self, session):
+        """Апсерт пишет значение и меняет его на следующем проходе."""
+        upsert_subscription(session, dag_id="d", queue_name="q", ack_unmatched=True)
+        session.commit()
+        assert session.query(RMQSubscription).one().ack_unmatched is True
+
+        upsert_subscription(session, dag_id="d", queue_name="q", ack_unmatched=False)
+        session.commit()
+        assert session.query(RMQSubscription).one().ack_unmatched is False
+
+    def test_row_created_without_the_parameter_reads_false(self, session):
+        """Строка, заведённая без параметра, читается как «возвращать в очередь»."""
+        upsert_subscription(session, dag_id="d", queue_name="q")
+        session.commit()
+
+        row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+        assert bool(row.ack_unmatched) is False
+
+
+class TestSharedQueueDisplayFields:
+    """Поля, которые страница Subscriptions раздаёт строке перед рендером."""
+
+    def test_a_row_read_from_the_database_carries_them_empty(self, session):
+        """Строка, не прошедшая через группировку, читается шаблоном без AttributeError."""
+        upsert_subscription(session, dag_id="d", queue_name="q")
+        session.commit()
+
+        row = session.query(RMQSubscription).one()
+        assert list(row.shared_queue_names) == []
+        assert row.shared_acking is False
+
+    def test_they_are_not_columns(self):
+        """Оба имени объявлены мимо таблицы: миграция их не добавляет."""
+        columns = {c.name for c in RMQSubscription.__table__.columns}
+        assert "shared_queue_names" not in columns
+        assert "shared_acking" not in columns
 
 
 class TestGetEnabled:
@@ -421,7 +460,7 @@ class TestSchemaMigration:
 
     def test_adds_absent_cycles_to_legacy_subscriptions(self, schema_engine):
         with schema_engine.begin() as conn:
-            conn.execute(text(SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES))
+            conn.execute(text(SUBSCRIPTIONS_DDL_PRE_MIGRATION))
             conn.execute(text(
                 "INSERT INTO rmq_watcher_subscriptions "
                 "(dag_id, queue_name, conn_id, source, enabled, consumer_status, "
@@ -442,6 +481,46 @@ class TestSchemaMigration:
             row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
             assert row.enabled is False
             assert row.absent_cycles is None
+        finally:
+            session.close()
+
+    def test_adds_ack_unmatched_to_legacy_subscriptions(self, schema_engine):
+        with schema_engine.begin() as conn:
+            conn.execute(text(SUBSCRIPTIONS_DDL_PRE_MIGRATION))
+            conn.execute(text(
+                "INSERT INTO rmq_watcher_subscriptions "
+                "(dag_id, queue_name, conn_id, source, enabled, consumer_status, "
+                " trigger_mode, created_at, updated_at) "
+                "VALUES ('d', 'q', 'rmq_default', 'dag_file', 1, 'connecting', "
+                " 'any', '2026-09-05 10:00:00', '2026-09-05 10:00:00')"
+            ))
+
+        ensure_table_exists()
+
+        columns = {
+            c["name"] for c in inspect(schema_engine).get_columns("rmq_watcher_subscriptions")
+        }
+        assert "ack_unmatched" in columns
+
+        session = sessionmaker(bind=schema_engine)()
+        try:
+            row = session.query(RMQSubscription).filter_by(dag_id="d", queue_name="q").one()
+            assert row.ack_unmatched is None
+            assert bool(row.ack_unmatched) is False
+        finally:
+            session.close()
+
+    def test_migrated_table_accepts_ack_unmatched_writes(self, schema_engine):
+        """Строка со старой схемой после миграции принимает запись флага."""
+        with schema_engine.begin() as conn:
+            conn.execute(text(SUBSCRIPTIONS_DDL_PRE_MIGRATION))
+        ensure_table_exists()
+
+        session = sessionmaker(bind=schema_engine)()
+        try:
+            upsert_subscription(session, dag_id="d", queue_name="q", ack_unmatched=True)
+            session.commit()
+            assert session.query(RMQSubscription).one().ack_unmatched is True
         finally:
             session.close()
 

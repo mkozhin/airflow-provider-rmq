@@ -1,5 +1,26 @@
 {% extends base_template %}
 
+{# One wording per message. The badge and the flash of the same warning are the two
+   constants of views.py, handed in as `shared_queue_warning` and
+   `shared_queue_ack_warning`, so the page and the notice cannot drift apart. #}
+{% macro shared_badge(names, acking, name_them=false) %}
+  {%- if names -%}
+    <span class="label label-warning"
+          title="Another enabled subscription listens to this queue on the same conn_id. {{ shared_queue_warning }}{% if acking %} {{ shared_queue_ack_warning }}{% endif %}">
+      ⚠ shared queue{% if name_them %}: {{ names | join(', ') }}{% endif %}{% if acking %} — messages deleted{% endif %}
+    </span>
+  {%- endif -%}
+{% endmacro %}
+
+{% macro ack_unmatched_cell(on) %}
+  {%- if on -%}
+    <span class="label label-info"
+          title="A message this subscription's filter rejects is acknowledged and gone instead of being returned to the queue. Dead-lettering does not apply to an acknowledgement, so the message simply disappears.">on</span>
+  {%- else -%}
+    —
+  {%- endif -%}
+{% endmacro %}
+
 {% block content %}
 <div class="container-fluid">
   <div class="page-header">
@@ -107,6 +128,7 @@
             <th>Queue(s)</th>
             <th>conn_id</th>
             <th>Cooldown</th>
+            <th>Ack unmatched</th>
             <th>Source</th>
             <th>Status</th>
             <th>Last Error</th>
@@ -131,6 +153,7 @@
               {% for q in item.queue_names %}
                 <span class="label label-default">{{ q }}</span>
               {% endfor %}
+              {{ shared_badge(item.shared_queue_names, item.shared_acking, name_them=true) }}
             </td>
             <td>{{ item.conn_id }}</td>
             <td>
@@ -140,6 +163,7 @@
                 —
               {% endif %}
             </td>
+            <td>{{ ack_unmatched_cell(item.ack_unmatched) }}</td>
             <td>
               {% if item.source == 'dag_file' %}
                 <span class="label label-info">dag_file</span>
@@ -186,7 +210,10 @@
                 </span>
               {% endif %}
             </td>
-            <td>{{ item.queue_name }}</td>
+            <td>
+              {{ item.queue_name }}
+              {{ shared_badge(item.shared_queue_names, item.shared_acking) }}
+            </td>
             <td>{{ item.conn_id }}</td>
             <td>
               {% if item.cooldown %}
@@ -195,6 +222,7 @@
                 —
               {% endif %}
             </td>
+            <td>{{ ack_unmatched_cell(item.ack_unmatched) }}</td>
             <td>
               {% if item.source == 'dag_file' %}
                 <span class="label label-info">dag_file</span>

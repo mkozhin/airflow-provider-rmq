@@ -9,9 +9,10 @@ from airflow_provider_rmq.watcher import models
 from airflow_provider_rmq.watcher.models import WatcherBase
 
 #: rmq_watcher_subscriptions as an installation that has not run the migration yet has
-#: it: every column the ORM maps except the miss counter. The table the migration has
-#: to bring up to date, and the table the Subscriptions page has to survive reading.
-SUBSCRIPTIONS_DDL_WITHOUT_ABSENT_CYCLES = """
+#: it: the columns of the first release, without the miss counter and without the
+#: unmatched-ack flag. The table the migration has to bring up to date, and the table
+#: the Subscriptions page has to survive reading.
+SUBSCRIPTIONS_DDL_PRE_MIGRATION = """
 CREATE TABLE rmq_watcher_subscriptions (
     id INTEGER NOT NULL PRIMARY KEY,
     dag_id VARCHAR(250) NOT NULL,

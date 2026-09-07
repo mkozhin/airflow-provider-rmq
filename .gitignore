@@ -18,5 +18,4 @@ build/
 airflow_provider_rmq/_version.py
 /.claude/
 
-# revmux review artifacts
-.revmux/
+.revmux/tasks/

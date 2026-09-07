@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from airflow_provider_rmq.triggers.rmq import RMQTrigger
-from airflow_provider_rmq.utils.amqp import DEFAULT_HEARTBEAT
-from tests.conftest import FakeAirflowConnection
+from airflow_provider_rmq.utils.amqp import DEFAULT_HEARTBEAT, match_and_ack
+from tests.conftest import STREAK_TEXT, FakeAirflowConnection, log_lines
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +31,7 @@ class TestSerialize:
             "poll_interval": 10.0,
             "mode": "pull",
             "message_wait_timeout": None,
+            "ack_unmatched": False,
         }
 
     def test_serialize_defaults(self):
@@ -620,3 +622,295 @@ class TestPushModeError:
         assert len(events) == 1
         assert events[0]["status"] == "error"
         assert "refused" in events[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# ack_unmatched — serialization and validation
+# ---------------------------------------------------------------------------
+class TestAckUnmatchedParameter:
+    def test_serialize_carries_the_flag_and_restores_it(self):
+        original = RMQTrigger(rmq_conn_id="conn", queue_name="q", ack_unmatched=True)
+        _, kwargs = original.serialize()
+        assert kwargs["ack_unmatched"] is True
+
+        restored = RMQTrigger(**kwargs)
+        assert restored.ack_unmatched is True
+
+    def test_default_is_false(self):
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+        assert trigger.ack_unmatched is False
+        assert trigger.serialize()[1]["ack_unmatched"] is False
+
+    @pytest.mark.parametrize("value", ["false", "true", 1, 0, None, [], "yes"])
+    def test_non_bool_is_rejected(self, value):
+        with pytest.raises(ValueError, match="ack_unmatched"):
+            RMQTrigger(rmq_conn_id="conn", queue_name="q", ack_unmatched=value)
+
+
+# ---------------------------------------------------------------------------
+# ack_unmatched — pull and push behaviour
+# ---------------------------------------------------------------------------
+def _make_broker_queue(stray_bodies, tail):
+    """Fake pull queue that models the broker: a requeued NACK puts the message back.
+
+    :param stray_bodies: Headers of the messages already sitting in the queue.
+    :param tail: Values ``get`` returns once the queue has drained — ``None`` stands for
+        an empty poll, a message for a new arrival.
+    :returns: ``(queue, pending, messages)``.
+    """
+    pending: deque = deque()
+
+    def _make(headers):
+        msg = _make_fake_message(body=b"stray", headers=headers, routing_key="rk")
+
+        async def _nack(requeue=False):
+            if requeue:
+                pending.append(msg)
+
+        msg.nack = AsyncMock(side_effect=_nack)
+        return msg
+
+    messages = [_make(h) for h in stray_bodies]
+    pending.extend(messages)
+
+    tail_iter = iter(tail)
+
+    async def _get(fail=False):
+        if pending:
+            return pending.popleft()
+        return next(tail_iter)
+
+    q = MagicMock()
+    q.get = AsyncMock(side_effect=_get)
+    return q, pending, messages
+
+
+async def _run_against(trigger, fake_queue):
+    fake_connection = _make_fake_connection(fake_queue)
+    with patch("airflow_provider_rmq.triggers.rmq.aio_pika") as mock_aio_pika:
+        mock_aio_pika.connect_robust = AsyncMock(return_value=fake_connection)
+        with patch("airflow_provider_rmq.triggers.rmq.BaseHook") as mock_base:
+            mock_base.get_connection = MagicMock(return_value=FakeAirflowConnection())
+            return await _collect_events(trigger)
+
+
+class TestAckUnmatchedPullMode:
+    @pytest.mark.asyncio
+    async def test_non_matching_message_is_acked(self):
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            ack_unmatched=True,
+        )
+        match_msg = _make_fake_message(body=b"order", headers={"x-type": "order"})
+        fake_queue, _pending, strays = _make_broker_queue(
+            [{"x-type": "invoice"}], tail=[match_msg],
+        )
+
+        events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        strays[0].ack.assert_awaited_once()
+        strays[0].nack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ack_unmatched_off_returns_the_message_to_the_queue(self):
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            poll_interval=0.01,
+        )
+        match_msg = _make_fake_message(body=b"order", headers={"x-type": "order"})
+        stray = _make_fake_message(body=b"invoice", headers={"x-type": "invoice"})
+        fake_queue = MagicMock()
+        fake_queue.get = AsyncMock(side_effect=[stray, match_msg])
+
+        events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        stray.nack.assert_awaited_once_with(requeue=True)
+        stray.ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_queue_of_stray_messages_drains_in_one_turn_each(self):
+        """N stray messages take N turns and leave the queue empty, not a redelivery loop."""
+        n = 5
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            poll_interval=0.01,
+            ack_unmatched=True,
+        )
+        match_msg = _make_fake_message(body=b"order", headers={"x-type": "order"})
+        # None stands for the empty poll that follows the drain: from there the trigger
+        # waits for new deliveries instead of turning over the same messages again.
+        fake_queue, pending, strays = _make_broker_queue(
+            [{"x-type": "invoice"}] * n, tail=[None, match_msg],
+        )
+
+        events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        assert len(pending) == 0
+        assert fake_queue.get.await_count == n + 2
+        for stray in strays:
+            stray.ack.assert_awaited_once()
+            stray.nack.assert_not_awaited()
+
+
+class TestAckUnmatchedPushMode:
+    @pytest.mark.asyncio
+    async def test_non_matching_message_is_acked(self):
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            mode="push",
+            ack_unmatched=True,
+        )
+        stray = _make_fake_message(body=b"invoice", headers={"x-type": "invoice"})
+        match_msg = _make_fake_message(body=b"order", headers={"x-type": "order"})
+        fake_queue = _make_push_queue([stray, match_msg])
+
+        events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        stray.ack.assert_awaited_once()
+        stray.nack.assert_not_awaited()
+        match_msg.ack.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ack_unmatched_off_returns_the_message_to_the_queue(self):
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            mode="push",
+        )
+        stray = _make_fake_message(body=b"invoice", headers={"x-type": "invoice"})
+        match_msg = _make_fake_message(body=b"order", headers={"x-type": "order"})
+        fake_queue = _make_push_queue([stray, match_msg])
+
+        events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        stray.nack.assert_awaited_once_with(requeue=True)
+        stray.ack.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Filter miss state
+# ---------------------------------------------------------------------------
+class TestFilterMissState:
+    @pytest.mark.asyncio
+    async def test_state_names_the_queue_and_logs_to_the_task_logger(self):
+        """The threshold WARNING must reach the task log, which hangs off ``airflow.task``."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="my_queue", ack_unmatched=True)
+        captured = []
+
+        async def _fake_match_and_ack(message, msg_filter, miss_state):
+            captured.append(miss_state)
+            return True
+
+        fake_queue = MagicMock()
+        fake_queue.get = AsyncMock(return_value=_make_fake_message())
+
+        with patch("airflow_provider_rmq.triggers.rmq.match_and_ack", new=_fake_match_and_ack):
+            await _run_against(trigger, fake_queue)
+
+        assert captured[0].queue_name == "my_queue"
+        assert captured[0].log.name == "airflow.task"
+        assert captured[0].ack_unmatched is True
+
+    @pytest.mark.asyncio
+    async def test_one_state_per_run_counting_across_deliveries(self):
+        """Counters span the whole run(): a per-delivery state would never reach a threshold."""
+        real_match_and_ack = match_and_ack
+        seen = []
+        streaks = []
+
+        async def _recording(message, msg_filter, miss_state):
+            seen.append(miss_state)
+            result = await real_match_and_ack(message, msg_filter, miss_state)
+            streaks.append(miss_state.streak)
+            return result
+
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            poll_interval=0.01,
+            ack_unmatched=True,
+        )
+        match_msg = _make_fake_message(body=b"order", headers={"x-type": "order"})
+        fake_queue, _pending, _strays = _make_broker_queue(
+            [{"x-type": "invoice"}] * 3, tail=[match_msg],
+        )
+
+        with patch("airflow_provider_rmq.triggers.rmq.match_and_ack", new=_recording):
+            events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        assert all(state is seen[0] for state in seen)
+        # The run of misses grows across deliveries and the match ends it; dropped is
+        # cleared by nothing and keeps the three messages that are gone for good.
+        assert streaks == [1, 2, 3, 0]
+        assert seen[0].dropped == 3
+
+    @pytest.mark.asyncio
+    async def test_the_threshold_line_goes_to_the_task_logger(self, caplog):
+        """The run of misses spans the whole run(), so the powers of ten are reached.
+
+        The assertion is on the name of the emitted record and not only on its text:
+        ``caplog`` attaches to the root and catches records from any logger, so a test
+        reading the message alone stays green whatever logger the line came from.
+        """
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="stray_orders",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            mode="push",
+            ack_unmatched=True,
+        )
+        messages = [
+            _make_fake_message(body=b"invoice", headers={"x-type": "invoice"})
+            for _ in range(1000)
+        ]
+        messages.append(_make_fake_message(body=b"order", headers={"x-type": "order"}))
+        fake_queue = _make_push_queue(messages)
+
+        with caplog.at_level("WARNING"):
+            events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        streak_lines = log_lines(caplog, STREAK_TEXT)
+        assert [r.getMessage().split()[0] for r in streak_lines] == ["100", "1000"]
+        assert [r.name for r in streak_lines] == ["airflow.task", "airflow.task"]
+        # A name of its own: "q" is a substring of "queue" and would be found in any
+        # wording of the line.
+        assert all("stray_orders" in r.getMessage() for r in streak_lines)
+
+    @pytest.mark.asyncio
+    async def test_push_mode_shares_the_same_state(self):
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q",
+            filter_data={"filter_headers": {"x-type": "order"}},
+            mode="push",
+            ack_unmatched=True,
+        )
+        seen = []
+        real_match_and_ack = match_and_ack
+
+        async def _recording(message, msg_filter, miss_state):
+            seen.append(miss_state)
+            return await real_match_and_ack(message, msg_filter, miss_state)
+
+        messages = [
+            _make_fake_message(body=b"invoice", headers={"x-type": "invoice"}),
+            _make_fake_message(body=b"invoice", headers={"x-type": "invoice"}),
+            _make_fake_message(body=b"order", headers={"x-type": "order"}),
+        ]
+        fake_queue = _make_push_queue(messages)
+
+        with patch("airflow_provider_rmq.triggers.rmq.match_and_ack", new=_recording):
+            events = await _run_against(trigger, fake_queue)
+
+        assert events[0]["status"] == "success"
+        assert all(state is seen[0] for state in seen)
+        assert seen[0].dropped == 2

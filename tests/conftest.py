@@ -85,3 +85,27 @@ def make_message(
         make_properties(headers=headers),
         body.encode("utf-8"),
     )
+
+# ---------------------------------------------------------------------------
+# Filter-miss log lines
+# ---------------------------------------------------------------------------
+#
+# Substrings of the WARNINGs FilterMissState writes. Four test modules assert on the
+# same lines from four different owners of the state, so the wording is named once
+# here and a change to a log line is one edit.
+
+#: Run of consecutive misses reached a power of ten.
+STREAK_TEXT = "in a row missed the filter"
+#: Cumulative count of misses acknowledged and gone reached a power of ten.
+DROPPED_TEXT = "have been dropped on queue"
+#: The filter could not be evaluated on a message.
+ERROR_TEXT = "Filter could not be evaluated"
+#: A whole batch was evaluated and nothing in it matched.
+EMPTY_BATCH_TEXT = "passed the filter — check filter_data"
+#: Part of a batch was acknowledged and dropped, whether or not anything matched.
+BATCH_DROPPED_TEXT = "did not pass the filter and were dropped"
+
+
+def log_lines(caplog, text):
+    """Records whose message contains ``text``."""
+    return [r for r in caplog.records if text in r.getMessage()]
