@@ -6,16 +6,20 @@ import enum
 import glob
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 import traceback
 from collections.abc import Iterator
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Any
 
 from airflow.listeners import hookimpl
 from sqlalchemy.orm import Session
 
+import airflow_provider_rmq
 from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.backoff import next_backoff
 from airflow_provider_rmq.utils.executor import BoundedExecutor
@@ -30,6 +34,7 @@ from airflow_provider_rmq.watcher.models import (
     is_schema_ready,
     upsert_subscription,
 )
+from airflow_provider_rmq.watcher.runner import CHILD_ENV_MARKER, PARENT_PID_ENV
 from airflow_provider_rmq.watcher.subscription_builder import (
     build_subscriptions,
     has_exchange_conflict,
@@ -117,10 +122,20 @@ _UNREADABLE_FILE_LIMIT = 1
 #: Seconds allowed for the manager to stop before the loop is torn down anyway.
 _STOP_TIMEOUT = 30.0
 
-#: Seconds ``before_stopping`` waits for the watcher thread to leave. The woken loop
-#: only has to finish the current cycle step, and the scheduler's own shutdown must
-#: not stall behind a watcher that refuses to.
-_JOIN_TIMEOUT = 5.0
+#: Module the scheduler starts as the watcher process, with ``python -m``.
+_RUNNER_MODULE = "airflow_provider_rmq.watcher.runner"
+
+#: Seconds ``before_stopping`` waits for the watcher process to exit after SIGTERM.
+#: The scheduler's own shutdown must not stall behind a watcher that takes its time,
+#: so a process still running after this is killed; the deliveries it had not
+#: acknowledged go back to their queues on the broker.
+_CHILD_STOP_TIMEOUT = 5.0
+
+#: Seconds ``before_stopping`` waits for the watcher process to be reaped after
+#: SIGKILL. A process in uninterruptible kernel I/O — a hung NFS mount with the DAG
+#: files on it — dies only once that I/O returns, and the scheduler does not wait for
+#: it past this.
+_CHILD_REAP_TIMEOUT = 2.0
 
 #: Workers of the cycle pool: the reconcile loop's own blocking calls (schema
 #: migration, Variable reads, DAG-file scan, subscription queries).
@@ -877,19 +892,36 @@ class _UntrustedScan(Exception):
 
 
 class RMQWatcherListener:
-    """Airflow Listener that runs a background RabbitMQ consumer loop inside the Scheduler process.
+    """Airflow Listener that runs the RabbitMQ consumer loop in a child process of the scheduler.
 
-    Lifecycle:
-    - ``on_starting`` fires when the Scheduler process starts; we spawn a daemon thread
-      with its own asyncio event loop.
+    The class plays two parts, one in each process.
+
+    In the scheduler process it only starts and stops the watcher process, and holds
+    no thread, event loop or pool there. Airflow forks the scheduler process — the
+    Celery send pool, the DAG processor manager — and a fork is only safe from a
+    process with a single thread.
+
+    - ``on_starting`` fires in the scheduler's main thread, inside ``Job.__init__``,
+      and starts ``python -m airflow_provider_rmq.watcher.runner`` with
+      :class:`subprocess.Popen`, which forks and execs in C with no Python code in
+      between. The scheduler's PID travels in the environment, together with a marker
+      that keeps a listener loaded in the watcher process from starting another one.
+    - ``before_stopping`` sends the watcher process SIGTERM and waits a bounded time
+      for it to exit, then kills it, and returns even if the killed process cannot be
+      reaped yet.
+
+    In the watcher process the runner calls :meth:`run` from a thread of its own:
+
     - The loop reconciles subscriptions from DAG files (mtime-based scan) and the DB
       every ``reconcile_interval`` seconds, then delegates to ``RMQConsumerManager``.
-    - ``before_stopping`` sets the stop event, wakes the loop out of its wait and
-      joins the thread briefly, so shutdown does not wait out a reconcile interval.
+    - :meth:`request_stop` sets the stop event and wakes the loop out of its wait, so
+      shutdown does not wait out a reconcile interval.
     """
 
     def __init__(self) -> None:
-        self._thread: threading.Thread | None = None
+        # Watcher process started by ``on_starting`` in the scheduler; ``None`` in every
+        # other process and before the start.
+        self._child: subprocess.Popen | None = None
         # Authoritative stop signal of the cycle. It exists from construction on, so a
         # stop requested before the loop has started is already recorded when it does.
         self._stop_event = threading.Event()
@@ -972,7 +1004,7 @@ class RMQWatcherListener:
         #: Step the current cycle is on, reported when the cycle runs out of budget.
         self._phase = "idle"
         # Loop and wake-up event of the currently running cycle, published as one
-        # tuple by every ``_main`` so that ``before_stopping`` can never pair the live
+        # tuple by every ``_main`` so that ``request_stop`` can never pair the live
         # loop with the previous loop's event.
         self._waker: tuple[asyncio.AbstractEventLoop, asyncio.Event] | None = None
 
@@ -982,6 +1014,15 @@ class RMQWatcherListener:
 
     @hookimpl
     def on_starting(self, component: Any) -> None:
+        if CHILD_ENV_MARKER in os.environ:
+            # The watcher process itself, where a plugin load registered the listener
+            # again. The loop already runs here; another process would be a second
+            # watcher on the same subscriptions.
+            log.info(
+                "RMQWatcherListener.on_starting in the watcher process — "
+                "not starting another one"
+            )
+            return
         name = type(component).__name__
         job_type = getattr(component, 'job_type', '') or ''
         # In Airflow 2.9+, on_starting fires inside Job.__init__() before super().__init__()
@@ -998,19 +1039,104 @@ class RMQWatcherListener:
             else " — watcher not started: only the scheduler process runs it",
         )
         if is_scheduler:
-            self._start()
+            self._spawn_child()
 
     @hookimpl
     def before_stopping(self, component: Any) -> None:
-        self.request_stop()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=_JOIN_TIMEOUT)
-            if thread.is_alive():
-                log.warning(
-                    "RMQ Watcher thread still running %.0fs after the stop signal — "
-                    "leaving it to the process exit", _JOIN_TIMEOUT,
+        self._stop_child()
+
+    def _spawn_child(self) -> None:
+        """Start the watcher process, unless the one started earlier is still running.
+
+        The process gets the scheduler's environment plus the child marker, the
+        scheduler's PID and a ``PYTHONPATH`` that begins with the directory this
+        package was imported from — a package installed in the plugins folder is
+        importable in the child before Airflow is, and Airflow adds its own dags,
+        plugins and config folders when it initialises there. stdout and stderr are
+        inherited, so the watcher's lines land in the scheduler container's log, and
+        every other descriptor of the scheduler is closed in the child.
+
+        A failure to start is logged and the scheduler goes on without the watcher.
+        """
+        child = self._child
+        if child is not None and child.poll() is None:
+            log.warning(
+                "RMQ Watcher process %d is already running — ignoring duplicate on_starting",
+                child.pid,
+            )
+            return
+        if threading.current_thread() is not threading.main_thread():
+            # The kernel ties the parent-death signal to the thread that started the
+            # process, so the watcher is told when this thread exits rather than when
+            # the scheduler does; the parent check of every cycle still ends it once
+            # the scheduler is gone.
+            log.warning(
+                "RMQ Watcher process is started from thread %r rather than the main "
+                "thread — it is signalled when that thread exits",
+                threading.current_thread().name,
+            )
+        env = dict(os.environ)
+        env[CHILD_ENV_MARKER] = "1"
+        env[PARENT_PID_ENV] = str(os.getpid())
+        package_root = str(Path(airflow_provider_rmq.__file__).parents[1])
+        python_path = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            package_root + os.pathsep + python_path if python_path else package_root
+        )
+        try:
+            self._child = subprocess.Popen(
+                [sys.executable, "-m", _RUNNER_MODULE],
+                env=env,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            log.exception(
+                "RMQ Watcher process could not be started — the scheduler runs without "
+                "the watcher"
+            )
+            return
+        log.info(
+            "RMQ Watcher process started with PID %d (scheduler PID %d)",
+            self._child.pid, os.getpid(),
+        )
+
+    def _stop_child(self) -> None:
+        """Stop the watcher process within a bounded time and log how it ended.
+
+        SIGTERM first, and :data:`_CHILD_STOP_TIMEOUT` for the loop to stop the
+        consumer manager and leave; then SIGKILL, and :data:`_CHILD_REAP_TIMEOUT` for
+        the kernel to finish the process. A process that is still not reaped after
+        that is logged with its PID and left behind: the scheduler's shutdown does not
+        depend on it. A process that has exited already — the container's init sends
+        SIGTERM to the whole process group, the watcher included — is only reaped.
+        """
+        child = self._child
+        if child is None:
+            return
+        self._child = None
+        code = child.poll()
+        if code is not None:
+            log.info("RMQ Watcher process %d had already exited with code %d", child.pid, code)
+            return
+        child.terminate()
+        try:
+            code = child.wait(timeout=_CHILD_STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "RMQ Watcher process %d still running %.0fs after SIGTERM — killing it",
+                child.pid, _CHILD_STOP_TIMEOUT,
+            )
+            child.kill()
+            try:
+                code = child.wait(timeout=_CHILD_REAP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                log.error(
+                    "RMQ Watcher process %d not reaped %.0fs after SIGKILL — leaving it "
+                    "behind, the scheduler goes on stopping",
+                    child.pid, _CHILD_REAP_TIMEOUT,
                 )
+                return
+        log.info("RMQ Watcher process %d exited with code %d", child.pid, code)
 
     def request_stop(self) -> None:
         """Ask the loop to stop after the step it is on.
@@ -1099,29 +1225,6 @@ class RMQWatcherListener:
             "stopping the watcher", self._parent_pid, current,
         )
         return True
-
-    def _start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            if not self._stop_event.is_set():
-                log.warning("RMQ Watcher thread already running — ignoring duplicate on_starting")
-                return
-            # Previous lifecycle is shutting down — wait briefly then start fresh
-            log.info("RMQ Watcher: waiting for previous thread to stop...")
-            self._thread.join(timeout=10)
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="rmq-watcher",
-            daemon=True,
-        )
-        self._thread.start()
-        log.info(
-            "RMQ Watcher thread started with the default reconcile interval of %ss and "
-            "a cycle budget of %.0fs; the first cycle reads %s and %s and logs any "
-            "override it finds",
-            self._reconcile_interval, self._cycle_timeout(),
-            RECONCILE_INTERVAL_VAR, CYCLE_TIMEOUT_VAR,
-        )
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():

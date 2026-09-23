@@ -300,25 +300,25 @@
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] `on_starting`: маркер в окружении → ничего; для шедулера — `_spawn_child()` по
+- [x] `on_starting`: маркер в окружении → ничего; для шедулера — `_spawn_child()` по
       Technical Details (дубль при живом процессе — WARNING; вызов не из основного
       потока — WARNING; ошибка `Popen` — ERROR)
-- [ ] `before_stopping` → `_stop_child()`: SIGTERM, `wait(_CHILD_STOP_TIMEOUT)`, затем
+- [x] `before_stopping` → `_stop_child()`: SIGTERM, `wait(_CHILD_STOP_TIMEOUT)`, затем
       SIGKILL + `wait(_CHILD_REAP_TIMEOUT)`; при повторном таймауте ERROR с PID и
       возврат; код выхода в лог
-- [ ] удалить потоковую схему в шедулере: `_start`, поле `_thread`, `_JOIN_TIMEOUT` и
+- [x] удалить потоковую схему в шедулере: `_start`, поле `_thread`, `_JOIN_TIMEOUT` и
       ветки `before_stopping`, работавшие с потоком; докстринг класса описывает
       процессную схему
-- [ ] тесты `on_starting`: аргументы `Popen`, окружение (маркер, `PARENT_PID_ENV`,
+- [x] тесты `on_starting`: аргументы `Popen`, окружение (маркер, `PARENT_PID_ENV`,
       `PYTHONPATH` с каталогом пакета перед существующим значением,
       `stdin=DEVNULL`); не-шедулер не запускает процесс; маркер блокирует запуск;
       дубль при живом процессе; вызов не из основного потока; ошибка `Popen`
-- [ ] тесты `before_stopping`: выход по SIGTERM; таймаут → SIGKILL; SIGKILL не
+- [x] тесты `before_stopping`: выход по SIGTERM; таймаут → SIGKILL; SIGKILL не
       добил процесс за `_CHILD_REAP_TIMEOUT` → ERROR и возврат без зависания; процесс уже
       завершён (путь, по которому dumb-init остановил runner раньше шедулера);
       `before_stopping` без процесса
-- [ ] удалить или переписать тесты потоковой схемы
-- [ ] run tests - must pass before next task
+- [x] удалить или переписать тесты потоковой схемы
+- [x] run tests - must pass before next task
 
 ### Task 4: Регрессионный тест — в процессе шедулера нет потоков плагина
 
