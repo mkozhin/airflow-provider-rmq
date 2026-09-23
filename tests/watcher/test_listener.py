@@ -4866,6 +4866,79 @@ class TestWatcherProcessStop:
             child.stdout.close()
 
 
+@contextlib.contextmanager
+def _watch_for_threads_and_loops():
+    """Record every thread started and every event loop created inside the block.
+
+    Yields a dict whose ``threads`` lists the names of the threads started and whose
+    ``loops`` counts the event loops created. The set of live threads is compared too:
+    a thread started and finished inside the block shows up in ``threads``, one still
+    running afterwards shows up in ``new_live_threads``. Only threads that appeared are
+    counted there — a thread a previous test left behind may end while the block runs,
+    which is not the scheduler gaining one.
+    """
+    seen: dict = {"threads": [], "loops": 0, "new_live_threads": set()}
+    real_start = threading.Thread.start
+    real_new_event_loop = asyncio.new_event_loop
+
+    def recording_start(thread, *args, **kwargs):
+        seen["threads"].append(thread.name)
+        return real_start(thread, *args, **kwargs)
+
+    def recording_new_event_loop():
+        seen["loops"] += 1
+        return real_new_event_loop()
+
+    before = set(threading.enumerate())
+    with patch.object(threading.Thread, "start", recording_start), patch.object(
+        asyncio, "new_event_loop", recording_new_event_loop
+    ):
+        yield seen
+    seen["new_live_threads"] = {
+        thread.name for thread in set(threading.enumerate()) - before
+    }
+
+
+class TestNothingOfThePluginRunsInTheScheduler:
+    """Airflow forks the scheduler process — the Celery send pool, the DAG processor
+    manager — and a fork is only safe from a process with a single thread. The
+    listener in the scheduler starts and stops the watcher process and leaves no
+    thread, event loop or pool of its own behind."""
+
+    @staticmethod
+    def _assert_nothing_of_the_plugin(listener, seen):
+        assert seen["threads"] == [], seen["threads"]
+        assert seen["new_live_threads"] == set(), seen["new_live_threads"]
+        assert seen["loops"] == 0
+        assert listener._waker is None
+        assert listener._cycle_pool is None
+        assert listener._consumer_pool is None
+        assert listener._manager is None
+
+    def test_on_starting_in_the_scheduler_leaves_the_process_as_it_was(self):
+        listener = RMQWatcherListener()
+        with _watch_for_threads_and_loops() as seen, _popen() as popen:
+            listener.on_starting(SchedulerJobRunner())
+
+        popen.assert_called_once()
+        assert listener._child is not None
+        self._assert_nothing_of_the_plugin(listener, seen)
+
+    def test_a_start_a_stop_and_a_start_again_leave_the_process_as_it_was(self):
+        listener = RMQWatcherListener()
+        first, second = _fake_child(111), _fake_child(222)
+        first.wait.return_value = 0
+        with _watch_for_threads_and_loops() as seen, _popen(first, second) as popen:
+            listener.on_starting(SchedulerJobRunner())
+            listener.before_stopping(SchedulerJobRunner())
+            listener.on_starting(SchedulerJobRunner())
+
+        assert popen.call_count == 2
+        first.terminate.assert_called_once()
+        assert listener._child is second
+        self._assert_nothing_of_the_plugin(listener, seen)
+
+
 class TestLifecycleDiagnostics:
     def test_unrecognised_component_logs_why_the_watcher_is_not_started(self, caplog):
         listener = RMQWatcherListener()

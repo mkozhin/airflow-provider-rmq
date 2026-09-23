@@ -325,12 +325,12 @@
 **Files:**
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] тест: множество потоков до и после `on_starting` для шедулера (замоканный
+- [x] тест: множество потоков до и после `on_starting` для шедулера (замоканный
       `Popen`) совпадает; event loop не создан; у экземпляра listener'а нет пулов
       (`_cycle_pool` и `_consumer_pool` — `None`)
-- [ ] тест: то же для последовательности `on_starting` → `before_stopping` →
+- [x] тест: то же для последовательности `on_starting` → `before_stopping` →
       `on_starting`
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 5: Интеграционный тест реального процесса runner'а
 
