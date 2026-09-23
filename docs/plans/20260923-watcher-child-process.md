@@ -397,18 +397,18 @@
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] в процессе шедулера после `on_starting` нет потоков, event loop и пулов плагина
-- [ ] `before_stopping` возвращает управление за ограниченное время, даже если
+- [x] в процессе шедулера после `on_starting` нет потоков, event loop и пулов плагина
+- [x] `before_stopping` возвращает управление за ограниченное время, даже если
       процесс не собирается после SIGKILL
-- [ ] цикл watcher'а работает в дочернем процессе и завершается по SIGTERM, по смерти
+- [x] цикл watcher'а работает в дочернем процессе и завершается по SIGTERM, по смерти
       шедулера и при SIGTERM до старта цикла
-- [ ] повторный `on_starting`, ошибка `Popen`, вызов не из основного потока, пакет из
+- [x] повторный `on_starting`, ошибка `Popen`, вызов не из основного потока, пакет из
       папки plugins обработаны
-- [ ] `rmq_watcher.cycle_completed` растёт на каждом проходе, дошедшем до конца, и не
+- [x] `rmq_watcher.cycle_completed` растёт на каждом проходе, дошедшем до конца, и не
       растёт на таймауте
-- [ ] код не использует API Airflow новее 2.9.1
-- [ ] run full test suite: `pytest tests/`
-- [ ] `ruff check` и `mypy` по изменённым файлам
+- [x] код не использует API Airflow новее 2.9.1
+- [x] run full test suite: `pytest tests/`
+- [x] `ruff check` и `mypy` по изменённым файлам
 
 ### Task 9: [Final] Update documentation
 
