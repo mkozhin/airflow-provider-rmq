@@ -185,7 +185,8 @@
   `RMQConsumerManager` в `_main` и `_cycle_step`. Подставленные тестом пулы он не
   трогает. Экземпляр listener'а в процессах scheduler, webserver, triggerer и worker
   пулов не создаёт; тесты, вызывающие `_run_cycle`/`_main` напрямую, получают пулы по
-  первому обращению.
+  первому обращению. Тесты, которые читают `_cycle_pool`/`_consumer_pool` сами, минуя
+  оба пути, до первого обращения видят `None` — их список в задаче 1.
 - **Listener в дочернем процессе:**
   - `_stop_event = threading.Event()` создаётся в `__init__`;
   - `run(parent_pid: int | None = None)` — запоминает `_parent_pid`, пишет
@@ -237,6 +238,20 @@
 - [ ] `_cycle_pool`/`_consumer_pool` в `__init__` — `None`; `_ensure_pools()` создаёт
       недостающие при первом обращении и не трогает подставленные; создание
       `RMQConsumerManager` в `_main` и `_cycle_step` получают пулы через него
+- [ ] перевести на `_ensure_pools()` тесты `tests/watcher/test_listener.py`, которые
+      читают атрибуты пулов напрямую, чтобы они падали при поломке и проверяли то же,
+      что сейчас:
+      - `test_busy_consumer_pool_leaves_the_cycle_pool_free` (стр. 3980) — берёт
+        `_cycle_pool` без подстановки; получать его через `_ensure_pools()`;
+      - `test_a_call_stuck_in_the_pool_does_not_block_the_next_loop` (стр. 3927) и
+        `test_loop_restart_reuses_the_pools_and_spares_the_default_executor`
+        (стр. 3908) — подменённый `_main` вызывает `_ensure_pools()`, как настоящий,
+        иначе первый молча проглатывает `AttributeError` в `_run_loop`, а второй
+        сравнивает `(None, None)` сам с собой;
+      - фикстура `e2e_listener` (стр. 4501, teardown на стр. 4522-4523) — гасит только
+        созданные пулы;
+      - найти остальные прямые обращения:
+        `grep -n "_cycle_pool\|_consumer_pool" tests/`
 - [ ] тесты `_ensure_pools()`: после конструктора пулов нет; первое обращение создаёт
       оба, повторное возвращает те же; подставленный пул сохраняется; `_run_cycle`,
       вызванный напрямую, работает без предварительной подготовки пулов
