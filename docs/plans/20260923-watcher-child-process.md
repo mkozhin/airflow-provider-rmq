@@ -277,22 +277,22 @@
 - Create: `airflow_provider_rmq/watcher/runner.py`
 - Create: `tests/watcher/test_runner.py`
 
-- [ ] константы `CHILD_ENV_MARKER`, `PARENT_PID_ENV`, `_EXIT_JOIN_TIMEOUT`; на верхнем
+- [x] константы `CHILD_ENV_MARKER`, `PARENT_PID_ENV`, `_EXIT_JOIN_TIMEOUT`; на верхнем
       уровне модуля только stdlib
-- [ ] `_set_parent_death_signal()` через `ctypes` (Linux; иначе no-op)
-- [ ] `main()` по шагам из Technical Details: маска сигналов, PID родителя,
+- [x] `_set_parent_death_signal()` через `ctypes` (Linux; иначе no-op)
+- [x] `main()` по шагам из Technical Details: маска сигналов, PID родителя,
       PDEATHSIG, проверка `getppid`, инициализация Airflow, поток цикла, ожидание в
       `sigtimedwait`, ограниченный join, `logging.shutdown()` + `os._exit()`;
       `if __name__ == "__main__": main()`
-- [ ] тесты `_set_parent_death_signal`: вызов `prctl` с `PR_SET_PDEATHSIG`/`SIGTERM`
+- [x] тесты `_set_parent_death_signal`: вызов `prctl` с `PR_SET_PDEATHSIG`/`SIGTERM`
       (замоканный `ctypes`), ошибка `prctl` — сообщение без падения, не-Linux — no-op
-- [ ] тесты `main()` (замоканы `os._exit`, `sigtimedwait`, listener): маска
+- [x] тесты `main()` (замоканы `os._exit`, `sigtimedwait`, listener): маска
       выставлена до всего остального; нет или битый `PARENT_PID_ENV` → код 2; родитель
       сменился до установки → выход без запуска цикла; сигнал → `request_stop()` и
       join; поток цикла завершился сам → выход без сигнала; поток не завершился за
       `_EXIT_JOIN_TIMEOUT` → WARNING и `os._exit`; исключение при инициализации →
       код 1
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 3: Listener запускает и останавливает дочерний процесс вместо потока
 
