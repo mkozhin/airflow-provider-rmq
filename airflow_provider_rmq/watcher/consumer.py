@@ -1336,13 +1336,13 @@ class RMQConsumerManager:
             # The consumers were cancelled above, so these rows are already final and
             # the pass runs before the closes rather than after them. A stop is often
             # the last thing this process does: on a broker that has gone silent every
-            # close runs to its full timeout, and a pass placed behind them reaches a
-            # thread the scheduler has stopped waiting for, or no thread at all once the
-            # budget over the whole stop cancels what is left of it. Running here costs
-            # at most a moment in which the row says ``disconnected`` while the broker
-            # still holds a registration that is on its way out, and buys the rows their
-            # own share of the budget. What the pass does not reach stays noted, for the
-            # next manager's cycle.
+            # close runs to its full timeout, and a pass placed behind them runs in a
+            # watcher process the scheduler kills five seconds after asking it to stop,
+            # or not at all once the budget over the whole stop cancels what is left of
+            # it. Running here costs at most a moment in which the row says
+            # ``disconnected`` while the broker still holds a registration that is on
+            # its way out, and buys the rows their own share of the budget. What the
+            # pass does not reach stays noted, for the next manager's cycle.
             await self._store_unwritten_statuses(
                 budget=_STOP_STATUS_TIMEOUT, first=set(self._active)
             )

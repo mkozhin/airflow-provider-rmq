@@ -3910,7 +3910,7 @@ class TestCycleWatchdog:
 
     def test_a_call_stuck_in_the_pool_does_not_block_the_next_loop(self):
         """A worker still occupied by a call the loop gave up on must not hold the
-        watcher thread — the pool outlives the loop by design."""
+        loop thread — the pool outlives the loop by design."""
         listener = RMQWatcherListener()
         listener._stop_event = _instant_stop_event()
         release = threading.Event()

@@ -1170,7 +1170,7 @@ class RMQWatcherListener:
             pass
 
     # ------------------------------------------------------------------
-    # Thread / event-loop bootstrap
+    # Loop bootstrap in the watcher process
     # ------------------------------------------------------------------
 
     def run(self, parent_pid: int | None = None) -> None:
@@ -1240,9 +1240,10 @@ class RMQWatcherListener:
                 # deliberately not called: on Python 3.10/3.11 it ends in a
                 # thread.join() with no timeout that wait_for cannot interrupt, so a
                 # single call stuck on the database would freeze this thread for good.
-                # The pools' own workers are joined by the interpreter's exit hook
-                # instead, where a stuck call delays process exit rather than the
-                # watcher thread — see BoundedExecutor.
+                # The pools' own workers are never joined either: the watcher process
+                # leaves through os._exit after a bounded wait for this thread, so a
+                # stuck call holds neither the loop nor the process's exit — see
+                # BoundedExecutor and the runner.
                 loop.close()
             if not self._stop_event.is_set():
                 self._stop_event.wait(timeout=30)
@@ -1756,11 +1757,14 @@ class RMQWatcherListener:
     def _extract_subscriptions_from_file(self, path: str) -> list[dict] | None:
         """Extract @rmq_trigger subscriptions from a DAG file via AST parsing.
 
-        AST parsing never executes the file and never acquires the Python import
-        lock, so it is safe to call from a background thread inside the Scheduler
-        process.  DagBag would acquire the import lock and could deadlock with the
-        Scheduler's own import activity, causing heartbeat failures and tasks being
-        marked as killed externally.
+        AST parsing never executes the file and imports nothing, so no DAG code runs
+        in the watcher process. The scan runs in a worker of the cycle pool under a
+        step timeout, and that timeout buys back the coroutine, not the worker. DagBag
+        would execute every file there — its imports and module-level calls — and a
+        file that hangs on import would keep the worker for as long as it hangs while
+        holding the import lock of every module it is in the middle of importing,
+        blocking any other thread of the process that imports one of them. Parsing
+        the source leaves nothing to wait on but the file read itself.
 
         dag_id is resolved from the explicit dag_id= argument of @dag(...) via
         ``_extract_dag_id_from_decorators``'s three-way contract: a string

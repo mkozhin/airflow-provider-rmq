@@ -9805,7 +9805,8 @@ class TestTheRowsAStopLeavesBehind:
         Closing comes second because the incident these rows exist for is a broker that
         has stopped answering, and on that broker every close runs to its full timeout.
         Writing behind them is writing on whatever the budget over the whole stop has
-        left, in a daemon thread the scheduler has already stopped waiting for.
+        left, in a watcher process the scheduler kills five seconds after asking it to
+        stop.
         """
         order = []
         _register_active(manager, _sub(id=7), real_task=True)

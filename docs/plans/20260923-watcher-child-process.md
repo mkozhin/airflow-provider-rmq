@@ -365,14 +365,14 @@
 - Modify: `airflow_provider_rmq/utils/executor.py`
 - Modify: `airflow_provider_rmq/watcher/consumer.py`
 
-- [ ] найти упоминания модели «поток внутри шедулера»
+- [x] найти упоминания модели «поток внутри шедулера»
       (`grep -rn -i "watcher thread\|scheduler process\|loop thread\|background thread"
       airflow_provider_rmq`), в том числе `listener.py:951, 1064-1071, 1233, 1576` и
       `utils/executor.py:29, 49`
-- [ ] переписать найденное в терминах текущей модели (цикл в потоке дочернего
+- [x] переписать найденное в терминах текущей модели (цикл в потоке дочернего
       процесса шедулера); обоснования, которые держались на процессе шедулера
       (например, import lock у `listener.py:1576`), проверить и сформулировать заново
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 7: ADR — watcher в дочернем процессе
 
