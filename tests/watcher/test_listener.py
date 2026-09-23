@@ -426,7 +426,7 @@ class TestListenerLifecycle:
 
     def test_before_stopping_noop_when_not_started(self):
         listener = RMQWatcherListener()
-        # _stop_event is None — must not raise
+        # No thread and no loop behind the listener — must not raise
         listener.before_stopping(MagicMock())
 
     def test_scheduler_component_name_matches(self):
@@ -3911,7 +3911,8 @@ class TestCycleWatchdog:
         seen = []
 
         async def fake_main():
-            seen.append((listener._cycle_pool, listener._consumer_pool))
+            # Reaches the pools the way the real ``_main`` does.
+            seen.append(listener._ensure_pools())
             if len(seen) == 1:
                 raise asyncio.TimeoutError()
             listener._stop_event.set()
@@ -3921,7 +3922,11 @@ class TestCycleWatchdog:
         ) as shutdown:
             listener._run_loop()
 
-        assert seen[0] == seen[1]
+        (cycle_first, consumer_first), (cycle_second, consumer_second) = seen
+        assert isinstance(cycle_first, BoundedExecutor)
+        assert isinstance(consumer_first, BoundedExecutor)
+        assert cycle_second is cycle_first
+        assert consumer_second is consumer_first
         shutdown.assert_not_called()
 
     def test_a_call_stuck_in_the_pool_does_not_block_the_next_loop(self):
@@ -3931,14 +3936,22 @@ class TestCycleWatchdog:
         listener._stop_event = _instant_stop_event()
         release = threading.Event()
         rounds = []
+        escaped = []
 
         async def fake_main():
             rounds.append(1)
+            cycle_pool, _ = listener._ensure_pools()
             if len(rounds) == 1:
-                await call_with_timeout(
-                    asyncio.wrap_future(listener._cycle_pool.submit(release.wait, 5)),
-                    0.05,
-                )
+                # The timeout is what ends this loop; ``_run_loop`` swallows whatever
+                # escapes, so the test keeps its own record of what that was.
+                try:
+                    await call_with_timeout(
+                        asyncio.wrap_future(cycle_pool.submit(release.wait, 5)),
+                        0.05,
+                    )
+                except BaseException as exc:
+                    escaped.append(exc)
+                    raise
             listener._stop_event.set()
 
         try:
@@ -3948,6 +3961,7 @@ class TestCycleWatchdog:
             release.set()
 
         assert len(rounds) == 2
+        assert len(escaped) == 1 and isinstance(escaped[0], asyncio.TimeoutError)
 
     @pytest.mark.asyncio
     async def test_hung_manager_stop_does_not_block_teardown(self):
@@ -3973,8 +3987,10 @@ class TestCycleWatchdog:
         with _cycle_patches(manager) as manager_cls:
             await listener._main()
 
-        assert manager_cls.call_args.kwargs["executor"] is listener._consumer_pool
-        assert listener._consumer_pool is not listener._cycle_pool
+        cycle_pool, consumer_pool = listener._ensure_pools()
+        assert manager_cls.call_args.kwargs["executor"] is consumer_pool
+        assert manager_cls.call_args.kwargs["cycle_executor"] is cycle_pool
+        assert consumer_pool is not cycle_pool
 
     @pytest.mark.asyncio
     async def test_busy_consumer_pool_leaves_the_cycle_pool_free(self):
@@ -3983,10 +3999,290 @@ class TestCycleWatchdog:
         release = threading.Event()
         for _ in range(2):
             listener._consumer_pool.submit(release.wait, 5)
+        cycle_pool, _ = listener._ensure_pools()
         try:
-            assert await listener._cycle_pool.run(lambda: "cycle work") == "cycle work"
+            assert await cycle_pool.run(lambda: "cycle work") == "cycle work"
         finally:
             release.set()
+
+
+class TestPoolsOnFirstUse:
+    """The listener is built in every Airflow component that loads the plugin, and only
+    the process that runs the loop may end up with the pools' threads."""
+
+    def test_a_new_listener_holds_no_pool(self):
+        listener = RMQWatcherListener()
+
+        assert listener._cycle_pool is None
+        assert listener._consumer_pool is None
+
+    def test_first_use_builds_both_pools_and_later_uses_get_the_same_ones(self):
+        listener = RMQWatcherListener()
+
+        cycle_pool, consumer_pool = listener._ensure_pools()
+        again = listener._ensure_pools()
+
+        assert isinstance(cycle_pool, BoundedExecutor)
+        assert isinstance(consumer_pool, BoundedExecutor)
+        assert cycle_pool is not consumer_pool
+        assert cycle_pool.name == "rmq-watcher-cycle"
+        assert consumer_pool.name == "rmq-watcher-consumer"
+        assert again[0] is cycle_pool and again[1] is consumer_pool
+        assert listener._cycle_pool is cycle_pool
+        assert listener._consumer_pool is consumer_pool
+
+    def test_a_pool_already_in_place_is_kept(self):
+        listener = RMQWatcherListener()
+        own = BoundedExecutor("test-cycle", 1)
+        listener._cycle_pool = own
+
+        cycle_pool, consumer_pool = listener._ensure_pools()
+
+        assert cycle_pool is own
+        assert isinstance(consumer_pool, BoundedExecutor)
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_run_directly_needs_no_pool_prepared(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+
+        with _cycle_patches(manager):
+            await listener._run_cycle()
+
+        listener._scan_subscriptions.assert_called_once()
+        manager.reconcile.assert_awaited_once()
+        assert listener._cycle_pool is not None
+
+
+class TestRunAndRequestStop:
+    """The entry points the runner drives the loop through."""
+
+    def test_the_stop_event_exists_from_construction(self):
+        listener = RMQWatcherListener()
+
+        assert isinstance(listener._stop_event, threading.Event)
+        assert not listener._stop_event.is_set()
+
+    def test_run_records_the_parent_and_runs_the_loop_in_the_calling_thread(self, caplog):
+        listener = RMQWatcherListener()
+        ran_in = []
+
+        with caplog.at_level(
+            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+        ), patch.object(
+            listener, "_run_loop", side_effect=lambda: ran_in.append(threading.current_thread())
+        ):
+            listener.run(parent_pid=4242)
+
+        assert ran_in == [threading.current_thread()]
+        assert listener._parent_pid == 4242
+        messages = [record.getMessage() for record in caplog.records]
+        started = [m for m in messages if "RMQ Watcher loop started" in m]
+        assert started, messages
+        assert re.search(r"default reconcile interval of 60s", started[0]), started[0]
+        assert re.search(r"cycle budget of 300s", started[0]), started[0]
+        assert RECONCILE_INTERVAL_VAR in started[0]
+        assert CYCLE_TIMEOUT_VAR in started[0]
+
+    def test_run_without_a_parent_leaves_the_parent_unchecked(self):
+        listener = RMQWatcherListener()
+
+        with patch.object(listener, "_run_loop"):
+            listener.run()
+
+        assert listener._parent_pid is None
+
+    def test_a_stop_requested_before_run_returns_without_a_cycle(self):
+        listener = RMQWatcherListener()
+        main = MagicMock()
+
+        listener.request_stop()
+        started = time.monotonic()
+        with patch.object(listener, "_main", main):
+            listener.run()
+
+        main.assert_not_called()
+        assert time.monotonic() - started < 1.0
+
+    def test_request_stop_twice_is_harmless(self):
+        listener = RMQWatcherListener()
+        loop = MagicMock()
+        loop.is_closed.return_value = False
+        listener._waker = (loop, MagicMock())
+
+        listener.request_stop()
+        listener.request_stop()
+
+        assert listener._stop_event.is_set()
+        assert loop.call_soon_threadsafe.call_count == 2
+
+    def test_request_stop_without_a_loop_only_sets_the_event(self):
+        listener = RMQWatcherListener()
+
+        listener.request_stop()
+        listener.request_stop()
+
+        assert listener._stop_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_request_stop_wakes_the_loop_out_of_its_wait(self):
+        listener = _cycle_listener()
+        listener._reconcile_interval = 30
+        manager = _fake_manager()
+        parked = asyncio.Event()
+
+        async def reconcile(subs):
+            parked.set()
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+
+        with _cycle_patches(manager):
+            task = asyncio.ensure_future(listener._main())
+            await call_with_timeout(parked.wait(), 5)
+            started = time.monotonic()
+            listener.request_stop()
+            await call_with_timeout(task, 5)
+
+        assert time.monotonic() - started < 1.0
+        manager.stop.assert_awaited()
+
+
+class TestParentCheck:
+    """A loop whose scheduler has exited stops on its own, pass by pass."""
+
+    @pytest.mark.asyncio
+    async def test_a_changed_parent_stops_the_loop_before_the_next_pass(self, caplog):
+        listener = _cycle_listener()
+        listener._parent_pid = 4242
+        manager = _fake_manager()
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.os.getppid", side_effect=[4242, 1]
+        ), caplog.at_level(
+            logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
+        ):
+            await call_with_timeout(listener._main(), 5)
+
+        manager.reconcile.assert_awaited_once()
+        manager.stop.assert_awaited()
+        assert listener._stop_event.is_set()
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("4242" in m and "exited" in m for m in errors), errors
+
+    @pytest.mark.asyncio
+    async def test_a_parent_gone_before_the_first_pass_runs_no_cycle(self):
+        listener = _cycle_listener()
+        listener._parent_pid = 4242
+        manager = _fake_manager()
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.os.getppid", return_value=1
+        ):
+            await call_with_timeout(listener._main(), 5)
+
+        manager.reconcile.assert_not_awaited()
+        listener._scan_subscriptions.assert_not_called()
+        assert listener._stop_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_no_parent_pid_means_no_parent_check(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        passes = []
+
+        async def stop_after_second(subs):
+            passes.append(1)
+            if len(passes) == 2:
+                listener._stop_event.set()
+
+        manager.reconcile = AsyncMock(side_effect=stop_after_second)
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.os.getppid"
+        ) as getppid:
+            await call_with_timeout(listener._main(), 5)
+
+        assert len(passes) == 2
+        getppid.assert_not_called()
+
+    def test_run_stops_once_the_parent_differs(self):
+        """The PID handed to ``run`` is the one the loop compares against."""
+        listener = _cycle_listener()
+        manager = _fake_manager()
+
+        with _cycle_patches(manager):
+            listener.run(parent_pid=os.getppid() + 1)
+
+        manager.reconcile.assert_not_awaited()
+        assert listener._stop_event.is_set()
+
+
+class TestCycleCompletedMetric:
+    """``rmq_watcher.cycle_completed`` says the loop is alive and turning."""
+
+    @staticmethod
+    def _completed(incr):
+        return [c for c in incr.call_args_list if c == call("rmq_watcher.cycle_completed")]
+
+    @pytest.mark.asyncio
+    async def test_every_pass_that_returned_counts(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        passes = []
+
+        async def stop_after_second(subs):
+            passes.append(1)
+            if len(passes) == 2:
+                listener._stop_event.set()
+
+        manager.reconcile = AsyncMock(side_effect=stop_after_second)
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.incr"
+        ) as incr:
+            await call_with_timeout(listener._main(), 5)
+
+        assert len(self._completed(incr)) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_pass_with_a_failed_step_still_counts(self, caplog):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+
+        def broken_scan():
+            listener._stop_event.set()
+            raise RuntimeError("scan blew up")
+
+        listener._scan_subscriptions = MagicMock(side_effect=broken_scan)
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.incr"
+        ) as incr, caplog.at_level(
+            logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
+        ):
+            await call_with_timeout(listener._main(), 5)
+
+        assert len(self._completed(incr)) == 1
+        assert any(
+            "Error in RMQ Watcher reconciliation cycle" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_pass_that_ran_out_of_budget_does_not_count(self):
+        listener = _cycle_listener()
+        listener._cycle_timeout_override = 0.05
+        manager = _fake_manager()
+        manager.reconcile = _never_returns
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.incr"
+        ) as incr, pytest.raises(asyncio.TimeoutError):
+            await listener._main()
+
+        assert self._completed(incr) == []
+        incr.assert_any_call("rmq_watcher.cycle_timed_out")
 
 
 class TestCycleTunables:
@@ -4517,10 +4813,11 @@ def e2e_listener(dagmodel_engine, tmp_path, monkeypatch):
         try:
             yield listener
         finally:
-            # Every listener builds two thread pools in its constructor, and the cases
-            # below actually put work on them.
-            listener._cycle_pool.shutdown()
-            listener._consumer_pool.shutdown()
+            # The cases below put work on the pools the cycle builds on first use;
+            # a case that never reached them leaves nothing to shut down.
+            for pool in (listener._cycle_pool, listener._consumer_pool):
+                if pool is not None:
+                    pool.shutdown()
 
 
 class TestScanMissEndToEnd:

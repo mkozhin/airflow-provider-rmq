@@ -235,10 +235,10 @@
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] `_cycle_pool`/`_consumer_pool` в `__init__` — `None`; `_ensure_pools()` создаёт
+- [x] `_cycle_pool`/`_consumer_pool` в `__init__` — `None`; `_ensure_pools()` создаёт
       недостающие при первом обращении и не трогает подставленные; создание
       `RMQConsumerManager` в `_main` и `_cycle_step` получают пулы через него
-- [ ] перевести на `_ensure_pools()` тесты `tests/watcher/test_listener.py`, которые
+- [x] перевести на `_ensure_pools()` тесты `tests/watcher/test_listener.py`, которые
       читают атрибуты пулов напрямую, чтобы они падали при поломке и проверяли то же,
       что сейчас:
       - `test_busy_consumer_pool_leaves_the_cycle_pool_free` (стр. 3980) — берёт
@@ -252,24 +252,24 @@
         созданные пулы;
       - найти остальные прямые обращения:
         `grep -n "_cycle_pool\|_consumer_pool" tests/`
-- [ ] тесты `_ensure_pools()`: после конструктора пулов нет; первое обращение создаёт
+- [x] тесты `_ensure_pools()`: после конструктора пулов нет; первое обращение создаёт
       оба, повторное возвращает те же; подставленный пул сохраняется; `_run_cycle`,
       вызванный напрямую, работает без предварительной подготовки пулов
-- [ ] `_stop_event` создаётся в `__init__`; `_start` продолжает работать (до задачи 3
+- [x] `_stop_event` создаётся в `__init__`; `_start` продолжает работать (до задачи 3
       он переиспользует или пересоздаёт событие, существующие тесты остаются зелёными)
-- [ ] `run(parent_pid=None)`: сохраняет `_parent_pid`, пишет INFO-строку об интервале
+- [x] `run(parent_pid=None)`: сохраняет `_parent_pid`, пишет INFO-строку об интервале
       и бюджете цикла, выполняет `_run_loop` в текущем потоке
-- [ ] `request_stop()`: stop event + `_wake_loop()`, идемпотентен, работает до
+- [x] `request_stop()`: stop event + `_wake_loop()`, идемпотентен, работает до
       запуска цикла
-- [ ] в `_main` перед каждым проходом — проверка `getppid()` против `_parent_pid`
+- [x] в `_main` перед каждым проходом — проверка `getppid()` против `_parent_pid`
       (ERROR, stop event, выход)
-- [ ] после возврата `_run_cycle` — `incr("rmq_watcher.cycle_completed")`
-- [ ] тесты: смена `getppid` останавливает цикл; `_parent_pid=None` родителя не
+- [x] после возврата `_run_cycle` — `incr("rmq_watcher.cycle_completed")`
+- [x] тесты: смена `getppid` останавливает цикл; `_parent_pid=None` родителя не
       проверяет; `request_stop()` до `run()` — `run()` сразу возвращается;
       повторный `request_stop()` безвреден
-- [ ] тесты: `cycle_completed` растёт, когда `_run_cycle` вернул управление (в том
+- [x] тесты: `cycle_completed` растёт, когда `_run_cycle` вернул управление (в том
       числе если внутри шаг упал и был записан в лог), и не растёт на таймауте цикла
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 2: Точка входа дочернего процесса `runner`
 

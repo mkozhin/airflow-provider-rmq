@@ -890,7 +890,13 @@ class RMQWatcherListener:
 
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
-        self._stop_event: threading.Event | None = None
+        # Authoritative stop signal of the cycle. It exists from construction on, so a
+        # stop requested before the loop has started is already recorded when it does.
+        self._stop_event = threading.Event()
+        # PID of the scheduler process the loop serves. ``_main`` compares it with the
+        # current parent before every pass and stops once they differ; ``None`` leaves
+        # the parent unchecked.
+        self._parent_pid: int | None = None
         self._manager: RMQConsumerManager | None = None
         # mtime-based incremental scan state, written by whichever cycle-pool worker runs
         # the "scan" step. One step of a name is in flight at a time (:class:`_StepInFlight`
@@ -947,10 +953,12 @@ class RMQWatcherListener:
         # good than back, and an installation generating dag_ids on the fly would
         # otherwise leave one entry per deletion here for the life of the process.
         self._deleted_dag_file_rows: dict[tuple[str, str, str], bool] = {}
-        # Both pools are built here, in whatever thread constructs the listener, and
-        # outlive every event loop the watcher thread creates.
-        self._cycle_pool = BoundedExecutor("rmq-watcher-cycle", _CYCLE_POOL_WORKERS)
-        self._consumer_pool = BoundedExecutor("rmq-watcher-consumer", _CONSUMER_POOL_WORKERS)
+        # Both pools are built by :meth:`_ensure_pools` on first use, in the process
+        # that runs the loop, and outlive every event loop created after them. The
+        # listener is instantiated in every Airflow component that loads the plugin,
+        # and a component that never runs the loop never gets a pool.
+        self._cycle_pool: BoundedExecutor | None = None
+        self._consumer_pool: BoundedExecutor | None = None
         # Tunables, cached between refreshes so that a database outage cannot stall
         # the loop at a point the cycle watchdog does not cover.
         self._reconcile_interval = DEFAULT_RECONCILE_INTERVAL
@@ -994,9 +1002,7 @@ class RMQWatcherListener:
 
     @hookimpl
     def before_stopping(self, component: Any) -> None:
-        if self._stop_event is not None:
-            self._stop_event.set()
-        self._wake_loop()
+        self.request_stop()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=_JOIN_TIMEOUT)
@@ -1005,6 +1011,18 @@ class RMQWatcherListener:
                     "RMQ Watcher thread still running %.0fs after the stop signal — "
                     "leaving it to the process exit", _JOIN_TIMEOUT,
                 )
+
+    def request_stop(self) -> None:
+        """Ask the loop to stop after the step it is on.
+
+        Sets the stop event and wakes the loop out of its wait between cycles. Safe to
+        call any number of times, from any thread, and before the loop has started —
+        :meth:`run` then returns without running a cycle. It is ordinary code with no
+        signal-handler restrictions, which is how the runner calls it once the signal
+        it waited for has arrived.
+        """
+        self._stop_event.set()
+        self._wake_loop()
 
     def _wake_loop(self) -> None:
         """Nudge the running cycle so it sees the stop event without waiting out the
@@ -1029,9 +1047,62 @@ class RMQWatcherListener:
     # Thread / event-loop bootstrap
     # ------------------------------------------------------------------
 
+    def run(self, parent_pid: int | None = None) -> None:
+        """Run the watcher loop in the calling thread until it is asked to stop.
+
+        :param parent_pid: PID of the scheduler process the loop serves. The loop
+            stops on its own once the current parent differs from it; ``None`` leaves
+            the parent unchecked.
+
+        Returns once :meth:`request_stop` has been called, or the parent has changed,
+        and the loop torn down.
+        """
+        self._parent_pid = parent_pid
+        log.info(
+            "RMQ Watcher loop started with the default reconcile interval of %ss and "
+            "a cycle budget of %.0fs; the first cycle reads %s and %s and logs any "
+            "override it finds",
+            self._reconcile_interval, self._cycle_timeout(),
+            RECONCILE_INTERVAL_VAR, CYCLE_TIMEOUT_VAR,
+        )
+        self._run_loop()
+
+    def _ensure_pools(self) -> tuple[BoundedExecutor, BoundedExecutor]:
+        """Return the cycle pool and the consumer pool, building whichever is missing.
+
+        Called from the loop thread only — the manager's creation in ``_main`` and
+        every :meth:`_cycle_step` — so the first check and the assignment after it
+        need no lock. A pool already in place is returned as it is.
+        """
+        if self._cycle_pool is None:
+            self._cycle_pool = BoundedExecutor("rmq-watcher-cycle", _CYCLE_POOL_WORKERS)
+        if self._consumer_pool is None:
+            self._consumer_pool = BoundedExecutor(
+                "rmq-watcher-consumer", _CONSUMER_POOL_WORKERS
+            )
+        return self._cycle_pool, self._consumer_pool
+
+    def _parent_is_gone(self) -> bool:
+        """Whether the scheduler process the loop serves has exited.
+
+        A child whose parent exits is reparented, so its parent PID changes; the
+        comparison needs nothing from the parent itself and holds even when the kernel
+        signal that normally reports the parent's death was never armed.
+        """
+        if self._parent_pid is None:
+            return False
+        current = os.getppid()
+        if current == self._parent_pid:
+            return False
+        log.error(
+            "RMQ Watcher: the scheduler process %d has exited (parent is now %d) — "
+            "stopping the watcher", self._parent_pid, current,
+        )
+        return True
+
     def _start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
-            if self._stop_event is None or not self._stop_event.is_set():
+            if not self._stop_event.is_set():
                 log.warning("RMQ Watcher thread already running — ignoring duplicate on_starting")
                 return
             # Previous lifecycle is shutting down — wait briefly then start fresh
@@ -1077,12 +1148,16 @@ class RMQWatcherListener:
     async def _main(self) -> None:
         wakeup = asyncio.Event()
         self._waker = (asyncio.get_running_loop(), wakeup)
+        cycle_pool, consumer_pool = self._ensure_pools()
         self._manager = RMQConsumerManager(
-            executor=self._consumer_pool, cycle_executor=self._cycle_pool
+            executor=consumer_pool, cycle_executor=cycle_pool
         )
         await self._manager.start()
         try:
             while not self._stop_event.is_set():
+                if self._parent_is_gone():
+                    self._stop_event.set()
+                    break
                 await self._refresh_settings()
                 budget = self._cycle_timeout()
                 started = time.monotonic()
@@ -1096,6 +1171,11 @@ class RMQWatcherListener:
                     )
                     incr("rmq_watcher.cycle_timed_out")
                     raise
+                # Liveness, not health: ``_run_cycle`` logs and swallows the failure of
+                # any single step, so every pass that returned counts here, whether or
+                # not all of its steps succeeded. Only a pass that ran out of budget
+                # does not.
+                incr("rmq_watcher.cycle_completed")
                 await self._wait_for_next_cycle()
         finally:
             await self._stop_manager()
@@ -1204,16 +1284,17 @@ class RMQWatcherListener:
         same call, and the steps that need no database would stop running with it.
         """
         timeout = _STEP_TIMEOUT if timeout is None else timeout
+        cycle_pool, _ = self._ensure_pools()
         attempt = self._step_attempts.get(name)
         if attempt is not None and not attempt.done():
             incr("rmq_watcher.cycle_step_skipped")
             raise _StepInFlight(
                 f"the {name!r} step of an earlier cycle is still running in the "
-                f"{self._cycle_pool.name!r} pool "
-                f"({self._cycle_pool.in_flight}/{self._cycle_pool.max_workers} "
+                f"{cycle_pool.name!r} pool "
+                f"({cycle_pool.in_flight}/{cycle_pool.max_workers} "
                 f"workers busy)"
             )
-        attempt = self._cycle_pool.submit(fn, *args)
+        attempt = cycle_pool.submit(fn, *args)
         self._step_attempts[name] = attempt
         try:
             return await call_with_timeout(asyncio.wrap_future(attempt), timeout)
