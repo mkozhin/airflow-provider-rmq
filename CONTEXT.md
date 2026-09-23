@@ -1,10 +1,22 @@
 # RMQ Watcher
 
 Airflow-провайдер, который реактивно запускает DAG run'ы по сообщениям из RabbitMQ. Фоновый
-процесс (**Watcher**) внутри Scheduler читает декларации `@rmq_trigger(...)` из DAG-файлов,
-синхронизирует их с БД Airflow и держит живые consumer-задачи на RabbitMQ.
+процесс (**Watcher**), дочерний у Scheduler'а, читает декларации `@rmq_trigger(...)` из
+DAG-файлов, синхронизирует их с БД Airflow и держит живые consumer-задачи на RabbitMQ.
 
 ## Language
+
+**Watcher**:
+Дочерний процесс Scheduler'а `python -m airflow_provider_rmq.watcher.runner`, в котором идёт
+цикл reconcile и живут consumer-задачи. Его запускает listener плагина в `on_starting` через
+`subprocess.Popen` и останавливает в `before_stopping`; по одному на Scheduler. В самом
+процессе Scheduler'а у плагина нет ни потоков, ни event loop, ни пулов: Airflow делает из него
+`fork()`, а fork безопасен только из однопоточного процесса (ADR 0008). Умерший Watcher не
+перезапускается до рестарта Scheduler'а; его живость показывает счётчик
+`rmq_watcher.cycle_completed` — прирост на каждом дошедшем до конца цикле, а не признак
+здоровья.
+_Avoid_: поток watcher'а, watcher внутри Scheduler'а, сервис watcher'а (отдельного сервиса нет —
+процесс живёт в контейнере Scheduler'а)
 
 **Subscription**:
 Связь "одна очередь → один DAG" с фильтром сообщений и опциональным cooldown. Единица учёта в

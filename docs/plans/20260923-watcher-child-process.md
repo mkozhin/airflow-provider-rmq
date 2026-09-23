@@ -412,7 +412,7 @@
 
 ### Task 9: [Final] Update documentation
 
-- [ ] `readme.md` и `readme_ru.md`: раздел «How it works» — цикл в дочернем процессе
+- [x] `readme.md` и `readme_ru.md`: раздел «How it works» — цикл в дочернем процессе
       шедулера, процесс в дереве и `<defunct>` при его смерти, строки в логе шедулера,
       метрика `rmq_watcher.cycle_completed` (живость, а не здоровье) и правило на её
       отсутствие, отдельный пул соединений с метабазой; места, описывающие цикл внутри
@@ -420,20 +420,20 @@
       asyncio loop…»), `readme.md:874` («…inside the Scheduler»), `readme.md:990`
       (`RMQWatcherListener (Scheduler Listener)`) и их пары `readme_ru.md:620, 873`;
       в дереве файлов (`readme.md:977` и соседние строки) добавить `runner.py`
-- [ ] `docs/backlog/`: удалить `stop-event-replacement-revives-watcher.md` (описывает
+- [x] `docs/backlog/`: удалить `stop-event-replacement-revives-watcher.md` (описывает
       `_start()`, которого больше нет); переписать предпосылку и оценку
       `trigger-dag-shares-scheduler-db-pool.md` под дочерний процесс со своим пулом
       соединений; поправить первый пункт `airflow-3-migration-path.md` («поток с
       asyncio-петлёй внутри процесса шедулера»)
-- [ ] `CONTEXT.md`: описание Watcher — дочерний процесс шедулера
-- [ ] `CHANGELOG.md`: новая секция `## v2.6.0` с изменением процессной модели и
+- [x] `CONTEXT.md`: описание Watcher — дочерний процесс шедулера
+- [x] `CHANGELOG.md`: новая секция `## v2.6.0` с изменением процессной модели и
       метрикой
-- [ ] `docs/live-verification.md`: сценарий 12 (остановка и рестарт scheduler'а) —
+- [x] `docs/live-verification.md`: сценарий 12 (остановка и рестарт scheduler'а) —
       ожидаемое поведение дочернего процесса; сценарий смерти шедулера по `kill -9`;
       как выглядит мёртвый watcher в `docker top`
-- [ ] `docs/incidents/20260923-scheduler-hang.md`: ссылка на ADR 0008 в разделе про
+- [x] `docs/incidents/20260923-scheduler-hang.md`: ссылка на ADR 0008 в разделе про
       решение со стороны плагина
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/` (skipped - the harness moves the plan after all phases finish)
 
 ## Post-Completion
 
