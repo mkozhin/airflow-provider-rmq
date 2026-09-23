@@ -6,8 +6,10 @@ import enum
 import glob
 import logging
 import os
+import site
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import traceback
@@ -24,6 +26,7 @@ from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.backoff import next_backoff
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.utils.metrics import incr
+from airflow_provider_rmq.watcher import runner as _runner
 from airflow_provider_rmq.watcher.consumer import RMQConsumerManager
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -34,7 +37,6 @@ from airflow_provider_rmq.watcher.models import (
     is_schema_ready,
     upsert_subscription,
 )
-from airflow_provider_rmq.watcher.runner import CHILD_ENV_MARKER, PARENT_PID_ENV
 from airflow_provider_rmq.watcher.subscription_builder import (
     build_subscriptions,
     has_exchange_conflict,
@@ -122,8 +124,32 @@ _UNREADABLE_FILE_LIMIT = 1
 #: Seconds allowed for the manager to stop before the loop is torn down anyway.
 _STOP_TIMEOUT = 30.0
 
-#: Module the scheduler starts as the watcher process, with ``python -m``.
-_RUNNER_MODULE = "airflow_provider_rmq.watcher.runner"
+#: Module the scheduler starts as the watcher process.
+_RUNNER_MODULE = _runner.__name__
+
+#: Program the watcher process runs with ``python -c``, the runner's module name as its
+#: argument.
+#:
+#: Its first step removes the entry ``python -c`` puts in front of :data:`sys.path`,
+#: the working directory the scheduler was started in — usually ``AIRFLOW_HOME``. The
+#: scheduler's own :data:`sys.path` has no such entry, and only ``sys``, which is built
+#: into the interpreter, is imported before the removal, so no module lying in that
+#: directory — ``runpy``, ``logging``, a package named like this one — is imported in
+#: the watcher process in its place. Under ``-P`` or ``PYTHONSAFEPATH`` (Python 3.11 and
+#: later) the entry is not added and nothing is removed. ``python -m`` adds the same
+#: entry and searches it for ``runpy`` and for the runner's package before any code of
+#: the watcher runs, which is why the process is not started that way.
+#:
+#: It then appends the directory named by the runner's ``PACKAGE_DIR_ENV``, when that
+#: is set, to the end of :data:`sys.path` and runs the module named by its argument as
+#: ``__main__``, the way ``python -m`` would.
+_BOOTSTRAP = (
+    "import sys; "
+    "getattr(sys.flags, 'safe_path', False) or sys.path.pop(0); "
+    "import os, runpy; "
+    f"sys.path.extend(filter(None, [os.environ.get({_runner.PACKAGE_DIR_ENV!r})])); "
+    "runpy.run_module(sys.argv[1], run_name='__main__', alter_sys=True)"
+)
 
 #: Seconds ``before_stopping`` waits for the watcher process to exit after SIGTERM.
 #: The scheduler's own shutdown must not stall behind a watcher that takes its time,
@@ -869,6 +895,49 @@ def _untrusted_listing_reason(
     return what
 
 
+def _site_directories() -> set[str]:
+    """Directories the interpreter puts on :data:`sys.path` by itself for installed
+    packages: the site-packages of the installation and of the user."""
+    paths = sysconfig.get_paths()
+    found = {paths["purelib"], paths["platlib"]}
+    try:
+        found.update(site.getsitepackages())
+    except AttributeError:
+        pass
+    user_site = site.getusersitepackages()
+    if user_site:
+        found.add(user_site)
+    return {os.path.realpath(path) for path in found}
+
+
+def _package_directory_off_site_path() -> str | None:
+    """Directory the package is imported from, or ``None`` when it is a site-packages one.
+
+    A package installed with pip lies in a site-packages directory, and the watcher
+    process finds it there, as the scheduler does. A package imported from anywhere
+    else — the plugins folder, which Airflow appends to :data:`sys.path` only once it
+    has initialised — is not importable before Airflow is, so the directory is handed
+    to the watcher process for :data:`_BOOTSTRAP` to append.
+    """
+    package_root = str(Path(airflow_provider_rmq.__file__).parents[1])
+    if os.path.realpath(package_root) in _site_directories():
+        return None
+    return package_root
+
+
+def _child_command() -> list[str]:
+    """Command line of the watcher process: ``python -c`` :data:`_BOOTSTRAP` with the
+    runner's module name as its argument.
+
+    The directory of a package found by :func:`_package_directory_off_site_path`
+    travels in the runner's ``PACKAGE_DIR_ENV`` and goes to the end of
+    :data:`sys.path`, where the scheduler has it, so a module in the plugins folder
+    named like one of the standard library or an installed package shadows it in
+    neither process. ``PYTHONPATH`` would put it ahead of both.
+    """
+    return [sys.executable, "-c", _BOOTSTRAP, _RUNNER_MODULE]
+
+
 class _StepInFlight(Exception):
     """The previous attempt at a cycle step is still occupying a worker of the pool.
 
@@ -902,10 +971,11 @@ class RMQWatcherListener:
     process with a single thread.
 
     - ``on_starting`` fires in the scheduler's main thread, inside ``Job.__init__``,
-      and starts ``python -m airflow_provider_rmq.watcher.runner`` with
-      :class:`subprocess.Popen`, which forks and execs in C with no Python code in
-      between. The scheduler's PID travels in the environment, together with a marker
-      that keeps a listener loaded in the watcher process from starting another one.
+      and starts the runner, ``airflow_provider_rmq.watcher.runner``, through
+      :data:`_BOOTSTRAP` (see :func:`_child_command`) with :class:`subprocess.Popen`,
+      which forks and execs in C with no Python code in between. The scheduler's PID travels in the
+      environment, together with a marker that keeps a listener loaded in the
+      watcher process from starting another one.
     - ``before_stopping`` sends the watcher process SIGTERM and waits a bounded time
       for it to exit, then kills it, and returns even if the killed process cannot be
       reaped yet.
@@ -922,13 +992,18 @@ class RMQWatcherListener:
         # Watcher process started by ``on_starting`` in the scheduler; ``None`` in every
         # other process and before the start.
         self._child: subprocess.Popen | None = None
+        # PID of the process that started the watcher process. A process forked from
+        # the scheduler afterwards — a LocalExecutor task supervisor — inherits this
+        # listener together with ``_child``, and the two tell it the watcher is the
+        # scheduler's, not its own.
+        self._owner_pid: int | None = None
         # Authoritative stop signal of the cycle. It exists from construction on, so a
         # stop requested before the loop has started is already recorded when it does.
         self._stop_event = threading.Event()
-        # PID of the scheduler process the loop serves. ``_main`` compares it with the
-        # current parent before every pass and stops once they differ; ``None`` leaves
-        # the parent unchecked.
-        self._parent_pid: int | None = None
+        # PID of the scheduler process the loop serves, set by :meth:`run` before the
+        # loop starts. ``_main`` compares it with the current parent before every pass
+        # and stops once they differ.
+        self._parent_pid: int
         self._manager: RMQConsumerManager | None = None
         # mtime-based incremental scan state, written by whichever cycle-pool worker runs
         # the "scan" step. One step of a name is in flight at a time (:class:`_StepInFlight`
@@ -1014,7 +1089,7 @@ class RMQWatcherListener:
 
     @hookimpl
     def on_starting(self, component: Any) -> None:
-        if CHILD_ENV_MARKER in os.environ:
+        if _runner.CHILD_ENV_MARKER in os.environ:
             # The watcher process itself, where a plugin load registered the listener
             # again. The loop already runs here; another process would be a second
             # watcher on the same subscriptions.
@@ -1036,7 +1111,7 @@ class RMQWatcherListener:
             "RMQWatcherListener.on_starting: component=%s (job_type=%s, is_scheduler=%s)%s",
             name, job_type, is_scheduler,
             "" if is_scheduler
-            else " — watcher not started: only the scheduler process runs it",
+            else " — watcher not started: only the scheduler starts the watcher process",
         )
         if is_scheduler:
             self._spawn_child()
@@ -1049,15 +1124,19 @@ class RMQWatcherListener:
         """Start the watcher process, unless the one started earlier is still running.
 
         The process gets the scheduler's environment plus the child marker, the
-        scheduler's PID and a ``PYTHONPATH`` that begins with the directory this
-        package was imported from — a package installed in the plugins folder is
-        importable in the child before Airflow is, and Airflow adds its own dags,
-        plugins and config folders when it initialises there. stdout and stderr are
-        inherited, so the watcher's lines land in the scheduler container's log, and
-        every other descriptor of the scheduler is closed in the child.
+        scheduler's PID and, for a package imported from outside the interpreter's
+        site-packages (the plugins folder), that directory — see
+        :func:`_child_command`. stdout and stderr are inherited, so the watcher's lines
+        land in the scheduler container's log, and every other descriptor of the
+        scheduler is closed in the child.
 
-        A failure to start is logged and the scheduler goes on without the watcher.
+        A process forked from the scheduler after the start inherits this listener
+        and starts nothing: the watcher process is the scheduler's. A failure to start
+        is logged and the scheduler goes on without the watcher.
         """
+        if self._is_a_fork_of_the_owner():
+            self._log_left_to_the_owner()
+            return
         child = self._child
         if child is not None and child.poll() is None:
             log.warning(
@@ -1065,8 +1144,11 @@ class RMQWatcherListener:
                 child.pid,
             )
             return
-        if threading.current_thread() is not threading.main_thread():
-            # The kernel ties the parent-death signal to the thread that started the
+        if (
+            sys.platform.startswith("linux")
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            # Linux ties the parent-death signal to the thread that started the
             # process, so the watcher is told when this thread exits rather than when
             # the scheduler does; the parent check of every cycle still ends it once
             # the scheduler is gone.
@@ -1075,17 +1157,19 @@ class RMQWatcherListener:
                 "thread — it is signalled when that thread exits",
                 threading.current_thread().name,
             )
+        pid = os.getpid()
+        package_dir = _package_directory_off_site_path()
         env = dict(os.environ)
-        env[CHILD_ENV_MARKER] = "1"
-        env[PARENT_PID_ENV] = str(os.getpid())
-        package_root = str(Path(airflow_provider_rmq.__file__).parents[1])
-        python_path = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = (
-            package_root + os.pathsep + python_path if python_path else package_root
-        )
+        env[_runner.CHILD_ENV_MARKER] = "1"
+        env[_runner.PARENT_PID_ENV] = str(pid)
+        if package_dir is None:
+            env.pop(_runner.PACKAGE_DIR_ENV, None)
+        else:
+            env[_runner.PACKAGE_DIR_ENV] = package_dir
+        self._owner_pid = pid
         try:
             self._child = subprocess.Popen(
-                [sys.executable, "-m", _RUNNER_MODULE],
+                _child_command(),
                 env=env,
                 stdin=subprocess.DEVNULL,
             )
@@ -1097,7 +1181,7 @@ class RMQWatcherListener:
             return
         log.info(
             "RMQ Watcher process started with PID %d (scheduler PID %d)",
-            self._child.pid, os.getpid(),
+            self._child.pid, pid,
         )
 
     def _stop_child(self) -> None:
@@ -1110,6 +1194,9 @@ class RMQWatcherListener:
         depend on it. A process that has exited already — the container's init sends
         SIGTERM to the whole process group, the watcher included — is only reaped.
         """
+        if self._is_a_fork_of_the_owner():
+            self._log_left_to_the_owner()
+            return
         child = self._child
         if child is None:
             return
@@ -1137,6 +1224,26 @@ class RMQWatcherListener:
                 )
                 return
         log.info("RMQ Watcher process %d exited with code %d", child.pid, code)
+
+    def _is_a_fork_of_the_owner(self) -> bool:
+        """Whether this process is a fork of the one that started the watcher process.
+
+        Such a process — the task supervisor LocalExecutor forks from the scheduler —
+        carries the scheduler's frames on its stack, so ``on_starting`` takes its job
+        for the scheduler, and it inherits ``_child``, whose ``poll()`` reads as an
+        exit because the process is not its child. It neither starts nor stops a
+        watcher process.
+        """
+        owner = self._owner_pid
+        return owner is not None and owner != os.getpid()
+
+    def _log_left_to_the_owner(self) -> None:
+        """Log that this fork of the scheduler leaves the watcher process to it."""
+        log.info(
+            "RMQWatcherListener in process %d, a fork of the scheduler process %d — the "
+            "watcher process belongs to the scheduler, nothing to start or stop here",
+            os.getpid(), self._owner_pid,
+        )
 
     def request_stop(self) -> None:
         """Ask the loop to stop after the step it is on.
@@ -1173,12 +1280,11 @@ class RMQWatcherListener:
     # Loop bootstrap in the watcher process
     # ------------------------------------------------------------------
 
-    def run(self, parent_pid: int | None = None) -> None:
+    def run(self, parent_pid: int) -> None:
         """Run the watcher loop in the calling thread until it is asked to stop.
 
         :param parent_pid: PID of the scheduler process the loop serves. The loop
-            stops on its own once the current parent differs from it; ``None`` leaves
-            the parent unchecked.
+            stops on its own once the current parent differs from it.
 
         Returns once :meth:`request_stop` has been called, or the parent has changed,
         and the loop torn down.
@@ -1213,13 +1319,14 @@ class RMQWatcherListener:
 
         A child whose parent exits is reparented, so its parent PID changes; the
         comparison needs nothing from the parent itself and holds even when the kernel
-        signal that normally reports the parent's death was never armed.
+        signal that normally reports the parent's death was never armed. A parent that
+        has changed arms the watcher process's hard deadline before the line saying so
+        is logged, so a logging handler that blocks cannot keep the process alive.
         """
-        if self._parent_pid is None:
-            return False
         current = os.getppid()
         if current == self._parent_pid:
             return False
+        _runner._arm_hard_exit()
         log.error(
             "RMQ Watcher: the scheduler process %d has exited (parent is now %d) — "
             "stopping the watcher", self._parent_pid, current,

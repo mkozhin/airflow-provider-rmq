@@ -89,7 +89,7 @@
    крутится, а не того, что всё здорово.
 
 Цикл watcher'а работает в дочернем процессе scheduler'а
-`python -m airflow_provider_rmq.watcher.runner`; его видно в
+`python -c <bootstrap> airflow_provider_rmq.watcher.runner`; его видно в
 `docker top airflow-scheduler` под `airflow scheduler`, а его строки — в тех же
 логах scheduler'а. `{pid}` в consumer-теге — PID этого процесса, тот же, что в
 строке `RMQ Watcher process started with PID …`.
@@ -437,7 +437,7 @@ cooldown-доставка переотправлялась чаще раза в 
 призраками, за которых потом поручится проверка живости.
 
 **Как.** `docker top airflow-scheduler` — запомнить PID процесса
-`python -m airflow_provider_rmq.watcher.runner`; `docker restart airflow-scheduler`,
+`python -c <bootstrap> airflow_provider_rmq.watcher.runner`; `docker restart airflow-scheduler`,
 затем сразу `rabbitmqctl list_consumers -p <vhost>` и снова `docker top`.
 
 **Ожидаемо.**
@@ -484,9 +484,17 @@ runner'а под ним; `kill -9 <PID airflow scheduler>` с хоста (`docke
 1. Процесс runner'а завершается за секунды: ядро шлёт ему SIGTERM, как только
    умирает основной поток scheduler'а (`PR_SET_PDEATHSIG`), и в логе
    появляется `RMQ Watcher process received SIGTERM — stopping the watcher`.
-   Там, где этого сигнала нет, цикл замечает смену родителя перед следующим
-   проходом: ERROR `RMQ Watcher: the scheduler process <pid> has exited (parent
-   is now …) — stopping the watcher`.
+   Там, где этого сигнала нет, смену родителя замечает основной поток runner'а
+   в пределах секунды или цикл перед следующим проходом: ERROR `RMQ Watcher
+   process: the scheduler process <pid> has exited (parent is now …) — stopping
+   the watcher` или `RMQ Watcher: the scheduler process <pid> has exited (parent
+   is now …) — stopping the watcher`. В любом случае runner пропадает из
+   `docker top` не позже чем через 60 с: на выходе он взводит SIGALRM, и ядро
+   завершает его, даже если выход застрял. Scheduler, убитый в первые секунды после
+   старта, пока runner ещё импортирует Airflow и загружает плагины, уводит его
+   так же, без запуска цикла: в stderr строка `RMQ Watcher process <pid>:
+   received SIGTERM while Airflow was being prepared — exiting` (или `… the
+   scheduler process <pid> exited while Airflow was being prepared — exiting`).
 2. Если scheduler — прямой потомок `dumb-init` (так в официальном образе), init
    выходит вместе с ним, контейнер останавливается целиком и поднимается заново
    по `restart: always`; строки о выходе runner'а при этом может не оказаться —

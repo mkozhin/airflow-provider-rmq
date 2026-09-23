@@ -6,7 +6,7 @@ added: 2026-09-02
 # Всплеск доставок исчерпывает пул соединений watcher'а с метабазой
 
 **Контекст.** Это про соединения с Postgres, не с RabbitMQ. Watcher работает в
-дочернем процессе шедулера (`python -m airflow_provider_rmq.watcher.runner`,
+дочернем процессе шедулера (`python -c <bootstrap> airflow_provider_rmq.watcher.runner`,
 ADR 0008) и ходит в метабазу через `WatcherSession`
 (`airflow_provider_rmq/watcher/models.py:96`), привязанную к движку Airflow этого
 процесса. Движок у процесса свой, и пул соединений тоже свой: с пулом шедулера

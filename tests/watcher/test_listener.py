@@ -7,6 +7,7 @@ import glob
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -22,6 +23,7 @@ from sqlalchemy.pool import NullPool
 import airflow_provider_rmq
 from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.executor import BoundedExecutor
+from airflow_provider_rmq.watcher import listener as listener_module
 from airflow_provider_rmq.watcher.listener import (
     CYCLE_TIMEOUT_VAR,
     RECONCILE_INTERVAL_VAR,
@@ -47,12 +49,19 @@ from airflow_provider_rmq.watcher.models import (
     WatcherBase,
     upsert_subscription,
 )
-from airflow_provider_rmq.watcher.runner import CHILD_ENV_MARKER, PARENT_PID_ENV
+from airflow_provider_rmq.watcher.runner import (
+    CHILD_ENV_MARKER,
+    PACKAGE_DIR_ENV,
+    PARENT_PID_ENV,
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_LISTENER_LOG = "airflow_provider_rmq.watcher.listener"
 
 
 def _decorators(src: str) -> list:
@@ -816,7 +825,7 @@ class TestUnreadableFileHold:
 
         caplog.clear()
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"):
+                             logger=_LISTENER_LOG):
             for _ in range(5):
                 self._scan(listener, mtime_error=OSError("stale handle"))
 
@@ -843,7 +852,7 @@ class TestUnreadableFileHold:
         listener = RMQWatcherListener()
 
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"):
+                             logger=_LISTENER_LOG):
             listener._extract_subscriptions_from_file(str(dag_file))
 
         assert any("Failed to parse DAG file" in r.getMessage() for r in caplog.records), \
@@ -862,7 +871,7 @@ class TestUnreadableFileHold:
         listener = RMQWatcherListener()
 
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"):
+                             logger=_LISTENER_LOG):
             listener._extract_subscriptions_from_file(str(dag_file))
 
         assert any("Failed to decode DAG file" in r.getMessage() for r in caplog.records), \
@@ -990,7 +999,7 @@ class TestEveryFileUnreadable:
 
         caplog.clear()
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"):
+                             logger=_LISTENER_LOG):
             for _ in range(5):
                 assert self._scan_all_stale(listener) == []
 
@@ -1365,7 +1374,7 @@ class TestEmptyScanDistrust:
 
         caplog.clear()
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"):
+                             logger=_LISTENER_LOG):
             for _ in range(5):
                 assert self._scan_empty(listener) == []
 
@@ -1398,7 +1407,7 @@ class TestEmptyScanDistrust:
                 self._scan_empty(listener)
 
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"):
+                             logger=_LISTENER_LOG):
             self._scan_empty(listener)
 
         assert "/dags" in caplog.text
@@ -2265,7 +2274,7 @@ class TestSyncToDb:
         ctx, _ = _make_session_ctx(existing_subs=[existing])
 
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"old_dag"}):
             listener._sync_to_db([])
 
@@ -2280,7 +2289,7 @@ class TestSyncToDb:
         ctx, _ = _make_session_ctx(existing_subs=[existing])
 
         with caplog.at_level(logging.INFO,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"old_dag"}):
             listener._sync_to_db([])
 
@@ -2306,7 +2315,7 @@ class TestSyncToDb:
                     "filter_data": {}}]
         ctx, _ = _make_session_ctx(existing_subs=[])
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"d"}):
             listener._sync_to_db(scanned)
 
@@ -2332,7 +2341,7 @@ class TestSyncToDb:
                     "filter_data": {}}]
         ctx, _ = _make_session_ctx(existing_subs=[])
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"d"}):
             listener._sync_to_db(scanned)
 
@@ -2348,7 +2357,7 @@ class TestSyncToDb:
         ctx, _ = _make_session_ctx(existing_subs=[])
 
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"d"}):
             listener._sync_to_db(scanned)
 
@@ -2404,7 +2413,7 @@ class TestSyncToDb:
         session.commit.side_effect = RuntimeError("the database went away")
 
         with caplog.at_level(logging.INFO,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
             listener._sync_to_db([])
 
@@ -2438,7 +2447,7 @@ class TestSyncToDb:
         session.commit.side_effect = RuntimeError("the database went away")
 
         with caplog.at_level(logging.INFO,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
             listener._sync_to_db([])
 
@@ -2455,7 +2464,7 @@ class TestSyncToDb:
                     "filter_data": {}}]
 
         with caplog.at_level(logging.INFO,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
             listener._sync_to_db(scanned)
 
@@ -2472,7 +2481,7 @@ class TestSyncToDb:
                     "filter_data": {}}]
 
         with caplog.at_level(logging.INFO,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"d"}), pytest.raises(RuntimeError):
             listener._sync_to_db(scanned)
 
@@ -2548,7 +2557,7 @@ class TestSyncToDb:
         ctx, _ = _make_session_ctx(existing_subs=[existing])
 
         with caplog.at_level(logging.INFO,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, {"other_dag"}):
             listener._sync_to_db([])
 
@@ -2563,7 +2572,7 @@ class TestSyncToDb:
         ctx, _ = _make_session_ctx(existing_subs=[existing])
 
         with caplog.at_level(logging.WARNING,
-                             logger="airflow_provider_rmq.watcher.listener"), \
+                             logger=_LISTENER_LOG), \
                 _sync_env(ctx, RuntimeError("db is down")):
             listener._sync_to_db([])
 
@@ -3351,6 +3360,7 @@ class TestMainExchangeMetaMerge:
         """Run `_main()` for exactly one reconcile cycle and capture the
         `active_subs` list passed to `RMQConsumerManager.reconcile`."""
         listener._stop_event = threading.Event()
+        listener._parent_pid = os.getppid()
         listener._scan_subscriptions = MagicMock(return_value=scanned)
         listener._sync_to_db = MagicMock()
 
@@ -3514,6 +3524,7 @@ def _cycle_listener():
     """Listener with the scan and the DB sync stubbed and no sleep between cycles."""
     listener = RMQWatcherListener()
     listener._stop_event = threading.Event()
+    listener._parent_pid = os.getppid()
     listener._scan_subscriptions = MagicMock(return_value=[])
     listener._sync_to_db = MagicMock()
     listener._reconcile_interval = 0
@@ -3636,7 +3647,7 @@ class TestCycleStepsAreBounded:
             ), patch("airflow_provider_rmq.watcher.listener.incr") as incr, \
                     caplog.at_level(
                         logging.WARNING,
-                        logger="airflow_provider_rmq.watcher.listener",
+                        logger=_LISTENER_LOG,
                     ):
                 await listener._run_cycle()
         finally:
@@ -3660,7 +3671,7 @@ class TestCycleStepsAreBounded:
             ), patch("airflow_provider_rmq.watcher.listener.incr") as incr, \
                     caplog.at_level(
                         logging.WARNING,
-                        logger="airflow_provider_rmq.watcher.listener",
+                        logger=_LISTENER_LOG,
                     ):
                 await listener._run_cycle()
                 await listener._run_cycle()
@@ -3782,7 +3793,7 @@ class TestUntrustedScan:
         )
 
         with _cycle_patches(manager), caplog.at_level(
-            logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
+            logging.ERROR, logger=_LISTENER_LOG
         ):
             await listener._run_cycle()
 
@@ -3803,7 +3814,7 @@ class TestUntrustedScan:
             with _cycle_patches(manager), patch(
                 "airflow_provider_rmq.watcher.listener._STEP_TIMEOUT", 0.05
             ), caplog.at_level(
-                logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+                logging.WARNING, logger=_LISTENER_LOG
             ):
                 await listener._run_cycle()   # times out, leaving the attempt in flight
                 await listener._run_cycle()   # _StepInFlight
@@ -3847,7 +3858,7 @@ class TestCycleWatchdog:
         with _cycle_patches(manager), patch(
             "airflow_provider_rmq.watcher.listener.incr"
         ) as incr, caplog.at_level(
-            logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
+            logging.ERROR, logger=_LISTENER_LOG
         ), pytest.raises(asyncio.TimeoutError):
             await listener._main()
 
@@ -4048,7 +4059,7 @@ class TestRunAndRequestStop:
         ran_in = []
 
         with caplog.at_level(
-            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+            logging.INFO, logger=_LISTENER_LOG
         ), patch.object(
             listener, "_run_loop", side_effect=lambda: ran_in.append(threading.current_thread())
         ):
@@ -4064,14 +4075,6 @@ class TestRunAndRequestStop:
         assert RECONCILE_INTERVAL_VAR in started[0]
         assert CYCLE_TIMEOUT_VAR in started[0]
 
-    def test_run_without_a_parent_leaves_the_parent_unchecked(self):
-        listener = RMQWatcherListener()
-
-        with patch.object(listener, "_run_loop"):
-            listener.run()
-
-        assert listener._parent_pid is None
-
     def test_a_stop_requested_before_run_returns_without_a_cycle(self):
         listener = RMQWatcherListener()
         main = MagicMock()
@@ -4079,7 +4082,7 @@ class TestRunAndRequestStop:
         listener.request_stop()
         started = time.monotonic()
         with patch.object(listener, "_main", main):
-            listener.run()
+            listener.run(parent_pid=os.getppid())
 
         main.assert_not_called()
         assert time.monotonic() - started < 1.0
@@ -4139,7 +4142,7 @@ class TestParentCheck:
         with _cycle_patches(manager), patch(
             "airflow_provider_rmq.watcher.listener.os.getppid", side_effect=[4242, 1]
         ), caplog.at_level(
-            logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
+            logging.ERROR, logger=_LISTENER_LOG
         ):
             await call_with_timeout(listener._main(), 5)
 
@@ -4148,6 +4151,41 @@ class TestParentCheck:
         assert listener._stop_event.is_set()
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert any("4242" in m and "exited" in m for m in errors), errors
+
+    def test_a_changed_parent_arms_the_hard_exit_before_the_line_saying_so(
+        self, monkeypatch
+    ):
+        """The watcher process is on its way out: a logging handler that blocks on the
+        error line must not keep it alive once the scheduler has died."""
+        from airflow_provider_rmq.watcher import runner
+
+        listener = _cycle_listener()
+        listener._parent_pid = 4242
+        events: list[str] = []
+        monkeypatch.setattr(runner, "_arm_hard_exit", lambda: events.append("armed"))
+
+        class _Recorder(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                events.append(f"log {record.getMessage()}")
+
+        handler = _Recorder(level=logging.ERROR)
+        listener_log = logging.getLogger(_LISTENER_LOG)
+        listener_log.addHandler(handler)
+        try:
+            with patch("airflow_provider_rmq.watcher.listener.os.getppid", return_value=1):
+                assert listener._parent_is_gone() is True
+        finally:
+            listener_log.removeHandler(handler)
+
+        assert events[0] == "armed"
+        assert events[1].startswith("log RMQ Watcher: the scheduler process 4242 has exited")
+
+    def test_an_unchanged_parent_arms_nothing(self, alarm_calls):
+        listener = _cycle_listener()
+        listener._parent_pid = os.getppid()
+
+        assert listener._parent_is_gone() is False
+        assert alarm_calls == []
 
     @pytest.mark.asyncio
     async def test_a_parent_gone_before_the_first_pass_runs_no_cycle(self):
@@ -4163,27 +4201,6 @@ class TestParentCheck:
         manager.reconcile.assert_not_awaited()
         listener._scan_subscriptions.assert_not_called()
         assert listener._stop_event.is_set()
-
-    @pytest.mark.asyncio
-    async def test_no_parent_pid_means_no_parent_check(self):
-        listener = _cycle_listener()
-        manager = _fake_manager()
-        passes = []
-
-        async def stop_after_second(subs):
-            passes.append(1)
-            if len(passes) == 2:
-                listener._stop_event.set()
-
-        manager.reconcile = AsyncMock(side_effect=stop_after_second)
-
-        with _cycle_patches(manager), patch(
-            "airflow_provider_rmq.watcher.listener.os.getppid"
-        ) as getppid:
-            await call_with_timeout(listener._main(), 5)
-
-        assert len(passes) == 2
-        getppid.assert_not_called()
 
     def test_run_stops_once_the_parent_differs(self):
         """The PID handed to ``run`` is the one the loop compares against."""
@@ -4238,7 +4255,7 @@ class TestCycleCompletedMetric:
         with _cycle_patches(manager), patch(
             "airflow_provider_rmq.watcher.listener.incr"
         ) as incr, caplog.at_level(
-            logging.ERROR, logger="airflow_provider_rmq.watcher.listener"
+            logging.ERROR, logger=_LISTENER_LOG
         ):
             await call_with_timeout(listener._main(), 5)
 
@@ -4379,7 +4396,7 @@ class TestReadSettings:
 
     def test_a_value_that_is_not_a_number_is_ignored_with_a_warning(self, caplog):
         with caplog.at_level(
-            logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+            logging.WARNING, logger=_LISTENER_LOG
         ), self._variables({RECONCILE_INTERVAL_VAR: "soon"}):
             interval, _ = _read_settings()
 
@@ -4392,7 +4409,7 @@ class TestReadSettings:
     @pytest.mark.parametrize("raw", ["0", "-30"])
     def test_a_non_positive_value_is_ignored_with_a_warning(self, caplog, raw):
         with caplog.at_level(
-            logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+            logging.WARNING, logger=_LISTENER_LOG
         ), self._variables({CYCLE_TIMEOUT_VAR: raw}):
             _, budget = _read_settings()
 
@@ -4408,7 +4425,7 @@ class TestReadSettings:
         infinite cycle budget is a watchdog that never fires, and a NaN one compares
         False against everything, which leaves the timers in no order at all."""
         with caplog.at_level(
-            logging.WARNING, logger="airflow_provider_rmq.watcher.listener"
+            logging.WARNING, logger=_LISTENER_LOG
         ), self._variables({CYCLE_TIMEOUT_VAR: raw}):
             _, budget = _read_settings()
 
@@ -4549,7 +4566,6 @@ class TestGracefulStop:
         untouched either way, so the observation is the call, not its effect.
         """
         listener = RMQWatcherListener()
-        listener._stop_event = threading.Event()
         loop = asyncio.new_event_loop()
         loop.close()
         loop.call_soon_threadsafe = MagicMock()
@@ -4566,7 +4582,6 @@ class TestGracefulStop:
         The nudge is made and it raises; stopping must go through all the same.
         """
         listener = RMQWatcherListener()
-        listener._stop_event = threading.Event()
         loop = MagicMock()
         loop.is_closed.return_value = False
         loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
@@ -4578,7 +4593,9 @@ class TestGracefulStop:
         assert listener._stop_event.is_set()
 
 
-_LISTENER_LOG = "airflow_provider_rmq.watcher.listener"
+# ---------------------------------------------------------------------------
+# Watcher process: start, stop and the scheduler's own threads
+# ---------------------------------------------------------------------------
 
 
 def _fake_child(pid: int = 4321, *, running: bool = True) -> MagicMock:
@@ -4599,18 +4616,94 @@ def _popen(*children):
         yield popen
 
 
+_PACKAGE_ROOT = str(Path(airflow_provider_rmq.__file__).parents[1])
+
+
+def _python_with_safe_path() -> str | None:
+    """An interpreter of Python 3.11 or later, which knows ``PYTHONSAFEPATH``, or
+    ``None`` when neither this one nor one on ``PATH`` is."""
+    if sys.version_info >= (3, 11):
+        return sys.executable
+    for name in ("python3.14", "python3.13", "python3.12", "python3.11", "python3"):
+        found = shutil.which(name)
+        if found is None:
+            continue
+        probe = subprocess.run(
+            [found, "-c", "import sys; print(sys.version_info >= (3, 11))"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if probe.stdout.strip() == "True":
+            return found
+    return None
+
+
+@contextlib.contextmanager
+def _package_in_site_packages(in_site: bool):
+    """Make the package's directory one of the interpreter's site-packages, or none."""
+    found = {os.path.realpath(_PACKAGE_ROOT)} if in_site else set()
+    with patch(
+        "airflow_provider_rmq.watcher.listener._site_directories", return_value=found
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _watch_for_threads_and_loops():
+    """Record every thread started and every event loop created inside the block.
+
+    Yields a dict whose ``threads`` lists the names of the threads started and whose
+    ``loops`` counts the event loops created. Only what the calling thread does is
+    recorded: a thread a previous test left behind may start threads or loops of its
+    own while the block runs, which is not the scheduler gaining one. Loops are counted
+    at construction, so every way of creating one — ``asyncio.new_event_loop``,
+    ``asyncio.run``, a policy — is seen. The set of live threads is compared too: a
+    thread started and finished inside the block shows up in ``threads``, one still
+    running afterwards shows up in ``new_live_threads``. Only threads that appeared are
+    counted there, for the same reason.
+    """
+    seen: dict = {"threads": [], "loops": 0, "new_live_threads": set()}
+    caller = threading.current_thread()
+    real_start = threading.Thread.start
+    real_loop_init = asyncio.BaseEventLoop.__init__
+
+    def recording_start(thread, *args, **kwargs):
+        if threading.current_thread() is caller:
+            seen["threads"].append(thread.name)
+        return real_start(thread, *args, **kwargs)
+
+    def recording_loop_init(loop, *args, **kwargs):
+        if threading.current_thread() is caller:
+            seen["loops"] += 1
+        return real_loop_init(loop, *args, **kwargs)
+
+    before = set(threading.enumerate())
+    with patch.object(threading.Thread, "start", recording_start), patch.object(
+        asyncio.BaseEventLoop, "__init__", recording_loop_init
+    ):
+        yield seen
+    seen["new_live_threads"] = {
+        thread.name for thread in set(threading.enumerate()) - before
+    }
+
+
 class TestWatcherProcessStart:
     """``on_starting`` in the scheduler starts the watcher process and nothing else."""
 
     def test_the_runner_module_is_started_with_the_scheduler_interpreter(self):
+        """A package in site-packages starts through the bootstrap too, with no
+        directory to append — not even one left in the scheduler's environment."""
         listener = RMQWatcherListener()
-        with _popen() as popen:
+        with patch.dict(os.environ, {PACKAGE_DIR_ENV: "/stale"}), _package_in_site_packages(
+            True
+        ), _popen() as popen:
             listener.on_starting(SchedulerJobRunner())
 
         popen.assert_called_once()
         assert popen.call_args.args[0] == [
-            sys.executable, "-m", "airflow_provider_rmq.watcher.runner",
+            sys.executable, "-c", listener_module._BOOTSTRAP,
+            "airflow_provider_rmq.watcher.runner",
         ]
+        assert PACKAGE_DIR_ENV not in popen.call_args.kwargs["env"]
         kwargs = popen.call_args.kwargs
         assert kwargs["stdin"] is subprocess.DEVNULL
         # stdout and stderr are inherited, so the watcher logs to the scheduler's
@@ -4629,24 +4722,162 @@ class TestWatcherProcessStart:
         assert env["RMQ_TEST_INHERITED"] == "yes"
         assert CHILD_ENV_MARKER not in os.environ, "the scheduler's own environment stays as it is"
 
-    def test_pythonpath_puts_the_package_directory_before_the_existing_value(self):
+    def test_a_package_outside_site_packages_starts_through_the_bootstrap(self):
+        """A package in the plugins folder is not importable before Airflow is: the
+        bootstrap appends its directory to the path and runs the runner module."""
         listener = RMQWatcherListener()
-        root = str(Path(airflow_provider_rmq.__file__).parents[1])
-        with patch.dict(os.environ, {"PYTHONPATH": "/opt/extra"}), _popen() as popen:
+        with _package_in_site_packages(False), _popen() as popen:
             listener.on_starting(SchedulerJobRunner())
 
-        env = popen.call_args.kwargs["env"]
-        assert env["PYTHONPATH"] == root + os.pathsep + "/opt/extra"
-        assert os.path.isdir(os.path.join(root, "airflow_provider_rmq"))
+        assert popen.call_args.args[0] == [
+            sys.executable, "-c", listener_module._BOOTSTRAP,
+            "airflow_provider_rmq.watcher.runner",
+        ]
+        assert popen.call_args.kwargs["env"][PACKAGE_DIR_ENV] == _PACKAGE_ROOT
+        assert os.path.isdir(os.path.join(_PACKAGE_ROOT, "airflow_provider_rmq"))
 
-    def test_pythonpath_is_the_package_directory_when_none_is_set(self):
+    @pytest.mark.parametrize("in_site", [True, False], ids=["site-packages", "plugins"])
+    @pytest.mark.parametrize("existing", ["/opt/extra", None], ids=["set", "unset"])
+    def test_pythonpath_is_passed_on_unchanged(self, existing, in_site):
+        """An entry on ``PYTHONPATH`` would precede the standard library and
+        site-packages in the watcher process alone."""
         listener = RMQWatcherListener()
-        root = str(Path(airflow_provider_rmq.__file__).parents[1])
-        with patch.dict(os.environ, {}), _popen() as popen:
+        with patch.dict(os.environ, {}), _package_in_site_packages(in_site), _popen() as popen:
             os.environ.pop("PYTHONPATH", None)
+            if existing is not None:
+                os.environ["PYTHONPATH"] = existing
             listener.on_starting(SchedulerJobRunner())
 
-        assert popen.call_args.kwargs["env"]["PYTHONPATH"] == root
+        assert popen.call_args.kwargs["env"].get("PYTHONPATH") == existing
+
+    def test_the_bootstrap_appends_the_directory_and_runs_its_argument_as_main(
+        self, tmp_path
+    ):
+        """The bootstrap in a real interpreter: the directory ends :data:`sys.path`,
+        after the standard library, and the module named by the argument runs as
+        ``__main__``. A module in the directory named like one of the standard library
+        — a custom secrets backend in ``plugins/secrets.py`` — does not shadow it."""
+        plugins = tmp_path / "plugins"
+        plugins.mkdir()
+        (plugins / "secrets.py").write_text("raise ImportError('plugins/secrets.py shadowed')\n")
+        (plugins / "rmq_bootstrap_probe.py").write_text(
+            "import os, sys, sysconfig\n"
+            "import secrets\n"
+            "if __name__ == '__main__':\n"
+            f"    plugins = os.environ[{PACKAGE_DIR_ENV!r}]\n"
+            "    stdlib = sys.path.index(sysconfig.get_paths()['stdlib'])\n"
+            "    print(sys.path.index(plugins) > stdlib, sys.path[-1] == plugins)\n"
+        )
+        env = dict(os.environ, **{PACKAGE_DIR_ENV: str(plugins)})
+        result = subprocess.run(
+            [sys.executable, "-c", listener_module._BOOTSTRAP, "rmq_bootstrap_probe"],
+            env=env, capture_output=True, text=True, timeout=60, check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["True", "True"]
+
+    @pytest.mark.parametrize("in_site", [True, False], ids=["site-packages", "plugins"])
+    def test_the_bootstrap_imports_nothing_from_the_working_directory(
+        self, tmp_path, in_site
+    ):
+        """The command line the listener starts, in a real interpreter, from a working
+        directory holding ``runpy.py``, ``logging.py`` and a package named like this
+        one: none of them is imported, and :data:`sys.path` is the interpreter's own
+        without the working directory — plus the package directory at its end for a
+        package outside site-packages.
+
+        A ``sitecustomize`` on ``PYTHONPATH`` prints :data:`sys.path` from ``os._exit``,
+        which the runner reaches with code 2 when the scheduler's PID is missing.
+        """
+        hooks = tmp_path / "hooks"
+        hooks.mkdir()
+        (hooks / "sitecustomize.py").write_text(
+            "import os, sys\n"
+            "_real_exit = os._exit\n"
+            "def _exit(code):\n"
+            "    print('SYS_PATH', repr(sys.path), flush=True)\n"
+            "    _real_exit(code)\n"
+            "os._exit = _exit\n"
+        )
+        cwd = tmp_path / "cwd"
+        (cwd / "airflow_provider_rmq" / "watcher").mkdir(parents=True)
+        shadows = {
+            "runpy.py": "runpy",
+            "logging.py": "logging",
+            "airflow_provider_rmq/__init__.py": "airflow_provider_rmq",
+            "airflow_provider_rmq/watcher/__init__.py": "airflow_provider_rmq.watcher",
+            "airflow_provider_rmq/watcher/runner.py": "airflow_provider_rmq.watcher.runner",
+        }
+        for relative, name in shadows.items():
+            (cwd / relative).write_text(
+                f"print('SHADOWED {name}', flush=True)\nraise SystemExit(3)\n"
+            )
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in (PARENT_PID_ENV, PACKAGE_DIR_ENV)
+        }
+        env["PYTHONPATH"] = str(hooks)
+        if not in_site:
+            env[PACKAGE_DIR_ENV] = _PACKAGE_ROOT
+        reference = subprocess.run(
+            [sys.executable, "-c", "import sys; print(repr(sys.path[1:]))"],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=True,
+        )
+
+        result = subprocess.run(
+            listener_module._child_command(),
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False,
+        )
+
+        assert "SHADOWED" not in result.stdout + result.stderr
+        assert result.returncode == 2, result.stderr
+        assert PARENT_PID_ENV in result.stderr
+        line = next(line for line in result.stdout.splitlines() if line.startswith("SYS_PATH"))
+        path = ast.literal_eval(line.split(" ", 1)[1])
+        expected = ast.literal_eval(reference.stdout.strip())
+        assert path == expected + ([] if in_site else [_PACKAGE_ROOT])
+        assert "" not in path and str(cwd) not in path
+
+    def test_under_safe_path_the_bootstrap_removes_nothing(self, tmp_path):
+        """With ``PYTHONSAFEPATH`` (Python 3.11 and later) ``python -c`` puts no working
+        directory on :data:`sys.path`, and the bootstrap leaves the path whole."""
+        python = _python_with_safe_path()
+        if python is None:
+            pytest.skip("no Python 3.11 or later to run the bootstrap under PYTHONSAFEPATH")
+        plugins = tmp_path / "plugins"
+        plugins.mkdir()
+        (plugins / "rmq_bootstrap_probe.py").write_text(
+            "import sys\nprint(repr(sys.path))\n"
+        )
+        env = dict(os.environ, PYTHONSAFEPATH="1", **{PACKAGE_DIR_ENV: str(plugins)})
+        env.pop("PYTHONPATH", None)
+        reference = subprocess.run(
+            [python, "-c", "import sys; print(repr(sys.path))"],
+            env=env, capture_output=True, text=True, timeout=60, check=True,
+        )
+
+        result = subprocess.run(
+            [python, "-c", listener_module._BOOTSTRAP, "rmq_bootstrap_probe"],
+            env=env, capture_output=True, text=True, timeout=60, check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        expected = ast.literal_eval(reference.stdout.strip())
+        assert ast.literal_eval(result.stdout.strip()) == expected + [str(plugins)]
+
+    def test_site_directories_hold_the_interpreters_site_packages(self):
+        import sysconfig
+
+        found = listener_module._site_directories()
+
+        assert os.path.realpath(sysconfig.get_paths()["purelib"]) in found
+        assert os.path.realpath(sys.prefix) not in found
+
+    def test_the_runner_module_name_comes_from_the_runner_itself(self):
+        from airflow_provider_rmq.watcher import runner
+
+        assert listener_module._RUNNER_MODULE == runner.__name__
 
     def test_the_start_is_logged_with_the_child_pid(self, caplog):
         listener = RMQWatcherListener()
@@ -4674,7 +4905,10 @@ class TestWatcherProcessStart:
 
         popen.assert_not_called()
         assert listener._child is None
-        assert any("watcher process" in r.getMessage() for r in caplog.records)
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages == [
+            "RMQWatcherListener.on_starting in the watcher process — not starting another one"
+        ]
 
     def test_a_duplicate_start_with_the_process_alive_is_ignored(self, caplog):
         listener = RMQWatcherListener()
@@ -4698,7 +4932,8 @@ class TestWatcherProcessStart:
         assert popen.call_count == 2
         assert listener._child.pid == 222
 
-    def test_a_start_from_another_thread_warns_and_still_starts(self, caplog):
+    def test_a_start_from_another_thread_warns_and_still_starts(self, caplog, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
         listener = RMQWatcherListener()
         with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG), _popen() as popen:
             thread = threading.Thread(target=listener._spawn_child, name="not-main")
@@ -4714,6 +4949,77 @@ class TestWatcherProcessStart:
         with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG), _popen():
             listener._spawn_child()
 
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_process_that_started_the_watcher_is_its_owner(self):
+        listener = RMQWatcherListener()
+        with _popen():
+            listener.on_starting(SchedulerJobRunner())
+
+        assert listener._owner_pid == os.getpid()
+
+    def test_a_fork_of_the_scheduler_starts_no_process(self, caplog):
+        """A LocalExecutor task supervisor is forked from the scheduler: its stack
+        holds the scheduler's frames and it inherits this listener with ``_child``,
+        whose ``poll()`` there reads as an exit. It must not start a watcher of its own."""
+        listener = RMQWatcherListener()
+        listener._owner_pid = os.getpid() + 1
+        inherited = _fake_child(111, running=False)
+        listener._child = inherited
+        with caplog.at_level(logging.INFO, logger=_LISTENER_LOG), _popen() as popen:
+            listener.on_starting(SchedulerJobRunner())
+
+        popen.assert_not_called()
+        assert listener._child is inherited
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            f"a fork of the scheduler process {os.getpid() + 1}" in m for m in messages
+        ), messages
+
+    def test_a_fork_of_the_scheduler_leaves_the_watcher_process_alone(self):
+        listener = RMQWatcherListener()
+        listener._owner_pid = os.getpid() + 1
+        inherited = _fake_child(111)
+        listener._child = inherited
+
+        listener.before_stopping(MagicMock())
+
+        inherited.poll.assert_not_called()
+        inherited.terminate.assert_not_called()
+        inherited.kill.assert_not_called()
+        assert listener._child is inherited
+
+    def test_a_failed_start_still_marks_the_owner(self):
+        """A fork taken after a failed start is still not the scheduler."""
+        listener = RMQWatcherListener()
+        with patch(
+            "airflow_provider_rmq.watcher.listener.subprocess.Popen",
+            side_effect=OSError("no such interpreter"),
+        ):
+            listener.on_starting(SchedulerJobRunner())
+
+        assert listener._owner_pid == os.getpid()
+
+    def test_off_linux_the_watcher_process_is_started_too(self, caplog, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG), _popen() as popen:
+            listener.on_starting(SchedulerJobRunner())
+
+        popen.assert_called_once()
+        assert listener._child is not None
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_off_linux_a_start_from_another_thread_does_not_warn(self, caplog, monkeypatch):
+        """The warning is about the parent-death signal, which only Linux has."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG), _popen() as popen:
+            thread = threading.Thread(target=listener._spawn_child, name="not-main")
+            thread.start()
+            thread.join(timeout=5)
+
+        popen.assert_called_once()
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_a_popen_failure_is_logged_and_the_scheduler_carries_on(self, caplog):
@@ -4821,17 +5127,22 @@ class TestWatcherProcessStop:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
     def test_a_real_process_stops_on_sigterm(self):
         listener = RMQWatcherListener()
-        listener._child = subprocess.Popen(
+        child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             stdin=subprocess.DEVNULL,
         )
-        child = listener._child
+        try:
+            listener._child = child
 
-        started = time.monotonic()
-        listener.before_stopping(MagicMock())
+            started = time.monotonic()
+            listener.before_stopping(MagicMock())
 
-        assert time.monotonic() - started < _CHILD_STOP_TIMEOUT
-        assert child.returncode == -15
+            assert time.monotonic() - started < _CHILD_STOP_TIMEOUT
+            assert child.returncode == -15
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
     def test_a_real_process_ignoring_sigterm_is_killed_in_bounded_time(self):
@@ -4864,39 +5175,6 @@ class TestWatcherProcessStop:
                 child.kill()
                 child.wait()
             child.stdout.close()
-
-
-@contextlib.contextmanager
-def _watch_for_threads_and_loops():
-    """Record every thread started and every event loop created inside the block.
-
-    Yields a dict whose ``threads`` lists the names of the threads started and whose
-    ``loops`` counts the event loops created. The set of live threads is compared too:
-    a thread started and finished inside the block shows up in ``threads``, one still
-    running afterwards shows up in ``new_live_threads``. Only threads that appeared are
-    counted there — a thread a previous test left behind may end while the block runs,
-    which is not the scheduler gaining one.
-    """
-    seen: dict = {"threads": [], "loops": 0, "new_live_threads": set()}
-    real_start = threading.Thread.start
-    real_new_event_loop = asyncio.new_event_loop
-
-    def recording_start(thread, *args, **kwargs):
-        seen["threads"].append(thread.name)
-        return real_start(thread, *args, **kwargs)
-
-    def recording_new_event_loop():
-        seen["loops"] += 1
-        return real_new_event_loop()
-
-    before = set(threading.enumerate())
-    with patch.object(threading.Thread, "start", recording_start), patch.object(
-        asyncio, "new_event_loop", recording_new_event_loop
-    ):
-        yield seen
-    seen["new_live_threads"] = {
-        thread.name for thread in set(threading.enumerate()) - before
-    }
 
 
 class TestNothingOfThePluginRunsInTheScheduler:
@@ -4943,7 +5221,7 @@ class TestLifecycleDiagnostics:
     def test_unrecognised_component_logs_why_the_watcher_is_not_started(self, caplog):
         listener = RMQWatcherListener()
         with caplog.at_level(
-            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+            logging.INFO, logger=_LISTENER_LOG
         ), patch.object(listener, "_spawn_child") as start:
             listener.on_starting(GunicornWebServer())
 
@@ -4955,7 +5233,7 @@ class TestLifecycleDiagnostics:
     def test_scheduler_component_is_logged_without_a_reason(self, caplog):
         listener = RMQWatcherListener()
         with caplog.at_level(
-            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+            logging.INFO, logger=_LISTENER_LOG
         ), patch.object(listener, "_spawn_child"):
             listener.on_starting(SchedulerJobRunner())
 
@@ -4965,7 +5243,7 @@ class TestLifecycleDiagnostics:
     async def test_an_override_is_logged_once_the_first_cycle_has_read_it(self, caplog):
         listener = RMQWatcherListener()
         with caplog.at_level(
-            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+            logging.INFO, logger=_LISTENER_LOG
         ), patch(
             "airflow_provider_rmq.watcher.listener._read_settings",
             return_value=(120, 999.0),
@@ -5488,7 +5766,7 @@ class TestConcurrentSchedulerWrites:
         )
 
         with caplog.at_level(
-            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+            logging.INFO, logger=_LISTENER_LOG
         ):
             self._sync(
                 listener, two_process_engine,
@@ -5524,7 +5802,7 @@ class TestConcurrentSchedulerWrites:
         )
 
         with caplog.at_level(
-            logging.INFO, logger="airflow_provider_rmq.watcher.listener"
+            logging.INFO, logger=_LISTENER_LOG
         ):
             self._sync(listener, two_process_engine, lambda: {"d"})
 

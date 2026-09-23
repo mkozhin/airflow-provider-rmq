@@ -14,7 +14,7 @@
   дочерний процесс fork может унаследовать захваченную ими блокировку и зависнуть.
 - Установка не меняется: `pip install`, без правок docker compose и без отдельных
   сервисов. Под шедулером в дереве процессов появляется процесс
-  `python -m airflow_provider_rmq.watcher.runner`.
+  `python -c <bootstrap> airflow_provider_rmq.watcher.runner`.
 - Поведение watcher'а для пользователя то же: те же подписки, переменные, страница
   Subscriptions, строки в логе контейнера шедулера.
 
@@ -109,24 +109,37 @@
   процесса свой движок SQLAlchemy: до `pool_size + max_overflow` соединений с
   метабазой на каждый шедулер сверх соединений самого шедулера.
 - **Сигналы без обработчиков.** Runner первой строкой блокирует SIGTERM и SIGINT
-  (`signal.pthread_sigmask`), и эту маску наследуют все потоки процесса. Цикл
-  watcher'а идёт в отдельном потоке runner'а; основной поток ждёт сигнал в
-  `signal.sigtimedwait` и, получив его, обычным кодом просит цикл остановиться.
-  Python-обработчик сигнала не выполняется никогда, поэтому сигнал не может прервать
+  (`signal.pthread_sigmask`), и эту маску наследуют все потоки процесса. Сигналы в
+  каждый момент забирает один поток: пока основной поток импортирует Airflow и
+  загружает плагины, — поток наблюдения, который при сигнале сразу завершает процесс;
+  после подготовки — основной поток. Цикл watcher'а идёт в отдельном потоке runner'а;
+  основной поток ждёт сигнал в `signal.sigtimedwait` (без него, на macOS, —
+  `signal.sigpending` и `signal.sigwait`) и, получив его, обычным кодом просит цикл
+  остановиться. Python-обработчик сигнала не выполняется никогда, поэтому сигнал не может прервать
   код, держащий блокировку (`threading.Event`, буфер stdout), а сигнал, пришедший до
   запуска цикла, остаётся в очереди ядра и не теряется. Поток внутри дочернего
-  процесса безопасен: сам дочерний процесс `fork()` не делает.
+  процесса безопасен: сам дочерний процесс `fork()` не делает. SIGHUP, SIGQUIT, SIGUSR1
+  и SIGUSR2 runner следом за маской игнорирует (`SIG_IGN`): dumb-init с
+  `DUMB_INIT_SETSID=1` пересылает сигнал всей группе процессов шедулера, а шедулер
+  обрабатывает SIGUSR2 (дамп executor'а) и SIGQUIT (стеки потоков) и работает дальше.
 - **Смерть родителя.** PID шедулера родитель передаёт в окружении. Runner ставит
   `prctl(PR_SET_PDEATHSIG, SIGTERM)` и сразу сравнивает `os.getppid()` с переданным
   PID: несовпадение значит, что шедулер умер до установки, и runner выходит. Дальше
-  ядро само присылает SIGTERM при завершении основного потока шедулера, а цикл
-  дополнительно сверяет `getppid()` перед каждым проходом. Пайп с EOF для этого не
+  ядро само присылает SIGTERM при завершении основного потока шедулера, а
+  `getppid()` дополнительно сверяют поток наблюдения во время подготовки, основной
+  поток между ожиданиями сигнала и цикл перед каждым проходом. Пайп с EOF для этого не
   подходит: fork'и шедулера (пул отправки, менеджер разбора DAG'ов) наследуют его
   конец, и EOF не приходит, пока они живы. PDEATHSIG привязан к потоку, запустившему
   процесс, — это основной поток шедулера (`Job.__init__`).
 - **Выход.** Основной поток runner'а ждёт поток цикла ограниченное время, затем
-  `logging.shutdown()` и `os._exit()`. At-exit join потоков пулов не выполняется, и
-  застрявший в пуле вызов не держит процесс.
+  закрывает логирование (`logging.shutdown()` в daemon-потоке, не дольше
+  `_LOGGING_SHUTDOWN_TIMEOUT`) и `os._exit()`. At-exit join потоков пулов не
+  выполняется, и застрявший в пуле вызов не держит процесс; оставленный поток,
+  держащий блокировку обработчика логов, не держит выход. Решив выйти, процесс
+  первым делом, до любой строки в stderr или в лог, взводит таймер `ITIMER_REAL` на
+  `_HARD_EXIT_DEADLINE` (60 с): SIGALRM не заблокирован и без обработчика, и ядро
+  завершает процесс, на чём бы ни застрял выход — запись в stderr, обработчик логов,
+  `dispose_orm()`; `os._exit` стоит в `finally`.
 - **Остановка из шедулера.** `before_stopping`: SIGTERM, ожидание
   `_CHILD_STOP_TIMEOUT` (5 с), затем SIGKILL и ожидание сборки `_CHILD_REAP_TIMEOUT`
   (2 с); процесс, не собранный и после этого, остаётся в логе с PID, а остановка
@@ -156,20 +169,27 @@
   `runner.py` на верхнем уровне импортирует только stdlib; listener и Airflow
   импортируются внутри `main()`:
   - `CHILD_ENV_MARKER = "AIRFLOW_PROVIDER_RMQ_WATCHER_CHILD"`;
-  - `PARENT_PID_ENV = "AIRFLOW_PROVIDER_RMQ_WATCHER_PARENT_PID"`.
+  - `PARENT_PID_ENV = "AIRFLOW_PROVIDER_RMQ_WATCHER_PARENT_PID"`;
+  - `PACKAGE_DIR_ENV = "AIRFLOW_PROVIDER_RMQ_WATCHER_PACKAGE_DIR"`.
 - **Запуск** (`on_starting` → `_spawn_child`, только шедулер):
   - маркер в окружении → ничего не делать;
   - `self._child` жив (`poll() is None`) → WARNING, второй процесс не запускается;
   - вызов не из основного потока → WARNING (PDEATHSIG сработает при завершении этого
     потока, а не процесса), процесс всё равно запускается;
-  - окружение: `os.environ` + маркер + `PARENT_PID_ENV=str(os.getpid())` +
-    `PYTHONPATH` = каталог, из которого импортирован пакет
-    (`Path(airflow_provider_rmq.__file__).parents[1]`), перед существующим
-    `PYTHONPATH`; каталоги dags/plugins/config дочерний процесс добавляет сам при
-    инициализации Airflow;
-  - `subprocess.Popen([sys.executable, "-m", "airflow_provider_rmq.watcher.runner"],
-    env=env, stdin=subprocess.DEVNULL)`; stdout/stderr наследуются (строки watcher'а
-    идут в `docker logs` шедулера);
+  - окружение: `os.environ` + маркер + `PARENT_PID_ENV=str(os.getpid())`; если пакет
+    импортирован не из site-packages интерпретатора или пользователя (папка plugins), —
+    `PACKAGE_DIR_ENV` = этот каталог (`Path(airflow_provider_rmq.__file__).parents[1]`),
+    иначе `PACKAGE_DIR_ENV` в окружении нет; `PYTHONPATH` передаётся без изменений;
+    каталоги dags/plugins/config дочерний процесс добавляет сам при инициализации
+    Airflow;
+  - `subprocess.Popen([sys.executable, "-c", _BOOTSTRAP,
+    "airflow_provider_rmq.watcher.runner"], env=env, stdin=subprocess.DEVNULL)`;
+    `_BOOTSTRAP`, импортировав только `sys`, убирает рабочий каталог, который `-c`
+    ставит в начало `sys.path` (при `sys.flags.safe_path` ничего не убирает), затем
+    добавляет `PACKAGE_DIR_ENV`, если он задан, в конец `sys.path` и выполняет модуль
+    runner'а через `runpy.run_module(..., run_name="__main__")`; рабочий каталог
+    процесса — шедулера; stdout/stderr наследуются (строки watcher'а идут в
+    `docker logs` шедулера);
   - INFO с PID дочернего процесса; при исключении `Popen` — ERROR, шедулер
     продолжает работу без watcher'а.
 - **Остановка** (`before_stopping` → `_stop_child`):
@@ -189,32 +209,65 @@
   оба пути, до первого обращения видят `None` — их список в задаче 1.
 - **Listener в дочернем процессе:**
   - `_stop_event = threading.Event()` создаётся в `__init__`;
-  - `run(parent_pid: int | None = None)` — запоминает `_parent_pid`, пишет
+  - `run(parent_pid: int)` — запоминает `_parent_pid`, пишет
     INFO-строку об интервале и бюджете цикла (сейчас стр. 1047-1053) и выполняет
     `_run_loop` в текущем потоке;
   - `request_stop()` — stop event + `_wake_loop()`; вызывается обычным кодом, не из
     обработчика сигнала; идемпотентен.
-- **Runner** (`airflow_provider_rmq/watcher/runner.py`, `main()`):
-  1. `signal.pthread_sigmask(SIG_BLOCK, {SIGTERM, SIGINT})` — первой строкой;
-  2. `parent = int(os.environ[PARENT_PID_ENV])`; нет или не число → сообщение в stderr,
-     `os._exit(2)`;
+- **Runner** (`airflow_provider_rmq/watcher/runner.py`, `main()`). Жёсткий срок
+  выхода — `_arm_hard_exit()`: `signal.setitimer(ITIMER_REAL, _HARD_EXIT_DEADLINE)`, где
+  `_HARD_EXIT_DEADLINE = int(_EXIT_JOIN_TIMEOUT) + 15` (60 с); уже взведённый таймер
+  (`signal.getitimer`) не трогается и не сдвигается. Он взводится первым действием на каждом решении выйти, до любой
+  строки в stderr или в лог:
+  1. `signal.pthread_sigmask(SIG_BLOCK, {SIGTERM, SIGINT})` — первой строкой; затем
+     `_ignore_group_signals()` — `SIG_IGN` для `_IGNORED_SIGNALS` (SIGHUP, SIGQUIT,
+     SIGUSR1, SIGUSR2); затем `_make_sigalrm_fatal()` — SIGALRM заблокирован в основном потоке, таймер
+     `ITIMER_REAL` снят, `SIG_IGN` (сбрасывает ожидающий SIGALRM), `SIG_DFL`, SIGALRM
+     снят с блокировки (игнорирование и маска наследуются через exec);
+  2. `parent = int(os.environ[PARENT_PID_ENV])`; нет или не число → срок, сообщение в
+     stderr, `os._exit(2)`;
   3. `_set_parent_death_signal()` — `prctl(PR_SET_PDEATHSIG, SIGTERM)` через
-     `ctypes.CDLL(None, use_errno=True)` на Linux; ошибка — сообщение, работа
-     продолжается; не Linux — no-op;
-  4. `os.getppid() != parent` → `os._exit(0)`;
-  5. `import airflow`, импорт listener'а; INFO с PID процесса и PID шедулера;
-  6. `listener = RMQWatcherListener()`; поток `rmq-watcher` с
-     `target=listener.run, args=(parent,)`, `daemon=True`;
-  7. цикл ожидания: `signal.sigtimedwait({SIGTERM, SIGINT}, 1.0)`; сигнал → INFO,
-     `listener.request_stop()`, выход из цикла; поток цикла завершился сам (смена
-     родителя в `_main`) → выход из цикла;
-  8. `thread.join(timeout=_EXIT_JOIN_TIMEOUT)` (с запасом над `_STOP_TIMEOUT`); поток
-     жив → WARNING;
-  9. `logging.shutdown()`, `os._exit(0)`; исключение на шагах 5-8 → запись в лог,
-     `logging.shutdown()`, `os._exit(1)`.
+     `ctypes.CDLL(None, use_errno=True)` на Linux; ошибка — возвращённая строка,
+     которую `_prepare_under_watch` пишет в stderr уже при запущенном потоке
+     наблюдения, работа продолжается; не Linux — no-op;
+  4. `os.getppid() != parent` → срок, сообщение в stderr, `os._exit(0)`;
+  5. подготовка (`_prepare_under_watch`): основной поток запускает поток наблюдения
+     `rmq-watcher-prepare-watch` (`daemon=True`, наследует маску) и сам делает
+     `import airflow`, `_prepare_airflow()` и импорт listener'а — как шедулер, в
+     основном потоке, где плагину доступны `signal.signal()` и
+     `signal.set_wakeup_fd()`; поток наблюдения (`_watch_preparation`), пока не
+     поставлено событие `finished`, ждёт сигнал
+     `_wait_for_stop_signal(_SIGNAL_POLL_INTERVAL)` и после каждого ожидания без
+     сигнала сверяет `os.getppid()` с `parent`; сигнал (в том числе взятый последним
+     ожиданием) или смена родителя → срок, строка в stderr через `os.write(2, …)`
+     (`_report`) и `os._exit(0)` прямо из потока наблюдения, без
+     `logging.shutdown()`; после подготовки (и при её исключении) основной поток
+     ставит `finished`, ждёт поток наблюдения, снова зовёт `_make_sigalrm_fatal()`
+     (плагин мог поставить обработчик SIGALRM или взвести таймер) и только потом идёт
+     дальше;
+  6. `listener = RMQWatcherListener()`; поток `rmq-watcher` (`daemon=True`) пишет INFO
+     с PID процесса и PID шедулера и выполняет `listener.run(parent)`, а исключение из
+     него — срок, запись в лог (`RMQ Watcher loop failed`) и отметка; основной поток
+     между запуском потока цикла и ожиданием в лог не пишет;
+  7. цикл ожидания: `_wait_for_stop_signal(_SIGNAL_POLL_INTERVAL)` — на Linux
+     `signal.sigtimedwait({SIGTERM, SIGINT}, 1.0)`, без `sigtimedwait` (macOS) опрос
+     `signal.sigpending()` раз в `_SIGNAL_PENDING_POLL` и `signal.sigwait()`; сигнал →
+     срок, `listener.request_stop()`, INFO, выход из цикла; после ожидания без сигнала
+     `os.getppid() != parent` → срок, `listener.request_stop()`, ERROR `RMQ Watcher
+     process: the scheduler process … has exited`, выход из цикла; поток цикла
+     завершился сам (смена родителя в `_main`) → выход из цикла;
+  8. срок (поток цикла мог закончиться сам); `thread.join(timeout=_EXIT_JOIN_TIMEOUT)`
+     (с запасом над `_STOP_TIMEOUT`); поток жив → строка в stderr через `_report`
+     (не лог: поток цикла может держать блокировку обработчика), код 0; поток отметил
+     исключение → код 1; иначе `_close_database_connections()`, код 0;
+  9. срок; `_shut_down_logging()` — `logging.shutdown()` в daemon-потоке с ожиданием
+     не дольше `_LOGGING_SHUTDOWN_TIMEOUT` (2 с), не дождались → строка в stderr;
+     исключение на шагах 5-8 → срок, запись в лог, код 1; `os._exit(код)` — в
+     `finally`, так что исключение на выходе его не пропускает.
 - **Цикл** (`_main`):
-  - перед каждым проходом: `_parent_pid` задан и `os.getppid() != _parent_pid` →
-    ERROR о завершении шедулера, stop event, выход;
+  - перед каждым проходом: `os.getppid() != _parent_pid` → жёсткий срок выхода
+    процесса (`runner._arm_hard_exit()`), ERROR о завершении шедулера, stop event,
+    выход;
   - после того как `_run_cycle` вернул управление — `incr("rmq_watcher.cycle_completed")`;
     при таймауте цикла счётчик не растёт.
 - **`_CHILD_STOP_TIMEOUT = 5.0`** — ожидание дочернего процесса после SIGTERM в
@@ -257,16 +310,15 @@
       вызванный напрямую, работает без предварительной подготовки пулов
 - [x] `_stop_event` создаётся в `__init__`; `_start` продолжает работать (до задачи 3
       он переиспользует или пересоздаёт событие, существующие тесты остаются зелёными)
-- [x] `run(parent_pid=None)`: сохраняет `_parent_pid`, пишет INFO-строку об интервале
+- [x] `run(parent_pid)`: сохраняет `_parent_pid`, пишет INFO-строку об интервале
       и бюджете цикла, выполняет `_run_loop` в текущем потоке
 - [x] `request_stop()`: stop event + `_wake_loop()`, идемпотентен, работает до
       запуска цикла
 - [x] в `_main` перед каждым проходом — проверка `getppid()` против `_parent_pid`
       (ERROR, stop event, выход)
 - [x] после возврата `_run_cycle` — `incr("rmq_watcher.cycle_completed")`
-- [x] тесты: смена `getppid` останавливает цикл; `_parent_pid=None` родителя не
-      проверяет; `request_stop()` до `run()` — `run()` сразу возвращается;
-      повторный `request_stop()` безвреден
+- [x] тесты: смена `getppid` останавливает цикл; `request_stop()` до `run()` —
+      `run()` сразу возвращается; повторный `request_stop()` безвреден
 - [x] тесты: `cycle_completed` растёт, когда `_run_cycle` вернул управление (в том
       числе если внутри шаг упал и был записан в лог), и не растёт на таймауте цикла
 - [x] run tests - must pass before next task
@@ -282,16 +334,54 @@
 - [x] `_set_parent_death_signal()` через `ctypes` (Linux; иначе no-op)
 - [x] `main()` по шагам из Technical Details: маска сигналов, PID родителя,
       PDEATHSIG, проверка `getppid`, инициализация Airflow, поток цикла, ожидание в
-      `sigtimedwait`, ограниченный join, `logging.shutdown()` + `os._exit()`;
+      `sigtimedwait`, ограниченный join, ограниченный `logging.shutdown()` +
+      `os._exit()`;
       `if __name__ == "__main__": main()`
 - [x] тесты `_set_parent_death_signal`: вызов `prctl` с `PR_SET_PDEATHSIG`/`SIGTERM`
-      (замоканный `ctypes`), ошибка `prctl` — сообщение без падения, не-Linux — no-op
+      (замоканный `ctypes`), ошибка `prctl` — возвращённая строка без падения и без
+      записи в stderr, не-Linux — no-op; строка пишется в stderr при запущенном потоке
+      наблюдения, и сигнал остановки завершает процесс, пока эта запись висит
 - [x] тесты `main()` (замоканы `os._exit`, `sigtimedwait`, listener): маска
       выставлена до всего остального; нет или битый `PARENT_PID_ENV` → код 2; родитель
       сменился до установки → выход без запуска цикла; сигнал → `request_stop()` и
       join; поток цикла завершился сам → выход без сигнала; поток не завершился за
-      `_EXIT_JOIN_TIMEOUT` → WARNING и `os._exit`; исключение при инициализации →
-      код 1
+      `_EXIT_JOIN_TIMEOUT` → строка в stderr и `os._exit`; поток цикла, оставленный с
+      блокировкой обработчика логов, не блокирует выход; исключение при
+      инициализации → код 1
+- [x] тесты подготовки: Airflow готовится в основном потоке; плагин, вызывающий
+      `signal.signal()`/`signal.set_wakeup_fd()`, загружается; поток наблюдения жив
+      во время подготовки и завершён до создания listener'а; сигнал во время
+      зависшей подготовки → `os._exit(0)` из потока наблюдения без
+      `logging.shutdown()`, listener не создан; смена родителя во время зависшей
+      подготовки → то же; то же без `sigtimedwait`; исключение подготовки → код 1
+      после завершения потока наблюдения
+- [x] тесты `_watch_preparation`: сигнал и смена родителя → код 0; сигнал, взятый
+      ожиданием, во время которого подготовка закончилась, → код 0 (не теряется);
+      после `finished` новых ожиданий нет; реальный SIGTERM забирается не основным
+      потоком, Python-обработчик не выполняется
+- [x] тесты `_report` (пишет в fd 2 мимо `sys.stderr`, закрытый stderr не роняет) и
+      `_shut_down_logging` (обычное закрытие; незавершившееся закрытие бросается;
+      реальный `logging.shutdown()` при блокировке обработчика, удерживаемой другим
+      потоком, не блокирует выход)
+- [x] тесты жёсткого срока выхода (таймер `ITIMER_REAL` в тестах подменён conftest'ом):
+      срок больше join'а и закрытия логирования; `_arm_hard_exit` взводит таймер и
+      не сдвигает уже взведённый (и в реальном процессе, с дробным остатком);
+      реальный процесс: таймер и ожидающий SIGALRM, оставленные плагином, после
+      `_make_sigalrm_fatal()` процесс не завершают, обработчик плагина не выполняется; реальный процесс с унаследованным игнорированием и
+      блокировкой SIGALRM после `_make_sigalrm_fatal()` завершается SIGALRM, когда все
+      потоки заблокированы; срок взводится раньше строки или шага выхода на каждом
+      решении выйти — сигнал и смена родителя в потоке наблюдения, сигнал и смена
+      родителя в основном потоке (затем `request_stop()`, затем строка), цикл,
+      закончившийся сам или упавший, исключение подготовки, ранние выходы с кодами 2
+      и 0, проверка родителя в цикле (`test_listener.py`); пока watcher работает,
+      срок не взведён; `os._exit` вызывается, даже если `_shut_down_logging` бросил;
+      строка о старте пишется из потока цикла; `_make_sigalrm_fatal` зовётся сразу
+      после маски и снова после подготовки
+- [x] тесты игнорируемых сигналов: `_ignore_group_signals` зовётся сразу после маски,
+      до `_make_sigalrm_fatal`; `_IGNORED_SIGNALS` — SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2,
+      без сигналов остановки и SIGALRM; реальный процесс: каждый из них, посланный себе
+      после `_ignore_group_signals()`, процесс не завершает, диспозиции SIGTERM, SIGINT
+      и SIGALRM не меняются
 - [x] run tests - must pass before next task
 
 ### Task 3: Listener запускает и останавливает дочерний процесс вместо потока
@@ -310,8 +400,9 @@
       ветки `before_stopping`, работавшие с потоком; докстринг класса описывает
       процессную схему
 - [x] тесты `on_starting`: аргументы `Popen`, окружение (маркер, `PARENT_PID_ENV`,
-      `PYTHONPATH` с каталогом пакета перед существующим значением,
-      `stdin=DEVNULL`); не-шедулер не запускает процесс; маркер блокирует запуск;
+      `PYTHONPATH` без изменений, `PACKAGE_DIR_ENV` только для пакета вне
+      site-packages, `stdin=DEVNULL`); `_BOOTSTRAP` в настоящем интерпретаторе не
+      импортирует модули из рабочего каталога; не-шедулер не запускает процесс; маркер блокирует запуск;
       дубль при живом процессе; вызов не из основного потока; ошибка `Popen`
 - [x] тесты `before_stopping`: выход по SIGTERM; таймаут → SIGKILL; SIGKILL не
       добил процесс за `_CHILD_REAP_TIMEOUT` → ERROR и возврат без зависания; процесс уже
@@ -352,6 +443,25 @@
 - [x] тест: SIGTERM, отправленный после маркера `masked` и до маркера `start`, не
       теряется — процесс выходит с кодом 0 и маркером выхода, цикл не остаётся
       работать
+- [x] тесты зависшей подготовки (stub с `RMQ_STUB_HANG_PREPARE`): SIGTERM → код 0
+      быстрее `_CHILD_STOP_TIMEOUT`; `kill -9` промежуточного процесса → процесс
+      watcher'а завершается с кодом 0
+- [x] тест: плагин в папке plugins, вызывающий при импорте `signal.signal()` и
+      `signal.set_wakeup_fd()`, загружается в процессе watcher'а (имя в строке
+      `start`), SIGTERM останавливает цикл
+- [x] тесты жёсткого срока выхода (stub с сокращённым `RMQ_STUB_HARD_EXIT_DEADLINE`):
+      `RMQ_STUB_HANG_EXIT` — закрытие соединений с метабазой зависает после SIGTERM,
+      процесс завершается SIGALRM в пределах срока; `RMQ_STUB_STALL_STDERR` с
+      `RMQ_STUB_HANG_PREPARE` — stderr заполнен и не читается, поток наблюдения
+      встаёт на `_report` после SIGTERM, процесс завершается SIGALRM; `kill -9`
+      промежуточного процесса при зависающем выходе — процесс watcher'а завершается
+      SIGALRM, сирота не остаётся
+- [x] тесты сигналов группе процессов (stub в собственной сессии): SIGHUP, SIGQUIT,
+      SIGUSR1 и SIGUSR2, посланные группе при работающем цикле и во время зависшей
+      подготовки (`RMQ_STUB_HANG_PREPARE`), процесс не завершают; SIGTERM после них
+      останавливает его с кодом 0; stub выключает core dump
+- [x] stub пишет `loop_started` в файл-маркер раньше, чем печатает маркер `start`, так
+      что порядок `loop_started` → `request_stop` в тестах не зависит от гонки
 - [x] тест: stub с маркером окружения, вызывающий `on_starting` шедулера, не порождает
       внука; то же при `AIRFLOW__CORE__LAZY_LOAD_PLUGINS=False`
 - [x] тесты помечены как Linux-only (`skipif`), таймауты не меньше 30 с на старт с
@@ -440,7 +550,7 @@
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
 
 **Проверка на стенде с Airflow 2.9.1:**
-- `docker top` шедулера: процесс `python -m airflow_provider_rmq.watcher.runner` под
+- `docker top` шедулера: процесс `python -c <bootstrap> airflow_provider_rmq.watcher.runner` под
   `airflow scheduler`;
 - `py-spy dump` процесса шедулера: только `MainThread`; у процесса runner'а — основной
   поток в `sigtimedwait` и потоки watcher'а;

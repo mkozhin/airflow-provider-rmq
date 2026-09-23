@@ -7,8 +7,8 @@ DAG-файлов, синхронизирует их с БД Airflow и держ�
 ## Language
 
 **Watcher**:
-Дочерний процесс Scheduler'а `python -m airflow_provider_rmq.watcher.runner`, в котором идёт
-цикл reconcile и живут consumer-задачи. Его запускает listener плагина в `on_starting` через
+Дочерний процесс Scheduler'а `python -c <bootstrap> airflow_provider_rmq.watcher.runner`, в
+котором идёт цикл reconcile и живут consumer-задачи. Его запускает listener плагина в `on_starting` через
 `subprocess.Popen` и останавливает в `before_stopping`; по одному на Scheduler. В самом
 процессе Scheduler'а у плагина нет ни потоков, ни event loop, ни пулов: Airflow делает из него
 `fork()`, а fork безопасен только из однопоточного процесса (ADR 0008). Умерший Watcher не

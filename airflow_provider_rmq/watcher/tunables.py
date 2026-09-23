@@ -1,12 +1,13 @@
 """Names, defaults and timing rules of the settings that tune the watcher.
 
 The reconcile interval and the cycle budget are read by two processes that share
-nothing else: the scheduler runs the loop, and the webserver renders the Subscriptions
-page and needs the same numbers to tell a fresh status row from a late one. The names,
-their defaults and the arithmetic over them therefore have one home that both read, and
-the view does not reach into the listener for them. The yes-or-no switch of the page's
-access is read by the webserver alone and lives here for the same reason: the name of a
-watcher setting and the rules for reading it belong together.
+nothing else: the watcher process, a child of the scheduler, runs the loop, and the
+webserver renders the Subscriptions page and needs the same numbers to tell a fresh
+status row from a late one. The names, their defaults and the arithmetic over them
+therefore have one home that both read, and the view does not reach into the listener
+for them. The yes-or-no switch of the page's access is read by the webserver alone
+and lives here for the same reason: the name of a watcher setting and the rules for
+reading it belong together.
 
 That switch is the one setting here that is not an Airflow Variable. It governs a
 permission of the Op role, and Airflow gives that role create, edit and delete on

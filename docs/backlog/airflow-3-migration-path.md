@@ -10,7 +10,7 @@ added: 2026-09-02
 одна деталь, а сама конструкция watcher'а:
 
 - дочерний процесс шедулера с asyncio-петлёй
-  (`python -m airflow_provider_rmq.watcher.runner`), который listener запускает
+  (`python -c <bootstrap> airflow_provider_rmq.watcher.runner`), который listener запускает
   в `on_starting` и останавливает в `before_stopping`, и определение «мы в
   шедулере» по стеку вызовов (`listener.py:1015-1041`);
 - прямой ORM к метабазе из плагина: `DagModel`, `serialized_dag` через

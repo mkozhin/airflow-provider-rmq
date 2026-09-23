@@ -40,8 +40,8 @@ log = logging.getLogger(__name__)
 SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE = (
     "Subscriptions are unavailable: the rmq_watcher_subscriptions table could "
     "not be read. Most often this means it does not yet match this version of "
-    "the provider, and the watcher loop in the scheduler migrates it on one of "
-    "its next cycles; the webserver log carries the actual error."
+    "the provider, and the watcher process under the scheduler migrates it on one "
+    "of its next cycles; the webserver log carries the actual error."
 )
 
 

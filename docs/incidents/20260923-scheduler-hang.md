@@ -423,7 +423,7 @@ PID шедулера — процесс `airflow scheduler`, у которого
 
 Стратегическое решение принято в [ADR 0008](../adr/0008-watcher-child-process.md)
 и вошло в v2.6.0: цикл watcher'а работает в дочернем процессе шедулера
-`python -m airflow_provider_rmq.watcher.runner`, который listener запускает через
+`python -c <bootstrap> airflow_provider_rmq.watcher.runner`, который listener запускает через
 `subprocess.Popen` (fork и exec в C, без Python-кода между ними). В процессе
 шедулера у плагина нет ни потоков, ни event loop, ни пулов, и условие гипотез 1 и 3
 со стороны плагина снято. Гипотезу 2 это решение не затрагивает.
