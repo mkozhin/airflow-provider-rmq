@@ -23,7 +23,10 @@
 - `airflow_provider_rmq/watcher/listener.py`:
   - `RMQWatcherListener.__init__` (стр. 891) создаёт пулы `BoundedExecutor`
     (стр. 952-953); потоки пулов появляются только при первом `submit`
-    (`utils/executor.py:59`), так что сам экземпляр потоков не создаёт;
+    (`utils/executor.py:59`), так что сам экземпляр потоков не создаёт. Пулы
+    используются в двух местах: создание `RMQConsumerManager` в `_main` (стр. 1081) и
+    `_cycle_step` (стр. 1212-1216); тесты местами подставляют свои пулы в
+    `_cycle_pool`/`_consumer_pool` напрямую;
   - `on_starting` (стр. 976) определяет шедулер и зовёт `_start` (стр. 1032), который
     создаёт stop event и поднимает поток `rmq-watcher` с `_run_loop` (стр. 1055);
     INFO-строка об интервале и бюджете цикла — стр. 1047-1053;
@@ -34,7 +37,7 @@
   - `_main` (стр. 1077) — цикл reconcile; `_run_cycle` сам перехватывает
     `_StepInFlight` и `Exception` (стр. 1178-1181), наружу выходит только таймаут
     цикла;
-  - `manager.stop()` ограничен `_STOP_TIMEOUT = 30.0` (стр. 113).
+  - `manager.stop()` ограничен `_STOP_TIMEOUT = 30.0` (стр. 118).
 - `airflow_provider_rmq/watcher/plugin.py:221` — `listeners = [RMQWatcherListener()]`:
   экземпляр создаётся при импорте плагина во всех компонентах Airflow (scheduler,
   webserver, triggerer, worker).
@@ -125,7 +128,9 @@
   `logging.shutdown()` и `os._exit()`. At-exit join потоков пулов не выполняется, и
   застрявший в пуле вызов не держит процесс.
 - **Остановка из шедулера.** `before_stopping`: SIGTERM, ожидание
-  `_CHILD_STOP_TIMEOUT` (5 с), затем SIGKILL. SIGKILL обрывает `manager.stop()`,
+  `_CHILD_STOP_TIMEOUT` (5 с), затем SIGKILL и ожидание сборки `_CHILD_REAP_TIMEOUT`
+  (2 с); процесс, не собранный и после этого, остаётся в логе с PID, а остановка
+  шедулера продолжается. SIGKILL обрывает `manager.stop()`,
   бюджет которого 30 с; неподтверждённые доставки брокер возвращает в очередь. При
   `docker stop` dumb-init присылает runner'у SIGTERM напрямую, вместе с шедулером;
   повторная просьба об остановке безвредна.
@@ -170,7 +175,17 @@
 - **Остановка** (`before_stopping` → `_stop_child`):
   - процесса нет → ничего; процесс уже завершён → `wait()` и код выхода в лог;
   - иначе `terminate()` → `wait(timeout=_CHILD_STOP_TIMEOUT)` → при `TimeoutExpired`
-    WARNING, `kill()` → `wait()`; код выхода в лог.
+    WARNING, `kill()` → `wait(timeout=_CHILD_REAP_TIMEOUT)`; код выхода в лог;
+  - `wait()` после SIGKILL тоже ограничен: процесс, стоящий в непрерываемом вводе-выводе
+    ядра (например, на зависшем NFS с DAG'ами), SIGKILL добивает не сразу. При
+    `TimeoutExpired` — ERROR с PID несобранного процесса, и `before_stopping`
+    возвращает управление, чтобы остановка шедулера не зависела от него.
+- **Пулы:** `_cycle_pool` и `_consumer_pool` в `__init__` — `None`; `_ensure_pools()`
+  создаёт недостающие при первом обращении и возвращает оба. Через него идут создание
+  `RMQConsumerManager` в `_main` и `_cycle_step`. Подставленные тестом пулы он не
+  трогает. Экземпляр listener'а в процессах scheduler, webserver, triggerer и worker
+  пулов не создаёт; тесты, вызывающие `_run_cycle`/`_main` напрямую, получают пулы по
+  первому обращению.
 - **Listener в дочернем процессе:**
   - `_stop_event = threading.Event()` создаётся в `__init__`;
   - `run(parent_pid: int | None = None)` — запоминает `_parent_pid`, пишет
@@ -201,7 +216,8 @@
     ERROR о завершении шедулера, stop event, выход;
   - после того как `_run_cycle` вернул управление — `incr("rmq_watcher.cycle_completed")`;
     при таймауте цикла счётчик не растёт.
-- **`_CHILD_STOP_TIMEOUT = 5.0`** — ожидание дочернего процесса в `before_stopping`.
+- **`_CHILD_STOP_TIMEOUT = 5.0`** — ожидание дочернего процесса после SIGTERM в
+  `before_stopping`; **`_CHILD_REAP_TIMEOUT = 2.0`** — ожидание после SIGKILL.
 
 ## What Goes Where
 
@@ -212,12 +228,18 @@
 
 ## Implementation Steps
 
-### Task 1: API цикла для дочернего процесса: `run`, `request_stop`, проверка родителя, метрика
+### Task 1: API цикла для дочернего процесса: пулы, `run`, `request_stop`, проверка родителя, метрика
 
 **Files:**
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
+- [ ] `_cycle_pool`/`_consumer_pool` в `__init__` — `None`; `_ensure_pools()` создаёт
+      недостающие при первом обращении и не трогает подставленные; создание
+      `RMQConsumerManager` в `_main` и `_cycle_step` получают пулы через него
+- [ ] тесты `_ensure_pools()`: после конструктора пулов нет; первое обращение создаёт
+      оба, повторное возвращает те же; подставленный пул сохраняется; `_run_cycle`,
+      вызванный напрямую, работает без предварительной подготовки пулов
 - [ ] `_stop_event` создаётся в `__init__`; `_start` продолжает работать (до задачи 3
       он переиспользует или пересоздаёт событие, существующие тесты остаются зелёными)
 - [ ] `run(parent_pid=None)`: сохраняет `_parent_pid`, пишет INFO-строку об интервале
@@ -267,7 +289,8 @@
       Technical Details (дубль при живом процессе — WARNING; вызов не из основного
       потока — WARNING; ошибка `Popen` — ERROR)
 - [ ] `before_stopping` → `_stop_child()`: SIGTERM, `wait(_CHILD_STOP_TIMEOUT)`, затем
-      SIGKILL + `wait()`, код выхода в лог
+      SIGKILL + `wait(_CHILD_REAP_TIMEOUT)`; при повторном таймауте ERROR с PID и
+      возврат; код выхода в лог
 - [ ] удалить потоковую схему в шедулере: `_start`, поле `_thread`, `_JOIN_TIMEOUT` и
       ветки `before_stopping`, работавшие с потоком; докстринг класса описывает
       процессную схему
@@ -275,7 +298,8 @@
       `PYTHONPATH` с каталогом пакета перед существующим значением,
       `stdin=DEVNULL`); не-шедулер не запускает процесс; маркер блокирует запуск;
       дубль при живом процессе; вызов не из основного потока; ошибка `Popen`
-- [ ] тесты `before_stopping`: выход по SIGTERM; таймаут → SIGKILL; процесс уже
+- [ ] тесты `before_stopping`: выход по SIGTERM; таймаут → SIGKILL; SIGKILL не
+      добил процесс за `_CHILD_REAP_TIMEOUT` → ERROR и возврат без зависания; процесс уже
       завершён (путь, по которому dumb-init остановил runner раньше шедулера);
       `before_stopping` без процесса
 - [ ] удалить или переписать тесты потоковой схемы
@@ -287,7 +311,8 @@
 - Modify: `tests/watcher/test_listener.py`
 
 - [ ] тест: множество потоков до и после `on_starting` для шедулера (замоканный
-      `Popen`) совпадает; event loop не создан; ни один пул не получил задачу
+      `Popen`) совпадает; event loop не создан; у экземпляра listener'а нет пулов
+      (`_cycle_pool` и `_consumer_pool` — `None`)
 - [ ] тест: то же для последовательности `on_starting` → `before_stopping` →
       `on_starting`
 - [ ] run tests - must pass before next task
@@ -298,16 +323,20 @@
 - Create: `tests/watcher/test_runner_process.py`
 - Create: `tests/watcher/runner_stub.py`
 
-- [ ] `runner_stub.py` — тестовая точка входа: подменяет `_main` listener'а корутиной,
-      которая печатает маркер старта (`flush=True`) и ждёт stop event, пишет маркер
-      выхода в файл из переменной окружения перед `os._exit`, затем зовёт
-      `runner.main()`
-- [ ] тест: процесс стартует и печатает маркер; SIGTERM → код выхода 0 и маркер
+- [ ] `runner_stub.py` — тестовая точка входа. Первым действием, до любого тяжёлого
+      импорта, блокирует SIGTERM/SIGINT той же маской, что `runner.main()`, и печатает
+      маркер `masked` (`flush=True`); затем импортирует listener, подменяет `_main`
+      корутиной, которая печатает маркер `start` (`flush=True`) и ждёт stop event,
+      подменяет выход так, чтобы маркер выхода записался в файл из переменной
+      окружения перед `os._exit`, и зовёт `runner.main()`
+- [ ] тест: процесс стартует и печатает оба маркера; SIGTERM → код выхода 0 и маркер
       выхода
 - [ ] тест смерти родителя: промежуточный процесс запускает stub с его PID в
       `PARENT_PID_ENV`; `kill -9` промежуточного → маркер выхода появляется
       (PDEATHSIG); завершение проверяется по файлу-маркеру, а не по `os.kill(pid, 0)`
-- [ ] тест: SIGTERM, отправленный сразу после старта, до запуска цикла, не теряется
+- [ ] тест: SIGTERM, отправленный после маркера `masked` и до маркера `start`, не
+      теряется — процесс выходит с кодом 0 и маркером выхода, цикл не остаётся
+      работать
 - [ ] тест: stub с маркером окружения, вызывающий `on_starting` шедулера, не порождает
       внука; то же при `AIRFLOW__CORE__LAZY_LOAD_PLUGINS=False`
 - [ ] тесты помечены как Linux-only (`skipif`), таймауты не меньше 30 с на старт с
@@ -342,7 +371,8 @@
       `sigtimedwait`; выход через `os._exit`; без перезапуска, метрика
       `cycle_completed` как сигнал живости; удаление потоковой схемы
 - [ ] следствия: отдельный пул соединений с метабазой; SIGKILL через 5 с обрывает
-      `manager.stop()`; dumb-init присылает SIGTERM всей группе; мёртвый процесс виден
+      `manager.stop()`; ожидание после SIGKILL ограничено, и несобранный процесс не
+      держит остановку шедулера; пулы создаются только в дочернем процессе; dumb-init присылает SIGTERM всей группе; мёртвый процесс виден
       как `<defunct>`; `close_fds=True`
 - [ ] отклонённые варианты: отдельный сервис в compose (меняет установку),
       `multiprocessing` spawn (зависимость от `__main__` шедулера),
@@ -352,8 +382,9 @@
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] в процессе шедулера после `on_starting` нет потоков, event loop и задач в пулах
-      плагина
+- [ ] в процессе шедулера после `on_starting` нет потоков, event loop и пулов плагина
+- [ ] `before_stopping` возвращает управление за ограниченное время, даже если
+      процесс не собирается после SIGKILL
 - [ ] цикл watcher'а работает в дочернем процессе и завершается по SIGTERM, по смерти
       шедулера и при SIGTERM до старта цикла
 - [ ] повторный `on_starting`, ошибка `Popen`, вызов не из основного потока, пакет из
@@ -370,7 +401,15 @@
       шедулера, процесс в дереве и `<defunct>` при его смерти, строки в логе шедулера,
       метрика `rmq_watcher.cycle_completed` (живость, а не здоровье) и правило на её
       отсутствие, отдельный пул соединений с метабазой; места, описывающие цикл внутри
-      процесса шедулера (в том числе `readme.md:891, 977`)
+      процесса шедулера: `readme.md:620` («The Scheduler process runs a background
+      asyncio loop…»), `readme.md:874` («…inside the Scheduler»), `readme.md:990`
+      (`RMQWatcherListener (Scheduler Listener)`) и их пары `readme_ru.md:620, 873`;
+      в дереве файлов (`readme.md:977` и соседние строки) добавить `runner.py`
+- [ ] `docs/backlog/`: удалить `stop-event-replacement-revives-watcher.md` (описывает
+      `_start()`, которого больше нет); переписать предпосылку и оценку
+      `trigger-dag-shares-scheduler-db-pool.md` под дочерний процесс со своим пулом
+      соединений; поправить первый пункт `airflow-3-migration-path.md` («поток с
+      asyncio-петлёй внутри процесса шедулера»)
 - [ ] `CONTEXT.md`: описание Watcher — дочерний процесс шедулера
 - [ ] `CHANGELOG.md`: новая секция `## v2.6.0` с изменением процессной модели и
       метрикой
