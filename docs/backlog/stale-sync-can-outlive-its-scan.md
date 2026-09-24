@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:1858
+where: airflow_provider_rmq/watcher/listener.py:2226
 added: 2026-09-03
 ---
 # Затянувшийся `_sync_to_db` может пережить скан, которым он был решён
