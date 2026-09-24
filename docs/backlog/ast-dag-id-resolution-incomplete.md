@@ -1,13 +1,14 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:320
+where: airflow_provider_rmq/watcher/listener.py:361
 added: 2026-08-08
 ---
 # AST-резолвинг `dag_id` не покрывает сложные и динамические случаи
 
 **Контекст.** `RMQWatcherListener._extract_subscriptions_from_file`
 (`airflow_provider_rmq/watcher/listener.py`) сканирует DAG-файлы через `ast`,
-не исполняя их (чтобы не ловить import lock Scheduler'а). Чтобы связать
+не исполняя их (DAG-код в процессе watcher'а не исполняется: зависший импорт занял бы
+воркер пула цикла и держал бы import lock'и модулей). Чтобы связать
 `@rmq_trigger` с правильным `dag_id`, парсер должен статически определить
 значение `dag_id=` из `@dag(...)`.
 

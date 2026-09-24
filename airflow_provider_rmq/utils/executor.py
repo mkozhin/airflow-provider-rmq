@@ -26,12 +26,12 @@ class BoundedExecutor:
     """A named thread pool that refuses work instead of queueing it without limit.
 
     The pool is created outside any event loop and never bound to one, so the same
-    pool serves every event loop the watcher thread creates. A call already running
-    in a worker keeps that worker until it returns — ``Future.cancel()`` refuses a
-    running task and CPython cannot interrupt a thread — so a blocked call (a hung
-    database connection waiting out the OS TCP timeout) costs a worker for as long
-    as it lasts. That makes saturation a real failure mode, which is why it is
-    logged rather than left to look like ordinary slowness.
+    pool serves every event loop the loop thread of the watcher process creates. A
+    call already running in a worker keeps that worker until it returns —
+    ``Future.cancel()`` refuses a running task and CPython cannot interrupt a thread —
+    so a blocked call (a hung database connection waiting out the OS TCP timeout)
+    costs a worker for as long as it lasts. That makes saturation a real failure mode,
+    which is why it is logged rather than left to look like ordinary slowness.
 
     Behind the workers the pool holds at most ``max_workers * _QUEUED_PER_WORKER``
     waiting calls, and :class:`PoolSaturated` is raised once that is full. The bound is
@@ -40,12 +40,13 @@ class BoundedExecutor:
     closes over — stays in the pool's queue until a worker is free to pick it up, so an
     unbounded queue grows for as long as the outage lasts.
 
-    Interpreter exit still waits for every worker: ``concurrent.futures.thread``
-    registers an at-exit hook that joins each thread with no timeout, and nothing
-    calls :meth:`shutdown` in the normal course of things. A call blocked on the
-    database therefore holds up process exit for as long as the operating system
-    keeps its socket open — the loop thread is bought back by the timeouts around
-    each call, the interpreter's own teardown is not.
+    Nothing calls :meth:`shutdown` in the normal course of things, and the workers are
+    never joined. ``concurrent.futures.thread`` registers an at-exit hook that joins
+    each worker with no timeout, so an ordinary interpreter exit would wait on a call
+    blocked on the database for as long as the operating system keeps its socket
+    open. The loop thread is bought back by the timeouts around each call; the process
+    is bought back by leaving through :func:`os._exit`, which runs no exit hooks — see
+    :mod:`airflow_provider_rmq.watcher.runner`.
 
     :param name: Pool name, used as the worker thread prefix and in log messages.
     :param max_workers: Upper bound on concurrently running calls.

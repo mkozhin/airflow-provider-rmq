@@ -9,9 +9,10 @@ added: 2026-09-02
 ветке 2.x. Но стоит записать, *что именно* держит его там, потому что это не
 одна деталь, а сама конструкция watcher'а:
 
-- поток с asyncio-петлёй внутри процесса шедулера, поднятый через listener
-  `on_starting`, и определение «мы в шедулере» по стеку вызовов
-  (`listener.py:856-873`);
+- дочерний процесс шедулера с asyncio-петлёй
+  (`python -c <bootstrap> airflow_provider_rmq.watcher.runner`), который listener запускает
+  в `on_starting` и останавливает в `before_stopping`, и определение «мы в
+  шедулере» по стеку вызовов (`RMQWatcherListener.on_starting` в `listener.py`);
 - прямой ORM к метабазе из плагина: `DagModel`, `serialized_dag` через
   `trigger_dag`, собственные таблицы через `airflow.settings.engine`;
 - вызов внутреннего `airflow.api.common.trigger_dag` из потока;
@@ -36,8 +37,9 @@ added: 2026-09-02
   ([[status-cache-stale-across-replicas]]) становятся ненужными;
 - таймауты `RMQTrigger` ([[rmq-trigger-has-no-amqp-timeouts]]) — та же работа,
   что написать AMQP-реализацию `MessageQueueTrigger`;
-- пул соединений шедулера ([[trigger-dag-shares-scheduler-db-pool]]) — запуск
-  идёт через события asset'а, а не через `trigger_dag` из 32 потоков.
+- пул соединений watcher'а с метабазой
+  ([[trigger-dag-burst-exhausts-watcher-db-pool]]) — запуск идёт через события
+  asset'а, а не через `trigger_dag` из 32 потоков.
 
 Чего у встроенного механизма нет и что пришлось бы нести самим: cooldown через
 DLX, exchange-режим с provisioning биндингов, страница Subscriptions,

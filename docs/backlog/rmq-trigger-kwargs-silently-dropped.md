@@ -1,13 +1,13 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/listener.py:644
+where: airflow_provider_rmq/watcher/listener.py:685
 added: 2026-08-08
 ---
 # Нелитеральный аргумент `@rmq_trigger` теряется, и подписка работает вопреки DAG-файлу
 
 **Симптом.** `_parse_rmq_trigger_decorator`
-(`airflow_provider_rmq/watcher/listener.py:592`) обходит kwargs вызова декоратора,
-отбрасывает всё, чего нет в `_RMQ_TRIGGER_KWARGS` (`listener.py:473`), и остальное
+(`airflow_provider_rmq/watcher/listener.py:633`) обходит kwargs вызова декоратора,
+отбрасывает всё, чего нет в `_RMQ_TRIGGER_KWARGS` (`listener.py:514`), и остальное
 пытается прочитать через `ast.literal_eval`:
 
 ```python
@@ -15,7 +15,7 @@ try:
     value = ast.literal_eval(kw.value)
 except (ValueError, TypeError):
     unreadable.append(kw.arg)
-    continue                      # listener.py:647
+    continue                      # listener.py:688
 kwargs[kw.arg] = value
 ```
 
@@ -26,7 +26,7 @@ kwargs[kw.arg] = value
 
 **Потерян маркер режима.** `queue=` / `queues=` / `exchange=` — единственный признак,
 по которому выбирается режим подписки. Без него `build_subscriptions` не вызывается
-вовсе (`listener.py:654`), функция возвращает пустой список (`listener.py:673`), и
+вовсе (`listener.py:695`), функция возвращает пустой список (`listener.py:714`), и
 подписка не появляется в UI; объяснение остаётся в WARNING'е Scheduler'а.
 
 **Потерян любой другой распознаваемый kwarg.** Маркер режима — литерал, подписка

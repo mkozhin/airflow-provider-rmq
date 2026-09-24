@@ -81,10 +81,18 @@
    rabbitmqctl list_connections name state user
    rabbitmqctl list_channels connection number consumer_count
    ```
-4. **Метрики statsd**, если подключён: `rmq_watcher.consumer_attached`,
-   `consumer_restarted`, `dag_triggered`, `cycle_timed_out`,
+4. **Метрики statsd**, если подключён: `rmq_watcher.cycle_completed`,
+   `consumer_attached`, `consumer_restarted`, `dag_triggered`, `cycle_timed_out`,
    `cycle_step_timed_out`, `cycle_step_skipped`, `tasks_abandoned`,
-   `filter_missed`, `filter_errored`.
+   `filter_missed`, `filter_errored`. `cycle_completed` растёт на каждом
+   дошедшем до конца цикле — это признак того, что процесс watcher'а жив и цикл
+   крутится, а не того, что всё здорово.
+
+Цикл watcher'а работает в дочернем процессе scheduler'а
+`python -c <bootstrap> airflow_provider_rmq.watcher.runner`; его видно в
+`docker top airflow-scheduler` под `airflow scheduler`, а его строки — в тех же
+логах scheduler'а. `{pid}` в consumer-теге — PID этого процесса, тот же, что в
+строке `RMQ Watcher process started with PID …`.
 
 Главный приём всей проверки: **сравнивать окно 1 с окном 3**. Расхождение между
 тем, что показывает страница, и тем, что отвечает `rabbitmqctl list_consumers`, —
@@ -428,21 +436,112 @@ cooldown-доставка переотправлялась чаще раза в 
 **Что имитируем.** Штатный рестарт: consumer'ы должны сняться, а не остаться
 призраками, за которых потом поручится проверка живости.
 
-**Как.** `docker restart airflow-scheduler`, затем сразу
+**Как.** `docker top airflow-scheduler` — запомнить PID процесса
+`python -c <bootstrap> airflow_provider_rmq.watcher.runner`; `docker restart airflow-scheduler`,
+затем сразу `rabbitmqctl list_consumers -p <vhost>` и снова `docker top`.
+
+**Ожидаемо.**
+
+1. В логе scheduler'а — `RMQ Watcher process received SIGTERM — stopping the
+   watcher` (dumb-init шлёт SIGTERM всей группе процессов, процессу watcher'а
+   тоже) и затем `RMQ Watcher process <pid> exited with code 0` или `… had
+   already exited with code 0`. Остановка scheduler'а ждёт процесс watcher'а не
+   дольше 5 с после SIGTERM и ещё 2 с после SIGKILL.
+2. Перед остановкой подписки получают статус `disconnected` — он дописывается
+   до закрытия соединений.
+3. После рестарта под новым `airflow scheduler` ровно один процесс runner'а, с
+   новым PID; прежнего нет.
+4. После рестарта в брокере ровно столько consumer'ов, сколько подписок, и все
+   с новым `pid` в теге — PID нового процесса runner'а. Старых тегов нет.
+5. Строки `conn_id` не остаются в `error` навсегда.
+
+**Допустимо.** WARNING `RMQ Watcher process <pid> still running 5s after
+SIGTERM — killing it` и код выхода `-9`: остановка consumer'ов не уложилась в
+5 с (обычно — молчащий брокер, на котором каждый `close` ждёт свой таймаут).
+Статусы тогда могут остаться прежними до первого цикла нового процесса, а
+неподтверждённые доставки брокер возвращает в очередь.
+
+**Провал.** В `list_consumers` видны теги с прежним `pid` — брокер держит
+призраков. Или число consumer'ов от рестарта к рестарту растёт. Или под одним
+scheduler'ом два процесса runner'а, или прежний runner пережил рестарт.
+
+**Время.** 5 минут, повторить трижды.
+
+---
+
+## Сценарий 12а. Scheduler убит `kill -9`
+
+**Что имитируем.** Scheduler умер без штатной остановки — OOM killer, `kill -9`:
+`before_stopping` не вызывается, и процесс watcher'а должен уйти сам.
+
+**Как.** `docker top airflow-scheduler` — PID `airflow scheduler` и PID
+runner'а под ним; `kill -9 <PID airflow scheduler>` с хоста (`docker top`
+показывает PID'ы хоста); затем `docker top airflow-scheduler` и
 `rabbitmqctl list_consumers -p <vhost>`.
 
 **Ожидаемо.**
 
-1. Перед остановкой подписки получают статус `disconnected` — он дописывается
-   до закрытия соединений.
-2. После рестарта в брокере ровно столько consumer'ов, сколько подписок, и все
-   с новым `pid` в теге. Старых тегов нет.
-3. Строки `conn_id` не остаются в `error` навсегда.
+1. Процесс runner'а завершается за секунды: ядро шлёт ему SIGTERM, как только
+   умирает основной поток scheduler'а (`PR_SET_PDEATHSIG`), и в логе
+   появляется `RMQ Watcher process received SIGTERM — stopping the watcher`.
+   Там, где этого сигнала нет, смену родителя замечает основной поток runner'а
+   в пределах секунды или цикл перед следующим проходом: ERROR `RMQ Watcher
+   process: the scheduler process <pid> has exited (parent is now …) — stopping
+   the watcher` или `RMQ Watcher: the scheduler process <pid> has exited (parent
+   is now …) — stopping the watcher`. В любом случае runner пропадает из
+   `docker top` не позже чем через 60 с: на выходе он взводит SIGALRM, и ядро
+   завершает его, даже если выход застрял. Scheduler, убитый в первые секунды после
+   старта, пока runner ещё импортирует Airflow и загружает плагины, уводит его
+   так же, без запуска цикла: в stderr строка `RMQ Watcher process <pid>:
+   received SIGTERM while Airflow was being prepared — exiting` (или `… the
+   scheduler process <pid> exited while Airflow was being prepared — exiting`).
+2. Если scheduler — прямой потомок `dumb-init` (так в официальном образе), init
+   выходит вместе с ним, контейнер останавливается целиком и поднимается заново
+   по `restart: always`; строки о выходе runner'а при этом может не оказаться —
+   процесс убит вместе с контейнером.
+3. В любом случае после подъёма — один процесс runner'а под новым
+   `airflow scheduler`, теги в брокере только с новым `pid`. Теги убитого
+   процесса исчезают сами: его соединения закрывает ядро вместе с процессом.
 
-**Провал.** В `list_consumers` видны теги с прежним `pid` — брокер держит
-призраков. Или число consumer'ов от рестарта к рестарту растёт.
+**Провал.** Процесс runner'а жив после смерти scheduler'а (в `ps -ef` на хосте
+он висит с другим родителем) и держит consumer'ов в брокере.
 
-**Время.** 5 минут, повторить трижды.
+**Время.** 5 минут.
+
+---
+
+## Сценарий 12б. Умер сам процесс watcher'а
+
+**Что имитируем.** Процесс watcher'а умер целиком (OOM, segfault), а scheduler
+жив. Процесс не перезапускается до рестарта scheduler'а — сценарий проверяет,
+что это видно.
+
+**Как.** `kill -9 <PID runner'а>` с хоста, затем `docker top airflow-scheduler`,
+`rabbitmqctl list_consumers -p <vhost>`, страница Subscriptions и метрики. В
+конце — `docker restart airflow-scheduler`.
+
+**Ожидаемо.**
+
+1. Scheduler работает дальше как ни в чём не бывало: DAG'и по расписанию
+   планируются, health-check зелёный.
+2. В `docker top airflow-scheduler` процесс runner'а виден как `<defunct>` под
+   `airflow scheduler` — его никто не собирает до остановки scheduler'а.
+3. Теги в брокере пропадают: соединения убитого процесса закрыты. Сообщения в
+   очередях копятся, DAG'и по ним не запускаются.
+4. `rmq_watcher.cycle_completed` перестаёт расти.
+5. Статусы подписок остаются теми, что были записаны до смерти (`listening`), —
+   писать `disconnected` некому. Last reconcile каждой строки `conn_id`
+   помечается предупреждением через интервал плюс бюджет цикла (320 с при
+   интервале 20 с).
+6. После `docker restart` — в логе `RMQ Watcher process <pid> had already exited
+   with code -9`, новый процесс runner'а стартует, накопленные сообщения
+   запускают DAG'и.
+
+**Провал.** Смерть процесса watcher'а задела scheduler. Или она не видна ни в
+`docker top`, ни по метрике, ни по Last reconcile. Или после рестарта
+scheduler'а watcher не вернулся.
+
+**Время.** 10 минут.
 
 ---
 
@@ -573,7 +672,10 @@ readme). Или страницу не закрыло какое-нибудь и�
 - `rabbitmqctl list_connections | wc -l` и `list_channels | wc -l` — не растут;
 - `rmq_watcher.tasks_abandoned` — не растёт (рост означает, что отменённые
   задачи не завершаются, то есть соединение не отвечает вовсе);
-- потребление памяти процессом scheduler'а — стабильно;
+- потребление памяти процессом scheduler'а и процессом runner'а под ним —
+  стабильно;
+- `rmq_watcher.cycle_completed` растёт без пауз длиннее интервала плюс бюджет
+  цикла;
 - в таблице `rmq_watcher_conn_status` `last_reconcile_at` двигается непрерывно;
 - ни одного `cycle_timed_out`.
 
@@ -592,7 +694,7 @@ readme). Или страницу не закрыло какое-нибудь и�
   промахи фильтра возвращаются в очередь и при конечном окне prefetch забили бы
   его целиком, остановив потребление.
   Цена — неограниченное число неподтверждённых доставок: при большом бэклоге
-  очередь вычитывается в память scheduler'а, а самая старая доставка может
+  очередь вычитывается в память процесса watcher'а, а самая старая доставка может
   упереться в `consumer_timeout` брокера (по умолчанию 30 минут). Если на стенде
   ожидается большой бэклог, поднимите `consumer_timeout` в `rabbitmq.conf`.
 - **Смена exchange в декораторе** не снимает биндинги прежнего exchange — они
@@ -642,6 +744,10 @@ readme). Или страницу не закрыло какое-нибудь и�
 | Порог удалённых по `ack_unmatched` | 100, дальше степени десяти | `_MISS_WARN_FLOOR` |
 | Исходов без сбоя вычисления до сброса серии сбоев | 100 | `_ERROR_STREAK_RESET_RUN` |
 | heartbeat / connect / rpc | 30 / 15 / 30 с | extra подключения |
+| Ожидание процесса watcher'а после SIGTERM при остановке scheduler'а | 5 с | `_CHILD_STOP_TIMEOUT` |
+| Ожидание после SIGKILL | 2 с | `_CHILD_REAP_TIMEOUT` |
+| Ожидание цикла внутри процесса watcher'а перед выходом | 45 с | `_EXIT_JOIN_TIMEOUT` |
+| Бюджет остановки consumer-менеджера | 30 с | `_STOP_TIMEOUT` |
 
 ### Статусы
 

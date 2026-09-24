@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import signal
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -31,6 +33,40 @@ CREATE TABLE rmq_watcher_subscriptions (
     CONSTRAINT uq_rmq_sub_dag_queue_conn UNIQUE (dag_id, queue_name, conn_id)
 )
 """
+
+
+@pytest.fixture(autouse=True)
+def alarm_calls(monkeypatch):
+    """Replace the real-time timer of :func:`signal.setitimer` in every test here and
+    return the seconds it was set to.
+
+    The watcher process arms a SIGALRM deadline once it decides to leave, the loop's
+    parent check among the places that do; a real timer in the pytest process would end
+    the whole run once it fired. The replacement keeps the value it was last set to and
+    :func:`signal.getitimer` reports it, with no time passing; the other timers are the
+    real ones.
+    """
+    calls: list[float] = []
+    armed = [0.0]
+    real_setitimer = signal.setitimer
+    real_getitimer = signal.getitimer
+
+    def setitimer(which: int, seconds: float, interval: float = 0.0) -> tuple[float, float]:
+        if which != signal.ITIMER_REAL:
+            return real_setitimer(which, seconds, interval)
+        calls.append(seconds)
+        previous = armed[0]
+        armed[0] = float(seconds)
+        return previous, 0.0
+
+    def getitimer(which: int) -> tuple[float, float]:
+        if which != signal.ITIMER_REAL:
+            return real_getitimer(which)
+        return armed[0], 0.0
+
+    monkeypatch.setattr(signal, "setitimer", setitimer)
+    monkeypatch.setattr(signal, "getitimer", getitimer)
+    return calls
 
 
 def _memory_engine():
