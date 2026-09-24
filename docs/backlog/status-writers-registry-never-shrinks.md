@@ -1,6 +1,6 @@
 ---
 worth: no
-where: airflow_provider_rmq/watcher/consumer.py:407
+where: airflow_provider_rmq/watcher/consumer.py:432
 added: 2026-08-29
 ---
 # Реестр `_status_writers` растёт всю жизнь процесса
@@ -9,7 +9,7 @@ added: 2026-08-29
 (`_status_writer`, `consumer.py`) и кладётся в процесс-глобальный
 `_status_writers` (`consumer.py`); удаления из реестра нет нигде в
 продакшн-коде. Мёртвые `sub_id` появляются штатно: `_sync_to_db`
-(`listener.py:1688`) удаляет `dag_file`-подписку, чей ключ не встретился в
+(через `_delete_absent_sub`, `listener.py`) удаляет `dag_file`-подписку, чей ключ не встретился в
 четырёх доверенных сканах подряд, а `delete`, `edit_group` и Create на странице
 Subscriptions удаляют и вставляют строки по воле оператора. Каждый удалённый id
 навсегда удерживает в реестре своего писателя.

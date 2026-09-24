@@ -4593,6 +4593,196 @@ class TestGracefulStop:
         assert listener._stop_event.is_set()
 
 
+class TestStopMidCycle:
+    """A stop that comes during a cycle ends it where it stands.
+
+    The watcher process gives the loop a bounded time to stop the consumer manager once
+    it has asked for the stop, and a cycle that went on through its remaining steps —
+    each one allowed a minute — would spend that time before the manager got any of it.
+    """
+
+    @staticmethod
+    def _started(release: threading.Event, started: threading.Event, result=None):
+        """A blocking call that reports its start and then holds its worker until
+        ``release`` is set."""
+        def blocked(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=5)
+            return result
+
+        return blocked
+
+    @pytest.mark.asyncio
+    async def test_a_stop_before_the_scan_runs_no_later_step_and_no_reconcile(self, caplog):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        listener._ensure_schema = AsyncMock(side_effect=listener.request_stop)
+        read_subs = MagicMock(return_value=[])
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions", read_subs
+        ), caplog.at_level(logging.DEBUG, logger=_LISTENER_LOG):
+            await listener._run_cycle()
+
+        listener._scan_subscriptions.assert_not_called()
+        listener._sync_to_db.assert_not_called()
+        read_subs.assert_not_called()
+        manager.reconcile.assert_not_awaited()
+        assert any(
+            "stop requested" in r.getMessage() and r.levelno == logging.INFO
+            for r in caplog.records
+        )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_a_stop_after_the_subscription_read_never_starts_the_reconcile(self):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+
+        def read_then_stop(*_args, **_kwargs):
+            listener._stop_event.set()
+            return []
+
+        with _cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions",
+            side_effect=read_then_stop,
+        ):
+            await listener._run_cycle()
+
+        manager.reconcile.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_stop_during_a_step_ends_the_cycle_without_waiting_for_the_worker(
+        self, caplog
+    ):
+        listener = _cycle_listener()
+        listener._reconcile_interval = 30
+        manager = _fake_manager()
+        release = threading.Event()
+        started = threading.Event()
+        listener._scan_subscriptions = self._started(release, started, result=[])
+
+        try:
+            with _cycle_patches(manager), patch(
+                "airflow_provider_rmq.watcher.listener.incr"
+            ) as incr, caplog.at_level(logging.DEBUG, logger=_LISTENER_LOG):
+                task = asyncio.ensure_future(listener._main())
+                await call_with_timeout(asyncio.to_thread(started.wait, 5), 5)
+                stopped_at = time.monotonic()
+                listener.request_stop()
+                await call_with_timeout(task, 5)
+                elapsed = time.monotonic() - stopped_at
+
+            assert not release.is_set(), "the worker is still in the call"
+            assert elapsed < 1.0
+            listener._sync_to_db.assert_not_called()
+            manager.reconcile.assert_not_awaited()
+            manager.stop.assert_awaited_once()
+            assert call("rmq_watcher.cycle_step_timed_out") not in incr.call_args_list
+            assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+            assert any("stop requested" in r.getMessage() for r in caplog.records)
+        finally:
+            release.set()
+
+    @pytest.mark.asyncio
+    async def test_a_stop_from_another_thread_ends_the_wait_for_a_step(self):
+        """The runner's main thread is where the stop comes from in production."""
+        listener = _cycle_listener()
+        listener._waker = (asyncio.get_running_loop(), asyncio.Event())
+        release = threading.Event()
+        started = threading.Event()
+
+        def stop_once_started():
+            started.wait(timeout=5)
+            listener.request_stop()
+
+        stopper = threading.Thread(target=stop_once_started)
+        stopper.start()
+        try:
+            with pytest.raises(listener_module._StopRequested):
+                await call_with_timeout(
+                    listener._cycle_step("scan", self._started(release, started)), 5
+                )
+            assert not release.is_set()
+        finally:
+            release.set()
+            stopper.join(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_a_wake_up_without_a_stop_leaves_the_step_to_finish(self):
+        listener = _cycle_listener()
+        wakeup = asyncio.Event()
+        listener._waker = (asyncio.get_running_loop(), wakeup)
+        release = threading.Event()
+        started = threading.Event()
+
+        step = asyncio.ensure_future(
+            listener._cycle_step("scan", self._started(release, started, result=["done"]))
+        )
+        try:
+            await call_with_timeout(asyncio.to_thread(started.wait, 5), 5)
+            wakeup.set()
+            await asyncio.sleep(0.05)
+            assert not step.done(), "a wake-up alone is not a stop"
+        finally:
+            release.set()
+
+        assert await call_with_timeout(step, 5) == ["done"]
+
+    @pytest.mark.asyncio
+    async def test_a_stop_during_the_migration_neither_defers_it_nor_runs_the_scan(
+        self, caplog
+    ):
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        listener._manager = manager
+        listener._waker = (asyncio.get_running_loop(), asyncio.Event())
+        release = threading.Event()
+        started = threading.Event()
+
+        try:
+            with _cycle_patches(manager), patch(
+                "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=False
+            ), patch(
+                "airflow_provider_rmq.watcher.listener.ensure_table_exists",
+                side_effect=self._started(release, started),
+            ), caplog.at_level(logging.DEBUG, logger=_LISTENER_LOG):
+                cycle = asyncio.ensure_future(listener._run_cycle())
+                await call_with_timeout(asyncio.to_thread(started.wait, 5), 5)
+                listener.request_stop()
+                await call_with_timeout(cycle, 5)
+        finally:
+            release.set()
+
+        assert listener._migration_backoff == 0
+        assert listener._migration_skip_cycles == 0
+        listener._scan_subscriptions.assert_not_called()
+        manager.reconcile.assert_not_awaited()
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_a_reconcile_under_way_runs_to_its_end_before_the_manager_stops(self):
+        listener = _cycle_listener()
+        listener._reconcile_interval = 30
+        manager = _fake_manager()
+        order = []
+
+        async def reconcile(subs):
+            listener.request_stop()
+            await asyncio.sleep(0.05)
+            order.append("reconcile finished")
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+        manager.stop = AsyncMock(side_effect=lambda: order.append("manager stopped"))
+
+        with _cycle_patches(manager):
+            await call_with_timeout(listener._main(), 5)
+
+        assert order == ["reconcile finished", "manager stopped"]
+
+
 # ---------------------------------------------------------------------------
 # Watcher process: start, stop and the scheduler's own threads
 # ---------------------------------------------------------------------------

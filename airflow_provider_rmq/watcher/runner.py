@@ -113,10 +113,13 @@ PARENT_PID_ENV = "AIRFLOW_PROVIDER_RMQ_WATCHER_PARENT_PID"
 PACKAGE_DIR_ENV = "AIRFLOW_PROVIDER_RMQ_WATCHER_PACKAGE_DIR"
 
 #: Seconds the main thread waits for the loop thread once the loop has been asked to
-#: stop. The loop finishes the step it is on and then stops the consumer manager, which
-#: is bounded by the listener's ``_STOP_TIMEOUT``; this is longer, so it leaves the
-#: manager all of its budget and some room for the teardown around it. A loop thread
-#: still running after it is left behind by the process exit.
+#: stop. The loop stops waiting for the blocking step it is on, starts no further step
+#: and then stops the consumer manager, which is bounded by the listener's
+#: ``_STOP_TIMEOUT``; this is longer, so it leaves the manager all of its budget and
+#: some room for the teardown around it. A reconcile the stop finds already running is
+#: the exception: it runs to its end under the cycle budget, and the manager's stop
+#: comes after it, inside this wait or not at all. A loop thread still running after
+#: it is left behind by the process exit.
 _EXIT_JOIN_TIMEOUT = 45.0
 
 #: Signals that stop the watcher. Blocked in every thread of the process and collected

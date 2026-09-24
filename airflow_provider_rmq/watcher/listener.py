@@ -948,6 +948,16 @@ class _StepInFlight(Exception):
     """
 
 
+class _StopRequested(Exception):
+    """A stop has been requested of the loop, so the cycle ends where it stands.
+
+    Raised by :meth:`RMQWatcherListener._cycle_step` in place of starting a step, or of
+    waiting any further for the one in flight, and by the cycle in place of starting
+    the reconcile. The pass ends there and the loop goes on to stop the consumer
+    manager, whose bounded stop is what marks the subscription rows disconnected.
+    """
+
+
 class _UntrustedScan(Exception):
     """The scan result is not a statement about the code, so the cycle must not sync it.
 
@@ -1246,20 +1256,26 @@ class RMQWatcherListener:
         )
 
     def request_stop(self) -> None:
-        """Ask the loop to stop after the step it is on.
+        """Ask the loop to end its cycle where it stands and stop the consumer manager.
 
-        Sets the stop event and wakes the loop out of its wait between cycles. Safe to
-        call any number of times, from any thread, and before the loop has started —
-        :meth:`run` then returns without running a cycle. It is ordinary code with no
-        signal-handler restrictions, which is how the runner calls it once the signal
-        it waited for has arrived.
+        Sets the stop event and wakes the loop. A loop waiting between cycles returns
+        from the wait at once; a cycle waiting on a blocking step stops waiting for it
+        and starts no further step, the reconcile included — the worker running that
+        step cannot be interrupted and is left to the process exit. A reconcile that
+        has already started runs to its end, under the cycle budget, before the loop
+        gets to the manager.
+
+        Safe to call any number of times, from any thread, and before the loop has
+        started — :meth:`run` then returns without running a cycle. It is ordinary code
+        with no signal-handler restrictions, which is how the runner calls it once the
+        signal it waited for has arrived.
         """
         self._stop_event.set()
         self._wake_loop()
 
     def _wake_loop(self) -> None:
         """Nudge the running cycle so it sees the stop event without waiting out the
-        reconcile interval.
+        reconcile interval or the blocking step in flight.
 
         The threading event is the authoritative signal; this only shortens the wait.
         An :class:`asyncio.Event` may be touched from its own loop alone, and that loop
@@ -1420,6 +1436,12 @@ class RMQWatcherListener:
         builtin ``TimeoutError`` from Python 3.11 on), so an ``except Exception``
         wrapped around this call instead of placed inside it would swallow the cycle
         watchdog whole and leave the layer a no-op.
+
+        A stop requested during the pass ends it before the next step, and a blocking
+        step in flight is not waited for (:class:`_StopRequested`): the loop goes on to
+        stop the consumer manager, and a reconcile is never started once a stop has
+        been requested. A reconcile already running when the stop arrives is not
+        interrupted and runs to its end, under the cycle budget.
         """
         try:
             self._phase = "migrate"
@@ -1465,7 +1487,10 @@ class RMQWatcherListener:
             active_subs = await self._cycle_step("read subs", _read_active_subs, exchange_meta)
 
             self._phase = "reconcile"
+            self._raise_if_stopping("reconcile")
             await self._manager.reconcile(active_subs)
+        except _StopRequested as exc:
+            log.info("RMQ Watcher: stop requested — ending this cycle %s", exc)
         except _StepInFlight as exc:
             log.warning("RMQ Watcher: skipping this reconciliation cycle — %s", exc)
         except Exception:
@@ -1482,6 +1507,8 @@ class RMQWatcherListener:
             it out and share :data:`_STEP_TIMEOUT`, the tunable read and the migration
             name one of their own.
         :returns: Whatever ``fn`` returned.
+        :raises _StopRequested: A stop has been requested, before the step started or
+            while its attempt was running.
         :raises _StepInFlight: The previous attempt at this step has not returned.
         :raises asyncio.TimeoutError: The attempt outlived ``timeout``.
 
@@ -1493,8 +1520,16 @@ class RMQWatcherListener:
         interrupted — hence the second half: one attempt of a step in flight at a time.
         Resubmitting every cycle would fill the four-worker pool with stuck copies of the
         same call, and the steps that need no database would stop running with it.
+
+        A step is not started once a stop has been requested, and a stop requested while
+        the attempt runs ends the wait for it at once (:meth:`_attempt_unless_stopping`):
+        the loop is on its way to stopping the consumer manager, and a step holding it
+        up for as long as ``timeout`` would spend the time the watcher process gives the
+        loop to get there. The attempt stays in the bookkeeping like any other attempt
+        the cycle stopped waiting for.
         """
         timeout = _STEP_TIMEOUT if timeout is None else timeout
+        self._raise_if_stopping(name)
         cycle_pool, _ = self._ensure_pools()
         attempt = self._step_attempts.get(name)
         if attempt is not None and not attempt.done():
@@ -1508,7 +1543,9 @@ class RMQWatcherListener:
         attempt = cycle_pool.submit(fn, *args)
         self._step_attempts[name] = attempt
         try:
-            return await call_with_timeout(asyncio.wrap_future(attempt), timeout)
+            return await call_with_timeout(
+                self._attempt_unless_stopping(name, attempt), timeout
+            )
         except asyncio.TimeoutError:
             incr("rmq_watcher.cycle_step_timed_out")
             log.warning(
@@ -1517,6 +1554,40 @@ class RMQWatcherListener:
                 name, timeout,
             )
             raise
+
+    def _raise_if_stopping(self, step: str) -> None:
+        """Raise :class:`_StopRequested` naming ``step`` once a stop has been requested."""
+        if self._stop_event.is_set():
+            raise _StopRequested(f"before the {step!r} step")
+
+    async def _attempt_unless_stopping(self, step: str, attempt: Future) -> Any:
+        """Await ``attempt``, giving up on it as soon as a stop has been requested.
+
+        :param step: Step name, carried by the :class:`_StopRequested` raised.
+        :param attempt: The step's call, submitted to the cycle pool.
+        :returns: Whatever the call returned.
+        :raises _StopRequested: The stop event was set while the call was running.
+
+        The call is raced against the wake-up event :meth:`request_stop` sets, and the
+        stop event decides what a wake-up means: one that comes without a stop leaves
+        the call to be awaited to its end, under the caller's bound. Giving up cancels
+        the call if it has not started yet; a call already running holds its worker
+        until it returns. A cycle run on a loop other than the one ``_main`` published
+        its wake-up event for has nothing to race against and awaits the call alone.
+        """
+        result = asyncio.wrap_future(attempt)
+        waker = self._waker
+        if waker is None or waker[0] is not asyncio.get_running_loop():
+            return await result
+        stopping = asyncio.ensure_future(waker[1].wait())
+        try:
+            await asyncio.wait({result, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            if not result.done() and self._stop_event.is_set():
+                raise _StopRequested(f"while the {step!r} step was running")
+            return await result
+        finally:
+            stopping.cancel()
+            result.cancel()
 
     async def _stop_manager(self) -> None:
         """Stop the manager, giving up after ``_STOP_TIMEOUT`` seconds.
@@ -1562,7 +1633,7 @@ class RMQWatcherListener:
             interval, cycle_timeout = await self._cycle_step(
                 "settings", _read_settings, timeout=_VARIABLE_TIMEOUT
             )
-        except _StepInFlight:
+        except (_StepInFlight, _StopRequested):
             return
         except Exception:
             log.warning(
@@ -1613,6 +1684,8 @@ class RMQWatcherListener:
             )
         except _StepInFlight:
             return
+        except _StopRequested:
+            raise
         except Exception:
             log.warning(
                 "RMQ Watcher: schema migration attempt failed or exceeded %ss",
