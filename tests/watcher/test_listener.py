@@ -25,11 +25,10 @@ from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.watcher import listener as listener_module
 from airflow_provider_rmq.watcher.dag_file_scan import (
-    _UNRESOLVED_DAG_ID,
     _collect_module_constants,
-    _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
     _read_function_triggers,
+    _static_dag_id,
 )
 from airflow_provider_rmq.watcher.listener import (
     CYCLE_TIMEOUT_VAR,
@@ -66,9 +65,9 @@ from airflow_provider_rmq.watcher.runner import (
 _LISTENER_LOG = "airflow_provider_rmq.watcher.listener"
 
 
-def _decorators(src: str) -> list:
-    """Parse a one-function snippet and return its decorator_list."""
-    return ast.parse(src).body[0].decorator_list
+def _function(src: str):
+    """Parse a one-function snippet and return its function node."""
+    return ast.parse(src).body[0]
 
 def _make_session_ctx(existing_subs=None):
     """Return (ctx, session) where ctx is a mock context manager for WatcherSession."""
@@ -90,8 +89,8 @@ def _make_session_ctx(existing_subs=None):
 class TestDagFileScanImportFootprint:
     def test_importing_the_scan_module_leaves_the_watcher_runtime_unloaded(self):
         """The decorator imports ``dag_file_scan`` inside the DAG processor, so the
-        module must not drag in the listener, the consumer (``aio_pika``, ``httpx``)
-        or the ORM models. A fresh interpreter is the only place where
+        module must not drag in the listener, the consumer, the runner, the ORM
+        models, ``aio_pika`` or ``httpx``. A fresh interpreter is the only place where
         ``sys.modules`` says what one import pulled in."""
         probe = (
             "import sys\n"
@@ -101,6 +100,9 @@ class TestDagFileScanImportFootprint:
             "        'airflow_provider_rmq.watcher.listener',\n"
             "        'airflow_provider_rmq.watcher.consumer',\n"
             "        'airflow_provider_rmq.watcher.models',\n"
+            "        'airflow_provider_rmq.watcher.runner',\n"
+            "        'aio_pika',\n"
+            "        'httpx',\n"
             "    ) if name in sys.modules\n"
             "]\n"
             "print(','.join(loaded))\n"
@@ -321,110 +323,109 @@ class TestCollectModuleConstantsPep695:
 
 
 # ---------------------------------------------------------------------------
-# _extract_dag_id_from_decorators
+# _static_dag_id
 # ---------------------------------------------------------------------------
 
 class TestExtractDagId:
     def test_string_literal_dag_id(self):
-        decs = _decorators("@dag(dag_id='my_dag')\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) == "my_dag"
+        func = _function("@dag(dag_id='my_dag')\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "my_dag"
 
     def test_attribute_access_dag(self):
-        decs = _decorators("@decorators.dag(dag_id='my_dag')\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) == "my_dag"
+        func = _function("@decorators.dag(dag_id='my_dag')\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "my_dag"
 
-    def test_no_dag_id_kwarg_returns_none(self):
-        decs = _decorators("@dag(schedule_interval=None)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is None
+    def test_no_dag_id_kwarg_falls_back_to_the_function_name(self):
+        func = _function("@dag(schedule_interval=None)\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "f"
 
-    def test_no_dag_decorator_returns_unresolved(self):
-        decs = _decorators("@some_other_decorator\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+    def test_no_dag_decorator_is_unresolved(self):
+        func = _function("@some_other_decorator\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
-    def test_non_literal_dag_id_without_constant_returns_unresolved(self):
-        decs = _decorators("@dag(dag_id=VARIABLE)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+    def test_non_literal_dag_id_without_constant_is_unresolved(self):
+        func = _function("@dag(dag_id=VARIABLE)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
-    def test_non_string_literal_dag_id_returns_unresolved(self):
-        decs = _decorators("@dag(dag_id=123)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+    def test_non_string_literal_dag_id_is_unresolved(self):
+        func = _function("@dag(dag_id=123)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
     def test_async_function_with_explicit_dag_id(self):
         src = "@dag(dag_id='async_dag')\nasync def f(): pass"
-        decs = ast.parse(src).body[0].decorator_list
-        assert _extract_dag_id_from_decorators(decs) == "async_dag"
+        assert _static_dag_id(_function(src), {}) == "async_dag"
 
-    def test_empty_decorator_list_returns_unresolved(self):
-        assert _extract_dag_id_from_decorators([]) is _UNRESOLVED_DAG_ID
+    def test_empty_decorator_list_is_unresolved(self):
+        assert _static_dag_id(_function("def f(): pass"), {}) is None
 
 
 class TestExtractDagIdConstants:
     def test_variable_dag_id_resolved_via_constants(self):
-        decs = _decorators("@dag(dag_id=DAG_ID)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs, {"DAG_ID": "real_id"}) == "real_id"
+        func = _function("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _static_dag_id(func, {"DAG_ID": "real_id"}) == "real_id"
 
-    def test_variable_dag_id_not_in_constants_returns_unresolved(self):
-        decs = _decorators("@dag(dag_id=DAG_ID)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs, {"OTHER": "x"}) is _UNRESOLVED_DAG_ID
+    def test_variable_dag_id_not_in_constants_is_unresolved(self):
+        func = _function("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _static_dag_id(func, {"OTHER": "x"}) is None
 
-    def test_empty_string_constant_returns_none(self):
+    def test_empty_string_constant_falls_back_to_the_function_name(self):
         # Regression: DAG_ID = "" (a str, so it IS collected into `constants`
         # by _collect_module_constants) referenced via dag_id=DAG_ID must
-        # fall back to the function name (None), not be returned verbatim as
+        # fall back to the function name, not be returned verbatim as
         # "" — matching the falsy rule already applied to the literal branch.
-        decs = _decorators("@dag(dag_id=DAG_ID)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs, {"DAG_ID": ""}) is None
+        func = _function("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _static_dag_id(func, {"DAG_ID": ""}) == "f"
 
     @pytest.mark.parametrize(
         "literal_src",
         ["''", "None", "False", "0", "0.0", "[]", "{}", "()"],
     )
-    def test_falsy_literal_dag_id_returns_none(self, literal_src):
-        decs = _decorators(f"@dag(dag_id={literal_src})\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is None
+    def test_falsy_literal_dag_id_falls_back_to_the_function_name(self, literal_src):
+        func = _function(f"@dag(dag_id={literal_src})\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "f"
 
 
 class TestExtractDagIdPositional:
     def test_positional_string_literal_dag_id(self):
-        decs = _decorators("@dag('my_dag')\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) == "my_dag"
+        func = _function("@dag('my_dag')\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "my_dag"
 
     def test_positional_variable_dag_id_resolved_via_constants(self):
-        decs = _decorators("@dag(DAG_NAME)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs, {"DAG_NAME": "resolved"}) == "resolved"
+        func = _function("@dag(DAG_NAME)\ndef f(): pass")
+        assert _static_dag_id(func, {"DAG_NAME": "resolved"}) == "resolved"
 
-    def test_positional_unresolvable_dag_id_returns_unresolved(self):
-        decs = _decorators("@dag(SOME_VAR)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+    def test_positional_unresolvable_dag_id_is_unresolved(self):
+        func = _function("@dag(SOME_VAR)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
-    def test_positional_empty_string_dag_id_returns_none(self):
-        decs = _decorators("@dag('')\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is None
+    def test_positional_empty_string_dag_id_falls_back_to_the_function_name(self):
+        func = _function("@dag('')\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "f"
 
-    def test_positional_truthy_non_string_literal_returns_unresolved(self):
-        decs = _decorators("@dag(123)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+    def test_positional_truthy_non_string_literal_is_unresolved(self):
+        func = _function("@dag(123)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
-    def test_positional_and_keyword_dag_id_conflict_returns_unresolved(self):
+    def test_positional_and_keyword_dag_id_conflict_is_unresolved(self):
         # @dag("a", dag_id="b") is invalid Python at call time (TypeError:
         # multiple values for argument 'dag_id') — must not resolve to
         # either value.
-        decs = _decorators("@dag('a', dag_id='b')\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+        func = _function("@dag('a', dag_id='b')\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
 
 class TestExtractDagIdUnpacking:
-    def test_dict_unpacking_returns_unresolved(self):
-        decs = _decorators('@dag(**{"dag_id": "real"})\ndef f(): pass')
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+    def test_dict_unpacking_is_unresolved(self):
+        func = _function('@dag(**{"dag_id": "real"})\ndef f(): pass')
+        assert _static_dag_id(func, {}) is None
 
-    def test_name_unpacking_returns_unresolved(self):
-        decs = _decorators("@dag(**DAG_KWARGS)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+    def test_name_unpacking_is_unresolved(self):
+        func = _function("@dag(**DAG_KWARGS)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
-    def test_star_args_returns_unresolved(self):
-        decs = _decorators("@dag(*ARGS)\ndef f(): pass")
-        assert _extract_dag_id_from_decorators(decs) is _UNRESOLVED_DAG_ID
+    def test_star_args_is_unresolved(self):
+        func = _function("@dag(*ARGS)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -916,6 +917,8 @@ class TestUnreadableFileHold:
         declaration and non-UTF-8 bytes inside a comment (which Python's own import
         accepts) read exactly as the DAG processor reads them."""
         trigger = (
+            b"from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            b"from airflow.decorators import dag\n"
             b"@rmq_trigger(queue='q')\n"
             b"@dag(dag_id='d')\n"
             b"def d(): pass\n"
@@ -1952,6 +1955,9 @@ class TestExtractSubscriptionsUnresolvedDagId:
             listener._extract_subscriptions_from_file(str(dag_file))
         assert "UI" not in caplog.text
         assert "Subscriptions page" not in caplog.text
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert "cannot statically resolve dag_id" in errors[0]
 
     def test_kwargs_unpacking_refuses_with_an_error(self, tmp_path, caplog):
         dag_file = tmp_path / "kwargs_unpacking_dag.py"
@@ -2170,43 +2176,73 @@ class TestExtractSubscriptionsFileRefusal:
         assert "dag_id='good'" not in errors[0]
 
     @pytest.mark.parametrize(
-        "beside",
+        ("beside", "expected"),
         [
             pytest.param(
                 "from airflow import DAG\nrmq_trigger(queue='b')(DAG('B'))\n",
+                "line 7: the name rmq_trigger is used other than as a decorator call",
                 id="direct-call-on-a-dag",
             ),
             pytest.param(
                 "from airflow_provider_rmq.watcher.decorators import rmq_trigger as rt\n"
                 "@rt(queue='b')\n@dag(dag_id='b')\ndef b(): pass\n",
+                "rmq_trigger is imported as 'rt'",
                 id="alias-used",
             ),
             pytest.param(
                 "from airflow_provider_rmq.watcher.decorators import rmq_trigger as rt\n",
+                "rmq_trigger is imported as 'rt'",
                 id="alias-unused",
             ),
             pytest.param(
                 "from airflow_provider_rmq.watcher import decorators\n"
                 "rt = decorators.rmq_trigger\n",
+                "the attribute .rmq_trigger is used other than as a decorator call",
                 id="attribute-alias",
             ),
             pytest.param(
                 "from functools import partial\n"
                 "RMQ = partial(rmq_trigger, conn_id='rmq_prod')\n",
+                "the name rmq_trigger is used other than as a decorator call",
                 id="partial",
             ),
             pytest.param(
                 "@dag(dag_id='b')\n@rmq_trigger(queue='b')\ndef b(): pass\n",
+                "placed below @dag(...)",
                 id="rmq-trigger-below-dag",
+            ),
+            pytest.param(
+                "from common_rmq import rmq_trigger\n"
+                "@rmq_trigger(queue='b')\n@dag(dag_id='b')\ndef b(): pass\n",
+                "rmq_trigger is not bound by one absolute import alone in the scope the "
+                "decorator runs in, not rmq_trigger of airflow_provider_rmq.watcher.decorators",
+                id="second-import-from-another-module",
+            ),
+            pytest.param(
+                "from common_rmq import *\n",
+                "the file has 'from ... import *'",
+                id="wildcard-import",
             ),
         ],
     )
     def test_a_mention_the_scan_cannot_follow_refuses_the_file(
-        self, tmp_path, caplog, beside
+        self, tmp_path, caplog, beside, expected
     ):
         result = self._extract(tmp_path, _IMPORTS + _READABLE_DAG + beside, caplog)
         assert result == []
-        assert len(_errors(caplog)) == 1
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert expected in errors[0]
+
+    def test_rmq_trigger_of_another_module_refuses_the_file(self, tmp_path, caplog):
+        result = self._extract(tmp_path, (
+            "from common_rmq import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+        ) + _READABLE_DAG, caplog)
+        assert result == []
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert "rmq_trigger is common_rmq.rmq_trigger" in errors[0]
 
     def test_rmq_trigger_below_dag_is_named_in_the_error(self, tmp_path, caplog):
         self._extract(tmp_path, _IMPORTS + (
@@ -2267,14 +2303,34 @@ class TestExtractSubscriptionsFileRefusal:
         assert _errors(caplog) == []
 
     def test_a_refused_file_answers_an_empty_list_not_none(self, tmp_path):
-        """The file was read and parsed, so its mtime is kept like any parsed file's:
-        it is not re-read on every cycle, and its rows go the counted-miss way."""
         result = self._extract(tmp_path, _IMPORTS + (
             "@rmq_trigger(queue=QUEUE)\n"
             "@dag(dag_id='d')\n"
             "def d(): pass\n"
         ))
         assert result == []
+
+    def test_a_refused_file_is_not_read_again_while_its_mtime_stands(self, tmp_path, caplog):
+        """The file was read and parsed, so its mtime is kept like any parsed file's:
+        the ERROR is written once, not on every cycle, and its rows go the
+        counted-miss way."""
+        (tmp_path / "dag.py").write_text(_IMPORTS + (
+            "@rmq_trigger(queue=QUEUE)\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        ))
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value=str(tmp_path))
+        with patch.object(
+            listener_module, "_read_and_parse", wraps=listener_module._read_and_parse
+        ) as parse, caplog.at_level(logging.WARNING):
+            listener._scan_subscriptions()
+            listener._scan_subscriptions()
+
+        assert parse.call_count == 1
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert "cannot be read statically" in errors[0]
 
 
 # ---------------------------------------------------------------------------
@@ -3391,6 +3447,8 @@ class TestExtractSubscriptionsGroupKeyAndCooldown:
     def test_single_queue_cooldown_zero_group_key_is_none(self, tmp_path):
         dag_file = tmp_path / "dag.py"
         dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
             "@rmq_trigger(queue='q', cooldown=0)\n"
             "@dag(dag_id='my_dag')\n"
             "def my_dag(): pass\n"
@@ -3404,6 +3462,8 @@ class TestExtractSubscriptionsGroupKeyAndCooldown:
     def test_single_queue_with_cooldown_group_key_is_dag_id(self, tmp_path):
         dag_file = tmp_path / "dag.py"
         dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
             "@rmq_trigger(queue='q', cooldown=300)\n"
             "@dag(dag_id='my_dag')\n"
             "def my_dag(): pass\n"
@@ -3417,6 +3477,8 @@ class TestExtractSubscriptionsGroupKeyAndCooldown:
     def test_queues_list_with_cooldown_creates_multiple_entries(self, tmp_path):
         dag_file = tmp_path / "dag.py"
         dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
             "@rmq_trigger(queues=['orders', 'payments'], cooldown=60)\n"
             "@dag(dag_id='multi_queue_dag')\n"
             "def multi_queue_dag(): pass\n"
@@ -3433,6 +3495,8 @@ class TestExtractSubscriptionsGroupKeyAndCooldown:
     def test_queues_list_no_cooldown_group_key_is_none(self, tmp_path):
         dag_file = tmp_path / "dag.py"
         dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
             "@rmq_trigger(queues=['a', 'b'])\n"
             "@dag(dag_id='dag_no_cooldown')\n"
             "def dag_no_cooldown(): pass\n"

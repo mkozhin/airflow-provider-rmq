@@ -12,7 +12,9 @@ from __future__ import annotations
 import importlib
 import sys
 import textwrap
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -281,19 +283,6 @@ class TestUnreadableFilesFailToImport:
                 id="dag-id-from-import",
             ),
             pytest.param(
-                "direct.py",
-                """
-                from airflow import DAG
-
-                with DAG("direct_dag", schedule=None, start_date=START) as direct:
-                    pass
-
-                rmq_trigger(queue="direct.q")(direct)
-                """,
-                "line 13: the name rmq_trigger is used other than as a decorator call",
-                id="direct-call-on-dag",
-            ),
-            pytest.param(
                 "alias_used.py",
                 """
                 from airflow_provider_rmq.watcher.decorators import rmq_trigger as rt
@@ -358,6 +347,20 @@ class TestUnreadableFilesFailToImport:
                 id="stacked-readable-and-unreadable",
             ),
             pytest.param(
+                "stacked_exchange.py",
+                """
+                @rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"])
+                @rmq_trigger(exchange="jetstat.other", routing_keys=["c.d"])
+                @dag(dag_id="stacked_exchange_dag", schedule=None, start_date=START)
+                def stacked_exchange_dag():
+                    pass
+
+                stacked_exchange_dag()
+                """,
+                "second exchange=",
+                id="stacked-exchange",
+            ),
+            pytest.param(
                 "unknown_key.py",
                 """
                 @rmq_trigger(queue="orders")
@@ -392,6 +395,100 @@ class TestUnreadableFilesFailToImport:
         assert "RMQTriggerNotStaticError" in error
         assert STEP_3 in error
         assert reason in error
+        assert not bag.dags
+
+    def test_direct_call_on_a_dag_fails_with_type_error(self, dags_folder):
+        path = _write(dags_folder, "direct.py", """
+            from airflow import DAG
+
+            with DAG("direct_dag", schedule=None, start_date=START) as direct:
+                pass
+
+            rmq_trigger(queue="direct.q")(direct)
+        """)
+        bag = _load(dags_folder)
+
+        error = _import_error(bag, path)
+        assert "TypeError" in error
+        assert "applied to the DAG 'direct_dag' itself" in error
+        assert not bag.dags
+
+    def test_same_named_wrapper_of_another_module(self, dags_folder, lib):
+        lib("rmq_static_check_common", """
+            import functools
+
+            from airflow_provider_rmq.watcher import decorators
+
+            rmq_trigger = functools.partial(decorators.rmq_trigger, conn_id="rmq_prod")
+        """)
+        path = dags_folder / "wrapper.py"
+        path.write_text(textwrap.dedent("""
+            from datetime import datetime
+
+            from airflow.decorators import dag
+            from rmq_static_check_common import rmq_trigger
+
+            @rmq_trigger(queue="orders")
+            @dag(dag_id="wrapper_dag", schedule=None, start_date=datetime(2024, 1, 1))
+            def wrapper_dag():
+                pass
+
+            wrapper_dag()
+        """), encoding="utf-8")
+        bag = _load(dags_folder)
+
+        error = _import_error(bag, path)
+        assert "RMQTriggerNotStaticError" in error
+        assert STEP_3 in error
+        assert "rmq_trigger is rmq_static_check_common.rmq_trigger" in error
+        assert not bag.dags
+
+    def test_same_named_dag_wrapper_of_another_module(self, dags_folder, lib):
+        lib("rmq_static_check_company", """
+            from airflow.decorators import dag as airflow_dag
+
+            def dag(dag_id, **kwargs):
+                return airflow_dag(dag_id=dag_id, **kwargs)
+        """)
+        path = dags_folder / "dag_wrapper.py"
+        path.write_text(textwrap.dedent("""
+            from datetime import datetime
+
+            from airflow_provider_rmq.watcher.decorators import rmq_trigger
+            from rmq_static_check_company import dag
+
+            @rmq_trigger(queue="orders")
+            @dag("dag_wrapper_dag", schedule=None, start_date=datetime(2024, 1, 1))
+            def dag_wrapper_dag():
+                pass
+
+            dag_wrapper_dag()
+        """), encoding="utf-8")
+        bag = _load(dags_folder)
+
+        error = _import_error(bag, path)
+        assert "RMQTriggerNotStaticError" in error
+        assert STEP_3 in error
+        assert "dag is rmq_static_check_company.dag, not Airflow's dag decorator" in error
+        assert not bag.dags
+
+    def test_dag_file_inside_a_zip(self, dags_folder):
+        archive = dags_folder / "pkg.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("zipped_dag.py", _HEADER + textwrap.dedent("""
+                @rmq_trigger(queue="orders")
+                @dag(dag_id="zipped_dag", schedule=None, start_date=START)
+                def zipped_dag():
+                    pass
+
+                zipped_dag()
+            """))
+        bag = _load(dags_folder)
+
+        assert len(bag.import_errors) == 1
+        [error] = bag.import_errors.values()
+        assert "RMQTriggerNotStaticError" in error
+        assert "cannot read this file" in error
         assert not bag.dags
 
     def test_re_exported_under_another_name(self, dags_folder, lib):
@@ -504,6 +601,29 @@ class TestCallSiteOutsideTheScannedFiles:
 
         error = _import_error(bag, path)
         assert NOT_SCANNED in error
+
+
+class TestOneParsePerFile:
+    def test_a_file_with_many_dags_is_parsed_once(self, dags_folder):
+        from airflow_provider_rmq.watcher import dag_file_scan
+
+        count = 20
+        _write(dags_folder, "many.py", "".join(f"""
+            @rmq_trigger(queue="q{n}", cooldown={n})
+            @dag(dag_id="many_{n}", schedule=None, start_date=START)
+            def many_{n}():
+                pass
+
+            many_{n}()
+        """ for n in range(count)))
+        with patch.object(
+            dag_file_scan, "_read_and_parse", wraps=dag_file_scan._read_and_parse
+        ) as parse:
+            bag = _load(dags_folder)
+
+        assert not bag.import_errors
+        assert len(bag.dags) == count
+        assert parse.call_count == 1
 
 
 class TestWholeFileFails:
@@ -638,4 +758,375 @@ class TestWatcherAndDecoratorReadTheSameFile:
         assert "RMQTriggerNotStaticError" in import_error
         assert STEP_3 in import_error
         assert "conn_id cannot be read" in import_error
+        assert not bag.dags
+
+    def test_a_dag_wrapper_that_renames_the_dag_fails_in_both_processes(
+        self, dags_folder, lib, caplog
+    ):
+        lib("rmq_static_check_prefixing", """
+            from airflow.decorators import dag as airflow_dag
+
+            def dag(dag_id, **kwargs):
+                return airflow_dag(dag_id="prod__" + dag_id, **kwargs)
+        """)
+        path = dags_folder / "prefixed.py"
+        path.write_text(textwrap.dedent("""
+            from datetime import datetime
+
+            from airflow_provider_rmq.watcher.decorators import rmq_trigger
+            from rmq_static_check_prefixing import dag
+
+            START = datetime(2024, 1, 1)
+
+            @rmq_trigger(queue="orders")
+            @dag("orders_dag", schedule=None, start_date=START)
+            def orders_dag():
+                pass
+
+            orders_dag()
+
+            @rmq_trigger(queue="payments")
+            @dag("payments_dag", schedule=None, start_date=START)
+            def payments_dag():
+                pass
+
+            payments_dag()
+        """), encoding="utf-8")
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert scanned == []
+        [error_log] = _watcher_errors(caplog)
+        assert str(path) in error_log
+        assert "dag is rmq_static_check_prefixing.dag" in error_log
+
+        import_error = _import_error(bag, path)
+        assert "RMQTriggerNotStaticError" in import_error
+        assert STEP_3 in import_error
+        assert "dag is rmq_static_check_prefixing.dag" in import_error
+        assert not bag.dags
+
+    def test_dag_imported_from_airflow_models_dag_is_read_by_both(self, dags_folder, caplog):
+        path = dags_folder / "models_dag.py"
+        path.write_text(textwrap.dedent("""
+            from datetime import datetime
+
+            import airflow.decorators
+            from airflow.models.dag import dag
+            from airflow_provider_rmq.watcher.decorators import rmq_trigger
+
+            START = datetime(2024, 1, 1)
+
+            @rmq_trigger(queue="orders")
+            @dag(dag_id="models_dag", schedule=None, start_date=START)
+            def models_dag():
+                pass
+
+            models_dag()
+
+            @rmq_trigger(queue="payments")
+            @airflow.decorators.dag(dag_id="decorators_dag", schedule=None, start_date=START)
+            def decorators_dag():
+                pass
+
+            decorators_dag()
+        """), encoding="utf-8")
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert not bag.import_errors
+        assert _watcher_errors(caplog) == []
+        assert sorted((r["dag_id"], r["queue_name"]) for r in scanned) == [
+            ("decorators_dag", "payments"), ("models_dag", "orders"),
+        ]
+        assert [s["queue_name"] for s in _subs(bag, "models_dag")] == ["orders"]
+        assert [s["queue_name"] for s in _subs(bag, "decorators_dag")] == ["payments"]
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            pytest.param(
+                """
+                def on_failure(context):
+                    dag = context["dag"]
+                    print(dag.dag_id)
+                """,
+                "",
+                id="local-in-a-callback",
+            ),
+            pytest.param(
+                """
+                def describe(dag):
+                    return dag.dag_id
+                """,
+                "",
+                id="parameter",
+            ),
+            pytest.param("", "dag = orders_dag()\n", id="factory-result-below"),
+            pytest.param(
+                "",
+                """
+                from airflow import DAG
+
+                with DAG("other_dag", schedule=None, start_date=START) as dag:
+                    pass
+                """,
+                id="with-dag-as-dag-below",
+            ),
+        ],
+    )
+    def test_a_binding_of_dag_the_decorator_cannot_see_is_read_by_both(
+        self, dags_folder, caplog, before, after
+    ):
+        path = _write(
+            dags_folder,
+            "local_dag.py",
+            textwrap.dedent(before)
+            + textwrap.dedent("""
+                from airflow.decorators import task
+
+                @rmq_trigger(queue="orders")
+                @dag(dag_id="orders_dag", schedule=None, start_date=START)
+                def orders_dag():
+                    @task
+                    def report(dag=None):
+                        return dag
+
+                    report()
+
+                orders_dag()
+            """)
+            + textwrap.dedent(after),
+        )
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert not bag.import_errors
+        assert _watcher_errors(caplog) == []
+        assert [(r["dag_id"], r["queue_name"]) for r in scanned] == [("orders_dag", "orders")]
+        assert [s["queue_name"] for s in _subs(bag, "orders_dag")] == ["orders"]
+
+    @pytest.mark.parametrize(
+        "after",
+        [
+            pytest.param("dag = create_dag()\n", id="factory-result-assigned-to-dag"),
+            pytest.param(
+                """
+                FACTORY_DAG = create_dag()
+
+                from airflow import DAG
+
+                with DAG("legacy_dag", schedule=None, start_date=START) as dag:
+                    pass
+                """,
+                id="with-dag-as-dag-below-the-factory-call",
+            ),
+        ],
+    )
+    def test_a_module_binding_of_dag_below_a_factory_call_is_read_by_both(
+        self, dags_folder, caplog, after
+    ):
+        path = _write(
+            dags_folder,
+            "factory_dag.py",
+            textwrap.dedent("""
+                def create_dag():
+                    @rmq_trigger(queue="orders")
+                    @dag(dag_id="factory_dag", schedule=None, start_date=START)
+                    def factory_dag():
+                        pass
+
+                    return factory_dag()
+
+            """)
+            + textwrap.dedent(after),
+        )
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert not bag.import_errors
+        assert _watcher_errors(caplog) == []
+        assert [(r["dag_id"], r["queue_name"]) for r in scanned] == [("factory_dag", "orders")]
+        assert [s["queue_name"] for s in _subs(bag, "factory_dag")] == ["orders"]
+
+    def test_a_module_rebinding_of_dag_above_a_factory_call_fails_in_both_processes(
+        self, dags_folder, caplog
+    ):
+        path = _write(dags_folder, "late_factory.py", """
+            def create_dag():
+                @rmq_trigger(queue="orders")
+                @dag(dag_id="factory_dag", schedule=None, start_date=START)
+                def factory_dag():
+                    pass
+
+                return factory_dag()
+
+            dag = dag
+            FACTORY_DAG = create_dag()
+        """)
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert scanned == []
+        [error_log] = _watcher_errors(caplog)
+        assert "dag is not bound by one absolute import alone" in error_log
+
+        import_error = _import_error(bag, path)
+        assert "RMQTriggerNotStaticError" in import_error
+        assert STEP_3 in import_error
+        assert "dag is not bound by one absolute import alone" in import_error
+        assert not bag.dags
+
+    def test_a_factory_handed_on_before_a_module_binding_of_dag_fails_in_both_processes(
+        self, dags_folder, caplog
+    ):
+        path = _write(dags_folder, "registry.py", """
+            from airflow import DAG
+
+            FACTORIES = []
+
+            def create_orders_dag():
+                @rmq_trigger(queue="orders")
+                @dag(dag_id="orders_dag", schedule=None, start_date=START)
+                def orders_dag():
+                    pass
+
+                return orders_dag()
+
+            FACTORIES.append(create_orders_dag)
+
+            with DAG("legacy_dag", schedule=None, start_date=START) as dag:
+                pass
+
+            for factory in FACTORIES:
+                factory()
+        """)
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert scanned == []
+        [error_log] = _watcher_errors(caplog)
+        assert "dag is not bound by one absolute import alone" in error_log
+
+        assert "TypeError" in _import_error(bag, path)
+        assert not bag.dags
+
+    def test_a_factory_its_file_never_calls_with_dag_rebound_below_fails_in_both_processes(
+        self, dags_folder, caplog, monkeypatch
+    ):
+        monkeypatch.syspath_prepend(str(dags_folder))
+        monkeypatch.delitem(sys.modules, "factories", raising=False)
+        factories = _write(dags_folder, "factories.py", """
+            from airflow import DAG
+
+            def create_orders_dag():
+                @rmq_trigger(queue="orders")
+                @dag(dag_id="orders_dag", schedule=None, start_date=START)
+                def orders_dag():
+                    pass
+
+                return orders_dag()
+
+            with DAG("legacy_dag", schedule=None, start_date=START) as dag:
+                pass
+        """)
+        caller = _write(dags_folder, "caller.py", """
+            from factories import create_orders_dag
+
+            create_orders_dag()
+        """)
+        try:
+            bag = _load(dags_folder)
+        finally:
+            sys.modules.pop("factories", None)
+        scanned = self._scan(factories, caplog)
+
+        assert scanned == []
+        [error_log] = _watcher_errors(caplog)
+        assert "dag is not bound by one absolute import alone" in error_log
+
+        assert "TypeError" in _import_error(bag, caller)
+        assert sorted(bag.dags) == ["legacy_dag"]
+
+    def test_a_decorator_without_wraps_below_dag_fails_in_both_processes(
+        self, dags_folder, caplog
+    ):
+        path = _write(dags_folder, "no_wraps.py", """
+            def no_wraps(func):
+                def inner():
+                    return func()
+
+                return inner
+
+            @rmq_trigger(queue="orders")
+            @dag(schedule=None, start_date=START)
+            @no_wraps
+            def my_dag():
+                pass
+
+            my_dag()
+
+            @rmq_trigger(queue="payments")
+            @dag(dag_id="neighbour", schedule=None, start_date=START)
+            def neighbour():
+                pass
+
+            neighbour()
+        """)
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert scanned == []
+        [error_log] = _watcher_errors(caplog)
+        assert "@no_wraps sits below @rmq_trigger(...)" in error_log
+
+        import_error = _import_error(bag, path)
+        assert "RMQTriggerNotStaticError" in import_error
+        assert STEP_3 in import_error
+        assert "@no_wraps sits below @rmq_trigger(...)" in import_error
+        assert not bag.dags
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            pytest.param("dag = dag\n", "", id="module-rebinding-above"),
+            pytest.param(
+                "",
+                """
+                def swap():
+                    global dag
+                    dag = None
+                """,
+                id="global-in-a-function",
+            ),
+        ],
+    )
+    def test_a_rebinding_of_dag_the_decorator_sees_fails_in_both_processes(
+        self, dags_folder, caplog, before, after
+    ):
+        path = _write(
+            dags_folder,
+            "rebound_dag.py",
+            before
+            + textwrap.dedent("""
+                @rmq_trigger(queue="orders")
+                @dag(dag_id="orders_dag", schedule=None, start_date=START)
+                def orders_dag():
+                    pass
+
+                orders_dag()
+            """)
+            + textwrap.dedent(after),
+        )
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert scanned == []
+        [error_log] = _watcher_errors(caplog)
+        assert "dag is not bound by one absolute import alone" in error_log
+
+        import_error = _import_error(bag, path)
+        assert "RMQTriggerNotStaticError" in import_error
+        assert STEP_3 in import_error
+        assert "dag is not bound by one absolute import alone" in import_error
         assert not bag.dags

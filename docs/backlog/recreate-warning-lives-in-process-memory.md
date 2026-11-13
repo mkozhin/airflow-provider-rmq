@@ -7,12 +7,12 @@ added: 2026-09-03
 
 **Симптом.** Когда скан пересоздаёт строку, которую сам же ранее удалил,
 `_sync_to_db` пишет WARNING с именем подписки и с тем, каким цикл прочитал её
-флаг `enabled` (`airflow_provider_rmq/watcher/listener.py:1686-1697`). Знание об
+флаг `enabled` (`airflow_provider_rmq/watcher/listener.py:1687-1698`). Знание об
 этом держит `_deleted_dag_file_rows` (`listener.py:473`) — словарь в памяти
 процесса watcher'а, ограниченный `_DELETED_ROWS_REMEMBERED = 256` записями
-(`listener.py:111`, вытеснение в `_remember_deleted_row`, `listener.py:1533`).
+(`listener.py:111`, вытеснение в `_remember_deleted_row`, `listener.py:1534`).
 `absent_cycles` при этом лежит в базе и переживает что угодно; несимметричен именно
-след. Docstring `_sync_to_db` (`listener.py:1561-1567`) это ограничение называет.
+след. Docstring `_sync_to_db` (`listener.py:1562-1568`) это ограничение называет.
 
 Процесс watcher'а — дочерний процесс шедулера: шедулер запускает его один раз при
 старте и останавливает при своей остановке, а упавший цикл (`_run_loop`,

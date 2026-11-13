@@ -154,10 +154,10 @@ def rmq_trigger(
     ``DAG`` — the real ``DAG`` only exists after the factory is called
     (``my_dag()`` at the end of the file). ``@rmq_trigger`` wraps the factory
     and attaches subscriptions when the wrapper itself is called, then returns
-    the resulting ``DAG``. Called directly on a ready ``DAG`` instance
+    the resulting ``DAG``. Applied to a ready ``DAG`` instance
     (``rmq_trigger(...)(dag)``, the ``with DAG(...) as dag:`` style), the
-    decorator attaches at once and the static check below fails the import:
-    the watcher does not see such a call.
+    decorator raises ``TypeError`` at once: the watcher does not see such a
+    call.
 
     **``@rmq_trigger`` must be the outermost decorator, placed above
     ``@dag(...)``, never below it.** Putting it below (i.e.
@@ -182,8 +182,15 @@ def rmq_trigger(
       ``DAGS_FOLDER`` with no directory or file name below it starting with
       ``.``;
     * any ``@rmq_trigger`` of the file cannot be read, ``rmq_trigger`` is
-      mentioned other than as a decorator call on a function, or a
-      ``dag_id`` cannot be resolved;
+      mentioned other than as a decorator call on a function, is not imported
+      from ``airflow_provider_rmq.watcher.decorators`` (a same-named wrapper
+      of another module, a relative import, ``from ... import *``), its
+      ``@dag(...)`` is not Airflow's decorator imported from
+      ``airflow.decorators`` or ``airflow.models.dag`` (a same-named ``dag`` of
+      another module is refused even when it keeps the ``dag_id``), a
+      decorator other than ``rmq_trigger(...)`` and ``dag(...)`` sits below
+      the first ``@rmq_trigger(...)`` of a function, or a ``dag_id`` cannot be
+      resolved;
     * the scan does not find this call, resolves another ``dag_id``, or reads
       other values than the decorator received.
 
@@ -225,6 +232,9 @@ def rmq_trigger(
         if not hasattr(dag_obj, "_rmq_subscriptions"):
             dag_obj._rmq_subscriptions = []
 
+        # The static check above refuses a file with a second exchange=
+        # subscription on one DAG; this check keeps the invariant in the DAG's
+        # own subscriptions as well, whatever the check reports.
         if has_exchange_conflict(dag_obj._rmq_subscriptions, new_subs):
             raise ValueError(
                 "Multiple @rmq_trigger(exchange=...) decorators on DAG "
@@ -238,12 +248,18 @@ def rmq_trigger(
 
     def decorator(dag_or_factory):
         if hasattr(dag_or_factory, "dag_id"):
-            return _attach(dag_or_factory)
+            raise TypeError(
+                f"rmq_trigger(...) was applied to the DAG {dag_or_factory.dag_id!r} "
+                "itself. The RMQ watcher reads subscriptions only from the "
+                "decorator form @rmq_trigger(...) placed above @dag(...) on a "
+                "function of a DAG file, so it would never register this one; "
+                "declare the DAG with @dag(...) and put @rmq_trigger(...) above it."
+            )
 
         if not callable(dag_or_factory):
             raise TypeError(
-                "@rmq_trigger must decorate a DAG instance or a callable "
-                f"@dag(...) factory function, got {type(dag_or_factory)!r}."
+                "@rmq_trigger must decorate a callable @dag(...) factory function, "
+                f"got {type(dag_or_factory)!r}."
             )
 
         @functools.wraps(dag_or_factory)

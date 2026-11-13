@@ -5,9 +5,7 @@ import ast
 import pytest
 
 from airflow_provider_rmq.watcher.dag_file_scan import (
-    _UNRESOLVED_DAG_ID,
     _collect_module_constants,
-    _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
     _iter_trigger_functions,
     _read_and_parse,
@@ -15,7 +13,7 @@ from airflow_provider_rmq.watcher.dag_file_scan import (
     _read_rmq_trigger_call,
     _resolve_static,
     _static_dag_id,
-    _Unresolved,
+    _Unreadable,
     _usable_constants,
 )
 
@@ -31,7 +29,7 @@ def _dag_id_of_last_function(src: str):
     constants = {name: value for name, (value, _) in _collect_module_constants(tree)[0].items()}
     func = tree.body[-1]
     assert isinstance(func, ast.FunctionDef)
-    return _extract_dag_id_from_decorators(func.decorator_list, constants)
+    return _static_dag_id(func, constants)
 
 
 # ---------------------------------------------------------------------------
@@ -214,15 +212,15 @@ class TestDagIdFromNonStringConstant:
     @pytest.mark.parametrize("literal", ["None", "0", "False", "123", "['d']"])
     def test_non_string_constant_is_unresolved(self, literal):
         src = f"DAG_ID = {literal}\n@dag(dag_id=DAG_ID)\ndef f(): pass\n"
-        assert _dag_id_of_last_function(src) is _UNRESOLVED_DAG_ID
+        assert _dag_id_of_last_function(src) is None
 
     def test_non_string_constant_positional_is_unresolved(self):
         src = "DAG_ID = None\n@dag(DAG_ID)\ndef f(): pass\n"
-        assert _dag_id_of_last_function(src) is _UNRESOLVED_DAG_ID
+        assert _dag_id_of_last_function(src) is None
 
     def test_empty_string_constant_falls_back_to_function_name(self):
         src = "DAG_ID = ''\n@dag(dag_id=DAG_ID)\ndef f(): pass\n"
-        assert _dag_id_of_last_function(src) is None
+        assert _dag_id_of_last_function(src) == "f"
 
     def test_string_constant_resolves(self):
         src = "DAG_ID = 'real'\n@dag(dag_id=DAG_ID)\ndef f(): pass\n"
@@ -230,7 +228,7 @@ class TestDagIdFromNonStringConstant:
 
     def test_none_literal_falls_back_to_function_name(self):
         src = "@dag(dag_id=None)\ndef f(): pass\n"
-        assert _dag_id_of_last_function(src) is None
+        assert _dag_id_of_last_function(src) == "f"
 
 
 # ---------------------------------------------------------------------------
@@ -251,13 +249,10 @@ class TestResolveStatic:
             ("-5", -5),
             ("+5", 5),
             ("-1.5", -1.5),
-            ("1+2j", 1 + 2j),
             ("True", True),
             ("None", None),
             ("['a', ('b', 1)]", ["a", ("b", 1)]),
             ("{'a': [1, {'b': None}]}", {"a": [1, {"b": None}]}),
-            ("{'a', 'b'}", {"a", "b"}),
-            ("set()", set()),
         ],
     )
     def test_literal(self, src, expected):
@@ -291,26 +286,18 @@ class TestResolveStatic:
             ("{'k': get()}", "function call"),
             ("{[1]: 'v'}", "unhashable"),
             ("UNKNOWN", "'UNKNOWN' is not a constant the scan can read"),
+            ("{'a', 'b'}", "a set display"),
+            ("set()", "function call"),
+            ("1+2j", "operator expression"),
+            ("2j", "complex literal"),
+            ("b'q'", "bytes literal"),
+            ("...", "ellipsis literal"),
         ],
     )
     def test_unreadable_has_reason(self, src, fragment):
-        result = _resolve_static(_expr(src), {"ENV": "prod", "X": {"a": 1}, "Q": "q"})
-        assert isinstance(result, _Unresolved)
-        assert fragment in result.reason
-
-    def test_constant_value_is_copied(self):
-        constants = {"FILTER": {"body": {"type": ["paid"]}}}
-        result = _resolve_static(_expr("FILTER"), constants)
-        assert result == constants["FILTER"]
-        result["body"]["type"].append("free")
-        result["extra"] = 1
-        assert constants == {"FILTER": {"body": {"type": ["paid"]}}}
-
-    def test_constant_inside_display_is_copied(self):
-        constants = {"QUEUES": ["q1"]}
-        result = _resolve_static(_expr("[QUEUES]"), constants)
-        result[0].append("q2")
-        assert constants == {"QUEUES": ["q1"]}
+        with pytest.raises(_Unreadable) as exc_info:
+            _resolve_static(_expr(src), {"ENV": "prod", "X": {"a": 1}, "Q": "q"})
+        assert fragment in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -407,22 +394,6 @@ class TestReadRmqTriggerCall:
             "routing_key_ids": ["job"],
             "routing_key_status": "succeeded",
         }
-
-    def test_read_values_do_not_share_objects_with_constants(self):
-        src = _decorated(
-            "rmq_trigger(queue='q', filter_data=FILTER)", "FILTER = {'a': ['b']}\n"
-        )
-        tree = ast.parse(src)
-        module_constants, module_scope_ids = _collect_module_constants(tree)
-        func = tree.body[-1]
-        assert isinstance(func, ast.FunctionDef)
-        constants = _usable_constants(func, module_constants, module_scope_ids)
-        call = func.decorator_list[0]
-        assert isinstance(call, ast.Call)
-        read = _read_rmq_trigger_call(call, constants)
-        read.kwargs["filter_data"]["a"].append("c")
-        assert constants["FILTER"] == {"a": ["b"]}
-        assert module_constants["FILTER"] == ({"a": ["b"]}, 1)
 
 
 class TestReadRmqTriggerCallUnreadable:
@@ -560,8 +531,19 @@ class TestUsableConstants:
 # ---------------------------------------------------------------------------
 
 
-def _file_read(src: str):
-    return _read_file_triggers(ast.parse(src))
+#: The imports that bind both forms of the decorator the scan reads.
+_TRIGGER_IMPORTS = (
+    "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+    "from airflow_provider_rmq.watcher import decorators\n"
+)
+
+
+#: The import that binds Airflow's ``dag``; ``_file_read`` puts it first in every file.
+_DAG_IMPORT = "from airflow.decorators import dag\n"
+
+
+def _file_read(src: str, imports: str = _TRIGGER_IMPORTS):
+    return _read_file_triggers(ast.parse(_DAG_IMPORT + imports + src))
 
 
 class TestReadAndParse:
@@ -689,6 +671,36 @@ class TestReadFileTriggers:
         assert any("placed below @dag(...)" in p for p in read.problems)
 
     @pytest.mark.parametrize(
+        "decorators_",
+        [
+            pytest.param("@rmq_trigger(queue='a')\n@dag()\n@no_wraps\n", id="below-dag"),
+            pytest.param("@rmq_trigger(queue='a')\n@rename\n@dag()\n",
+                         id="between-rmq-trigger-and-dag"),
+            pytest.param("@rmq_trigger(queue='a')\n@helpers.wrap(1)\n"
+                         "@rmq_trigger(queue='b')\n@dag()\n",
+                         id="between-two-rmq-triggers"),
+        ],
+    )
+    def test_other_decorator_below_rmq_trigger_refuses_the_file(self, decorators_):
+        read = _file_read(
+            "@rmq_trigger(queue='n')\n@dag(dag_id='neighbour')\ndef neighbour(): pass\n"
+            + decorators_ + "def my_dag(): pass\n"
+        )
+        assert read.subscriptions == []
+        assert any(
+            "'my_dag'" in p and "sits below @rmq_trigger(...)" in p for p in read.problems
+        ), read.problems
+
+    def test_other_decorator_above_rmq_trigger_keeps_the_file_readable(self):
+        read = _file_read(
+            "@log_calls\n@helpers.wrap(1)\n@rmq_trigger(queue='a')\n@dag()\ndef my_dag(): pass\n"
+        )
+        assert read.problems == []
+        assert [(s["dag_id"], s["queue_name"]) for s in read.subscriptions] == [
+            ("my_dag", "a"),
+        ]
+
+    @pytest.mark.parametrize(
         ("src", "expected"),
         [
             ("rmq_trigger(queue='b')(DAG('B'))\n", "the name rmq_trigger"),
@@ -712,21 +724,413 @@ class TestReadFileTriggers:
         assert any(expected in p for p in read.problems), read.problems
 
     @pytest.mark.parametrize(
-        "src",
+        "imports",
         [
-            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n",
-            "from airflow_provider_rmq.watcher.decorators import rmq_trigger as rmq_trigger\n",
-            "from airflow_provider_rmq.watcher import decorators\n",
-            "NAME = 'rmq_trigger'\n",
+            pytest.param(_TRIGGER_IMPORTS, id="from-decorators-and-from-watcher"),
+            pytest.param(
+                "from airflow_provider_rmq.watcher.decorators import rmq_trigger as rmq_trigger\n"
+                "import airflow_provider_rmq.watcher.decorators as decorators\n",
+                id="import-as-own-name-and-module-alias",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher import rmq_trigger, decorators\n",
+                id="package-re-export",
+            ),
+            pytest.param(
+                _TRIGGER_IMPORTS + "NAME = 'rmq_trigger'\n",
+                id="string-holding-the-name",
+            ),
         ],
     )
-    def test_mentions_the_scan_follows(self, src):
+    def test_mentions_the_scan_follows(self, imports):
         read = _file_read(
-            src + "@rmq_trigger(queue='a')\n@decorators.rmq_trigger(queue='b')\n"
-            "@dag(dag_id='a')\ndef a(): pass\n"
+            "@rmq_trigger(queue='a')\n@decorators.rmq_trigger(queue='b')\n"
+            "@dag(dag_id='a')\ndef a(): pass\n",
+            imports,
         )
         assert read.problems == []
         assert [s["queue_name"] for s in read.subscriptions] == ["a", "b"]
+
+    @pytest.mark.parametrize(
+        ("imports", "decorator"),
+        [
+            pytest.param(
+                "import airflow_provider_rmq.watcher.decorators\n",
+                "airflow_provider_rmq.watcher.decorators.rmq_trigger",
+                id="dotted-module-path",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq import watcher\n",
+                "watcher.rmq_trigger",
+                id="package-attribute",
+            ),
+            pytest.param(
+                "import airflow_provider_rmq.watcher.decorators\nimport airflow_provider_rmq\n",
+                "airflow_provider_rmq.watcher.decorators.rmq_trigger",
+                id="top-package-imported-twice",
+            ),
+        ],
+    )
+    def test_attribute_forms_bound_to_the_provider_are_read(self, imports, decorator):
+        read = _file_read(
+            f"@{decorator}(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n", imports
+        )
+        assert read.problems == []
+        assert [s["queue_name"] for s in read.subscriptions] == ["a"]
+
+    @pytest.mark.parametrize(
+        ("imports", "decorator", "expected"),
+        [
+            pytest.param(
+                "from common_rmq import rmq_trigger\n", "rmq_trigger",
+                "rmq_trigger is common_rmq.rmq_trigger", id="same-name-of-another-module",
+            ),
+            pytest.param(
+                "from .common import rmq_trigger\n", "rmq_trigger",
+                "rmq_trigger is not bound by one absolute import alone", id="relative-import",
+            ),
+            pytest.param(
+                "from common import *\n", "rmq_trigger",
+                "'from ... import *'", id="wildcard-import",
+            ),
+            pytest.param(
+                _TRIGGER_IMPORTS + "from common import *\n", "rmq_trigger",
+                "'from ... import *'", id="wildcard-beside-the-provider-import",
+            ),
+            pytest.param("", "rmq_trigger", "rmq_trigger is not bound by one absolute import alone",
+                         id="no-import"),
+            pytest.param(
+                "import common_rmq as decorators\n", "decorators.rmq_trigger",
+                "decorators.rmq_trigger is common_rmq.rmq_trigger", id="other-module-alias",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher import decorators\n"
+                "decorators = None\n",
+                "decorators.rmq_trigger",
+                "decorators.rmq_trigger is not bound by one absolute import alone", id="alias-rebound",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+                "def swap():\n    global rmq_trigger\n    rmq_trigger = None\n",
+                "rmq_trigger",
+                "rmq_trigger is not bound by one absolute import alone", id="global-rebinding",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher import decorators\n",
+                "get_module().rmq_trigger",
+                "is not bound by one absolute import alone", id="computed-base",
+            ),
+        ],
+    )
+    def test_rmq_trigger_not_bound_to_the_provider_refuses_the_file(
+        self, imports, decorator, expected
+    ):
+        read = _file_read(
+            "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n"
+            .replace("rmq_trigger", decorator, 1),
+            imports,
+        )
+        assert read.subscriptions == []
+        assert any(expected in p for p in read.problems), read.problems
+        assert any("airflow_provider_rmq.watcher.decorators" in p for p in read.problems)
+
+    @pytest.mark.parametrize(
+        ("imports", "decorator"),
+        [
+            pytest.param("from airflow.decorators import dag\n", "dag", id="from-decorators"),
+            pytest.param("from airflow.models.dag import dag\n", "dag", id="from-models-dag"),
+            pytest.param("from airflow import decorators as af\n", "af.dag",
+                         id="decorators-module"),
+            pytest.param("import airflow.decorators\n", "airflow.decorators.dag",
+                         id="dotted-decorators-path"),
+            pytest.param("import airflow.models.dag as dag_module\n", "dag_module.dag",
+                         id="models-dag-module-alias"),
+        ],
+    )
+    def test_dag_bound_to_airflow_is_read(self, imports, decorator):
+        read = _read_file_triggers(ast.parse(
+            _TRIGGER_IMPORTS + imports
+            + f"@rmq_trigger(queue='a')\n@{decorator}(dag_id='a')\ndef a(): pass\n"
+        ))
+        assert read.problems == []
+        assert [(s["dag_id"], s["queue_name"]) for s in read.subscriptions] == [("a", "a")]
+
+    @pytest.mark.parametrize(
+        ("imports", "decorator", "expected"),
+        [
+            pytest.param("from company import dag\n", "dag",
+                         "dag is company.dag", id="same-name-of-another-module"),
+            pytest.param("from .common import dag\n", "dag",
+                         "dag is not bound by one absolute import alone", id="relative-import"),
+            pytest.param("", "dag", "dag is not bound by one absolute import alone",
+                         id="no-import"),
+            pytest.param("from airflow.models import dag\n", "dag",
+                         "dag is airflow.models.dag,", id="the-module-not-the-decorator"),
+            pytest.param(
+                "from airflow.decorators import dag\n"
+                "def dag(dag_id, **kw): pass\n",
+                "dag", "dag is not bound by one absolute import alone",
+                id="local-definition",
+            ),
+            pytest.param("import company as af\n", "af.dag",
+                         "af.dag is company.dag", id="other-module-alias"),
+            pytest.param(
+                "from airflow.decorators import dag\nfrom common import *\n", "dag",
+                "'from ... import *'", id="wildcard-import",
+            ),
+        ],
+    )
+    def test_dag_not_bound_to_airflow_refuses_the_file(self, imports, decorator, expected):
+        read = _read_file_triggers(ast.parse(
+            _TRIGGER_IMPORTS + imports
+            + "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n"
+            + "@rmq_trigger(queue='b')\n"
+            + f"@{decorator}(dag_id='b')\ndef b(): pass\n"
+        ))
+        assert read.subscriptions == []
+        assert any(expected in p for p in read.problems), read.problems
+        assert any("airflow.decorators" in p for p in read.problems)
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            pytest.param(
+                "def on_failure(context):\n    dag = context['dag']\n    return dag\n",
+                "", id="local-in-a-callback",
+            ),
+            pytest.param("def helper(dag):\n    return dag\n", "", id="parameter"),
+            pytest.param("def other():\n    dag = 1\n", "", id="local-in-another-function"),
+            pytest.param("pick = lambda dag: dag\n", "", id="lambda-parameter"),
+            pytest.param("IDS = [dag for dag in ('x', 'y')]\n", "", id="comprehension-variable"),
+            pytest.param("class Holder:\n    dag = None\n", "", id="class-attribute"),
+            pytest.param("", "dag = a()\n", id="factory-result-below"),
+            pytest.param(
+                "", "from airflow import DAG\nwith DAG('b') as dag:\n    pass\n",
+                id="with-dag-as-dag-below",
+            ),
+            pytest.param(
+                "def helper(decorators, rmq_trigger):\n    return decorators\n", "",
+                id="provider-names-as-parameters",
+            ),
+        ],
+    )
+    def test_bindings_the_decorator_cannot_see_keep_the_file_readable(self, before, after):
+        read = _file_read(
+            before
+            + "@rmq_trigger(queue='a')\n@decorators.rmq_trigger(queue='b')\n"
+            + "@dag(dag_id='a')\ndef a():\n"
+            + "    @task\n    def t(dag=None):\n        return dag\n    t()\n"
+            + after
+        )
+        assert read.problems == []
+        assert [(s["dag_id"], s["queue_name"]) for s in read.subscriptions] == [
+            ("a", "a"), ("a", "b"),
+        ]
+
+    def test_nested_dag_function_ignores_bindings_of_other_scopes(self):
+        read = _file_read(
+            "def helper(dag):\n    return dag\n"
+            "def make():\n"
+            "    @rmq_trigger(queue='n')\n    @dag(dag_id='nested')\n    def nested():\n"
+            "        dag = 1\n"
+            "    def callback(dag): pass\n"
+            "    return nested()\n"
+            "dag_object = make()\n"
+        )
+        assert read.problems == []
+        assert [s["dag_id"] for s in read.subscriptions] == ["nested"]
+
+    @pytest.mark.parametrize(
+        "after",
+        [
+            pytest.param("dag = make()\n", id="factory-result-assigned-to-dag"),
+            pytest.param("dag: object = make()\n", id="annotated-factory-result"),
+            pytest.param("first, dag = 1, make()\n", id="tuple-assignment-calling-the-factory"),
+            pytest.param(
+                "make()\nfrom airflow import DAG\nwith DAG('legacy') as dag:\n    pass\n",
+                id="with-dag-as-dag-below-the-factory-call",
+            ),
+            pytest.param(
+                "if ENABLED:\n    made = make()\nelse:\n    dag = None\n",
+                id="rebinding-below-the-call-under-if",
+            ),
+            pytest.param("", id="factory-never-mentioned-and-no-binding-below"),
+        ],
+    )
+    def test_module_bindings_below_a_factory_call_keep_the_file_readable(self, after):
+        read = _file_read(
+            "def make():\n"
+            "    @rmq_trigger(queue='n')\n    @decorators.rmq_trigger(queue='m')\n"
+            "    @dag(dag_id='factory_dag')\n    def nested(): pass\n"
+            "    return nested()\n"
+            + after
+        )
+        assert read.problems == []
+        assert [(s["dag_id"], s["queue_name"]) for s in read.subscriptions] == [
+            ("factory_dag", "n"), ("factory_dag", "m"),
+        ]
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            pytest.param("dag = None\n" + "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n",
+                         id="module-rebinding-above"),
+            pytest.param(
+                "from airflow import DAG\nwith DAG('b') as dag:\n    pass\n"
+                "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n",
+                id="with-dag-as-dag-above",
+            ),
+            pytest.param(
+                "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n"
+                "def swap():\n    global dag\n    dag = None\n",
+                id="global-in-a-function-below",
+            ),
+            pytest.param(
+                "IDS = [(dag := i) for i in range(2)]\n"
+                "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n",
+                id="walrus-in-a-comprehension-above",
+            ),
+            pytest.param(
+                "for _ in range(2):\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    dag = None\n",
+                id="rebinding-below-in-a-loop",
+            ),
+            pytest.param(
+                "def make(dag):\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n",
+                id="parameter-of-the-enclosing-factory",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    dag = a()\n    return dag\n",
+                id="local-of-the-enclosing-factory",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "dag = None\nmake()\n",
+                id="module-rebinding-below-a-factory",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "dag = None; make()\n",
+                id="factory-call-after-a-rebinding-on-the-same-line",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "from airflow import DAG\nwith DAG('legacy') as dag:\n    made = make()\n",
+                id="factory-call-inside-with-dag-as-dag",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "def build():\n    return make()\n"
+                "dag = None\n",
+                id="factory-called-from-a-function",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "for _ in range(2):\n    made = make()\n"
+                "dag = None\n",
+                id="factory-called-in-a-loop",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "made = make() if (dag := None) is None else None\n",
+                id="walrus-below-a-factory",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "made = make()\nalias = make\ndag = None\n",
+                id="factory-assigned-to-another-name",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "FACTORIES = []\nFACTORIES.append(make)\n"
+                "from airflow import DAG\nwith DAG('legacy') as dag:\n    pass\n"
+                "for factory in FACTORIES:\n    factory()\n",
+                id="factory-appended-to-a-list",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "register(make)\ndag = None\n",
+                id="factory-passed-to-a-call",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n"
+                "from airflow import DAG\nwith DAG('legacy') as dag:\n    pass\n",
+                id="factory-never-mentioned",
+            ),
+            pytest.param(
+                "class Holder:\n    dag = None\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n",
+                id="class-attribute-above-a-method",
+            ),
+        ],
+    )
+    def test_bindings_the_decorator_sees_refuse_the_file(self, src):
+        read = _file_read(src)
+        assert read.subscriptions == []
+        assert any("dag is not bound by one absolute import alone" in p for p in read.problems), (
+            read.problems
+        )
+
+    def test_import_below_the_decorated_function_is_not_seen(self):
+        read = _read_file_triggers(ast.parse(
+            _TRIGGER_IMPORTS
+            + "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n"
+            + "from airflow.decorators import dag\n"
+        ))
+        assert read.subscriptions == []
+        assert any("dag is not bound by one absolute import alone" in p for p in read.problems)
+
+    def test_foreign_dag_without_rmq_trigger_is_no_problem(self):
+        read = _read_file_triggers(ast.parse(
+            _TRIGGER_IMPORTS
+            + "from airflow.decorators import dag\n"
+            + "import company\n"
+            + "@company.dag(dag_id='other')\ndef other(): pass\n"
+            + "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n"
+        ))
+        assert read.problems == []
+        assert [s["dag_id"] for s in read.subscriptions] == ["a"]
+
+    def test_calls_record_their_lines_dag_id_and_built_subscriptions(self):
+        read = _file_read(
+            "@rmq_trigger(queue='a')\n"
+            "@rmq_trigger(\n    queue='b',\n    cooldown=5,\n)\n"
+            "@dag(dag_id='d')\ndef d(): pass\n",
+            imports="from airflow_provider_rmq.watcher.decorators import rmq_trigger\n",
+        )
+        assert read.problems == []
+        assert [(c.first_line, c.last_line, c.dag_id) for c in read.calls] == [
+            (3, 3, "d"), (4, 7, "d"),
+        ]
+        assert read.calls[1].subscriptions == [{
+            "queue_name": "b", "conn_id": "rmq_default", "filter_data": {},
+            "cooldown": 5, "ack_unmatched": False,
+        }]
 
     def test_nested_factory_and_module_if_with_literals(self):
         read = _file_read(
@@ -743,4 +1147,4 @@ class TestReadFileTriggers:
 
     def test_file_without_rmq_trigger_is_empty_and_clean(self):
         read = _file_read("@dag(dag_id='a')\ndef a(): pass\n")
-        assert read == ([], [])
+        assert read == ([], [], [])

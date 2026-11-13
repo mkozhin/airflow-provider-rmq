@@ -10,12 +10,16 @@ from __future__ import annotations
 import glob
 import os
 import textwrap
+import zipfile
+from unittest.mock import patch
 
 import pytest
 
+from airflow_provider_rmq.watcher import dag_file_scan
 from airflow_provider_rmq.watcher.dag_file_scan import (
     RMQTriggerNotStaticError,
     _same_value,
+    _subscription_differences,
     _verify_static_readability,
     _watcher_scans,
 )
@@ -100,11 +104,6 @@ class TestSameValue:
         assert not _same_value([[1, 2]], [[1, 2, 3]])
         assert not _same_value([1, 2], [2, 1])
 
-    def test_sets_compare_members_with_their_type(self):
-        assert _same_value({1, 2}, {2, 1})
-        assert not _same_value({1}, {True})
-        assert not _same_value({1, 2}, {1, 3})
-
 
 # ---------------------------------------------------------------------------
 # _watcher_scans
@@ -137,27 +136,78 @@ class TestWatcherScans:
         assert _watcher_scans(str(folder / "a.py"), str(folder) + os.sep)
         assert _watcher_scans(str(folder / "sub" / ".." / "a.py"), str(folder))
 
-    def test_agrees_with_the_watcher_glob(self, tmp_path, dags_folder):
-        for rel in [
-            "dags/a.py", "dags/sub/b.py", "dags/sub/deeper/c.py",
-            "dags/.x.py", "dags/sub/.y.py", "dags/.hidden/a.py", "dags/sub/.hidden/b.py",
-            "dags/a.txt", "dags/sub/notes.md",
-            "outside.py", "dags2/a.py",
-        ]:
+    @staticmethod
+    def _tree(tmp_path, rels):
+        for rel in rels:
             path = tmp_path / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("")
 
+    @staticmethod
+    def _listed_and_scanned(tmp_path, dags_folder):
+        """What the watcher's glob lists, and which spelling of every file the check scans."""
         listed = set(glob.glob(os.path.join(str(dags_folder), "**", "*.py"), recursive=True))
         everything = {
             os.path.join(root, name)
-            for root, _dirs, names in os.walk(tmp_path)
+            for root, _dirs, names in os.walk(tmp_path, followlinks=True)
             for name in names
         }
-        scanned = {p for p in everything if _watcher_scans(p, str(dags_folder))}
+        return listed, {p for p in everything if _watcher_scans(p, str(dags_folder))}
+
+    def test_agrees_with_the_watcher_glob(self, tmp_path, dags_folder):
+        self._tree(tmp_path, [
+            "dags/a.py", "dags/sub/b.py", "dags/sub/deeper/c.py",
+            "dags/.x.py", "dags/sub/.y.py", "dags/.hidden/a.py", "dags/sub/.hidden/b.py",
+            "dags/a.txt", "dags/sub/notes.md",
+            "outside.py", "dags2/a.py",
+        ])
+
+        listed, scanned = self._listed_and_scanned(tmp_path, dags_folder)
 
         assert scanned == listed
         assert len(listed) == 3
+
+    def test_agrees_with_the_glob_through_a_symlinked_subdirectory(self, tmp_path, dags_folder):
+        self._tree(tmp_path, ["dags/a.py", "shared/b.py", "shared/.c.py", "hidden_src/d.py"])
+        (dags_folder / "linked").symlink_to(tmp_path / "shared", target_is_directory=True)
+        (dags_folder / ".linked").symlink_to(tmp_path / "hidden_src", target_is_directory=True)
+
+        listed, scanned = self._listed_and_scanned(tmp_path, dags_folder)
+
+        assert scanned == listed
+        assert listed == {str(dags_folder / "a.py"), str(dags_folder / "linked" / "b.py")}
+        assert not _watcher_scans(str(tmp_path / "shared" / "b.py"), str(dags_folder))
+
+    def test_agrees_with_the_glob_through_a_symlinked_dags_folder(self, tmp_path):
+        self._tree(tmp_path, ["real_dags/a.py", "real_dags/sub/b.py", "real_dags/.x.py"])
+        link = tmp_path / "dags_link"
+        link.symlink_to(tmp_path / "real_dags", target_is_directory=True)
+
+        listed, scanned = self._listed_and_scanned(tmp_path, link)
+
+        # The glob lists the link's spelling; the check also recognizes the real
+        # path of the same files, the spelling a module imported through a
+        # sys.path entry naming the real folder carries.
+        assert listed == {str(link / "a.py"), str(link / "sub" / "b.py")}
+        assert listed <= scanned
+        assert {os.path.realpath(p) for p in scanned} == {
+            os.path.realpath(p) for p in listed
+        }
+        assert _watcher_scans(str(tmp_path / "real_dags" / "a.py"), str(link))
+        assert not _watcher_scans(str(tmp_path / "real_dags" / ".x.py"), str(link))
+
+    def test_real_path_of_the_folder_matches_a_symlinked_spelling(self, tmp_path):
+        real = tmp_path / "real_dags"
+        real.mkdir()
+        link = tmp_path / "dags_link"
+        link.symlink_to(real, target_is_directory=True)
+        assert _watcher_scans(str(link / "a.py"), str(real))
+        assert not _watcher_scans(str(link / ".hidden" / "a.py"), str(real))
+
+    def test_file_inside_a_zip_in_the_folder_counts_as_scanned(self, dags_folder):
+        # The glob never lists it; the check refuses it one step later, when the
+        # file does not open (TestFileTheWatcherCannotRead).
+        assert _watcher_scans(str(dags_folder / "pkg.zip" / "dag.py"), str(dags_folder))
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +375,13 @@ class TestFileTheWatcherCannotRead:
             _verify(missing, "simple", dags_folder, lineno=1, queue="q")
         assert "FileNotFoundError" in str(exc.value)
 
+    def test_file_inside_a_zip(self, dags_folder):
+        archive = dags_folder / "pkg.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("dag.py", _HEADER + textwrap.dedent(_SIMPLE))
+        with pytest.raises(RMQTriggerNotStaticError, match="cannot read this file"):
+            _verify(str(archive / "dag.py"), "simple", dags_folder, lineno=3, queue="q")
+
     def test_file_that_does_not_decode(self, dags_folder):
         path = dags_folder / "latin.py"
         path.write_bytes(_HEADER.encode() + b"X = '\xff'\n" + textwrap.dedent(_SIMPLE).encode())
@@ -380,6 +437,22 @@ class TestFileProblemRefusesTheCall:
         """)
         with pytest.raises(RMQTriggerNotStaticError, match="cannot statically resolve dag_id"):
             _verify(path, "prod_dag", dags_folder, queue="q")
+
+
+    def test_rmq_trigger_of_another_module(self, dags_folder):
+        path = _write(dags_folder, "wrapper.py", """
+            from airflow.decorators import dag
+            from common_rmq import rmq_trigger
+
+            @rmq_trigger(queue="q")
+            @dag(dag_id="wrapped", schedule=None)
+            def wrapped():
+                pass
+        """, header=False)
+        with pytest.raises(RMQTriggerNotStaticError, match="refuses all of its subscriptions") as exc:
+            _verify(path, "wrapped", dags_folder, queue="q")
+        assert "rmq_trigger is common_rmq.rmq_trigger" in str(exc.value)
+        assert "rmq_trigger must be imported from" in str(exc.value)
 
 
 class TestCallNotFound:
@@ -446,17 +519,62 @@ class TestValuesDiffer:
         with pytest.raises(RMQTriggerNotStaticError, match="builds 2 subscription"):
             _verify(path, "many", dags_folder, queues=["a", "b", "c"])
 
-    def test_row_keys_the_watcher_adds_are_not_compared(self, dags_folder):
-        path = _write(dags_folder, "cool.py", """
-            @rmq_trigger(queue="q", cooldown=30)
-            @dag(dag_id="cool", schedule=None)
-            def cool():
+
+class TestSubscriptionDifferences:
+    def test_a_key_on_one_side_only_reads_as_nothing(self):
+        static = [{"queue_name": "q", "exchange": "ex"}]
+        runtime = [{"queue_name": "q", "routing_keys": ["a.b"]}]
+        assert _subscription_differences(static, runtime) == [
+            "subscription 1, exchange: the watcher reads 'ex', the decorator receives nothing",
+            ("subscription 1, routing_keys: the watcher reads nothing, the decorator "
+             "receives ['a.b']"),
+        ]
+
+    def test_same_subscriptions_have_no_difference(self):
+        subs = [{"queue_name": "q", "filter_data": {"n": 1}}]
+        assert _subscription_differences(subs, [{"queue_name": "q", "filter_data": {"n": 1}}]) == []
+
+
+# ---------------------------------------------------------------------------
+# _verify_static_readability: one reading per version of the file
+# ---------------------------------------------------------------------------
+
+
+class TestOneReadingPerFileVersion:
+    @staticmethod
+    def _many_dags(count: int) -> str:
+        return "".join(f"""
+            @rmq_trigger(queue="q{n}", cooldown={n})
+            @dag(dag_id="d{n}", schedule=None)
+            def d{n}():
                 pass
-        """)
-        runtime = build_subscriptions(dag_id="cool", queue="q", cooldown=30)
-        for sub in runtime:
-            sub["dag_id"] = "cool"
-            sub["group_key"] = "something else"
-        _verify_static_readability(
-            path, _line_of(path, "@rmq_trigger"), "cool", runtime, str(dags_folder)
-        )
+        """ for n in range(count))
+
+    def test_every_call_of_a_file_is_answered_from_one_parse(self, dags_folder):
+        count = 30
+        path = _write(dags_folder, "many.py", self._many_dags(count))
+        with patch.object(
+            dag_file_scan, "_read_and_parse", wraps=dag_file_scan._read_and_parse
+        ) as parse:
+            for n in range(count):
+                _verify(path, f"d{n}", dags_folder,
+                        lineno=_line_of(path, "@rmq_trigger", n), queue=f"q{n}", cooldown=n)
+        assert parse.call_count == 1
+
+    def test_a_changed_file_is_read_again(self, dags_folder):
+        path = _write(dags_folder, "simple.py", _SIMPLE)
+        _verify(path, "simple", dags_folder, queue="q")
+        _write(dags_folder, "simple.py", _SIMPLE.replace('queue="q"', 'queue="other_q"'))
+        with pytest.raises(RMQTriggerNotStaticError, match="'other_q'"):
+            _verify(path, "simple", dags_folder, queue="q")
+
+    def test_a_parse_failure_is_kept_for_the_version(self, dags_folder):
+        path = dags_folder / "broken.py"
+        path.write_text(_HEADER + "def (:\n")
+        with patch.object(
+            dag_file_scan, "_read_and_parse", wraps=dag_file_scan._read_and_parse
+        ) as parse:
+            for _ in range(3):
+                with pytest.raises(RMQTriggerNotStaticError, match="SyntaxError"):
+                    _verify(str(path), "simple", dags_folder, lineno=3, queue="q")
+        assert parse.call_count == 1

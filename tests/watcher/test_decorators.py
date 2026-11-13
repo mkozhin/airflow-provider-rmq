@@ -14,13 +14,18 @@ from airflow_provider_rmq.watcher.decorators import rmq_trigger
 def static_check(monkeypatch):
     """Replace the decorator's static-readability check and return the stand-in.
 
-    The tests here apply ``rmq_trigger(...)`` to DAG objects directly, a form the
-    watcher's scan never reads, so the real check would reject every one of
+    The tests here apply ``rmq_trigger(...)`` to factories in this test module,
+    a file outside any DAGS_FOLDER, so the real check would reject every one of
     them; the check itself runs in ``test_decorator_static_check.py``.
     """
     check = MagicMock(return_value=None)
     monkeypatch.setattr(decorators, "_verify_static_readability", check)
     return check
+
+
+def _build(trigger, dag):
+    """Apply ``trigger`` the way a DAG file does: to a factory, then call the factory."""
+    return trigger(lambda: dag)()
 
 
 def _make_dag(dag_id="test_dag", schedule=None):
@@ -35,49 +40,49 @@ def _make_dag(dag_id="test_dag", schedule=None):
 class TestRmqTriggerDecorator:
     def test_adds_rmq_subscriptions_attribute(self):
         dag = _make_dag()
-        rmq_trigger(queue="orders")(dag)
+        _build(rmq_trigger(queue="orders"), dag)
         assert hasattr(dag, "_rmq_subscriptions")
         assert len(dag._rmq_subscriptions) == 1
 
     def test_dag_returned_unchanged(self):
         dag = _make_dag(dag_id="my_dag", schedule="@daily")
-        result = rmq_trigger(queue="q")(dag)
+        result = _build(rmq_trigger(queue="q"), dag)
         assert result is dag
         assert result.dag_id == "my_dag"
         assert result.schedule_interval == "@daily"
 
     def test_stacking_multiple_queues(self):
         dag = _make_dag()
-        rmq_trigger(queue="q1")(dag)
-        rmq_trigger(queue="q2", conn_id="rmq_alt")(dag)
+        _build(rmq_trigger(queue="q1"), dag)
+        _build(rmq_trigger(queue="q2", conn_id="rmq_alt"), dag)
         assert len(dag._rmq_subscriptions) == 2
         queue_names = {s["queue_name"] for s in dag._rmq_subscriptions}
         assert queue_names == {"q1", "q2"}
 
     def test_default_conn_id(self):
         dag = _make_dag()
-        rmq_trigger(queue="orders")(dag)
+        _build(rmq_trigger(queue="orders"), dag)
         assert dag._rmq_subscriptions[0]["conn_id"] == "rmq_default"
 
     def test_custom_conn_id(self):
         dag = _make_dag()
-        rmq_trigger(queue="orders", conn_id="rmq_eu")(dag)
+        _build(rmq_trigger(queue="orders", conn_id="rmq_eu"), dag)
         assert dag._rmq_subscriptions[0]["conn_id"] == "rmq_eu"
 
     def test_filter_data_filter_headers_format(self):
         dag = _make_dag()
         fd = {"filter_headers": {"type": "new_order", "region": "eu"}}
-        rmq_trigger(queue="orders", filter_data=fd)(dag)
+        _build(rmq_trigger(queue="orders", filter_data=fd), dag)
         assert dag._rmq_subscriptions[0]["filter_data"] == fd
 
     def test_filter_data_none_stored_as_empty_dict(self):
         dag = _make_dag()
-        rmq_trigger(queue="orders", filter_data=None)(dag)
+        _build(rmq_trigger(queue="orders", filter_data=None), dag)
         assert dag._rmq_subscriptions[0]["filter_data"] == {}
 
     def test_subscription_dict_shape(self):
         dag = _make_dag()
-        rmq_trigger(queue="payments", conn_id="rmq_pay", filter_data={"filter_headers": {"k": "v"}})(dag)
+        _build(rmq_trigger(queue="payments", conn_id="rmq_pay", filter_data={"filter_headers": {"k": "v"}}), dag)
         sub = dag._rmq_subscriptions[0]
         assert set(sub.keys()) == {
             "queue_name",
@@ -90,9 +95,9 @@ class TestRmqTriggerDecorator:
 
     def test_stacking_preserves_order(self):
         dag = _make_dag()
-        rmq_trigger(queue="first")(dag)
-        rmq_trigger(queue="second")(dag)
-        rmq_trigger(queue="third")(dag)
+        _build(rmq_trigger(queue="first"), dag)
+        _build(rmq_trigger(queue="second"), dag)
+        _build(rmq_trigger(queue="third"), dag)
         names = [s["queue_name"] for s in dag._rmq_subscriptions]
         assert names == ["first", "second", "third"]
 
@@ -100,54 +105,54 @@ class TestRmqTriggerDecorator:
 
     def test_default_ack_unmatched_is_false(self):
         dag = _make_dag()
-        rmq_trigger(queue="orders")(dag)
+        _build(rmq_trigger(queue="orders"), dag)
         assert dag._rmq_subscriptions[0]["ack_unmatched"] is False
 
     def test_explicit_ack_unmatched(self):
         dag = _make_dag()
-        rmq_trigger(queue="orders", ack_unmatched=True)(dag)
+        _build(rmq_trigger(queue="orders", ack_unmatched=True), dag)
         assert dag._rmq_subscriptions[0]["ack_unmatched"] is True
 
     def test_queues_list_all_share_ack_unmatched(self):
         dag = _make_dag()
-        rmq_trigger(queues=["a", "b", "c"], ack_unmatched=True)(dag)
+        _build(rmq_trigger(queues=["a", "b", "c"], ack_unmatched=True), dag)
         assert len(dag._rmq_subscriptions) == 3
         assert all(sub["ack_unmatched"] is True for sub in dag._rmq_subscriptions)
 
     def test_exchange_mode_carries_ack_unmatched(self):
         dag = _make_dag()
-        rmq_trigger(exchange="ex", routing_keys=["a.b"], ack_unmatched=True)(dag)
+        _build(rmq_trigger(exchange="ex", routing_keys=["a.b"], ack_unmatched=True), dag)
         assert dag._rmq_subscriptions[0]["ack_unmatched"] is True
 
     def test_non_bool_ack_unmatched_raises(self):
         dag = _make_dag()
         with pytest.raises(ValueError, match="ack_unmatched"):
-            rmq_trigger(queue="q", ack_unmatched="yes")(dag)
+            _build(rmq_trigger(queue="q", ack_unmatched="yes"), dag)
 
     # --- cooldown ---
 
     def test_default_cooldown_is_zero(self):
         dag = _make_dag()
-        rmq_trigger(queue="orders")(dag)
+        _build(rmq_trigger(queue="orders"), dag)
         assert dag._rmq_subscriptions[0]["cooldown"] == 0
 
     def test_explicit_cooldown(self):
         dag = _make_dag()
-        rmq_trigger(queue="orders", cooldown=300)(dag)
+        _build(rmq_trigger(queue="orders", cooldown=300), dag)
         assert dag._rmq_subscriptions[0]["cooldown"] == 300
 
     # --- queues (list) ---
 
     def test_queues_list_creates_multiple_subscriptions(self):
         dag = _make_dag()
-        rmq_trigger(queues=["orders", "payments"])(dag)
+        _build(rmq_trigger(queues=["orders", "payments"]), dag)
         assert len(dag._rmq_subscriptions) == 2
         names = [s["queue_name"] for s in dag._rmq_subscriptions]
         assert names == ["orders", "payments"]
 
     def test_queues_list_with_cooldown(self):
         dag = _make_dag()
-        rmq_trigger(queues=["a", "b", "c"], cooldown=60)(dag)
+        _build(rmq_trigger(queues=["a", "b", "c"], cooldown=60), dag)
         assert len(dag._rmq_subscriptions) == 3
         for sub in dag._rmq_subscriptions:
             assert sub["cooldown"] == 60
@@ -157,7 +162,7 @@ class TestRmqTriggerDecorator:
     def test_queues_list_inherits_conn_id_and_filter(self):
         dag = _make_dag()
         fd = {"filter_headers": {"type": "order"}}
-        rmq_trigger(queues=["q1", "q2"], conn_id="rmq_eu", filter_data=fd)(dag)
+        _build(rmq_trigger(queues=["q1", "q2"], conn_id="rmq_eu", filter_data=fd), dag)
         for sub in dag._rmq_subscriptions:
             assert sub["conn_id"] == "rmq_eu"
             assert sub["filter_data"] == fd
@@ -165,14 +170,14 @@ class TestRmqTriggerDecorator:
     def test_queues_list_no_group_key_in_decorator(self):
         """group_key must NOT be set by the decorator — listener sets it."""
         dag = _make_dag()
-        rmq_trigger(queues=["a", "b"])(dag)
+        _build(rmq_trigger(queues=["a", "b"]), dag)
         for sub in dag._rmq_subscriptions:
             assert "group_key" not in sub
 
     def test_single_queue_no_group_key_in_decorator(self):
         """group_key must NOT be set by the decorator — listener sets it."""
         dag = _make_dag()
-        rmq_trigger(queue="a")(dag)
+        _build(rmq_trigger(queue="a"), dag)
         for sub in dag._rmq_subscriptions:
             assert "group_key" not in sub
 
@@ -181,46 +186,46 @@ class TestRmqTriggerDecorator:
     def test_queue_and_queues_mutually_exclusive(self):
         dag = _make_dag()
         with pytest.raises(ValueError, match="exactly one"):
-            rmq_trigger(queue="q", queues=["q"])(dag)
+            _build(rmq_trigger(queue="q", queues=["q"]), dag)
 
     def test_neither_queue_nor_queues_raises(self):
         dag = _make_dag()
         with pytest.raises(ValueError, match="exactly one"):
-            rmq_trigger()(dag)
+            _build(rmq_trigger(), dag)
 
     def test_negative_cooldown_raises(self):
         dag = _make_dag()
         with pytest.raises(ValueError, match="cooldown"):
-            rmq_trigger(queue="q", cooldown=-1)(dag)
+            _build(rmq_trigger(queue="q", cooldown=-1), dag)
 
     def test_exchange_validation_error_surfaces(self):
         """A ValueError raised by build_subscriptions (e.g. missing routing keys)
         propagates unchanged through the decorator."""
         dag = _make_dag()
         with pytest.raises(ValueError, match="routing_keys"):
-            rmq_trigger(exchange="jetstat.airflow")(dag)
+            _build(rmq_trigger(exchange="jetstat.airflow"), dag)
 
     # --- exchange stacking conflict ---
 
     def test_stacking_exchange_on_same_dag_raises(self):
         dag = _make_dag()
-        rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"])(dag)
+        _build(rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"]), dag)
         with pytest.raises(ValueError, match="not supported"):
-            rmq_trigger(exchange="jetstat.other", routing_keys=["c.d"])(dag)
+            _build(rmq_trigger(exchange="jetstat.other", routing_keys=["c.d"]), dag)
 
     def test_stacking_exchange_does_not_partially_mutate(self):
         """A rejected second exchange decorator must not leave the first
         subscription's metadata corrupted."""
         dag = _make_dag()
-        rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"])(dag)
+        _build(rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"]), dag)
         with pytest.raises(ValueError):
-            rmq_trigger(exchange="jetstat.other", routing_keys=["c.d"])(dag)
+            _build(rmq_trigger(exchange="jetstat.other", routing_keys=["c.d"]), dag)
         assert len(dag._rmq_subscriptions) == 1
         assert dag._rmq_subscriptions[0]["exchange"] == "jetstat.airflow"
 
     def test_exchange_subscription_dict_shape(self):
         dag = _make_dag(dag_id="my_dag")
-        rmq_trigger(exchange="jetstat.airflow", routing_key_ids=["abc"])(dag)
+        _build(rmq_trigger(exchange="jetstat.airflow", routing_key_ids=["abc"]), dag)
         sub = dag._rmq_subscriptions[0]
         assert sub["queue_name"] == "rmq_watcher.sub.my_dag"
         assert sub["exchange"] == "jetstat.airflow"
@@ -230,8 +235,8 @@ class TestRmqTriggerDecorator:
         """A queue-mode subscription followed by an exchange-mode subscription
         is fine — conflict only triggers when both entries carry 'exchange'."""
         dag = _make_dag()
-        rmq_trigger(queue="q1")(dag)
-        rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"])(dag)
+        _build(rmq_trigger(queue="q1"), dag)
+        _build(rmq_trigger(exchange="jetstat.airflow", routing_keys=["a.b"]), dag)
         assert len(dag._rmq_subscriptions) == 2
 
     # --- backward compatibility ---
@@ -239,7 +244,7 @@ class TestRmqTriggerDecorator:
     def test_backward_compat_single_queue_no_cooldown(self):
         """@rmq_trigger(queue="...") without cooldown works as before."""
         dag = _make_dag()
-        rmq_trigger(queue="orders", conn_id="rmq_default")(dag)
+        _build(rmq_trigger(queue="orders", conn_id="rmq_default"), dag)
         sub = dag._rmq_subscriptions[0]
         assert sub["queue_name"] == "orders"
         assert sub["conn_id"] == "rmq_default"
@@ -351,12 +356,19 @@ class TestRmqTriggerTaskFlowFactory:
             wrapped()
 
     def test_invalid_input_none_raises_type_error(self):
-        with pytest.raises(TypeError, match="DAG instance or a callable"):
+        with pytest.raises(TypeError, match="callable @dag"):
             rmq_trigger(queue="orders")(None)
 
     def test_invalid_input_string_raises_type_error(self):
-        with pytest.raises(TypeError, match="DAG instance or a callable"):
+        with pytest.raises(TypeError, match="callable @dag"):
             rmq_trigger(queue="orders")("not a dag or callable")
+
+    def test_ready_dag_raises_type_error_without_the_check(self, static_check):
+        dag = _make_dag(dag_id="ready_dag")
+        with pytest.raises(TypeError, match="applied to the DAG 'ready_dag' itself"):
+            rmq_trigger(queue="orders")(dag)
+        static_check.assert_not_called()
+        assert not hasattr(dag, "_rmq_subscriptions")
 
 
 class TestRmqTriggerStaticCheckCall:
@@ -370,7 +382,7 @@ class TestRmqTriggerStaticCheckCall:
         monkeypatch.setattr(settings, "DAGS_FOLDER", "/opt/airflow/dags")
         dag = _make_dag(dag_id="checked_dag")
         line = sys._getframe().f_lineno + 1
-        rmq_trigger(queue="orders", conn_id="rmq_eu")(dag)
+        _build(rmq_trigger(queue="orders", conn_id="rmq_eu"), dag)
 
         static_check.assert_called_once()
         path, lineno, dag_id, subs, dags_folder = static_check.call_args.args
@@ -399,10 +411,10 @@ class TestRmqTriggerStaticCheckCall:
     def test_multiline_call_site_line_lies_within_the_call(self, static_check):
         dag = _make_dag()
         first = sys._getframe().f_lineno + 1
-        rmq_trigger(
+        _build(rmq_trigger(
             queue="orders",
             conn_id="rmq_eu",
-        )(dag)
+        ), dag)
         last = first + 3
 
         lineno = static_check.call_args.args[1]
@@ -411,21 +423,21 @@ class TestRmqTriggerStaticCheckCall:
     def test_builder_error_surfaces_before_the_check(self, static_check):
         dag = _make_dag()
         with pytest.raises(ValueError, match="'cooldown' must be >= 0"):
-            rmq_trigger(queue="orders", cooldown=-1)(dag)
+            _build(rmq_trigger(queue="orders", cooldown=-1), dag)
         static_check.assert_not_called()
 
     def test_check_error_propagates_and_leaves_dag_untouched(self, static_check):
         static_check.side_effect = RMQTriggerNotStaticError("not static")
         dag = _make_dag()
         with pytest.raises(RMQTriggerNotStaticError, match="not static"):
-            rmq_trigger(queue="orders")(dag)
+            _build(rmq_trigger(queue="orders"), dag)
         assert not hasattr(dag, "_rmq_subscriptions")
 
     def test_each_stacked_call_is_checked_with_its_own_line(self, static_check):
         dag = _make_dag()
         first = sys._getframe().f_lineno + 1
-        rmq_trigger(queue="q1")(dag)
-        rmq_trigger(queue="q2")(dag)
+        _build(rmq_trigger(queue="q1"), dag)
+        _build(rmq_trigger(queue="q2"), dag)
 
         lines = [call.args[1] for call in static_check.call_args_list]
         assert lines == [first, first + 1]

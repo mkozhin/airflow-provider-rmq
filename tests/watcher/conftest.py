@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from airflow_provider_rmq.watcher import models
+from airflow_provider_rmq.watcher import dag_file_scan, models
 from airflow_provider_rmq.watcher.models import WatcherBase
 
 #: rmq_watcher_subscriptions as an installation that has not run the migration yet has
@@ -33,6 +33,16 @@ CREATE TABLE rmq_watcher_subscriptions (
     CONSTRAINT uq_rmq_sub_dag_queue_conn UNIQUE (dag_id, queue_name, conn_id)
 )
 """
+
+
+@pytest.fixture(autouse=True)
+def fresh_file_analyses(monkeypatch):
+    """Give every test an empty cache of the static check's per-file analyses.
+
+    A test that writes a file twice within the filesystem's timestamp granularity
+    and with the same size would otherwise be answered from the first version.
+    """
+    monkeypatch.setattr(dag_file_scan, "_analyses", {})
 
 
 @pytest.fixture(autouse=True)

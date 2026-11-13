@@ -1412,9 +1412,11 @@ class RMQWatcherListener:
             log.error(
                 "rmq_trigger: DAG file %s cannot be read statically, so no subscription "
                 "of this file is registered. Arguments of @rmq_trigger and dag_id= of "
-                "@dag(...) must be literals or constants assigned at the top level of "
-                "this file, and @rmq_trigger must be a decorator call directly above "
-                "@dag(...):\n%s",
+                "@dag(...) must be literals or constants assigned exactly once at the "
+                "top level of this file, above the decorated module-level function, "
+                "and @rmq_trigger must be a decorator call above @dag(...), imported "
+                "from airflow_provider_rmq.watcher.decorators, with dag imported from "
+                "airflow.decorators:\n%s",
                 path, "\n".join(f"  - {problem}" for problem in read.problems),
             )
             return []
