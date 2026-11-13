@@ -17,6 +17,7 @@ import pytest
 
 from airflow_provider_rmq.watcher import dag_file_scan
 from airflow_provider_rmq.watcher.dag_file_scan import (
+    _READABLE_FILE_REMEDY,
     RMQTriggerNotStaticError,
     _same_value,
     _subscription_differences,
@@ -29,13 +30,6 @@ _HEADER = (
     "from airflow.decorators import dag\n"
     "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
 )
-
-
-@pytest.fixture
-def dags_folder(tmp_path):
-    folder = tmp_path / "dags"
-    folder.mkdir()
-    return folder
 
 
 def _write(folder, name: str, body: str, *, header: bool = True) -> str:
@@ -452,7 +446,7 @@ class TestFileProblemRefusesTheCall:
         with pytest.raises(RMQTriggerNotStaticError, match="refuses all of its subscriptions") as exc:
             _verify(path, "wrapped", dags_folder, queue="q")
         assert "rmq_trigger is common_rmq.rmq_trigger" in str(exc.value)
-        assert "rmq_trigger must be imported from" in str(exc.value)
+        assert _READABLE_FILE_REMEDY in str(exc.value)
 
 
 class TestCallNotFound:

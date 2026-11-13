@@ -343,25 +343,27 @@ watcher продолжает регистрировать. Это закрыва
     (после неё, в функции, классе, лямбде, включении или цикле; `dag = create_dag()`
     выполняет вызов до привязки); `:=` ниже фабрики учитывается всегда; `global` в любой функции файла
     считается привязкой; локальные имена других функций, лямбд и включений не учитываются;
-  - `_trigger_origin_problems(tree, origins)` — вызов `rmq_trigger` в `decorator_list` читается,
-    только если имя связано абсолютным импортом из
+  - `_origin_problems(func, origins, has_wildcard)` — на функции с `@rmq_trigger` каждый
+    вызов `rmq_trigger(...)` и `dag(...)` в `decorator_list` сверяется с ожидаемым
+    декоратором (`_ExpectedDecorator`: `_PROVIDER_TRIGGER`, `_AIRFLOW_DAG`). Вызов
+    `rmq_trigger` читается, только если имя связано абсолютным импортом из
     `airflow_provider_rmq.watcher.decorators` (или `airflow_provider_rmq.watcher`), а
     `<module>.rmq_trigger` — если `<module>` связан импортом с одним из этих модулей;
-    одноимённый `rmq_trigger` другого модуля, относительный импорт и `import *` —
-    проблема файла;
-  - `_dag_origin_problems(tree, origins)` — то же для `@dag(...)` на функции с `@rmq_trigger`:
-    читается только `dag`, связанный абсолютным импортом с `airflow.decorators.dag` или
+    `dag` — только связанный абсолютным импортом с `airflow.decorators.dag` или
     `airflow.models.dag.dag` (оба пути есть в Airflow 2.9 и указывают на одну функцию), и
-    `<module>.dag` с `<module>`, связанным с `airflow.decorators` или `airflow.models.dag`;
-    иное — проблема файла;
+    `<module>.dag` с `<module>`, связанным с `airflow.decorators` или `airflow.models.dag`.
+    Одноимённый декоратор другого модуля, относительный импорт и `import *` в файле
+    (`has_wildcard`, `_has_wildcard_import` — один раз на файл) — проблема файла;
   - `_read_file_triggers(tree) -> _TriggerRead` (`subscriptions`, `problems`, `calls`): проблема
     хоть одной функции, нерезолвимый `dag_id` на функции с `@rmq_trigger`, упоминание
     имени `rmq_trigger` или атрибута `.rmq_trigger` иначе, чем как `func` вызова в
-    `decorator_list` функции (кроме импорта под собственным именем), проблема
-    `_trigger_origin_problems` — пустые `subscriptions` у всего файла; то же, если
-    `rmq_trigger` в `decorator_list` стоит ниже вызова `dag` или ниже первого вызова
-    `rmq_trigger` стоит декоратор, не являющийся вызовом `rmq_trigger` или `dag`
-    (`_other_decorator_problems`);
+    `decorator_list` функции (кроме импорта под собственным именем,
+    `_stray_trigger_mentions`), проблема `_origin_problems` — пустые `subscriptions` у
+    всего файла; то же, если `rmq_trigger` в `decorator_list` стоит ниже вызова `dag`
+    (`_decorator_order_problems`) или ниже первого вызова `rmq_trigger` стоит декоратор,
+    не являющийся вызовом `rmq_trigger` или `dag` (`_other_decorator_problems`). Каждая
+    проблема начинается с места (`_where`: `line N`, затем функция и `dag_id`, если
+    известны);
   - `_watcher_scans(path, dags_folder) -> bool` — тот же отбор, что у
     `glob(DAGS_FOLDER/**/*.py)`: `.py`, внутри папки по `os.path.abspath` (а если нет —
     по `os.path.realpath` обоих путей, для модуля, импортированного через другое

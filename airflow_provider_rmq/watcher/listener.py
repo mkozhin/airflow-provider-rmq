@@ -26,6 +26,7 @@ from airflow_provider_rmq.utils.metrics import incr
 from airflow_provider_rmq.watcher import runner as _runner
 from airflow_provider_rmq.watcher.consumer import RMQConsumerManager
 from airflow_provider_rmq.watcher.dag_file_scan import (
+    _READABLE_FILE_REMEDY,
     _read_and_parse,
     _read_file_triggers,
 )
@@ -1352,13 +1353,11 @@ class RMQWatcherListener:
         blocking any other thread of the process that imports one of them. Parsing
         the source leaves nothing to wait on but the file read itself.
 
-        The file is refused whole: if any ``@rmq_trigger`` of it cannot be read
-        statically — an argument that is not a literal or a readable constant of the
-        file, a ``dag_id`` that cannot be proven, arguments ``build_subscriptions``
-        refuses, a second ``exchange=`` subscription on one DAG, ``@rmq_trigger``
-        below ``@dag(...)``, or a mention of ``rmq_trigger`` other than as a decorator
-        call on a function — not one subscription of the file is registered, and an
-        ERROR names the file and every problem with its DAG, parameter and reason.
+        The file is refused whole: if ``_read_file_triggers`` reports any problem
+        with it — its docstring lists what the scan refuses — not one subscription
+        of the file is registered, and an ERROR names the file, every problem with
+        its location and reason, and how to write the file
+        (``dag_file_scan._READABLE_FILE_REMEDY``).
         The decorator raises on the same file at import time, which takes every DAG
         of the file out of Airflow; a subscription kept for a neighbouring DAG would
         consume for a DAG Airflow no longer runs. Rows the file registered before go
@@ -1411,13 +1410,10 @@ class RMQWatcherListener:
         if read.problems:
             log.error(
                 "rmq_trigger: DAG file %s cannot be read statically, so no subscription "
-                "of this file is registered. Arguments of @rmq_trigger and dag_id= of "
-                "@dag(...) must be literals or constants assigned exactly once at the "
-                "top level of this file, above the decorated module-level function, "
-                "and @rmq_trigger must be a decorator call above @dag(...), imported "
-                "from airflow_provider_rmq.watcher.decorators, with dag imported from "
-                "airflow.decorators:\n%s",
-                path, "\n".join(f"  - {problem}" for problem in read.problems),
+                "of this file is registered. %s\n%s",
+                path,
+                _READABLE_FILE_REMEDY,
+                "\n".join(f"  - {problem}" for problem in read.problems),
             )
             return []
         return read.subscriptions

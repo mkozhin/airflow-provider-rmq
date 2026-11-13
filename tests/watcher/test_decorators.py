@@ -37,6 +37,15 @@ def _make_dag(dag_id="test_dag", schedule=None):
     return dag
 
 
+class TestNotStaticErrorExport:
+    def test_package_and_decorator_module_export_the_scan_error(self):
+        import airflow_provider_rmq.watcher as watcher_package
+
+        assert watcher_package.RMQTriggerNotStaticError is RMQTriggerNotStaticError
+        assert decorators.RMQTriggerNotStaticError is RMQTriggerNotStaticError
+        assert "RMQTriggerNotStaticError" in watcher_package.__all__
+
+
 class TestRmqTriggerDecorator:
     def test_adds_rmq_subscriptions_attribute(self):
         dag = _make_dag()

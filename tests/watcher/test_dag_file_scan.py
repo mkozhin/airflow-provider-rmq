@@ -1,26 +1,38 @@
 from __future__ import annotations
 
 import ast
+import inspect
+import subprocess
+import sys
 
 import pytest
 
 from airflow_provider_rmq.watcher.dag_file_scan import (
+    _RMQ_TRIGGER_KWARGS,
+    _RMQ_TRIGGER_POSITIONAL,
     _collect_module_constants,
     _is_rmq_trigger_call,
     _iter_trigger_functions,
     _read_and_parse,
     _read_file_triggers,
+    _read_function_triggers,
     _read_rmq_trigger_call,
     _resolve_static,
     _static_dag_id,
     _Unreadable,
     _usable_constants,
 )
+from airflow_provider_rmq.watcher.decorators import rmq_trigger
 
 
 def _constants(src: str) -> dict:
     """Parse a module source snippet and return its constant map."""
     return _collect_module_constants(ast.parse(src))[0]
+
+
+def _function(src: str):
+    """Parse a one-function snippet and return its function node."""
+    return ast.parse(src).body[0]
 
 
 def _dag_id_of_last_function(src: str):
@@ -30,6 +42,347 @@ def _dag_id_of_last_function(src: str):
     func = tree.body[-1]
     assert isinstance(func, ast.FunctionDef)
     return _static_dag_id(func, constants)
+
+
+# ---------------------------------------------------------------------------
+# dag_file_scan import footprint
+# ---------------------------------------------------------------------------
+
+
+class TestDagFileScanImportFootprint:
+    def test_importing_the_scan_module_leaves_the_watcher_runtime_unloaded(self):
+        """The decorator imports ``dag_file_scan`` inside the DAG processor, so the
+        module must not drag in the listener, the consumer, the runner, the ORM
+        models, ``aio_pika`` or ``httpx``. A fresh interpreter is the only place where
+        ``sys.modules`` says what one import pulled in."""
+        probe = (
+            "import sys\n"
+            "import airflow_provider_rmq.watcher.dag_file_scan\n"
+            "loaded = [\n"
+            "    name for name in (\n"
+            "        'airflow_provider_rmq.watcher.listener',\n"
+            "        'airflow_provider_rmq.watcher.consumer',\n"
+            "        'airflow_provider_rmq.watcher.models',\n"
+            "        'airflow_provider_rmq.watcher.runner',\n"
+            "        'aio_pika',\n"
+            "        'httpx',\n"
+            "    ) if name in sys.modules\n"
+            "]\n"
+            "print(','.join(loaded))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# _collect_module_constants
+# ---------------------------------------------------------------------------
+
+
+class TestCollectModuleConstantsBaseCases:
+    def test_single_string_constant_resolves_with_correct_lineno(self):
+        result = _constants("DAG_ID = 'my_dag'\n")
+        assert result == {"DAG_ID": ("my_dag", 1)}
+
+    def test_single_string_constant_lineno_matches_assignment_line(self):
+        result = _constants("\n\nDAG_ID = 'my_dag'\n")
+        assert result["DAG_ID"] == ("my_dag", 3)
+
+    def test_annotated_assignment_resolves(self):
+        result = _constants("DAG_ID: str = 'my_dag'\n")
+        assert result == {"DAG_ID": ("my_dag", 1)}
+
+    def test_non_string_constant_collected(self):
+        result = _constants("DAG_ID = 123\n")
+        assert result == {"DAG_ID": (123, 1)}
+
+    def test_non_literal_rhs_ignored(self):
+        result = _constants("DAG_ID = some_func()\n")
+        assert result == {}
+
+
+class TestCollectModuleConstantsReassignment:
+    """All of these forms poison the constant → empty map."""
+
+    def test_re_literal_assignment(self):
+        result = _constants("DAG_ID = 'first'\nDAG_ID = 'second'\n")
+        assert result == {}
+
+    def test_aug_assign(self):
+        result = _constants("DAG_ID = 'first'\nDAG_ID += '_daily'\n")
+        assert result == {}
+
+    def test_tuple_unpacking(self):
+        result = _constants("DAG_ID, Q = 'real', 'q'\n")
+        assert result == {}
+
+    def test_chained_assignment(self):
+        result = _constants("DAG_ID = OTHER = 'real'\n")
+        assert result == {}
+
+    def test_re_import(self):
+        result = _constants("DAG_ID = 'real'\nfrom settings import DAG_ID\n")
+        assert result == {}
+
+    def test_import_as(self):
+        result = _constants("DAG_ID = 'real'\nimport x as DAG_ID\n")
+        assert result == {}
+
+    def test_def_with_same_name(self):
+        result = _constants("DAG_ID = 'real'\ndef DAG_ID(): pass\n")
+        assert result == {}
+
+    def test_class_with_same_name(self):
+        result = _constants("DAG_ID = 'real'\nclass DAG_ID: pass\n")
+        assert result == {}
+
+    def test_del(self):
+        result = _constants("DAG_ID = 'real'\ndel DAG_ID\n")
+        assert result == {}
+
+    def test_top_level_for_target(self):
+        result = _constants("DAG_ID = 'real'\nfor DAG_ID in range(3): pass\n")
+        assert result == {}
+
+    def test_with_as(self):
+        result = _constants("DAG_ID = 'real'\nwith open('x') as DAG_ID: pass\n")
+        assert result == {}
+
+    def test_conditional_reassignment_inside_if(self):
+        result = _constants("DAG_ID = 'old'\nif True:\n    DAG_ID = 'new'\n")
+        assert result == {}
+
+
+class TestCollectModuleConstantsExoticBindingForms:
+    """Module-scope binding forms that earlier, less complete enumerations
+    of binding forms missed — all must poison the constant."""
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "DAG_ID = 'real'\ntry:\n    pass\nexcept Exception as DAG_ID:\n    pass\n",
+            "DAG_ID = 'real'\ndef f():\n    global DAG_ID\n    DAG_ID = 'local'\n",
+            "DAG_ID = 'real'\nif (DAG_ID := 'walrus'):\n    pass\n",
+            "DAG_ID = 'real'\nmatch 1:\n    case DAG_ID:\n        pass\n",
+            "DAG_ID = 'real'\nmatch [1, 2]:\n    case [*DAG_ID]:\n        pass\n",
+            "DAG_ID = 'real'\nmatch {'k': 1}:\n    case {'k': _, **DAG_ID}:\n        pass\n",
+            "DAG_ID = 'real'\nif True:\n    for DAG_ID in range(3):\n        pass\n",
+        ],
+        ids=[
+            "except_as",
+            "global_plus_function_assign",
+            "walrus_in_if",
+            "match_as",
+            "match_star",
+            "match_mapping_rest",
+            "nested_for_inside_if",
+        ],
+    )
+    def test_exotic_binding_forms_poison_constant(self, src):
+        assert _constants(src) == {}
+
+
+class TestCollectModuleConstantsWildcardImport:
+    def test_wildcard_import_disables_resolution_entirely(self):
+        result = _constants("DAG_ID = 'local'\nfrom settings import *\n")
+        assert result == {}
+
+    def test_wildcard_import_disables_unrelated_constant_too(self):
+        # With only one constant name in the file, "DAG_ID absent" is
+        # ambiguous between "wildcard poisons file-wide" and "wildcard only
+        # poisons names that plausibly collide with its exports". A second,
+        # entirely unrelated constant name proves it's the former: the
+        # wildcard import disables resolution for the WHOLE file
+        # unconditionally, not just for names that happen to collide.
+        result = _constants(
+            "DAG_ID = 'local'\nUNRELATED_NAME = 'other'\nfrom settings import *\n"
+        )
+        assert result == {}
+
+
+class TestCollectModuleConstantsWalrusInNestedScope:
+    """Cases that only _outer_parts (traversing the enclosing-scope parts of
+    a scope-boundary node) catches — a naive scope-pruned walk that skipped
+    these entirely would miss the walrus poisoning."""
+
+    def test_walrus_inside_comprehension(self):
+        result = _constants("DAG_ID = 'real'\nxs = [(DAG_ID := i) for i in range(3)]\n")
+        assert result == {}
+
+    def test_walrus_in_parameter_default(self):
+        result = _constants(
+            "DAG_ID = 'real'\ndef g(x=(DAG_ID := 'other')): pass\n"
+        )
+        assert result == {}
+
+    def test_walrus_in_decorator_expression(self):
+        result = _constants(
+            "DAG_ID = 'real'\n@deco(DAG_ID := 'n')\ndef f(): pass\n"
+        )
+        assert result == {}
+
+
+class TestCollectModuleConstantsForeignScopeDoesNotPoison:
+    """Binding a same-named identifier in a FOREIGN (nested) scope must NOT
+    poison the module-level constant — this is the payoff of the
+    scope-aware walk over a scope-blind ast.walk."""
+
+    def test_same_named_function_parameter(self):
+        result = _constants("DAG_NAME = 'real'\ndef process(DAG_NAME): pass\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+    def test_class_body_attribute(self):
+        result = _constants("DAG_NAME = 'real'\nclass C:\n    DAG_NAME = 'b'\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+    def test_local_variable_inside_function(self):
+        result = _constants("DAG_NAME = 'real'\ndef f():\n    DAG_NAME = 'loc'\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+    def test_comprehension_target(self):
+        result = _constants("DAG_NAME = 'real'\nys = [DAG_NAME for DAG_NAME in range(3)]\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+    def test_lambda_parameter(self):
+        result = _constants("DAG_NAME = 'real'\nf = lambda DAG_NAME: DAG_NAME\n")
+        assert result == {"DAG_NAME": ("real", 1)}
+
+
+class TestCollectModuleConstantsDonstroyRegression:
+    def test_module_constant_used_as_parameter_default_value_resolves(self):
+        # Matches the real donstroy_pipeline_spark_all.py shape: the module
+        # constant is referenced (Name/Load, not a binding) as a parameter
+        # default value elsewhere in the file — it must still resolve.
+        src = (
+            "DAG_NAME = 'donstroy_pipeline_spark_all'\n"
+            "def create_cluster(x, dag_name: str = DAG_NAME): pass\n"
+        )
+        result = _constants(src)
+        assert result == {"DAG_NAME": ("donstroy_pipeline_spark_all", 1)}
+
+
+class TestCollectModuleConstantsPep695:
+    # PEP 695 `type X = ...` binds the alias name via an ordinary ast.Name
+    # in Store context, already covered by the first poison branch — no
+    # separate handling needed. Raw 3.12 syntax cannot appear directly in
+    # this file's body since CI also runs 3.10/3.11 (SyntaxError at parse
+    # time), so the snippet is parsed from a string instead.
+    @pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 `type` statement requires 3.12+")
+    def test_pep695_type_alias_with_same_name_poisons_constant(self):
+        src = "DAG_ID = 'real'\ntype DAG_ID = int\n"
+        result = _constants(src)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# _static_dag_id
+# ---------------------------------------------------------------------------
+
+class TestStaticDagIdBaseCases:
+    def test_string_literal_dag_id(self):
+        func = _function("@dag(dag_id='my_dag')\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "my_dag"
+
+    def test_attribute_access_dag(self):
+        func = _function("@decorators.dag(dag_id='my_dag')\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "my_dag"
+
+    def test_no_dag_id_kwarg_falls_back_to_the_function_name(self):
+        func = _function("@dag(schedule_interval=None)\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "f"
+
+    def test_no_dag_decorator_is_unresolved(self):
+        func = _function("@some_other_decorator\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
+
+    def test_non_literal_dag_id_without_constant_is_unresolved(self):
+        func = _function("@dag(dag_id=VARIABLE)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
+
+    def test_non_string_literal_dag_id_is_unresolved(self):
+        func = _function("@dag(dag_id=123)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
+
+    def test_async_function_with_explicit_dag_id(self):
+        src = "@dag(dag_id='async_dag')\nasync def f(): pass"
+        assert _static_dag_id(_function(src), {}) == "async_dag"
+
+    def test_empty_decorator_list_is_unresolved(self):
+        assert _static_dag_id(_function("def f(): pass"), {}) is None
+
+
+class TestStaticDagIdConstants:
+    def test_variable_dag_id_resolved_via_constants(self):
+        func = _function("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _static_dag_id(func, {"DAG_ID": "real_id"}) == "real_id"
+
+    def test_variable_dag_id_not_in_constants_is_unresolved(self):
+        func = _function("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _static_dag_id(func, {"OTHER": "x"}) is None
+
+    def test_empty_string_constant_falls_back_to_the_function_name(self):
+        # Regression: DAG_ID = "" (a str, so it IS collected into `constants`
+        # by _collect_module_constants) referenced via dag_id=DAG_ID must
+        # fall back to the function name, not be returned verbatim as
+        # "" — matching the falsy rule already applied to the literal branch.
+        func = _function("@dag(dag_id=DAG_ID)\ndef f(): pass")
+        assert _static_dag_id(func, {"DAG_ID": ""}) == "f"
+
+    @pytest.mark.parametrize(
+        "literal_src",
+        ["''", "None", "False", "0", "0.0", "[]", "{}", "()"],
+    )
+    def test_falsy_literal_dag_id_falls_back_to_the_function_name(self, literal_src):
+        func = _function(f"@dag(dag_id={literal_src})\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "f"
+
+
+class TestStaticDagIdPositional:
+    def test_positional_string_literal_dag_id(self):
+        func = _function("@dag('my_dag')\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "my_dag"
+
+    def test_positional_variable_dag_id_resolved_via_constants(self):
+        func = _function("@dag(DAG_NAME)\ndef f(): pass")
+        assert _static_dag_id(func, {"DAG_NAME": "resolved"}) == "resolved"
+
+    def test_positional_unresolvable_dag_id_is_unresolved(self):
+        func = _function("@dag(SOME_VAR)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
+
+    def test_positional_empty_string_dag_id_falls_back_to_the_function_name(self):
+        func = _function("@dag('')\ndef f(): pass")
+        assert _static_dag_id(func, {}) == "f"
+
+    def test_positional_truthy_non_string_literal_is_unresolved(self):
+        func = _function("@dag(123)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
+
+    def test_positional_and_keyword_dag_id_conflict_is_unresolved(self):
+        # @dag("a", dag_id="b") is invalid Python at call time (TypeError:
+        # multiple values for argument 'dag_id') — must not resolve to
+        # either value.
+        func = _function("@dag('a', dag_id='b')\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
+
+
+class TestStaticDagIdUnpacking:
+    def test_dict_unpacking_is_unresolved(self):
+        func = _function('@dag(**{"dag_id": "real"})\ndef f(): pass')
+        assert _static_dag_id(func, {}) is None
+
+    def test_name_unpacking_is_unresolved(self):
+        func = _function("@dag(**DAG_KWARGS)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
+
+    def test_star_args_is_unresolved(self):
+        func = _function("@dag(*ARGS)\ndef f(): pass")
+        assert _static_dag_id(func, {}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +674,29 @@ def _read_call(src: str, function: str = "f"):
 
 def _decorated(decorator: str, prelude: str = "") -> str:
     return f"{prelude}@{decorator}\n@dag(dag_id='d')\ndef f():\n    pass\n"
+
+
+class TestRmqTriggerParameterNames:
+    """The parameter names the scan maps arguments onto are ``rmq_trigger``'s own.
+
+    A parameter of ``rmq_trigger`` missing here would make every file passing it
+    a file the scan refuses ("rmq_trigger has no such parameter").
+    """
+
+    def test_positional_names_are_the_positional_or_keyword_parameters_in_order(self):
+        parameters = inspect.signature(rmq_trigger).parameters.values()
+        assert _RMQ_TRIGGER_POSITIONAL == tuple(
+            p.name for p in parameters if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+
+    def test_keyword_names_are_every_parameter(self):
+        parameters = inspect.signature(rmq_trigger).parameters
+        assert all(
+            p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            for p in parameters.values()
+        )
+        assert len(set(_RMQ_TRIGGER_KWARGS)) == len(_RMQ_TRIGGER_KWARGS)
+        assert set(_RMQ_TRIGGER_KWARGS) == set(parameters)
 
 
 class TestReadRmqTriggerCall:
@@ -1148,3 +1524,422 @@ class TestReadFileTriggers:
     def test_file_without_rmq_trigger_is_empty_and_clean(self):
         read = _file_read("@dag(dag_id='a')\ndef a(): pass\n")
         assert read == ([], [], [])
+
+
+# ---------------------------------------------------------------------------
+# _is_rmq_trigger_call
+# ---------------------------------------------------------------------------
+
+
+class TestIsRmqTriggerCall:
+    def test_bare_call_returns_true(self):
+        assert _is_rmq_trigger_call(_expr("rmq_trigger(queue='orders')")) is True
+
+    def test_attribute_access_call_returns_true(self):
+        assert _is_rmq_trigger_call(_expr("decorators.rmq_trigger(queue='orders')")) is True
+
+    def test_unrelated_call_returns_false(self):
+        assert _is_rmq_trigger_call(_expr("some_other_call(queue='orders')")) is False
+
+    def test_non_call_node_returns_false(self):
+        # A bare `@some_name` decorator is an ast.Name, not an ast.Call.
+        assert _is_rmq_trigger_call(_expr("some_name")) is False
+
+
+# ---------------------------------------------------------------------------
+# _read_function_triggers — one decorator call, queue and cooldown parameters
+# ---------------------------------------------------------------------------
+
+def _read_decorator(src: str, dag_id: str = "test_dag"):
+    """Read one decorator call string placed above ``@dag(dag_id=...)`` on a function."""
+    tree = ast.parse(f"@{src}\n@dag(dag_id={dag_id!r})\ndef f(): pass\n")
+    func = tree.body[0]
+    assert isinstance(func, ast.FunctionDef)
+    return _read_function_triggers(func, {}, dag_id)
+
+
+def _decorator_subscriptions(src: str, dag_id: str = "test_dag") -> list[dict]:
+    """Subscription dicts of one decorator call string, empty when it is refused."""
+    return _read_decorator(src, dag_id).subscriptions
+
+
+def _decorator_problems(src: str, dag_id: str = "test_dag") -> str:
+    """All problems of one decorator call string, as one text."""
+    return "\n".join(_read_decorator(src, dag_id).problems)
+
+
+class TestReadFunctionTriggers:
+    def test_single_queue_no_cooldown_returns_one_dict(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='orders')")
+        assert len(result) == 1
+        assert result[0]["queue_name"] == "orders"
+        assert result[0]["cooldown"] == 0
+        assert result[0]["conn_id"] == "rmq_default"
+
+    def test_queues_list_returns_n_dicts(self):
+        result = _decorator_subscriptions("rmq_trigger(queues=['orders', 'payments'])")
+        assert len(result) == 2
+        queue_names = [d["queue_name"] for d in result]
+        assert "orders" in queue_names
+        assert "payments" in queue_names
+
+    def test_queues_list_all_share_same_cooldown(self):
+        result = _decorator_subscriptions("rmq_trigger(queues=['a', 'b', 'c'], cooldown=300)")
+        assert len(result) == 3
+        assert all(d["cooldown"] == 300 for d in result)
+
+    def test_cooldown_parsed_correctly(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q', cooldown=60)")
+        assert len(result) == 1
+        assert result[0]["cooldown"] == 60
+
+    def test_cooldown_zero_is_default(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q')")
+        assert result[0]["cooldown"] == 0
+
+    def test_dag_id_and_group_key_are_set_on_every_row(self):
+        result = _decorator_subscriptions("rmq_trigger(queues=['a', 'b'], cooldown=60)", "my_dag")
+        assert [(d["dag_id"], d["group_key"]) for d in result] == [
+            ("my_dag", "my_dag"),
+            ("my_dag", "my_dag"),
+        ]
+
+    def test_non_rmq_trigger_returns_empty_list(self):
+        read = _read_decorator("some_other_decorator(queue='q')")
+        assert read.subscriptions == []
+        assert read.problems == []
+
+    def test_no_queue_or_queues_is_refused_by_the_builder(self):
+        read = _read_decorator("rmq_trigger(conn_id='rmq')")
+        assert read.subscriptions == []
+        assert "the arguments are refused" in "\n".join(read.problems)
+
+    def test_non_literal_queues_is_a_problem(self):
+        read = _read_decorator("rmq_trigger(queues=SOME_VAR)")
+        assert read.subscriptions == []
+        assert "queues cannot be read" in "\n".join(read.problems)
+
+    def test_conn_id_propagated_to_all_entries(self):
+        result = _decorator_subscriptions("rmq_trigger(queues=['a', 'b'], conn_id='my_conn')")
+        assert all(d["conn_id"] == "my_conn" for d in result)
+
+    def test_filter_data_propagated_to_all_entries(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(queues=['a', 'b'], filter_data={'filter_headers': {'k': 'v'}})"
+        )
+        assert all(d["filter_data"] == {"filter_headers": {"k": "v"}} for d in result)
+
+    def test_positional_queue_name_parsed(self):
+        result = _decorator_subscriptions("rmq_trigger('my_queue')")
+        assert len(result) == 1
+        assert result[0]["queue_name"] == "my_queue"
+
+    def test_positional_conn_id_filter_data_and_cooldown_parsed(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger('q', None, 'rmq_prod', {'body.type': 'paid'}, 30)"
+        )
+        assert len(result) == 1
+        assert result[0]["conn_id"] == "rmq_prod"
+        assert result[0]["filter_data"] == {"body.type": "paid"}
+        assert result[0]["cooldown"] == 30
+
+    def test_attribute_access_rmq_trigger(self):
+        result = _decorator_subscriptions("decorators.rmq_trigger(queue='q')")
+        assert len(result) == 1
+        assert result[0]["queue_name"] == "q"
+
+    def test_ack_unmatched_literal_true_parsed(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q', ack_unmatched=True)")
+        assert result[0]["ack_unmatched"] is True
+
+    def test_ack_unmatched_literal_false_parsed(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q', ack_unmatched=False)")
+        assert result[0]["ack_unmatched"] is False
+
+    def test_ack_unmatched_absent_is_false(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q')")
+        assert result[0]["ack_unmatched"] is False
+
+    def test_non_literal_ack_unmatched_is_refused_not_defaulted(self):
+        read = _read_decorator("rmq_trigger(queue='q', ack_unmatched=ACK_UNMATCHED)")
+        assert read.subscriptions == []
+        assert "ack_unmatched cannot be read" in "\n".join(read.problems)
+
+    def test_problem_names_dag_line_parameter_and_reason(self):
+        text = _decorator_problems("rmq_trigger(queue='orders', conn_id=get_conn())", dag_id="my_dag")
+        assert "dag_id='my_dag'" in text
+        assert "line 1" in text
+        assert "conn_id cannot be read" in text
+        assert "a function call" in text
+
+    def test_non_literal_queue_selector_is_a_problem(self):
+        read = _read_decorator("rmq_trigger(queue=QUEUE_CONST)", dag_id="my_dag")
+        assert read.subscriptions == []
+        assert "queue cannot be read" in "\n".join(read.problems)
+
+    def test_an_unreadable_argument_skips_the_build(self):
+        """The arguments that were read do not say what the decorator receives, so the
+        builder is not asked about them: the problem is the unreadable argument."""
+        text = _decorator_problems("rmq_trigger(exchange='ex', routing_key_ids=REPORT_IDS)")
+        assert "routing_key_ids cannot be read" in text
+        assert "the arguments are refused" not in text
+
+    def test_unreadable_cooldown_beside_a_buildable_exchange_call_is_refused(self):
+        read = _read_decorator(
+            "rmq_trigger(exchange='ex', routing_keys=['a.b'], cooldown=COOLDOWN)"
+        )
+        assert read.subscriptions == []
+        assert "cooldown cannot be read" in "\n".join(read.problems)
+
+    def test_dict_unpacking_of_an_unknown_name_is_a_problem(self):
+        read = _read_decorator("rmq_trigger(**opts)", dag_id="my_dag")
+        assert read.subscriptions == []
+        assert "**opts cannot be read" in "\n".join(read.problems)
+
+    def test_dict_unpacking_beside_a_literal_queue_is_refused(self):
+        read = _read_decorator("rmq_trigger(queue='orders', **opts)")
+        assert read.subscriptions == []
+        assert "**opts cannot be read" in "\n".join(read.problems)
+
+    def test_a_non_literal_positional_queue_is_a_problem(self):
+        read = _read_decorator("rmq_trigger(QUEUE_CONST)", dag_id="my_dag")
+        assert read.subscriptions == []
+        assert "queue cannot be read" in "\n".join(read.problems)
+
+    def test_a_queues_argument_that_is_not_a_list_does_not_break_the_report(self):
+        read = _read_decorator("rmq_trigger(queues=5, cooldown=COOLDOWN)")
+        assert read.subscriptions == []
+        assert "cooldown cannot be read" in "\n".join(read.problems)
+
+    def test_literal_kwargs_produce_no_problem(self):
+        read = _read_decorator("rmq_trigger(queue='q', cooldown=60, ack_unmatched=True)")
+        assert read.problems == []
+
+    def test_non_bool_ack_unmatched_skipped_returns_empty(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q', ack_unmatched='yes')")
+        assert result == []
+
+    def test_non_bool_ack_unmatched_problem_carries_the_builder_text(self):
+        assert "ack_unmatched" in _decorator_problems("rmq_trigger(queue='q', ack_unmatched='yes')")
+
+    def test_negative_cooldown_skipped_returns_empty(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q', cooldown=-1)")
+        assert result == []
+
+    def test_negative_cooldown_problem_names_the_dag_and_the_builder_text(self):
+        text = _decorator_problems("rmq_trigger(queue='q', cooldown=-1)", dag_id="neg_dag")
+        assert "neg_dag" in text
+        assert "'cooldown' must be >= 0" in text
+
+    def test_string_cooldown_skipped_returns_empty(self):
+        # A typo'd literal like cooldown="abc" is a valid string literal but
+        # semantically invalid — refused by the builder, not raised out of here.
+        result = _decorator_subscriptions("rmq_trigger(queue='q', cooldown='abc')")
+        assert result == []
+
+    def test_string_cooldown_problem_names_the_dag(self):
+        text = _decorator_problems("rmq_trigger(queue='q', cooldown='abc')", dag_id="str_cooldown_dag")
+        assert "str_cooldown_dag" in text
+
+    def test_list_cooldown_skipped_returns_empty(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q', cooldown=[1, 2])")
+        assert result == []
+
+    def test_float_cooldown_skipped_returns_empty(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q', cooldown=1.5)")
+        assert result == []
+
+    def test_bool_cooldown_skipped_returns_empty(self):
+        result = _decorator_subscriptions("rmq_trigger(queue='q', cooldown=True)")
+        assert result == []
+
+    def test_queues_with_non_string_items_skipped_returns_empty(self):
+        result = _decorator_subscriptions("rmq_trigger(queues=[1, 2, 3])")
+        assert result == []
+
+    def test_queues_with_mixed_string_and_int_items_skipped_returns_empty(self):
+        result = _decorator_subscriptions("rmq_trigger(queues=['a', 2])")
+        assert result == []
+
+    def test_queues_with_non_string_items_problem_names_the_dag(self):
+        assert "bad_queues_dag" in _decorator_problems(
+            "rmq_trigger(queues=[1, 2, 3])", dag_id="bad_queues_dag"
+        )
+
+    def test_stacked_calls_each_contribute_rows(self):
+        tree = ast.parse(
+            "@rmq_trigger(queue='a')\n"
+            "@rmq_trigger(queue='b', cooldown=30)\n"
+            "@dag(dag_id='d')\n"
+            "def f(): pass\n"
+        )
+        read = _read_function_triggers(tree.body[0], {}, "d")
+        assert read.problems == []
+        assert [s["queue_name"] for s in read.subscriptions] == ["a", "b"]
+
+    def test_stacked_readable_and_unreadable_calls_report_the_unreadable_one(self):
+        tree = ast.parse(
+            "@rmq_trigger(queue='a')\n"
+            "@rmq_trigger(queue='b', conn_id=get_conn())\n"
+            "@dag(dag_id='d')\n"
+            "def f(): pass\n"
+        )
+        read = _read_function_triggers(tree.body[0], {}, "d")
+        assert len(read.problems) == 1
+        assert "line 2" in read.problems[0]
+
+
+# ---------------------------------------------------------------------------
+# _read_function_triggers — exchange-mode
+# ---------------------------------------------------------------------------
+
+
+class TestReadFunctionTriggersExchange:
+    def test_exchange_with_routing_key_ids_literal_list(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'])",
+            dag_id="my_dag",
+        )
+        assert len(result) == 1
+        sub = result[0]
+        assert sub["exchange"] == "jetstat.airflow"
+        assert sub["queue_name"] == "rmq_watcher.sub.my_dag"
+        assert sub["routing_keys"] == ["abc123.*"]
+
+    def test_exchange_default_routing_key_status_is_wildcard(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'])"
+        )
+        assert result[0]["routing_keys"] == ["abc123.*"]
+
+    def test_exchange_explicit_string_routing_key_status(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
+            "routing_key_status='succeeded')"
+        )
+        assert result[0]["routing_keys"] == ["abc123.succeeded"]
+
+    def test_exchange_explicit_list_routing_key_status(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
+            "routing_key_status=['succeeded', 'failed'])"
+        )
+        assert set(result[0]["routing_keys"]) == {"abc123.succeeded", "abc123.failed"}
+
+    def test_exchange_with_literal_routing_keys_directly(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='some.other.exchange', routing_keys=['region.eu.alert'])"
+        )
+        assert len(result) == 1
+        assert result[0]["exchange"] == "some.other.exchange"
+        assert result[0]["routing_keys"] == ["region.eu.alert"]
+
+    def test_exchange_routing_keys_and_routing_key_ids_union(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_keys=['literal.key'], "
+            "routing_key_ids=['abc123'])"
+        )
+        assert set(result[0]["routing_keys"]) == {"literal.key", "abc123.*"}
+
+    def test_non_literal_routing_key_ids_skipped(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=SOME_VAR)"
+        )
+        assert result == []
+
+    def test_non_literal_routing_keys_skipped(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_keys=SOME_VAR)"
+        )
+        assert result == []
+
+    def test_non_literal_routing_key_status_is_refused_not_defaulted(self):
+        # A wildcard default would bind more routing keys than the decorator asks
+        # for, so the call is refused rather than built from the rest.
+        read = _read_decorator(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
+            "routing_key_status=SOME_VAR)"
+        )
+        assert read.subscriptions == []
+        assert "routing_key_status cannot be read" in "\n".join(read.problems)
+
+    def test_exchange_and_queue_mutex_violation_skipped(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', queue='q', routing_keys=['a.b'])"
+        )
+        assert result == []
+
+    def test_exchange_without_routing_keys_skipped(self):
+        result = _decorator_subscriptions("rmq_trigger(exchange='jetstat.airflow')")
+        assert result == []
+
+    def test_exchange_dot_in_routing_key_id_skipped(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc.123'])"
+        )
+        assert result == []
+
+    def test_exchange_reserved_prefix_skipped(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='rmq_watcher.something', routing_keys=['a.b'])"
+        )
+        assert result == []
+
+    def test_exchange_empty_routing_key_status_list_skipped(self):
+        # routing_key_status=[] collapses the routing_key_ids cross-product to
+        # an empty set — build_subscriptions raises ValueError, which becomes a
+        # problem, not an exception out of the reader.
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
+            "routing_key_status=[])"
+        )
+        assert result == []
+
+    def test_non_string_exchange_skipped_returns_empty(self):
+        # exchange=123 is a valid literal but semantically invalid — refused by
+        # build_subscriptions, not raised as an AttributeError from
+        # exchange.startswith(...).
+        result = _decorator_subscriptions("rmq_trigger(exchange=123, routing_keys=['a.b'])")
+        assert result == []
+
+    def test_non_string_exchange_problem_names_the_dag(self):
+        assert "bad_exchange_dag" in _decorator_problems(
+            "rmq_trigger(exchange=123, routing_keys=['a.b'])", dag_id="bad_exchange_dag"
+        )
+
+    def test_non_str_non_list_routing_key_status_skipped_returns_empty(self):
+        # routing_key_status=123 must not reach list(routing_key_status) and
+        # raise an uncaught TypeError.
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='ex', routing_key_ids=['abc'], routing_key_status=123)"
+        )
+        assert result == []
+
+    def test_routing_keys_as_plain_string_skipped_returns_empty(self):
+        # Forgetting list brackets (routing_keys="literal.string" instead of
+        # routing_keys=["literal.string"]) must not silently expand into
+        # one-character wildcard routing keys — build_subscriptions rejects
+        # non-list routing_keys with ValueError.
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='ex', routing_keys='literal.string')"
+        )
+        assert result == []
+
+    def test_routing_key_ids_as_plain_string_skipped_returns_empty(self):
+        result = _decorator_subscriptions(
+            "rmq_trigger(exchange='jetstat.airflow', "
+            "routing_key_ids='670f877702775c2de8325b1f')"
+        )
+        assert result == []
+
+    def test_second_exchange_call_on_one_dag_is_a_problem(self):
+        tree = ast.parse(
+            "@rmq_trigger(exchange='exchange.one', routing_keys=['a.b'])\n"
+            "@rmq_trigger(exchange='exchange.two', routing_keys=['c.d'])\n"
+            "@dag(dag_id='d')\n"
+            "def f(): pass\n"
+        )
+        read = _read_function_triggers(tree.body[0], {}, "d")
+        assert len(read.problems) == 1
+        assert "second exchange=" in read.problems[0]
+        assert "rmq_watcher.sub.d" in read.problems[0]

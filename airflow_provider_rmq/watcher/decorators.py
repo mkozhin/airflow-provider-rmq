@@ -4,11 +4,16 @@ import functools
 import sys
 from typing import Any
 
-from airflow_provider_rmq.watcher.dag_file_scan import _verify_static_readability
+from airflow_provider_rmq.watcher.dag_file_scan import (
+    RMQTriggerNotStaticError,
+    _verify_static_readability,
+)
 from airflow_provider_rmq.watcher.subscription_builder import (
     build_subscriptions,
     has_exchange_conflict,
 )
+
+__all__ = ["RMQTriggerNotStaticError", "rmq_trigger"]
 
 
 def rmq_trigger(
@@ -65,11 +70,13 @@ def rmq_trigger(
         ``routing_keys``/``routing_key_ids``.  ``exchange`` must not start
         with ``"rmq_watcher."`` (reserved for cooldown/fire infrastructure).
         **Stacking multiple ``@rmq_trigger(exchange=...)`` on the same DAG is
-        not supported** and raises ``ValueError`` — they would all resolve to
-        the same ``rmq_watcher.sub.{dag_id}`` queue; use one decorator call
-        with the union of routing keys instead. The error surfaces when the
-        ``@dag(...)`` factory is called (see "Decorator order and DAG types"
-        below) — during DAG file import, before the DAG is registered.
+        not supported** — they would all resolve to the same
+        ``rmq_watcher.sub.{dag_id}`` queue; use one decorator call with the
+        union of routing keys instead. The watcher refuses such a file, and
+        the decorator raises ``RMQTriggerNotStaticError`` (a ``ValueError``)
+        naming the second call when the ``@dag(...)`` factory is called (see
+        "Decorator order and DAG types" below) — during DAG file import,
+        before the DAG is registered.
     :param routing_keys: Literal topic routing keys of any shape, used as-is.
         Can be combined with ``routing_key_ids``; the final routing key set
         is the union of both (see ADR-0004). Only valid together with
@@ -174,9 +181,10 @@ def rmq_trigger(
     constant counts only when the file mentions it nowhere but in
     ``rmq_trigger`` arguments. Imported names, calls, attributes, f-strings
     and concatenation are not read. When the DAG is built, the decorator runs
-    the same reading on its own call site (``_verify_static_readability``)
-    and raises ``RMQTriggerNotStaticError``, a ``ValueError`` that fails the
-    import of the whole file, when:
+    the watcher's own reading of the file against its call site and raises
+    ``RMQTriggerNotStaticError`` (importable from
+    ``airflow_provider_rmq.watcher``), a ``ValueError`` that fails the import
+    of the whole file, when:
 
     * the file is not one the watcher scans — a ``*.py`` file inside
       ``DAGS_FOLDER`` with no directory or file name below it starting with
@@ -232,9 +240,10 @@ def rmq_trigger(
         if not hasattr(dag_obj, "_rmq_subscriptions"):
             dag_obj._rmq_subscriptions = []
 
-        # The static check above refuses a file with a second exchange=
-        # subscription on one DAG; this check keeps the invariant in the DAG's
-        # own subscriptions as well, whatever the check reports.
+        # Unreachable while the static check above runs: it refuses a file with
+        # a second exchange= subscription on one DAG. This check keeps that
+        # invariant in the DAG's own subscriptions for a call the static check
+        # lets through, such as one made with the check replaced in tests.
         if has_exchange_conflict(dag_obj._rmq_subscriptions, new_subs):
             raise ValueError(
                 "Multiple @rmq_trigger(exchange=...) decorators on DAG "

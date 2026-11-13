@@ -33,8 +33,12 @@ from airflow_provider_rmq.watcher.subscription_builder import (
 )
 
 # ---------------------------------------------------------------------------
-# Module-level constant collection (for dag_id=NAME and rmq_trigger arguments)
+# Kinds of AST nodes
 # ---------------------------------------------------------------------------
+
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 # Nodes whose body is a separate scope: the node's own name binds in the
 # enclosing scope, but its contents do not affect module scope.
@@ -43,11 +47,12 @@ _SCOPE_BOUNDARIES = (
     ast.AsyncFunctionDef,
     ast.ClassDef,
     ast.Lambda,
-    ast.ListComp,
-    ast.SetComp,
-    ast.DictComp,
-    ast.GeneratorExp,
+    *_COMPREHENSIONS,
 )
+
+# ---------------------------------------------------------------------------
+# Module-level constant collection (for dag_id=NAME and rmq_trigger arguments)
+# ---------------------------------------------------------------------------
 
 
 def _outer_parts(node: ast.AST) -> Iterator[ast.AST]:
@@ -56,7 +61,7 @@ def _outer_parts(node: ast.AST) -> Iterator[ast.AST]:
     return annotations, and a comprehension's outermost iterable. Everything
     else inside the boundary belongs to the new scope.
     """
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if isinstance(node, _FunctionNode):
         yield from node.decorator_list
         yield from node.args.defaults
         yield from (d for d in node.args.kw_defaults if d is not None)
@@ -69,7 +74,7 @@ def _outer_parts(node: ast.AST) -> Iterator[ast.AST]:
     elif isinstance(node, ast.Lambda):
         yield from node.args.defaults
         yield from (d for d in node.args.kw_defaults if d is not None)
-    elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+    elif isinstance(node, _COMPREHENSIONS):
         if node.generators:
             yield node.generators[0].iter   # evaluated in the enclosing scope
 
@@ -112,6 +117,14 @@ def _contains_mutable(value: Any) -> bool:
     if isinstance(value, tuple):
         return any(_contains_mutable(item) for item in value)
     return False
+
+
+def _has_wildcard_import(tree: ast.Module) -> bool:
+    """Tell whether the file has a ``from ... import *``, which can bind any name."""
+    return any(
+        isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names)
+        for node in ast.walk(tree)
+    )
 
 
 def _trigger_argument_name_ids(tree: ast.Module) -> set[int]:
@@ -199,7 +212,6 @@ def _collect_module_constants(
     unreadable); guessing wrong is not.
     """
     binding_counts: dict[str, int] = {}
-    has_wildcard_import = False
     module_scope_function_ids: set[int] = set()
 
     def _bump(name: str) -> None:
@@ -209,13 +221,11 @@ def _collect_module_constants(
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             _bump(node.id)
         elif isinstance(node, ast.alias):
-            if node.name == "*" and node.asname is None:
-                has_wildcard_import = True
-            else:
+            if node.name != "*":
                 _bump(node.asname or node.name.split(".")[0])
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             _bump(node.name)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if isinstance(node, _FunctionNode):
                 module_scope_function_ids.add(id(node))
         elif isinstance(node, ast.ExceptHandler) and node.name:
             _bump(node.name)
@@ -238,7 +248,7 @@ def _collect_module_constants(
         elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
             _bump(node.target.id)
 
-    if has_wildcard_import:
+    if _has_wildcard_import(tree):
         return {}, module_scope_function_ids
 
     constants: dict[str, tuple[Any, int]] = {}
@@ -281,57 +291,8 @@ def _collect_module_constants(
     return constants, module_scope_function_ids
 
 
-
-
-_RMQ_TRIGGER_KWARGS = (
-    "queue",
-    "queues",
-    "exchange",
-    "routing_keys",
-    "routing_key_ids",
-    "routing_key_status",
-    "conn_id",
-    "filter_data",
-    "cooldown",
-    "ack_unmatched",
-)
-
-
-def _is_call_named(node: ast.AST, name: str) -> TypeGuard[ast.Call]:
-    """Return True if ``node`` calls ``name(...)`` or ``<anything>.name(...)``."""
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    return (
-        (isinstance(func, ast.Name) and func.id == name)
-        or (isinstance(func, ast.Attribute) and func.attr == name)
-    )
-
-
-def _is_rmq_trigger_call(node: ast.AST) -> TypeGuard[ast.Call]:
-    """Return True if node is a call to rmq_trigger(...).
-
-    Handles both bare name ``rmq_trigger(...)`` and attribute access
-    ``decorators.rmq_trigger(...)`` — the two forms the scan reads as the
-    ``@rmq_trigger`` decorator. The match is by name; whether the name is bound
-    to the provider's decorator is ``_trigger_origin_problems``'s question.
-    """
-    return _is_call_named(node, "rmq_trigger")
-
-
-def _is_dag_call(node: ast.AST) -> TypeGuard[ast.Call]:
-    """Return True if node is a call to Airflow's ``dag(...)`` decorator.
-
-    Matches ``dag(...)`` and ``<module>.dag(...)``; a ``dag`` imported under
-    another name is not recognized, so its ``dag_id`` stays unresolved. The
-    match is by name; whether the name is bound to Airflow's decorator is
-    ``_dag_origin_problems``'s question.
-    """
-    return _is_call_named(node, "dag")
-
-
 def _usable_constants(
-    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    node: _FunctionNode,
     module_constants: dict[str, tuple[Any, int]],
     module_scope_function_ids: set[int],
 ) -> dict[str, Any]:
@@ -360,12 +321,48 @@ def _usable_constants(
 
 
 # ---------------------------------------------------------------------------
+# Recognizing rmq_trigger(...) and dag(...) decorator calls
+# ---------------------------------------------------------------------------
+
+
+def _is_call_named(node: ast.AST, name: str) -> TypeGuard[ast.Call]:
+    """Return True if ``node`` calls ``name(...)`` or ``<anything>.name(...)``."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        (isinstance(func, ast.Name) and func.id == name)
+        or (isinstance(func, ast.Attribute) and func.attr == name)
+    )
+
+
+def _is_rmq_trigger_call(node: ast.AST) -> TypeGuard[ast.Call]:
+    """Return True if node is a call to rmq_trigger(...).
+
+    Handles both bare name ``rmq_trigger(...)`` and attribute access
+    ``decorators.rmq_trigger(...)`` — the two forms the scan reads as the
+    ``@rmq_trigger`` decorator. The match is by name; whether the name is bound
+    to the provider's decorator is ``_origin_problems``'s question.
+    """
+    return _is_call_named(node, "rmq_trigger")
+
+
+def _is_dag_call(node: ast.AST) -> TypeGuard[ast.Call]:
+    """Return True if node is a call to Airflow's ``dag(...)`` decorator.
+
+    Matches ``dag(...)`` and ``<module>.dag(...)``; a ``dag`` imported under
+    another name is not recognized, so its ``dag_id`` stays unresolved. The
+    match is by name; whether the name is bound to Airflow's decorator is
+    ``_origin_problems``'s question.
+    """
+    return _is_call_named(node, "dag")
+
+
+# ---------------------------------------------------------------------------
 # Where the names of a decorator expression come from
 # ---------------------------------------------------------------------------
 
-_ScopeOwner = ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
-
-_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_ScopeOwner = ast.Module | _FunctionNode | ast.ClassDef
 
 #: Statements whose body can run more than once.
 _LOOPS = (ast.For, ast.AsyncFor, ast.While)
@@ -378,8 +375,12 @@ def _walrus_targets(comprehension: ast.AST) -> Iterator[ast.Name]:
         node = stack.pop()
         if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
             yield node.target
-        if node is not comprehension and isinstance(
-            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        # A nested comprehension binds its ``:=`` targets in the same enclosing
+        # scope; a function, class or lambda keeps them in its own.
+        if (
+            node is not comprehension
+            and isinstance(node, _SCOPE_BOUNDARIES)
+            and not isinstance(node, _COMPREHENSIONS)
         ):
             continue
         stack.extend(ast.iter_child_nodes(node))
@@ -439,7 +440,7 @@ class _Scope(NamedTuple):
 def _read_scope(owner: _ScopeOwner) -> _Scope:
     """Collect the bindings of the scope ``owner`` opens: its parameters and body."""
     nodes: list[ast.AST]
-    if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if isinstance(owner, _FunctionNode):
         args = owner.args
         nodes = [*args.posonlyargs, *args.args, *args.kwonlyargs]
         nodes.extend(arg for arg in (args.vararg, args.kwarg) if arg is not None)
@@ -535,9 +536,7 @@ class _NameOrigins:
         """Return the scope enclosing ``node`` and whether a loop lies in between."""
         in_loop = False
         parent = self._parents[id(node)]
-        while not isinstance(
-            parent, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
+        while not isinstance(parent, _ScopeOwner):
             in_loop = in_loop or isinstance(parent, _LOOPS)
             parent = self._parents[id(parent)]
         return parent, in_loop
@@ -645,7 +644,7 @@ class _NameOrigins:
     def path(self, name: str, func: _FunctionNode) -> str | None:
         """Return the dotted path ``name`` in the decorators of ``func`` is bound to."""
         owner, in_loop = self._owner(func)
-        top: _ScopeOwner | _FunctionNode = func
+        top: _ScopeOwner = func
         while not isinstance(owner, ast.Module):
             if top is func or not isinstance(owner, ast.ClassDef):
                 scope = self._scope(owner)
@@ -658,7 +657,7 @@ class _NameOrigins:
                     return self._single_path(paths)
             top = owner
             owner, in_loop = self._owner(owner)
-        if in_loop or not isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if in_loop or not isinstance(top, _FunctionNode):
             return self._module_path(name, None, func)
         return self._module_path(name, top, func)
 
@@ -672,141 +671,127 @@ class _NameOrigins:
         return None
 
 
-def _has_wildcard_import(tree: ast.Module) -> bool:
-    """Tell whether the file has a ``from ... import *``, which can bind any name."""
-    return any(
-        isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names)
-        for node in ast.walk(tree)
-    )
+# ---------------------------------------------------------------------------
+# Where a problem is, and the decorators an rmq_trigger function must use
+# ---------------------------------------------------------------------------
 
 
-#: The dotted paths under which the provider's decorator is importable.
-_PROVIDER_TRIGGER_PATHS = frozenset({
-    "airflow_provider_rmq.watcher.decorators.rmq_trigger",
-    "airflow_provider_rmq.watcher.rmq_trigger",
-})
+def _where(line: int, func: _FunctionNode | None = None, dag_id: str | None = None) -> str:
+    """Locate a problem: ``line N``, then the function and the ``dag_id`` when known.
+
+    Every problem the scan reports starts with this, followed by ``": "`` and the
+    reason, so the problems of one file read alike in one message.
+    """
+    parts = [f"line {line}"]
+    if func is not None:
+        parts.append(f"function {func.name!r}")
+    if dag_id is not None:
+        parts.append(f"dag_id={dag_id!r}")
+    return ", ".join(parts)
 
 
-def _trigger_origin_problems(tree: ast.Module, origins: _NameOrigins) -> list[str]:
-    """Report every ``@rmq_trigger(...)`` decorator call not bound to the provider's decorator.
+class _ExpectedDecorator(NamedTuple):
+    """The decorator a decorator call of a given name must be bound to.
 
-    The scan builds a subscription from what ``rmq_trigger`` of
-    ``airflow_provider_rmq.watcher.decorators`` would build. A same-named wrapper
-    of another module — ``functools.partial(rmq_trigger, conn_id=...)``, a
-    ``def rmq_trigger(**kw)`` — passes the decorator other arguments than the
-    file shows, so a call is read only when its ``rmq_trigger`` is:
+    ``paths`` are the dotted paths it is importable under; ``described`` names it
+    in a problem; ``module`` is the module a problem tells the user to import
+    ``name`` from.
+    """
 
-    - the bare name, bound by ``from airflow_provider_rmq.watcher.decorators
-      import rmq_trigger`` (or ``from airflow_provider_rmq.watcher import
-      rmq_trigger``);
-    - ``<module>.rmq_trigger``, where ``<module>`` is bound to
-      ``airflow_provider_rmq.watcher.decorators`` or
-      ``airflow_provider_rmq.watcher`` by an import
-      (``from airflow_provider_rmq.watcher import decorators``,
-      ``import airflow_provider_rmq.watcher.decorators as d``).
+    name: str
+    paths: frozenset[str]
+    described: str
+    module: str
 
-    The names are resolved in the scope the decorator runs in (``origins``):
-    an unrelated function's own ``rmq_trigger`` or ``decorators`` does not
-    count, a rebinding the decorator would see does. A file with ``from ...
-    import *`` cannot tell where any name comes from, so each of its calls is
+
+#: ``rmq_trigger`` must be the provider's decorator, importable from the module
+#: that defines it and from the package that re-exports it.
+_PROVIDER_TRIGGER = _ExpectedDecorator(
+    "rmq_trigger",
+    frozenset({
+        "airflow_provider_rmq.watcher.decorators.rmq_trigger",
+        "airflow_provider_rmq.watcher.rmq_trigger",
+    }),
+    "rmq_trigger of airflow_provider_rmq.watcher.decorators",
+    "airflow_provider_rmq.watcher.decorators",
+)
+
+#: ``dag`` must be Airflow's ``@dag`` decorator. In Airflow 2.x
+#: ``airflow.decorators`` re-exports the function defined in ``airflow.models.dag``.
+_AIRFLOW_DAG = _ExpectedDecorator(
+    "dag",
+    frozenset({
+        "airflow.decorators.dag",
+        "airflow.models.dag.dag",
+    }),
+    "Airflow's dag decorator",
+    "airflow.decorators",
+)
+
+
+def _origin_problems(
+    func: _FunctionNode, origins: _NameOrigins, has_wildcard: bool
+) -> list[str]:
+    """Report the decorator calls of an ``@rmq_trigger`` function bound to another decorator.
+
+    The scan builds a subscription from what the provider's ``rmq_trigger``
+    would build and takes the ``dag_id`` from ``@dag(...)`` as Airflow's
+    decorator reads it. A same-named wrapper of another module —
+    ``functools.partial(rmq_trigger, conn_id=...)``, a ``def rmq_trigger(**kw)``,
+    a ``def dag(dag_id, **kw)`` that prefixes the id — passes the decorator other
+    arguments than the file shows, or gives the DAG another ``dag_id``. So on
+    ``func``, which carries an ``rmq_trigger(...)`` decorator call, each
+    ``rmq_trigger(...)`` and ``dag(...)`` decorator call is read only when its
+    name is:
+
+    - the bare name, bound by an import of one of the expected decorator's
+      paths (``_PROVIDER_TRIGGER``, ``_AIRFLOW_DAG``) — ``from
+      airflow_provider_rmq.watcher.decorators import rmq_trigger``, ``from
+      airflow_provider_rmq.watcher import rmq_trigger``, ``from airflow.decorators
+      import dag``, ``from airflow.models.dag import dag``;
+    - ``<module>.<name>``, where ``<module>`` is bound by an import to the module
+      of one of those paths (``from airflow_provider_rmq.watcher import
+      decorators``, ``import airflow_provider_rmq.watcher.decorators as d``,
+      ``from airflow import decorators``, ``import airflow.decorators``).
+
+    The names are resolved in the scope the decorator runs in (``origins``): an
+    unrelated function's own ``rmq_trigger``, a ``dag`` parameter of a task,
+    ``dag = context["dag"]`` in a callback or a ``with DAG(...) as dag:`` below
+    the decorated function do not count; a module-level rebinding above it,
+    ``global dag`` in a function or a ``dag`` of the factory enclosing a nested
+    DAG function do. In a file with ``from ... import *`` (``has_wildcard``)
+    the scan cannot tell where any name comes from, so each such call is
     reported.
     """
-    has_wildcard = _has_wildcard_import(tree)
     problems: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    for dec in func.decorator_list:
+        if _is_rmq_trigger_call(dec):
+            expected = _PROVIDER_TRIGGER
+        elif _is_dag_call(dec):
+            expected = _AIRFLOW_DAG
+        else:
             continue
-        for dec in node.decorator_list:
-            if not _is_rmq_trigger_call(dec):
-                continue
-            written = ast.unparse(dec.func)
-            if has_wildcard:
-                problems.append(
-                    f"line {dec.lineno}: the file has 'from ... import *', so the "
-                    f"scan cannot tell where {written} comes from — import "
-                    "rmq_trigger by name from airflow_provider_rmq.watcher.decorators "
-                    "and drop the wildcard import"
-                )
-                continue
-            path = origins.dotted_path(dec.func, node)
-            if path in _PROVIDER_TRIGGER_PATHS:
-                continue
-            what = (
-                f"{written} is {path}"
-                if path is not None
-                else f"{written} is not bound by one absolute import alone in the scope the decorator runs in"
-            )
+        written = ast.unparse(dec.func)
+        where = _where(dec.lineno, func)
+        if has_wildcard:
             problems.append(
-                f"line {dec.lineno}: {what}, not rmq_trigger of "
-                "airflow_provider_rmq.watcher.decorators — import it with "
-                "'from airflow_provider_rmq.watcher.decorators import rmq_trigger'"
+                f"{where}: the file has 'from ... import *', so the scan cannot tell "
+                f"where {written} comes from — import {expected.name} by name from "
+                f"{expected.module} and drop the wildcard import"
             )
-    return problems
-
-
-#: The dotted paths under which Airflow's ``@dag`` decorator is importable in
-#: Airflow 2.x: ``airflow.decorators`` re-exports the function defined in
-#: ``airflow.models.dag``.
-_AIRFLOW_DAG_PATHS = frozenset({
-    "airflow.decorators.dag",
-    "airflow.models.dag.dag",
-})
-
-
-def _dag_origin_problems(tree: ast.Module, origins: _NameOrigins) -> list[str]:
-    """Report every ``@dag(...)`` call on an ``@rmq_trigger`` function not bound to Airflow's decorator.
-
-    The scan takes the ``dag_id`` from the ``@dag(...)`` call as Airflow's
-    decorator reads it. A same-named wrapper of another module — a ``def
-    dag(dag_id, **kw)`` that prefixes the id, a ``partial`` with other defaults
-    — gives the DAG another ``dag_id`` than the file shows, so on a function
-    carrying ``@rmq_trigger(...)`` a ``dag(...)`` decorator call is read only when
-    its ``dag`` is:
-
-    - the bare name, bound by ``from airflow.decorators import dag`` (or
-      ``from airflow.models.dag import dag``);
-    - ``<module>.dag``, where ``<module>`` is bound to ``airflow.decorators`` or
-      ``airflow.models.dag`` by an import (``from airflow import decorators``,
-      ``import airflow.decorators``).
-
-    The names are resolved in the scope the decorator runs in (``origins``): a
-    ``dag`` parameter of a task, ``dag = context["dag"]`` in a callback or a
-    ``with DAG(...) as dag:`` below the decorated function does not count, a
-    module-level rebinding above it, ``global dag`` in a function or a ``dag``
-    of the factory enclosing a nested DAG function does. A file with ``from ...
-    import *`` cannot tell where any name comes from, so each such call is
-    reported.
-    """
-    has_wildcard = _has_wildcard_import(tree)
-    problems: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not any(_is_rmq_trigger_call(dec) for dec in node.decorator_list):
+        path = origins.dotted_path(dec.func, func)
+        if path in expected.paths:
             continue
-        for dec in node.decorator_list:
-            if not _is_dag_call(dec):
-                continue
-            written = ast.unparse(dec.func)
-            if has_wildcard:
-                problems.append(
-                    f"line {dec.lineno}: the file has 'from ... import *', so the "
-                    f"scan cannot tell where {written} comes from — import dag by "
-                    "name from airflow.decorators and drop the wildcard import"
-                )
-                continue
-            path = origins.dotted_path(dec.func, node)
-            if path in _AIRFLOW_DAG_PATHS:
-                continue
-            what = (
-                f"{written} is {path}"
-                if path is not None
-                else f"{written} is not bound by one absolute import alone in the scope the decorator runs in"
-            )
-            problems.append(
-                f"line {dec.lineno}: {what}, not Airflow's dag decorator — import "
-                "it with 'from airflow.decorators import dag'"
-            )
+        what = (
+            f"{written} is {path}"
+            if path is not None
+            else f"{written} is not bound by one absolute import alone in the scope the decorator runs in"
+        )
+        problems.append(
+            f"{where}: {what}, not {expected.described} — import it with "
+            f"'from {expected.module} import {expected.name}'"
+        )
     return problems
 
 
@@ -816,6 +801,20 @@ def _dag_origin_problems(tree: ast.Module, origins: _NameOrigins) -> list[str]:
 
 #: ``rmq_trigger``'s positional-or-keyword parameters, in signature order.
 _RMQ_TRIGGER_POSITIONAL = ("queue", "queues", "conn_id", "filter_data", "cooldown")
+
+#: Every parameter of ``rmq_trigger``, each accepted as a keyword.
+_RMQ_TRIGGER_KWARGS = (
+    "queue",
+    "queues",
+    "exchange",
+    "routing_keys",
+    "routing_key_ids",
+    "routing_key_status",
+    "conn_id",
+    "filter_data",
+    "cooldown",
+    "ack_unmatched",
+)
 
 
 class _Unreadable(Exception):
@@ -1016,8 +1015,6 @@ def _read_rmq_trigger_call(call: ast.Call, constants: dict[str, Any]) -> _CallRe
 # Reading a whole DAG file
 # ---------------------------------------------------------------------------
 
-_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
-
 
 def _read_and_parse(path: str) -> ast.Module:
     """Read ``path`` as bytes and parse it the way an import compiles it.
@@ -1048,7 +1045,7 @@ def _iter_trigger_functions(
     """
     module_constants, module_scope_function_ids = _collect_module_constants(tree)
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if not isinstance(node, _FunctionNode):
             continue
         if not any(_is_rmq_trigger_call(d) for d in node.decorator_list):
             continue
@@ -1167,7 +1164,7 @@ def _read_function_triggers(
     for decorator in func.decorator_list:
         if not _is_rmq_trigger_call(decorator):
             continue
-        where = f"dag_id={dag_id!r}, rmq_trigger at line {decorator.lineno}"
+        where = _where(decorator.lineno, func, dag_id)
         read = _read_rmq_trigger_call(decorator, constants)
         if read.unreadable:
             problems.extend(
@@ -1204,7 +1201,9 @@ def _read_function_triggers(
     return _TriggerRead(subscriptions, problems, calls)
 
 
-def _stray_trigger_mentions(tree: ast.Module) -> list[str]:
+def _stray_trigger_mentions(
+    tree: ast.Module, trigger_functions: Iterable[_FunctionNode]
+) -> list[str]:
     """Describe every mention of ``rmq_trigger`` the scan cannot follow.
 
     The scan reads ``rmq_trigger`` only as the ``func`` of a call that is itself
@@ -1215,14 +1214,17 @@ def _stray_trigger_mentions(tree: ast.Module) -> list[str]:
     ``partial(rmq_trigger, ...)``, a bare ``@rmq_trigger`` without a call, a
     decorator on a class, a local definition of that name. An import of
     ``rmq_trigger`` under its own name is not a mention; where it imports the
-    decorator from is ``_trigger_origin_problems``'s question.
+    decorator from is ``_origin_problems``'s question.
+
+    ``trigger_functions`` are the functions of ``tree`` carrying an
+    ``rmq_trigger(...)`` decorator call (``_iter_trigger_functions``).
     """
-    followed: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            followed.update(
-                id(dec.func) for dec in node.decorator_list if _is_rmq_trigger_call(dec)
-            )
+    followed = {
+        id(dec.func)
+        for func in trigger_functions
+        for dec in func.decorator_list
+        if _is_rmq_trigger_call(dec)
+    }
 
     problems: list[str] = []
     for node in ast.walk(tree):
@@ -1236,7 +1238,7 @@ def _stray_trigger_mentions(tree: ast.Module) -> list[str]:
             and node.asname not in (None, "rmq_trigger")
         ):
             problems.append(
-                f"line {node.lineno}: rmq_trigger is imported as {node.asname!r} — "
+                f"{_where(node.lineno)}: rmq_trigger is imported as {node.asname!r} — "
                 "import it under its own name"
             )
             continue
@@ -1245,7 +1247,7 @@ def _stray_trigger_mentions(tree: ast.Module) -> list[str]:
             and node.name == "rmq_trigger"
         ):
             problems.append(
-                f"line {node.lineno}: the file defines its own rmq_trigger"
+                f"{_where(node.lineno)}: the file defines its own rmq_trigger"
             )
             continue
         else:
@@ -1253,7 +1255,7 @@ def _stray_trigger_mentions(tree: ast.Module) -> list[str]:
         if id(node) in followed:
             continue
         problems.append(
-            f"line {node.lineno}: {what} is used other than as a decorator call "
+            f"{_where(node.lineno)}: {what} is used other than as a decorator call "
             "@rmq_trigger(...) on a function"
         )
     return problems
@@ -1272,8 +1274,8 @@ def _decorator_order_problems(func: _FunctionNode) -> list[str]:
     if dag_index is None:
         return []
     return [
-        f"function {func.name!r}, rmq_trigger at line {dec.lineno}: placed below "
-        "@dag(...) — @rmq_trigger must be the outermost decorator, above @dag(...)"
+        f"{_where(dec.lineno, func)}: @rmq_trigger(...) is placed below @dag(...) — "
+        "@rmq_trigger must be the outermost decorator, above @dag(...)"
         for dec in func.decorator_list[dag_index + 1:]
         if _is_rmq_trigger_call(dec)
     ]
@@ -1297,7 +1299,7 @@ def _other_decorator_problems(func: _FunctionNode) -> list[str]:
     if first is None:
         return []
     return [
-        f"function {func.name!r}, line {dec.lineno}: @"
+        f"{_where(dec.lineno, func)}: @"
         f"{ast.unparse(dec.func if isinstance(dec, ast.Call) else dec)} sits below "
         "@rmq_trigger(...) and can change the DAG it decorates — only "
         "@rmq_trigger(...) and @dag(...) may sit below the first @rmq_trigger(...); "
@@ -1325,29 +1327,29 @@ def _read_file_triggers(tree: ast.Module) -> _TriggerRead:
       first ``@rmq_trigger`` of a function (``_other_decorator_problems``);
     - a mention of ``rmq_trigger`` the scan cannot follow
       (``_stray_trigger_mentions``);
-    - a decorator call whose ``rmq_trigger`` is not bound to the provider's
-      decorator (``_trigger_origin_problems``);
-    - a ``@dag(...)`` call on an ``@rmq_trigger`` function whose ``dag`` is not
-      bound to Airflow's decorator (``_dag_origin_problems``).
+    - on a function carrying ``@rmq_trigger``, a decorator call whose
+      ``rmq_trigger`` is not bound to the provider's decorator, or whose ``dag``
+      is not bound to Airflow's (``_origin_problems``).
+
+    Every problem starts with its location (``_where``).
 
     ``calls`` lists every call read, problems or not, so the decorator's check
     can look its own call up.
     """
     origins = _NameOrigins(tree)
-    problems = (
-        _stray_trigger_mentions(tree)
-        + _trigger_origin_problems(tree, origins)
-        + _dag_origin_problems(tree, origins)
-    )
+    has_wildcard = _has_wildcard_import(tree)
+    trigger_functions = list(_iter_trigger_functions(tree))
+    problems = _stray_trigger_mentions(tree, [func for func, _ in trigger_functions])
     subscriptions: list[dict] = []
     calls: list[_TriggerCall] = []
-    for func, constants in _iter_trigger_functions(tree):
+    for func, constants in trigger_functions:
+        problems.extend(_origin_problems(func, origins, has_wildcard))
         problems.extend(_decorator_order_problems(func))
         problems.extend(_other_decorator_problems(func))
         dag_id = _static_dag_id(func, constants)
         if dag_id is None:
             problems.append(
-                f"function {func.name!r} at line {func.lineno}: cannot statically "
+                f"{_where(func.lineno, func)}: cannot statically "
                 "resolve dag_id — dag_id= of @dag(...) must be a string literal, or "
                 "a string constant assigned once at the top level of this file above "
                 "a module-level function, and dag must be imported under its own name"
@@ -1360,6 +1362,18 @@ def _read_file_triggers(tree: ast.Module) -> _TriggerRead:
     if problems:
         return _TriggerRead([], problems, calls)
     return _TriggerRead(subscriptions, [], calls)
+
+
+#: How to write a file the scan reads in full: the advice that follows the
+#: problems of a refused file in the watcher's ERROR and in the import error.
+_READABLE_FILE_REMEDY = (
+    "Arguments of @rmq_trigger and dag_id= of @dag(...) must be literals or "
+    "constants assigned exactly once at the top level of this file, above the "
+    "decorated module-level function, and @rmq_trigger(...) must be a decorator "
+    "call above @dag(...), with rmq_trigger imported from "
+    "airflow_provider_rmq.watcher.decorators and dag from airflow.decorators "
+    "(or airflow.models.dag)."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1551,11 +1565,7 @@ def _verify_static_readability(
         raise RMQTriggerNotStaticError(
             f"{where}: the RMQ watcher cannot read every @rmq_trigger of this file "
             "statically and refuses all of its subscriptions:\n"
-            f"{listed}\n"
-            "Arguments and dag_id must be literals or constants assigned once at "
-            "the top level of this file above the decorated function, "
-            "rmq_trigger must be imported from airflow_provider_rmq.watcher.decorators "
-            "and dag from airflow.decorators."
+            f"{listed}\n{_READABLE_FILE_REMEDY}"
         )
 
     found = next(

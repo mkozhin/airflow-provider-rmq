@@ -45,6 +45,22 @@ def fresh_file_analyses(monkeypatch):
     monkeypatch.setattr(dag_file_scan, "_analyses", {})
 
 
+@pytest.fixture
+def dags_folder(tmp_path, monkeypatch):
+    """A ``DAGS_FOLDER`` under ``tmp_path``, set on ``airflow.settings``.
+
+    The decorator's static check reads ``airflow.settings.DAGS_FOLDER`` while a
+    DAG file is imported; a test that hands the folder to the check directly gets
+    the same folder there.
+    """
+    from airflow import settings
+
+    folder = tmp_path / "dags"
+    folder.mkdir()
+    monkeypatch.setattr(settings, "DAGS_FOLDER", str(folder))
+    return folder
+
+
 @pytest.fixture(autouse=True)
 def alarm_calls(monkeypatch):
     """Replace the real-time timer of :func:`signal.setitimer` in every test here and

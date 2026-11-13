@@ -27,21 +27,10 @@ _HEADER = (
     "START = datetime(2024, 1, 1)\n"
 )
 
-STEP_3 = "cannot read every @rmq_trigger of this file statically"
-STEP_4 = "rmq_trigger is called through a name the RMQ watcher does not recognize"
-STEP_6 = "the RMQ watcher reads other arguments from the file"
+FILE_REFUSED = "cannot read every @rmq_trigger of this file statically"
+CALL_NOT_FOUND = "rmq_trigger is called through a name the RMQ watcher does not recognize"
+VALUES_DIFFER = "the RMQ watcher reads other arguments from the file"
 NOT_SCANNED = "in a file the RMQ watcher does not scan"
-
-
-@pytest.fixture
-def dags_folder(tmp_path, monkeypatch):
-    """A ``DAGS_FOLDER`` under ``tmp_path``, set on ``airflow.settings``."""
-    from airflow import settings
-
-    folder = tmp_path / "dags"
-    folder.mkdir()
-    monkeypatch.setattr(settings, "DAGS_FOLDER", str(folder))
-    return folder
 
 
 @pytest.fixture
@@ -393,7 +382,7 @@ class TestUnreadableFilesFailToImport:
 
         error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in error
-        assert STEP_3 in error
+        assert FILE_REFUSED in error
         assert reason in error
         assert not bag.dags
 
@@ -439,7 +428,7 @@ class TestUnreadableFilesFailToImport:
 
         error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in error
-        assert STEP_3 in error
+        assert FILE_REFUSED in error
         assert "rmq_trigger is rmq_static_check_common.rmq_trigger" in error
         assert not bag.dags
 
@@ -468,7 +457,7 @@ class TestUnreadableFilesFailToImport:
 
         error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in error
-        assert STEP_3 in error
+        assert FILE_REFUSED in error
         assert "dag is rmq_static_check_company.dag, not Airflow's dag decorator" in error
         assert not bag.dags
 
@@ -509,7 +498,7 @@ class TestUnreadableFilesFailToImport:
 
         error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in error
-        assert STEP_4 in error
+        assert CALL_NOT_FOUND in error
         assert not bag.dags
 
 
@@ -529,7 +518,7 @@ class TestConstantChangedBeforeTheFactoryCall:
         bag = _load(dags_folder)
 
         error = _import_error(bag, path)
-        assert STEP_3 in error
+        assert FILE_REFUSED in error
         assert "queue cannot be read — 'QUEUE'" in error
         assert not bag.dags
 
@@ -550,7 +539,7 @@ class TestConstantChangedBeforeTheFactoryCall:
 
         error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in error
-        assert STEP_6 in error
+        assert VALUES_DIFFER in error
         assert "subscription 1, filter_data: the watcher reads" in error
         assert not bag.dags
 
@@ -649,7 +638,7 @@ class TestWholeFileFails:
         bag = _load(dags_folder)
 
         error = _import_error(bag, path)
-        assert STEP_3 in error
+        assert FILE_REFUSED in error
         assert "bad_dag" in error
         assert "good_dag" not in bag.dags
         assert "bad_dag" not in bag.dags
@@ -756,7 +745,7 @@ class TestWatcherAndDecoratorReadTheSameFile:
 
         import_error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in import_error
-        assert STEP_3 in import_error
+        assert FILE_REFUSED in import_error
         assert "conn_id cannot be read" in import_error
         assert not bag.dags
 
@@ -802,7 +791,7 @@ class TestWatcherAndDecoratorReadTheSameFile:
 
         import_error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in import_error
-        assert STEP_3 in import_error
+        assert FILE_REFUSED in import_error
         assert "dag is rmq_static_check_prefixing.dag" in import_error
         assert not bag.dags
 
@@ -973,7 +962,7 @@ class TestWatcherAndDecoratorReadTheSameFile:
 
         import_error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in import_error
-        assert STEP_3 in import_error
+        assert FILE_REFUSED in import_error
         assert "dag is not bound by one absolute import alone" in import_error
         assert not bag.dags
 
@@ -1082,7 +1071,7 @@ class TestWatcherAndDecoratorReadTheSameFile:
 
         import_error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in import_error
-        assert STEP_3 in import_error
+        assert FILE_REFUSED in import_error
         assert "@no_wraps sits below @rmq_trigger(...)" in import_error
         assert not bag.dags
 
@@ -1127,6 +1116,6 @@ class TestWatcherAndDecoratorReadTheSameFile:
 
         import_error = _import_error(bag, path)
         assert "RMQTriggerNotStaticError" in import_error
-        assert STEP_3 in import_error
+        assert FILE_REFUSED in import_error
         assert "dag is not bound by one absolute import alone" in import_error
         assert not bag.dags
