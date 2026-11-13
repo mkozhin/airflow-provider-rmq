@@ -1,6 +1,6 @@
 """Shared subscription dict construction for ``@rmq_trigger``.
 
-Both the decorator (``decorators.py``) and the AST parser (``listener.py``)
+Both the decorator (``decorators.py``) and the AST parser (``dag_file_scan.py``)
 need to validate the same ``queue``/``queues``/``exchange`` arguments and
 build the same shape of subscription dict, from two different extraction
 paths (real Python values vs. ``ast.literal_eval`` results). This module is

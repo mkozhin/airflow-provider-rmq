@@ -24,6 +24,13 @@ import airflow_provider_rmq
 from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.watcher import listener as listener_module
+from airflow_provider_rmq.watcher.dag_file_scan import (
+    _UNRESOLVED_DAG_ID,
+    _collect_module_constants,
+    _extract_dag_id_from_decorators,
+    _is_rmq_trigger_call,
+    _parse_rmq_trigger_decorator,
+)
 from airflow_provider_rmq.watcher.listener import (
     CYCLE_TIMEOUT_VAR,
     RECONCILE_INTERVAL_VAR,
@@ -34,13 +41,8 @@ from airflow_provider_rmq.watcher.listener import (
     _DELETED_ROWS_REMEMBERED,
     _INACTIVE_DAG_MISSES,
     _UNREADABLE_FILE_LIMIT,
-    _UNRESOLVED_DAG_ID,
     _UNTRUSTED_SCAN_LIMIT,
     _UntrustedScan,
-    _collect_module_constants,
-    _extract_dag_id_from_decorators,
-    _is_rmq_trigger_call,
-    _parse_rmq_trigger_decorator,
     _read_active_subs,
     _read_settings,
 )
@@ -78,6 +80,38 @@ def _make_session_ctx(existing_subs=None):
     ctx.__enter__ = MagicMock(return_value=session)
     ctx.__exit__ = MagicMock(return_value=False)
     return ctx, session
+
+
+# ---------------------------------------------------------------------------
+# dag_file_scan import footprint
+# ---------------------------------------------------------------------------
+
+
+class TestDagFileScanImportFootprint:
+    def test_importing_the_scan_module_leaves_the_watcher_runtime_unloaded(self):
+        """The decorator imports ``dag_file_scan`` inside the DAG processor, so the
+        module must not drag in the listener, the consumer (``aio_pika``, ``httpx``)
+        or the ORM models. A fresh interpreter is the only place where
+        ``sys.modules`` says what one import pulled in."""
+        probe = (
+            "import sys\n"
+            "import airflow_provider_rmq.watcher.dag_file_scan\n"
+            "loaded = [\n"
+            "    name for name in (\n"
+            "        'airflow_provider_rmq.watcher.listener',\n"
+            "        'airflow_provider_rmq.watcher.consumer',\n"
+            "        'airflow_provider_rmq.watcher.models',\n"
+            "    ) if name in sys.modules\n"
+            "]\n"
+            "print(','.join(loaded))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == ""
 
 
 # ---------------------------------------------------------------------------

@@ -354,17 +354,17 @@ watcher продолжает регистрировать. Это закрыва
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] перенести в `dag_file_scan.py` все имена из первого пункта Technical Details без
+- [x] перенести в `dag_file_scan.py` все имена из первого пункта Technical Details без
       изменения поведения
-- [ ] `listener.py` импортирует перенесённое из `dag_file_scan`;
+- [x] `listener.py` импортирует перенесённое из `dag_file_scan`;
       `_extract_subscriptions_from_file` остаётся методом listener'а
-- [ ] перенаправить импорты и `patch`-цели тестов (`...listener.log` для предупреждений
+- [x] перенаправить импорты и `patch`-цели тестов (`...listener.log` для предупреждений
       парсера и т.п.) на новый модуль
-- [ ] тест в подпроцессе: после `import airflow_provider_rmq.watcher.dag_file_scan` в
+- [x] тест в подпроцессе: после `import airflow_provider_rmq.watcher.dag_file_scan` в
       `sys.modules` нет `airflow_provider_rmq.watcher.listener`, `.consumer`, `.models`
-- [ ] docstring модуля `subscription_builder.py` (3-9) и упоминания расположения парсера
+- [x] docstring модуля `subscription_builder.py` (3-9) и упоминания расположения парсера
       в перенесённых docstring'ах и комментариях указывают на `dag_file_scan.py`
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 2: Константы любого литерального типа и защита от мутации
 
