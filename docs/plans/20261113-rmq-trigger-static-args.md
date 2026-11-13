@@ -373,29 +373,29 @@ watcher продолжает регистрировать. Это закрыва
 - Create: `tests/watcher/test_dag_file_scan.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] `_collect_module_constants` хранит значения любого типа, который даёт
+- [x] `_collect_module_constants` хранит значения любого типа, который даёт
       `ast.literal_eval`; `test_non_string_constant_ignored` (`DAG_ID = 123` → `{}`)
       переписать под новое поведение сбора
-- [ ] для значений, содержащих `list`/`dict`: имя пригодно, только если каждое его
+- [x] для значений, содержащих `list`/`dict`: имя пригодно, только если каждое его
       упоминание в файле, кроме присваивания, стоит внутри аргументов вызова
       `rmq_trigger` — обход всего дерева
-- [ ] `_extract_dag_id_from_decorators` принимает константу для `dag_id` только строкой;
+- [x] `_extract_dag_id_from_decorators` принимает константу для `dag_id` только строкой;
       при поиске константы проверка «не строка» раньше проверки на пустое значение;
       ветка литерала сохраняет порядок «сначала пустое значение»
-- [ ] docstring'и `_collect_module_constants` (только строки, WARNING у вызывающего) и
+- [x] docstring'и `_collect_module_constants` (только строки, WARNING у вызывающего) и
       `_extract_dag_id_from_decorators` (константы как `dict[str, str]`) описывают
       значения любого типа и правило для `list`/`dict`
-- [ ] тесты: строка/число/bool/None/список/кортеж/словарь собираются; двойное связывание,
+- [x] тесты: строка/число/bool/None/список/кортеж/словарь собираются; двойное связывание,
       `global`, walrus, `import *` — как прежде
-- [ ] тесты изменяемых констант: `X[k] = v`, `del X[k]`, `X["a"]["b"] = v`,
+- [x] тесты изменяемых констант: `X[k] = v`, `del X[k]`, `X["a"]["b"] = v`,
       `X.append(...)`, `alias = X` (и запись через `alias`), `helper(X)`, чтение `X["a"]`
       вне `rmq_trigger` делают имя непригодным; `X` только в `filter_data=X` и в `**X`
       остаётся пригодным; строковая константа с `DAG_ID.lower()` в файле остаётся
       пригодной
-- [ ] тесты `dag_id`: `DAG_ID = None`/`0`/`False` в `dag_id=` нерезолвимы;
+- [x] тесты `dag_id`: `DAG_ID = None`/`0`/`False` в `dag_id=` нерезолвимы;
       `@dag(dag_id=None)` литералом по-прежнему даёт имя функции
       (`test_falsy_literal_dag_id_returns_none` проходит без изменений)
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 3: Чтение вызова `rmq_trigger` через константы
 

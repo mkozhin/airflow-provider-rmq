@@ -17,6 +17,7 @@ import ast
 import enum
 import logging
 from collections.abc import Iterator
+from typing import Any
 
 from airflow_provider_rmq.watcher.subscription_builder import build_subscriptions
 
@@ -85,13 +86,68 @@ def _module_scope_nodes(tree: ast.Module) -> Iterator[ast.AST]:
         stack.extend(ast.iter_child_nodes(node))
 
 
+def _contains_mutable(value: Any) -> bool:
+    """Return True if ``value`` is, or holds at any depth, a ``list``, ``dict`` or ``set``.
+
+    These are the mutable containers ``ast.literal_eval`` can produce; a tuple is
+    looked into because a tuple of lists is mutable through its elements.
+    """
+    if isinstance(value, (list, dict, set)):
+        return True
+    if isinstance(value, tuple):
+        return any(_contains_mutable(item) for item in value)
+    return False
+
+
+def _trigger_argument_name_ids(tree: ast.Module) -> set[int]:
+    """Return ``id()`` of every ``Name`` that is an ``rmq_trigger(...)`` argument value.
+
+    A name counts when it is a positional argument, a keyword value or a ``**NAME``
+    unpacking of an ``rmq_trigger`` call — directly, or nested only inside list,
+    tuple and dict displays there (``queues=[Q1, Q2]``, ``filter_data={"k": V}``).
+    These are exactly the positions where the decorator receives the value as is,
+    without any code of the DAG file touching it.
+    """
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and _is_rmq_trigger_call(node)):
+            continue
+        stack: list[ast.expr | None] = [*node.args, *(kw.value for kw in node.keywords)]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, ast.Name):
+                ids.add(id(item))
+            elif isinstance(item, (ast.List, ast.Tuple)):
+                stack.extend(item.elts)
+            elif isinstance(item, ast.Dict):
+                stack.extend(item.keys)
+                stack.extend(item.values)
+    return ids
+
+
 def _collect_module_constants(
     tree: ast.Module,
-) -> tuple[dict[str, tuple[str, int]], set[int]]:
-    """Collect simple top-level ``NAME = "literal string"`` assignments
-    (plus annotated ``NAME: str = "literal"``), each paired with its line
-    number so callers can enforce "only usable before this point in the
-    file" — see ``_resolve_function_dag_id``.
+) -> tuple[dict[str, tuple[Any, int]], set[int]]:
+    """Collect simple top-level ``NAME = <literal>`` assignments (plus annotated
+    ``NAME: T = <literal>``), each paired with its line number so callers can
+    enforce "only usable before this point in the file" — see
+    ``_resolve_function_dag_id``.
+
+    The value is anything ``ast.literal_eval`` produces: strings, numbers,
+    booleans, ``None``, and lists, tuples, dicts and sets built from them.
+    Callers decide which types they accept — ``dag_id=NAME`` takes a string
+    constant only.
+
+    A value that is or holds a ``list``, ``dict`` or ``set`` could be changed
+    after its assignment (``X["k"] = v``, ``X.append(...)``, ``helper(X)``,
+    a write through ``alias = X``), and no static reading can follow that. Such
+    a name is kept only if every mention of it anywhere in the file, other
+    than the assignment itself, is an ``rmq_trigger(...)`` argument value —
+    directly, inside list/tuple/dict displays there, or as ``**NAME`` (see
+    ``_trigger_argument_name_ids``). Any other mention, a read included,
+    drops the name. Strings and numbers cannot change, so for them the rule
+    does not apply and ``DAG_ID.lower()`` elsewhere in the file keeps
+    ``DAG_ID`` usable.
 
     Returns ``(constants, module_scope_function_ids)``. The second element
     is ``id()`` of every ``FunctionDef``/``AsyncFunctionDef`` whose
@@ -124,9 +180,9 @@ def _collect_module_constants(
     statically unknown, so any earlier literal could have been silently
     replaced.
 
-    Refusing to resolve an ambiguous name is safe (the caller skips
-    registration and logs a WARNING); guessing wrong is not — same principle
-    as ``_UNRESOLVED_DAG_ID`` below.
+    Refusing to resolve an ambiguous name is safe (the caller reports it as
+    unreadable); guessing wrong is not — same principle as
+    ``_UNRESOLVED_DAG_ID`` below.
     """
     binding_counts: dict[str, int] = {}
     has_wildcard_import = False
@@ -171,7 +227,8 @@ def _collect_module_constants(
     if has_wildcard_import:
         return {}, module_scope_function_ids
 
-    constants: dict[str, tuple[str, int]] = {}
+    constants: dict[str, tuple[Any, int]] = {}
+    assignment_targets: dict[str, ast.Name] = {}
     for node in tree.body:  # value extraction: top-level ONLY, unconditional
         if isinstance(node, ast.Assign):
             if len(node.targets) != 1:
@@ -192,8 +249,21 @@ def _collect_module_constants(
             value = ast.literal_eval(value_node)
         except (ValueError, TypeError):
             continue
-        if isinstance(value, str):
-            constants[name] = (value, node.lineno)
+        constants[name] = (value, node.lineno)
+        assignment_targets[name] = target
+
+    mutable = {name for name, (value, _) in constants.items() if _contains_mutable(value)}
+    if mutable:
+        allowed = _trigger_argument_name_ids(tree)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Name)
+                and node.id in mutable
+                and node is not assignment_targets[node.id]
+                and id(node) not in allowed
+            ):
+                del constants[node.id]
+                mutable.discard(node.id)
     return constants, module_scope_function_ids
 
 
@@ -209,7 +279,7 @@ _UNRESOLVED_DAG_ID = _DagIdSentinel.UNRESOLVED
 
 
 def _extract_dag_id_from_decorators(
-    decorators: list[ast.expr], constants: dict[str, str] | None = None
+    decorators: list[ast.expr], constants: dict[str, Any] | None = None
 ) -> str | _DagIdSentinel | None:
     """Resolve the ``dag_id`` a recognized ``@dag(...)`` call among ``decorators`` would produce.
 
@@ -221,16 +291,18 @@ def _extract_dag_id_from_decorators(
     - ``None`` — a recognized ``@dag(...)`` call was found, and EITHER no
       ``dag_id=`` keyword was set at all (Airflow's own default behaviour is
       to fall back to the decorated function's name in this case, so it is
-      safe for the caller to do the same), OR ``dag_id=`` resolved to a
-      falsy value (``""``, ``None``, ``False``, ``0``, and generally
-      anything falsy ``ast.literal_eval`` can produce — this mirrors
-      Airflow's own ``dag_id or f.__name__`` in ``airflow/models/dag.py``).
-      Falling back to the function name is only ever safe for this ``None``
-      case.
+      safe for the caller to do the same), OR ``dag_id=`` is a falsy literal
+      (``""``, ``None``, ``False``, ``0``, and generally anything falsy
+      ``ast.literal_eval`` can produce — this mirrors Airflow's own
+      ``dag_id or f.__name__`` in ``airflow/models/dag.py``), OR ``dag_id=``
+      names an empty-string constant. Falling back to the function name is
+      only ever safe for this ``None`` case.
     - ``_UNRESOLVED_DAG_ID`` — ``dag_id=`` is set to something that cannot
       be statically proven (a non-literal expression whose name is not in
-      ``constants``, or a truthy non-string literal such as ``dag_id=123``),
-      OR no recognized ``@dag(...)`` call exists among ``decorators`` at all
+      ``constants``, a name whose constant is not a string such as
+      ``DAG_ID = None``/``0``/``False``, or a truthy non-string literal such
+      as ``dag_id=123``), OR no recognized ``@dag(...)`` call exists among
+      ``decorators`` at all
       (e.g. an aliased import — ``from airflow.decorators import dag as
       airflow_dag`` — is not matched by the ``is_dag`` predicate below).
       Guessing the function name here would silently register a
@@ -238,12 +310,14 @@ def _extract_dag_id_from_decorators(
       Airflow DAG — the caller must skip registration and log a warning
       instead (see ``_resolve_function_dag_id``).
 
-    **Deliberate falsy asymmetry**: any falsy value that was actually
-    resolved (a literal or a module constant — both always ``str`` here)
-    returns ``None`` and falls back to the function name; a name that
-    could not be resolved at all stays ``_UNRESOLVED_DAG_ID``. See the two
-    ``_resolve()`` branches below for exactly why this makes
-    ``DAG_ID = None`` behave differently from ``DAG_ID = ""``.
+    **Deliberate literal/constant asymmetry**: a falsy literal of any type
+    returns ``None`` and falls back to the function name, as in Airflow. A
+    constant is accepted only as a string: the "not a string" check runs
+    before the "empty" check, so ``DAG_ID = None`` (or ``0``, ``False``)
+    referenced as ``dag_id=DAG_ID`` stays ``_UNRESOLVED_DAG_ID``, while
+    ``DAG_ID = ""`` falls back to the function name. A name that could not
+    be resolved at all stays ``_UNRESOLVED_DAG_ID``. See the two
+    ``_resolve()`` branches below.
 
     No logging happens inside this function — the caller decides whether an
     ``_UNRESOLVED_DAG_ID`` deserves a WARNING, because only it knows the
@@ -251,10 +325,11 @@ def _extract_dag_id_from_decorators(
     unresolvable ``dag_id=`` on a DAG with no ``@rmq_trigger`` at all is not
     this plugin's concern and must stay silent).
 
-    ``constants`` is a flat ``dict[str, str]`` of name → value. The caller
-    (``_resolve_function_dag_id``) is responsible for turning
-    ``_collect_module_constants``'s
-    ``dict[str, tuple[str, int]]`` output into this shape — filtering out
+    ``constants`` is a flat ``dict[str, Any]`` of name → value; values of
+    any literal type may be present, and only strings are accepted for
+    ``dag_id``. The caller (``_resolve_function_dag_id``) is responsible for
+    turning ``_collect_module_constants``'s
+    ``dict[str, tuple[Any, int]]`` output into this shape — filtering out
     constants assigned after the decorated function's own line (use-before-
     definition) and passing an empty dict for nested functions, whose
     module-level constants may be shadowed by a local binding of the same
@@ -298,11 +373,13 @@ def _extract_dag_id_from_decorators(
     def _resolve(value_node: ast.expr) -> str | _DagIdSentinel | None:
         if isinstance(value_node, ast.Name):
             if value_node.id in constants:
-                # Same falsy rule as the literal branch below — a module
-                # constant IS a str (per _collect_module_constants), so an
-                # empty-string constant must fall back to the function name
-                # too, not be returned verbatim.
+                # Type check comes FIRST: a constant holds any literal type,
+                # and only a string names a DAG. An empty-string constant
+                # then falls back to the function name, like an empty
+                # literal below.
                 resolved = constants[value_node.id]
+                if not isinstance(resolved, str):
+                    return _UNRESOLVED_DAG_ID
                 return resolved if resolved else None
             return _UNRESOLVED_DAG_ID
         try:
@@ -568,7 +645,7 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
 
 def _resolve_function_dag_id(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
-    module_constants: dict[str, tuple[str, int]],
+    module_constants: dict[str, tuple[Any, int]],
     module_scope_function_ids: set[int],
     path: str,
 ) -> str | None:
@@ -590,7 +667,7 @@ def _resolve_function_dag_id(
     use, already carrying the "no dag_id= at all -> function name" fallback.
     """
     if id(node) not in module_scope_function_ids:
-        usable_constants: dict[str, str] = {}  # nested: refuse to resolve
+        usable_constants: dict[str, Any] = {}  # nested: refuse to resolve
     else:
         # Position filter: a constant assigned AFTER this function's own
         # line must not be used to resolve its dag_id= — real Python

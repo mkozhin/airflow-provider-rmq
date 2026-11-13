@@ -138,9 +138,9 @@ class TestCollectModuleConstantsBaseCases:
         result = _constants("DAG_ID: str = 'my_dag'\n")
         assert result == {"DAG_ID": ("my_dag", 1)}
 
-    def test_non_string_constant_ignored(self):
+    def test_non_string_constant_collected(self):
         result = _constants("DAG_ID = 123\n")
-        assert result == {}
+        assert result == {"DAG_ID": (123, 1)}
 
     def test_non_literal_rhs_ignored(self):
         result = _constants("DAG_ID = some_func()\n")
