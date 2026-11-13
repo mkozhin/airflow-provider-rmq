@@ -67,12 +67,9 @@ def rmq_trigger(
         **Stacking multiple ``@rmq_trigger(exchange=...)`` on the same DAG is
         not supported** and raises ``ValueError`` — they would all resolve to
         the same ``rmq_watcher.sub.{dag_id}`` queue; use one decorator call
-        with the union of routing keys instead. The timing of this error
-        depends on which branch below applies: immediate, at decoration
-        time, for a ready ``DAG`` instance; deferred until the wrapper is
-        called, for an uncalled TaskFlow factory (see "Decorator order and
-        DAG types" below) — either way it always surfaces during DAG file
-        import, before the DAG is registered.
+        with the union of routing keys instead. The error surfaces when the
+        ``@dag(...)`` factory is called (see "Decorator order and DAG types"
+        below) — during DAG file import, before the DAG is registered.
     :param routing_keys: Literal topic routing keys of any shape, used as-is.
         Can be combined with ``routing_key_ids``; the final routing key set
         is the union of both (see ADR-0004). Only valid together with
@@ -120,8 +117,9 @@ def rmq_trigger(
       same DAG shares the cooldown window.  This is intentional.
     * **All cooldown DAGs must use one conn_id/vhost.**  The
       ``rmq_watcher.*`` infrastructure queues are created in the vhost of the
-      first cooldown connection found.  Mixing conn_ids with cooldown is not
-      supported.
+      lowest ``conn_id`` among the cooldown subscriptions.  Mixing conn_ids
+      with cooldown is not supported: the watcher logs it as an ERROR, and
+      deliveries on the other conn_ids never fire their DAG.
     * **No consumer is ever attached to ``rmq_watcher.pending.{dag_id}``.**
       The queue acts as a pure timer — its only purpose is to expire the
       message and dead-letter it to ``rmq_watcher.fire``.
@@ -141,12 +139,9 @@ def rmq_trigger(
 
     Decorator order and DAG types
     ------------------------------
-    ``@rmq_trigger`` supports two ways of decorating a DAG:
-
-    * **A ready ``DAG`` instance** — the classic ``with DAG(...) as dag:``
-      style. Subscriptions are attached immediately, at decoration time.
-    * **An uncalled TaskFlow factory from ``@dag(...)``** — the style used
-      throughout this repository's examples and README::
+    The watcher finds subscriptions by reading DAG files without executing
+    them, and it recognizes one form only: ``@rmq_trigger(...)`` as a
+    decorator call above ``@dag(...)`` on a function of a file it scans::
 
           @rmq_trigger(queue="orders")
           @dag(dag_id="my_dag", schedule=None)
@@ -155,28 +150,48 @@ def rmq_trigger(
 
           my_dag()
 
-      ``airflow.decorators.dag(...)`` returns a plain factory function, not a
-      ``DAG`` — the real ``DAG`` only exists after the factory is called
-      (``my_dag()`` at the end of the file). In this case ``@rmq_trigger``
-      wraps the factory and defers attaching subscriptions until the wrapper
-      itself is called, then returns the resulting ``DAG``.
+    ``airflow.decorators.dag(...)`` returns a plain factory function, not a
+    ``DAG`` — the real ``DAG`` only exists after the factory is called
+    (``my_dag()`` at the end of the file). ``@rmq_trigger`` wraps the factory
+    and attaches subscriptions when the wrapper itself is called, then returns
+    the resulting ``DAG``. Called directly on a ready ``DAG`` instance
+    (``rmq_trigger(...)(dag)``, the ``with DAG(...) as dag:`` style), the
+    decorator attaches at once and the static check below fails the import:
+    the watcher does not see such a call.
 
     **``@rmq_trigger`` must be the outermost decorator, placed above
     ``@dag(...)``, never below it.** Putting it below (i.e.
     ``@dag(...)`` then ``@rmq_trigger(...)`` then the function) makes
-    ``@rmq_trigger`` decorate a plain function instead of a DAG/factory,
-    which raises ``TypeError`` at decoration time with a hint about the
-    correct order.
+    ``@rmq_trigger`` wrap the plain function instead of the factory; calling
+    the factory then raises ``TypeError`` with a hint about the correct order.
 
-    **``dag_id`` must be statically resolvable.** The Scheduler's AST scan
-    (which finds ``@rmq_trigger`` without executing the file) only resolves
-    ``dag_id`` in ``@dag(...)`` — positional or keyword — when it is a string
-    literal, or a simple module-level string constant assigned earlier in the
-    file than this function. Anything else (an imported constant, an f-string,
-    concatenation, a function call, ``**kwargs`` unpacking) is not resolved:
-    the subscription is skipped entirely (it will not appear on the
-    Subscriptions page), and a WARNING is logged the next time the file is
-    re-scanned.
+    **``dag_id`` and every argument must be statically readable.** The
+    watcher's scan reads ``dag_id`` of ``@dag(...)`` and the arguments of
+    ``@rmq_trigger(...)``, positional or keyword, from the file's source:
+    literals; constants assigned a literal exactly once at the top level of the
+    file, above a module-level decorated function; list, tuple and dict
+    displays built from them; ``**OPTS`` of a dict constant. A list or dict
+    constant counts only when the file mentions it nowhere but in
+    ``rmq_trigger`` arguments. Imported names, calls, attributes, f-strings
+    and concatenation are not read. When the DAG is built, the decorator runs
+    the same reading on its own call site (``_verify_static_readability``)
+    and raises ``RMQTriggerNotStaticError``, a ``ValueError`` that fails the
+    import of the whole file, when:
+
+    * the file is not one the watcher scans — a ``*.py`` file inside
+      ``DAGS_FOLDER`` with no directory or file name below it starting with
+      ``.``;
+    * any ``@rmq_trigger`` of the file cannot be read, ``rmq_trigger`` is
+      mentioned other than as a decorator call on a function, or a
+      ``dag_id`` cannot be resolved;
+    * the scan does not find this call, resolves another ``dag_id``, or reads
+      other values than the decorator received.
+
+    The watcher, for its part, refuses every subscription of a file whose
+    ``@rmq_trigger`` calls it cannot all read, and logs an ERROR, so no DAG
+    runs on subscriptions other than the ones its file declares.
+    ``DagBag(dag_folder=...)`` in tests and CI needs ``DAGS_FOLDER`` pointing
+    at the same folder, or every DAG with ``@rmq_trigger`` fails to import.
     """
     # The call site of rmq_trigger(...): the file and line the watcher's scan has
     # to find this call at, checked once the decorated DAG exists.

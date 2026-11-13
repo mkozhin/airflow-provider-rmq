@@ -43,27 +43,21 @@ resource pattern in addition to read access on ``orders``/``payments``::
         "^(rmq_watcher\\..*|orders|payments)$" \\
         "^(rmq_watcher\\..*|orders|payments)$"
 
-Gotcha: literal arguments only
--------------------------------
-``@rmq_trigger(...)`` is re-parsed from the DAG file's source via ``ast``
-whenever the reconcile loop re-scans the file (mtime-gated — unchanged
-files are not re-parsed on every cycle, only when their mtime changes) —
-only literal values (strings, ints, lists of literals, ...) are recognised.
-Referencing a module-level variable or constant in the decorator call is
-ignored with a WARNING in the Scheduler log naming the DAG, the queue and the
-parameter. What happens next depends on which argument was lost: an
-unreadable ``queue``/``queues``/``exchange``, or a set the subscription
-builder refuses, skips the subscription; an unreadable ``cooldown`` or
-``ack_unmatched`` leaves a working subscription running on that parameter's
-default, against what this file declares. Always write the queue
-names/cooldown value directly in the decorator call, as below.
-
-Note this literal-only restriction applies to the arguments of
-``@rmq_trigger(...)`` itself, not to ``dag_id`` in ``@dag(...)``: ``dag_id``
-now also resolves simple module-level string constants (e.g.
-``DAG_NAME = "x"`` then ``dag_id=DAG_NAME``), not just string literals —
-see "How it works" in the README. ``_parse_rmq_trigger_decorator``'s
-behavior for ``@rmq_trigger(...)``'s own arguments is unchanged.
+Gotcha: statically readable arguments
+--------------------------------------
+The watcher reads ``@rmq_trigger(...)`` from this file's source via ``ast``
+and never executes the file, so each argument must be something the source
+alone says: a literal, or a constant assigned a literal exactly once at the
+top level of this file, above the DAG function. ``COOLDOWN = 300`` followed
+by ``cooldown=COOLDOWN`` is read, and so is ``queues=[ORDERS_Q,
+PAYMENTS_Q]`` with two string constants; a list or dict constant is read
+only if the file uses it nowhere but in ``rmq_trigger`` arguments. An
+imported constant, a function call or an f-string is not read: the
+decorator then fails the import of this file with
+``RMQTriggerNotStaticError`` (a Broken DAG in the Airflow UI), and the
+watcher registers no subscription of the file and logs an ERROR naming the
+parameter and the reason. ``dag_id`` in ``@dag(...)`` follows the same rule
+and must be a string. See "How it works" in the README.
 """
 from __future__ import annotations
 

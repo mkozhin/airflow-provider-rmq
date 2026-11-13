@@ -136,7 +136,8 @@ Watcher и декоратор пользуются одними и теми же
   `_read_file_triggers` и watcher пишет ERROR'ом;
 - `_read_function_triggers(func, constants, dag_id)` — чтение всех вызовов `rmq_trigger`
   одной функции и сборка её подписок с перечнем проблем;
-- `_read_file_triggers(tree, path)` — подписки всего файла или отказ всему файлу.
+- `_read_file_triggers(tree)` — подписки всего файла и прочитанные вызовы (строки,
+  `dag_id`, подписки каждого) или отказ всему файлу.
 
 ### Что читается
 
@@ -297,15 +298,23 @@ watcher продолжает регистрировать. Это закрыва
   `_UNRESOLVED_DAG_ID`, `_extract_dag_id_from_decorators`, `_RMQ_TRIGGER_KWARGS`,
   `_is_rmq_trigger_call`, `_scanned_queue_label`, `_UNREADABLE_KWARG_OUTCOMES`,
   `_warn_unreadable_kwarg`, `_parse_rmq_trigger_decorator`, `_resolve_function_dag_id`.
-  В задаче 4 последние четыре заменяются новым кодом.
+  В задаче 4 `_scanned_queue_label`, `_UNREADABLE_KWARG_OUTCOMES`,
+  `_warn_unreadable_kwarg`, `_parse_rmq_trigger_decorator` и `_resolve_function_dag_id`
+  заменяются новым кодом, и у модуля не остаётся логгера: ничего в нём не логирует.
+  `_DagIdSentinel`, `_UNRESOLVED_DAG_ID` и `_extract_dag_id_from_decorators` сведены в
+  один `_static_dag_id(func, constants) -> str | None`.
 - Новые функции `dag_file_scan.py`:
   - `_collect_module_constants(tree) -> tuple[dict[str, tuple[Any, int]], set[int]]` —
-    значения любого типа, который даёт `ast.literal_eval`; константа со значением,
-    содержащим `list`/`dict`, пригодна, только если все её упоминания стоят внутри
-    аргументов вызовов `rmq_trigger`;
-  - `_resolve_static(node, constants) -> Any | _Unresolved` — рекурсивно: `Constant`,
-    `Name` из констант, `List`/`Tuple`, `Dict` (ключ `None`, то есть `{**X}`, — отказ),
-    `UnaryOp(USub/UAdd)` над числом; результат — глубокая копия;
+    значения, которые `_resolve_static` читает без констант: JSON-скаляры и списки,
+    кортежи, словари из них; константа со значением, содержащим `list`/`dict`, пригодна,
+    только если все её упоминания стоят внутри аргументов вызовов `rmq_trigger`;
+  - `_resolve_static(node, constants) -> Any`, отказ — исключение `_Unreadable` с
+    причиной, которое `_read_rmq_trigger_call` ловит один раз на аргумент. Рекурсивно:
+    `Constant` JSON-скалярного типа (`str`, `int`, `float`, `bool`, `None`), `Name` из
+    констант (значение константы как есть, без копии), `List`/`Tuple`, `Dict` (ключ
+    `None`, то есть `{**X}`, — отказ), `UnaryOp(USub/UAdd)` над `int`/`float`. Литерал
+    множества, `bytes`, комплексное число и всё остальное — отказ: подписка хранится
+    как JSON;
   - `_read_rmq_trigger_call(call, constants) -> _CallRead` —
     `_CallRead(kwargs: dict, unreadable: list[tuple[str, str]])`, второй элемент —
     `(параметр, причина)`. Позиционные маппятся на
@@ -314,28 +323,44 @@ watcher продолжает регистрировать. Это закрыва
     распаковке, повтор параметра между позиционными, ключевыми и `**` — нечитаемо;
   - `_read_and_parse(path) -> ast.Module`, `_usable_constants(...)`,
     `_iter_trigger_functions(tree)`, `_static_dag_id(func, constants)`,
-    `_read_function_triggers(func, constants, dag_id) -> _FunctionRead`
-    (`subscriptions`, `problems`; отказ `build_subscriptions` — тоже проблема с текстом
-    билдера);
-  - `_read_file_triggers(tree, path) -> _FileRead` (`subscriptions`, `problems`): проблема
+    `_read_function_triggers(func, constants, dag_id) -> _TriggerRead`
+    (`subscriptions`, `problems`, `calls`: для каждого прочитанного вызова — первая и
+    последняя строка, `dag_id` и подписки `build_subscriptions`; отказ
+    `build_subscriptions` — тоже проблема с текстом билдера);
+  - `_trigger_origin_problems(tree)` — вызов `rmq_trigger` в `decorator_list` читается,
+    только если имя связано абсолютным импортом из
+    `airflow_provider_rmq.watcher.decorators` (или `airflow_provider_rmq.watcher`), а
+    `<module>.rmq_trigger` — если `<module>` связан импортом с одним из этих модулей;
+    одноимённый `rmq_trigger` другого модуля, относительный импорт и `import *` —
+    проблема файла;
+  - `_read_file_triggers(tree) -> _TriggerRead` (`subscriptions`, `problems`, `calls`): проблема
     хоть одной функции, нерезолвимый `dag_id` на функции с `@rmq_trigger`, упоминание
     имени `rmq_trigger` или атрибута `.rmq_trigger` иначе, чем как `func` вызова в
-    `decorator_list` функции (кроме импорта под собственным именем), — пустые
-    `subscriptions` у всего файла; то же, если `rmq_trigger` в `decorator_list` стоит ниже
-    вызова `dag`;
+    `decorator_list` функции (кроме импорта под собственным именем), проблема
+    `_trigger_origin_problems` — пустые `subscriptions` у всего файла; то же, если
+    `rmq_trigger` в `decorator_list` стоит ниже вызова `dag`;
   - `_watcher_scans(path, dags_folder) -> bool` — тот же отбор, что у
-    `glob(DAGS_FOLDER/**/*.py)`: `.py`, внутри папки по `os.path.abspath`, ни один
-    компонент пути после папки, включая имя файла, не начинается с точки;
+    `glob(DAGS_FOLDER/**/*.py)`: `.py`, внутри папки по `os.path.abspath` (а если нет —
+    по `os.path.realpath` обоих путей, для модуля, импортированного через другое
+    написание той же папки), ни один компонент пути после папки, включая имя файла, не
+    начинается с точки;
+  - `_analyse_file(path)` — результат `_read_file_triggers` (или исключение чтения и
+    разбора) в словаре модуля по абсолютному пути и версии файла
+    `(st_ino, st_mtime_ns, st_size)`: файл читается и разбирается один раз на версию,
+    сколько бы вызовов `@rmq_trigger` в нём ни проверялось;
   - `RMQTriggerNotStaticError(ValueError)`, `_verify_static_readability(path, lineno,
-    dag_id, runtime_subs, dags_folder)`.
+    dag_id, runtime_subs, dags_folder)` — шаги 3–5 ищут свой вызов в `calls` анализа
+    файла и сравнивают его `dag_id` и подписки, второго чтения вызова нет.
 - `listener.py`: `_extract_subscriptions_from_file` работает через `_read_and_parse` и
   `_read_file_triggers`, при проблемах пишет ERROR и возвращает пустой список.
 - `decorators.py`: `rmq_trigger` захватывает `(filename, f_lineno)` до создания
   `decorator`; `_attach` строит подписки из фактических аргументов, вызывает
   `_verify_static_readability` с `airflow.settings.DAGS_FOLDER` и продолжает с подписками
   из фактических аргументов.
-- Тесты, вызывающие `rmq_trigger(...)(dag)` напрямую, подменяют
-  `decorators._verify_static_readability` autouse-фикстурой в `test_decorators.py`;
+- `rmq_trigger(...)` на готовом `DAG` сразу бросает `TypeError`, без проверки файла:
+  такой вызов скан не видит никогда.
+- Тесты `test_decorators.py` применяют `rmq_trigger(...)` к фабрикам из тестового
+  модуля и подменяют `decorators._verify_static_readability` autouse-фикстурой;
   переключателя в рабочем коде нет.
 
 ## What Goes Where
@@ -545,15 +570,15 @@ watcher продолжает регистрировать. Это закрыва
 
 ### Task 8: [Final] Update documentation
 
-- [ ] `readme.md:628-630` и `readme_ru.md:628-630` (абзац 626 про доверенный скан не
+- [x] `readme.md:628-630` и `readme_ru.md:628-630` (абзац 626 про доверенный скан не
       трогать): какие формы аргументов и `dag_id`
       читаются, что нечитаемость ломает импорт всего файла, что `@rmq_trigger` должен
       стоять в файле, который сканирует watcher (внутри `DAGS_FOLDER`, без точки в
       начале имени каталога или файла), что проверка DAG'ов через
       `DagBag(dag_folder=...)` в CI должна выставлять `DAGS_FOLDER` на ту же папку
-- [ ] `readme.md:769` и `readme_ru.md:768`: убрать ветку «готовый инстанс `DAG`» из абзаца
+- [x] `readme.md:769` и `readme_ru.md:768`: убрать ветку «готовый инстанс `DAG`» из абзаца
       про стекинг `exchange=`
-- [ ] docstring `rmq_trigger`: `:param exchange:` (`decorators.py:68-73`) без ветки
+- [x] docstring `rmq_trigger`: `:param exchange:` (`decorators.py:68-73`) без ветки
       готового `DAG`; раздел «Decorator order and DAG types» переписать — watcher видит
       только форму `@rmq_trigger(...)` над `@dag(...)` в файле внутри `DAGS_FOLDER`,
       прямой вызов на готовом `DAG` даёт ошибку импорта; абзац про статически читаемые
@@ -561,22 +586,23 @@ watcher продолжает регистрировать. Это закрыва
       наименьшем `conn_id` cooldown-подписок (`decorators.py:119` называет «первое
       найденное соединение»); `TypeError` при неверном порядке декораторов возникает при
       вызове фабрики, а не при декорировании (`decorators.py:162`)
-- [ ] `docs/live-verification.md:703-708`: нечитаемый аргумент — import error и отказ
+- [x] `docs/live-verification.md:703-708`: нечитаемый аргумент — import error и отказ
       watcher'а всему файлу с ERROR; ссылку на удаляемый
       `rmq-trigger-kwargs-silently-dropped.md` убрать
-- [ ] переписать блоки «Gotcha: literal arguments only» целиком:
+- [x] переписать блоки «Gotcha: literal arguments only» целиком:
       `docs/example_dags/rmq_watcher_jetstat_exchange.py:65-82` и
       `docs/example_dags/rmq_watcher_cooldown_multi_queue.py:46-67`
-- [ ] перенаправить ссылки `listener.py:N` в `docs/backlog/` (`where:` и текст) на строки
+- [x] перенаправить ссылки `listener.py:N` в `docs/backlog/` (`where:` и текст) на строки
       после задач 1 и 4; ссылки на перенесённые функции, включая `where:`
       `ast-dag-id-resolution-incomplete.md`, — на `dag_file_scan.py`
-- [ ] бэклог: `git rm docs/backlog/rmq-trigger-kwargs-silently-dropped.md`; переписать
+- [x] бэклог: `git rm docs/backlog/rmq-trigger-kwargs-silently-dropped.md`; переписать
       `docs/backlog/ast-dag-id-resolution-incomplete.md` — f-строки, конкатенация,
       импортированные константы, `@dag(**DAG_KWARGS)` и фабрики по-прежнему не
       резолвятся, но на DAG'е с `@rmq_trigger` дают видимую ошибку импорта; `**CONST`
       резолвится для `rmq_trigger`, но не для `@dag(...)`; ссылку
       `[[rmq-trigger-kwargs-silently-dropped]]` (строка 55) убрать
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/` — переносит harness после завершения
+      плана; путь файла в ветке не меняется
 
 ## Post-Completion
 

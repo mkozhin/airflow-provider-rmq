@@ -62,24 +62,20 @@ and ``jetstat.airflow.unrouted``::
         "^(rmq_watcher\\..*|jetstat\\.airflow(\\.unrouted|\\.log)?)$" \\
         "^(rmq_watcher\\..*|jetstat\\.airflow(\\.unrouted)?)$"
 
-Gotcha: literal arguments only
--------------------------------
-``@rmq_trigger(...)`` is re-parsed from the DAG file's source via ``ast``
-whenever the reconcile loop re-scans the file (mtime-gated — unchanged
-files are not re-parsed on every cycle, only when their mtime changes) —
-only literal values are recognised. Referencing a module-level variable
-(e.g. a ``REPORT_ID`` constant) for ``routing_key_ids`` is ignored with a
-WARNING in the Scheduler log naming the DAG, the queue and the parameter, and
-the subscription is skipped — an ``exchange`` with no readable routing keys
-does not build. Write the report id directly as a string literal in the
-decorator call, as below.
-
-Note this literal-only restriction applies to the arguments of
-``@rmq_trigger(...)`` itself, not to ``dag_id`` in ``@dag(...)``: ``dag_id``
-now also resolves simple module-level string constants (e.g.
-``DAG_NAME = "x"`` then ``dag_id=DAG_NAME``), not just string literals —
-see "How it works" in the README. ``_parse_rmq_trigger_decorator``'s
-behavior for ``@rmq_trigger(...)``'s own arguments is unchanged.
+Gotcha: statically readable arguments
+--------------------------------------
+The watcher reads ``@rmq_trigger(...)`` from this file's source via ``ast``
+and never executes the file, so each argument must be something the source
+alone says: a literal, or a constant assigned a literal exactly once at the
+top level of this file, above the DAG function. ``REPORT_ID = "670f..."``
+followed by ``routing_key_ids=[REPORT_ID]`` is read; a list or dict constant
+is read only if the file uses it nowhere but in ``rmq_trigger`` arguments.
+An imported constant, a function call or an f-string is not read: the
+decorator then fails the import of this file with
+``RMQTriggerNotStaticError`` (a Broken DAG in the Airflow UI), and the
+watcher registers no subscription of the file and logs an ERROR naming the
+parameter and the reason. ``dag_id`` in ``@dag(...)`` follows the same rule
+and must be a string. See "How it works" in the README.
 """
 from __future__ import annotations
 
