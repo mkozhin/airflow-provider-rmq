@@ -1,16 +1,20 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/consumer.py:2076
+where: airflow_provider_rmq/utils/management.py:49
 added: 2026-08-30
 ---
 # Смена exchange в декораторе оставляет старые биндинги
 
-**Симптом.** `_provision_one_exchange_sub` (`airflow_provider_rmq/watcher/consumer.py`)
-сверяет биндинги через `get_current_bindings(..., exchange, ...)`, где
-`exchange` — тот, что назван в декораторе сейчас. Ответ Management API
-фильтруется по нему, поэтому в сверку попадают только биндинги нового
-exchange'а: недостающие добавляются, лишние на **прежнем** exchange не видны и
-не удаляются.
+**Симптом.** `_provision_one_exchange_sub` (`airflow_provider_rmq/watcher/consumer.py:2131`)
+сверяет биндинги через `get_current_bindings(..., exchange, ...)` (`consumer.py:2178`),
+где `exchange` — тот, что назван в декораторе сейчас. Ответ Management API
+фильтруется по нему (`b.get("source") == exchange`,
+`airflow_provider_rmq/utils/management.py:49`), а `_sync_bindings`
+(`consumer.py:3908`) снимает биндинги только с переданного exchange'а. Поэтому в
+сверку попадают только биндинги нового exchange'а: недостающие добавляются,
+лишние на **прежнем** exchange не видны и не удаляются. Прежний exchange нигде не
+хранится — метаданные exchange-подписки берутся из текущего скана
+(`exchange_meta`, `listener.py:1477`).
 
 Трасса. DAG в exchange-режиме переключают с `jetstat` на `jetstat_v2`. Имя
 очереди — `rmq_watcher.sub.{dag_id}` — не меняется, orphan-трекинг ключуется по
