@@ -14,10 +14,12 @@ third-party dependencies.
 from __future__ import annotations
 
 import ast
+import copy
 import enum
 import logging
 from collections.abc import Iterator
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 from airflow_provider_rmq.watcher.subscription_builder import build_subscriptions
 
@@ -25,7 +27,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Module-level constant collection (for resolving dag_id=NAME references)
+# Module-level constant collection (for dag_id=NAME and rmq_trigger arguments)
 # ---------------------------------------------------------------------------
 
 # Nodes whose body is a separate scope: the node's own name binds in the
@@ -643,6 +645,36 @@ def _parse_rmq_trigger_decorator(node: ast.expr, dag_id: str) -> list[dict]:
     return subscriptions
 
 
+def _usable_constants(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_constants: dict[str, tuple[Any, int]],
+    module_scope_function_ids: set[int],
+) -> dict[str, Any]:
+    """Return the module constants the decorators of ``node`` may refer to.
+
+    One filter for both ``dag_id=NAME`` and the ``rmq_trigger`` arguments:
+
+    - a function whose decorators do not run in module scope (nested in a
+      factory, a class body, ...) gets no constants — a local binding of the
+      same name could shadow the module-level one;
+    - a module-level function gets the constants assigned above its own line.
+      A constant assigned later would raise ``NameError`` when the decorator
+      runs at import time, so resolving it statically would be a false
+      positive.
+
+    ``module_constants`` and ``module_scope_function_ids`` are the two halves
+    of ``_collect_module_constants``'s result. The values are returned as
+    stored; ``_resolve_static`` copies them when it hands them out.
+    """
+    if id(node) not in module_scope_function_ids:
+        return {}
+    return {
+        name: value
+        for name, (value, lineno) in module_constants.items()
+        if lineno < node.lineno
+    }
+
+
 def _resolve_function_dag_id(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     module_constants: dict[str, tuple[Any, int]],
@@ -666,19 +698,7 @@ def _resolve_function_dag_id(
     registered (dag_id unresolvable); otherwise returns the dag_id string to
     use, already carrying the "no dag_id= at all -> function name" fallback.
     """
-    if id(node) not in module_scope_function_ids:
-        usable_constants: dict[str, Any] = {}  # nested: refuse to resolve
-    else:
-        # Position filter: a constant assigned AFTER this function's own
-        # line must not be used to resolve its dag_id= — real Python
-        # would NameError at import time in that case (use-before-
-        # definition), so statically resolving it would be a false
-        # positive.
-        usable_constants = {
-            name: value
-            for name, (value, lineno) in module_constants.items()
-            if lineno < node.lineno
-        }
+    usable_constants = _usable_constants(node, module_constants, module_scope_function_ids)
     dag_id = _extract_dag_id_from_decorators(node.decorator_list, usable_constants)
     if dag_id is _UNRESOLVED_DAG_ID:
         if any(_is_rmq_trigger_call(d) for d in node.decorator_list):
@@ -697,3 +717,207 @@ def _resolve_function_dag_id(
     if dag_id is None:
         return node.name
     return dag_id
+
+
+# ---------------------------------------------------------------------------
+# Static values of rmq_trigger(...) arguments
+# ---------------------------------------------------------------------------
+
+#: ``rmq_trigger``'s positional-or-keyword parameters, in signature order.
+_RMQ_TRIGGER_POSITIONAL = ("queue", "queues", "conn_id", "filter_data", "cooldown")
+
+
+@dataclass(frozen=True)
+class _Unresolved:
+    """An argument expression the scan cannot evaluate, and why."""
+
+    reason: str
+
+
+#: What an expression the scan does not evaluate is, by node type, for the reason text.
+_UNREADABLE_EXPRESSIONS: dict[type[ast.AST], str] = {
+    ast.Call: "a function call",
+    ast.Attribute: "an attribute access",
+    ast.Subscript: "a subscript",
+    ast.JoinedStr: "an f-string",
+    ast.BinOp: "an operator expression (concatenation, arithmetic, ...)",
+    ast.BoolOp: "a boolean expression",
+    ast.IfExp: "a conditional expression",
+    ast.Compare: "a comparison",
+    ast.Starred: "a starred (*) unpacking",
+    ast.Lambda: "a lambda",
+    ast.ListComp: "a comprehension",
+    ast.SetComp: "a comprehension",
+    ast.DictComp: "a comprehension",
+    ast.GeneratorExp: "a comprehension",
+    ast.NamedExpr: "an assignment expression (:=)",
+}
+
+
+def _unknown_name_reason(name: str) -> str:
+    return (
+        f"{name!r} is not a constant the scan can read — it must be assigned a "
+        "literal exactly once at the top level of this file, above a module-level "
+        "function, and a list or dict constant may appear only in rmq_trigger "
+        "arguments"
+    )
+
+
+def _resolve_static(node: ast.expr, constants: dict[str, Any]) -> Any:
+    """Evaluate an ``rmq_trigger`` argument expression without executing the file.
+
+    Returns the value, or an ``_Unresolved`` carrying the reason. Readable are:
+    literals; names found in ``constants`` (the ``_usable_constants`` of the
+    decorated function); list, tuple, set and dict displays whose elements, keys
+    included, are readable themselves (``queues=[Q1, Q2]``,
+    ``filter_data={"body.type": PAID}``); ``-``/``+`` applied to a number. Anything
+    else ``ast.literal_eval`` accepts (``1+2j``, ``set()``) is read through it.
+    Everything else is unreadable: it is computed when the file is imported, and
+    the scan never imports it.
+
+    The result never shares objects with ``constants``: a constant's value is
+    deep-copied, and displays are built afresh.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id in constants:
+            return copy.deepcopy(constants[node.id])
+        return _Unresolved(_unknown_name_reason(node.id))
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        items = []
+        for elt in node.elts:
+            item = _resolve_static(elt, constants)
+            if isinstance(item, _Unresolved):
+                return item
+            items.append(item)
+        if isinstance(node, ast.List):
+            return items
+        if isinstance(node, ast.Tuple):
+            return tuple(items)
+        try:
+            return set(items)
+        except TypeError:
+            return _Unresolved("a set display holds an unhashable element")
+    if isinstance(node, ast.Dict):
+        result: dict[Any, Any] = {}
+        for key_node, value_node in zip(node.keys, node.values):
+            if key_node is None:
+                return _Unresolved("a dict display unpacks another dict (**)")
+            key = _resolve_static(key_node, constants)
+            if isinstance(key, _Unresolved):
+                return key
+            value = _resolve_static(value_node, constants)
+            if isinstance(value, _Unresolved):
+                return value
+            try:
+                result[key] = value
+            except TypeError:
+                return _Unresolved("a dict display has an unhashable key")
+        return result
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        operand = _resolve_static(node.operand, constants)
+        if isinstance(operand, _Unresolved):
+            return operand
+        # Exact type, as in ast.literal_eval: a sign on a bool is not a number.
+        if type(operand) not in (int, float, complex):
+            return _Unresolved("a sign applied to something other than a number")
+        return -operand if isinstance(node.op, ast.USub) else +operand
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        pass
+    what = _UNREADABLE_EXPRESSIONS.get(type(node), f"a {type(node).__name__} expression")
+    return _Unresolved(f"{what} is computed when the file is imported")
+
+
+class _CallRead(NamedTuple):
+    """What the scan read from one ``rmq_trigger(...)`` call.
+
+    ``kwargs`` maps parameter names to the values read, ready for
+    ``build_subscriptions``. ``unreadable`` lists ``(parameter, reason)`` for every
+    argument that could not be read; the parameter is a placeholder such as
+    ``"*args"`` or ``"**OPTS"`` when the argument names none. A call with any
+    unreadable argument does not say what the decorator receives, so its
+    ``kwargs`` must not be used to build subscriptions.
+    """
+
+    kwargs: dict[str, Any]
+    unreadable: list[tuple[str, str]]
+
+
+def _read_rmq_trigger_call(call: ast.Call, constants: dict[str, Any]) -> _CallRead:
+    """Read the arguments of one ``rmq_trigger(...)`` call statically.
+
+    ``constants`` are the ``_usable_constants`` of the decorated function. Read are:
+
+    - positional arguments, mapped onto ``queue, queues, conn_id, filter_data,
+      cooldown`` (the parameters ``rmq_trigger`` accepts positionally);
+    - keyword arguments of ``rmq_trigger``'s own parameters;
+    - ``**NAME``, where ``NAME`` is a dict constant whose keys are parameter names.
+
+    Each value goes through ``_resolve_static``. Unreadable, with the reason, is: a
+    value ``_resolve_static`` cannot evaluate, a sixth positional argument, ``*args``,
+    ``**`` of anything but a dict constant, a key that is not a parameter (written
+    out or inside the unpacked dict), and a parameter given more than once across
+    positional, keyword and ``**`` arguments — Python rejects the last three when it
+    calls the decorator, so the call never produces what the scan would read.
+    """
+    kwargs: dict[str, Any] = {}
+    unreadable: list[tuple[str, str]] = []
+
+    def _take(param: str, value: Any) -> None:
+        if param in kwargs:
+            unreadable.append((param, "the parameter is given more than once"))
+        elif isinstance(value, _Unresolved):
+            unreadable.append((param, value.reason))
+        else:
+            kwargs[param] = value
+
+    for index, arg in enumerate(call.args):
+        if isinstance(arg, ast.Starred):
+            # The positions the unpacked values land on are unknown, so nothing
+            # after it can be mapped onto a parameter either.
+            unreadable.append(
+                ("*args", "a starred (*) unpacking hides which parameters it fills")
+            )
+            break
+        if index >= len(_RMQ_TRIGGER_POSITIONAL):
+            limit = len(_RMQ_TRIGGER_POSITIONAL)
+            unreadable.append((
+                f"positional argument {index + 1}",
+                f"rmq_trigger takes at most {limit} positional arguments",
+            ))
+            continue
+        _take(_RMQ_TRIGGER_POSITIONAL[index], _resolve_static(arg, constants))
+
+    for kw in call.keywords:
+        if kw.arg is not None:
+            if kw.arg not in _RMQ_TRIGGER_KWARGS:
+                unreadable.append((kw.arg, "rmq_trigger has no such parameter"))
+                continue
+            _take(kw.arg, _resolve_static(kw.value, constants))
+            continue
+        # **expr: only a dict constant of this file says which arguments it carries.
+        if not isinstance(kw.value, ast.Name):
+            unreadable.append(
+                ("**", "only a dict constant of this file can be unpacked (**NAME)")
+            )
+            continue
+        label = f"**{kw.value.id}"
+        unpacked = _resolve_static(kw.value, constants)
+        if isinstance(unpacked, _Unresolved):
+            unreadable.append((label, unpacked.reason))
+            continue
+        if not isinstance(unpacked, dict):
+            unreadable.append((label, f"{kw.value.id!r} is not a dict constant"))
+            continue
+        for key, value in unpacked.items():
+            if not isinstance(key, str) or key not in _RMQ_TRIGGER_KWARGS:
+                unreadable.append((
+                    f"{label}[{key!r}]", "rmq_trigger has no such parameter"
+                ))
+                continue
+            _take(key, value)
+
+    return _CallRead(kwargs, unreadable)

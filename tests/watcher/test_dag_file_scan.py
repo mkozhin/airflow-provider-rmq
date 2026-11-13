@@ -8,6 +8,11 @@ from airflow_provider_rmq.watcher.dag_file_scan import (
     _UNRESOLVED_DAG_ID,
     _collect_module_constants,
     _extract_dag_id_from_decorators,
+    _is_rmq_trigger_call,
+    _read_rmq_trigger_call,
+    _resolve_static,
+    _Unresolved,
+    _usable_constants,
 )
 
 
@@ -222,3 +227,325 @@ class TestDagIdFromNonStringConstant:
     def test_none_literal_falls_back_to_function_name(self):
         src = "@dag(dag_id=None)\ndef f(): pass\n"
         assert _dag_id_of_last_function(src) is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_static
+# ---------------------------------------------------------------------------
+
+
+def _expr(src: str) -> ast.expr:
+    return ast.parse(src, mode="eval").body
+
+
+class TestResolveStatic:
+    @pytest.mark.parametrize(
+        ("src", "expected"),
+        [
+            ("'q'", "q"),
+            ("30", 30),
+            ("-5", -5),
+            ("+5", 5),
+            ("-1.5", -1.5),
+            ("1+2j", 1 + 2j),
+            ("True", True),
+            ("None", None),
+            ("['a', ('b', 1)]", ["a", ("b", 1)]),
+            ("{'a': [1, {'b': None}]}", {"a": [1, {"b": None}]}),
+            ("{'a', 'b'}", {"a", "b"}),
+            ("set()", set()),
+        ],
+    )
+    def test_literal(self, src, expected):
+        result = _resolve_static(_expr(src), {})
+        assert result == expected
+        assert type(result) is type(expected)
+
+    def test_constant_names_inside_displays(self):
+        constants = {"Q1": "q1", "Q2": "q2", "PAID": "paid", "KEY": "body.type", "N": 3}
+        assert _resolve_static(_expr("[Q1, Q2]"), constants) == ["q1", "q2"]
+        assert _resolve_static(_expr("{KEY: PAID, 'n': -N}"), constants) == {
+            "body.type": "paid", "n": -3,
+        }
+        assert _resolve_static(_expr("(Q1, [Q2, {'x': N}])"), constants) == (
+            "q1", ["q2", {"x": 3}],
+        )
+
+    @pytest.mark.parametrize(
+        ("src", "fragment"),
+        [
+            ("get_conn()", "function call"),
+            ("settings.CONN", "attribute access"),
+            ("os.environ['X']", "subscript"),
+            ("f'{ENV}.orders'", "f-string"),
+            ("ENV + '.orders'", "operator expression"),
+            ("{**X}", "unpacks another dict"),
+            ("[*Q]", "starred"),
+            ("-'a'", "other than a number"),
+            ("-True", "other than a number"),
+            ("[Q, get()]", "function call"),
+            ("{'k': get()}", "function call"),
+            ("{[1]: 'v'}", "unhashable"),
+            ("UNKNOWN", "'UNKNOWN' is not a constant the scan can read"),
+        ],
+    )
+    def test_unreadable_has_reason(self, src, fragment):
+        result = _resolve_static(_expr(src), {"ENV": "prod", "X": {"a": 1}, "Q": "q"})
+        assert isinstance(result, _Unresolved)
+        assert fragment in result.reason
+
+    def test_constant_value_is_copied(self):
+        constants = {"FILTER": {"body": {"type": ["paid"]}}}
+        result = _resolve_static(_expr("FILTER"), constants)
+        assert result == constants["FILTER"]
+        result["body"]["type"].append("free")
+        result["extra"] = 1
+        assert constants == {"FILTER": {"body": {"type": ["paid"]}}}
+
+    def test_constant_inside_display_is_copied(self):
+        constants = {"QUEUES": ["q1"]}
+        result = _resolve_static(_expr("[QUEUES]"), constants)
+        result[0].append("q2")
+        assert constants == {"QUEUES": ["q1"]}
+
+
+# ---------------------------------------------------------------------------
+# _read_rmq_trigger_call
+# ---------------------------------------------------------------------------
+
+
+def _read_call(src: str, function: str = "f"):
+    """Read the single ``rmq_trigger`` decorator of ``function`` as the scan would."""
+    tree = ast.parse(src)
+    module_constants, module_scope_ids = _collect_module_constants(tree)
+    func = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
+    )
+    calls = [dec for dec in func.decorator_list if _is_rmq_trigger_call(dec)]
+    assert len(calls) == 1
+    constants = _usable_constants(func, module_constants, module_scope_ids)
+    return _read_rmq_trigger_call(calls[0], constants)
+
+
+def _decorated(decorator: str, prelude: str = "") -> str:
+    return f"{prelude}@{decorator}\n@dag(dag_id='d')\ndef f():\n    pass\n"
+
+
+class TestReadRmqTriggerCall:
+    def test_bare_constant_name(self):
+        read = _read_call(_decorated(
+            "rmq_trigger(queue='q', conn_id=RMQ_CONN)", "RMQ_CONN = 'rmq_prod'\n"
+        ))
+        assert read.kwargs == {"queue": "q", "conn_id": "rmq_prod"}
+        assert read.unreadable == []
+
+    def test_positional_queue_constant(self):
+        read = _read_call(_decorated("rmq_trigger(QUEUE)", "QUEUE = 'orders'\n"))
+        assert read.kwargs == {"queue": "orders"}
+        assert read.unreadable == []
+
+    def test_positional_conn_id_filter_data_cooldown(self):
+        read = _read_call(_decorated(
+            "rmq_trigger(QUEUE, None, RMQ_CONN, {'body.type': 'paid'}, COOLDOWN)",
+            "QUEUE = 'orders'\nRMQ_CONN = 'rmq_prod'\nCOOLDOWN = 30\n",
+        ))
+        assert read.kwargs == {
+            "queue": "orders",
+            "queues": None,
+            "conn_id": "rmq_prod",
+            "filter_data": {"body.type": "paid"},
+            "cooldown": 30,
+        }
+        assert read.unreadable == []
+
+    def test_queues_list_of_constants(self):
+        read = _read_call(_decorated(
+            "rmq_trigger(queues=[Q1, Q2])", "Q1 = 'a'\nQ2 = 'b'\n"
+        ))
+        assert read.kwargs == {"queues": ["a", "b"]}
+
+    def test_filter_data_with_constant_value(self):
+        read = _read_call(_decorated(
+            "rmq_trigger(queue='q', filter_data={'body.type': PAID})", "PAID = 'paid'\n"
+        ))
+        assert read.kwargs == {"queue": "q", "filter_data": {"body.type": "paid"}}
+
+    def test_unpacked_dict_constant(self):
+        read = _read_call(_decorated(
+            "rmq_trigger(**RMQ_OPTS)",
+            "RMQ_OPTS = {'queue': 'q', 'conn_id': 'rmq_prod', 'cooldown': 30}\n",
+        ))
+        assert read.kwargs == {"queue": "q", "conn_id": "rmq_prod", "cooldown": 30}
+        assert read.unreadable == []
+
+    def test_unpacked_dict_constant_mixed_with_explicit_arguments(self):
+        read = _read_call(_decorated(
+            "rmq_trigger(QUEUE, filter_data={'k': 'v'}, **RMQ_OPTS)",
+            "QUEUE = 'orders'\nRMQ_OPTS = {'conn_id': 'rmq_prod', 'ack_unmatched': True}\n",
+        ))
+        assert read.kwargs == {
+            "queue": "orders",
+            "filter_data": {"k": "v"},
+            "conn_id": "rmq_prod",
+            "ack_unmatched": True,
+        }
+        assert read.unreadable == []
+
+    def test_attribute_form(self):
+        read = _read_call(_decorated(
+            "decorators.rmq_trigger(exchange=EX, routing_key_ids=['job'], "
+            "routing_key_status=STATUS)",
+            "EX = 'events'\nSTATUS = 'succeeded'\n",
+        ))
+        assert read.kwargs == {
+            "exchange": "events",
+            "routing_key_ids": ["job"],
+            "routing_key_status": "succeeded",
+        }
+
+    def test_read_values_do_not_share_objects_with_constants(self):
+        src = _decorated(
+            "rmq_trigger(queue='q', filter_data=FILTER)", "FILTER = {'a': ['b']}\n"
+        )
+        tree = ast.parse(src)
+        module_constants, module_scope_ids = _collect_module_constants(tree)
+        func = tree.body[-1]
+        assert isinstance(func, ast.FunctionDef)
+        constants = _usable_constants(func, module_constants, module_scope_ids)
+        call = func.decorator_list[0]
+        assert isinstance(call, ast.Call)
+        read = _read_rmq_trigger_call(call, constants)
+        read.kwargs["filter_data"]["a"].append("c")
+        assert constants["FILTER"] == {"a": ["b"]}
+        assert module_constants["FILTER"] == ({"a": ["b"]}, 1)
+
+
+class TestReadRmqTriggerCallUnreadable:
+    @staticmethod
+    def _single(read) -> tuple[str, str]:
+        assert len(read.unreadable) == 1, read.unreadable
+        return read.unreadable[0]
+
+    @pytest.mark.parametrize(
+        ("decorator", "prelude", "param", "fragment"),
+        [
+            ("rmq_trigger(queue='q', conn_id=RMQ_CONN)",
+             "from common.rmq import RMQ_CONN\n", "conn_id", "'RMQ_CONN' is not a constant"),
+            ("rmq_trigger(queue='q', conn_id=get_conn())", "", "conn_id", "function call"),
+            ("rmq_trigger(queue='q', conn_id=settings.RMQ_CONN)", "", "conn_id",
+             "attribute access"),
+            ("rmq_trigger(queue=f'{ENV}.orders')", "ENV = 'prod'\n", "queue", "f-string"),
+            ("rmq_trigger(queue=ENV + '.orders')", "ENV = 'prod'\n", "queue",
+             "operator expression"),
+            ("rmq_trigger(queue='q', filter_data={**BASE})", "BASE = {'a': 1}\n",
+             "filter_data", "unpacks another dict"),
+            ("rmq_trigger(*ARGS)", "ARGS = ('q',)\n", "*args", "starred"),
+            ("rmq_trigger(queue='q', **load())", "", "**", "dict constant"),
+            ("rmq_trigger(queue='q', **OPTS)", "OPTS = ['a']\n", "**OPTS",
+             "not a dict constant"),
+            ("rmq_trigger(queues_=['q'])", "", "queues_", "no such parameter"),
+            ("rmq_trigger(**OPTS)", "OPTS = {'queue': 'q', 'queues_': ['q']}\n",
+             "**OPTS['queues_']", "no such parameter"),
+            ("rmq_trigger('q', queue='r')", "", "queue", "more than once"),
+            ("rmq_trigger(queue='q', **OPTS)", "OPTS = {'queue': 'r'}\n", "queue",
+             "more than once"),
+            ("rmq_trigger('q', None, 'c', None, 0, 'extra')", "", "positional argument 6",
+             "at most 5"),
+        ],
+        ids=["imported_name", "call", "attribute", "f_string", "concatenation",
+             "dict_unpacking_in_display", "star_args", "unpacked_call",
+             "unpacked_non_dict_constant", "unknown_keyword", "unknown_key_in_unpacking",
+             "positional_and_keyword", "keyword_and_unpacking", "sixth_positional"],
+    )
+    def test_reason(self, decorator, prelude, param, fragment):
+        read = _read_call(_decorated(decorator, prelude))
+        got_param, reason = self._single(read)
+        assert got_param == param
+        assert fragment in reason
+
+    def test_readable_arguments_beside_an_unreadable_one_are_kept(self):
+        read = _read_call(_decorated("rmq_trigger(queue='q', conn_id=get_conn(), cooldown=5)"))
+        assert read.kwargs == {"queue": "q", "cooldown": 5}
+        assert [param for param, _ in read.unreadable] == ["conn_id"]
+
+    def test_constant_below_the_function(self):
+        src = _decorated("rmq_trigger(queue='q', conn_id=RMQ_CONN)") + "RMQ_CONN = 'rmq_prod'\n"
+        param, reason = self._single(_read_call(src))
+        assert param == "conn_id"
+        assert "'RMQ_CONN' is not a constant" in reason
+
+    def test_constant_used_in_a_nested_function(self):
+        src = (
+            "RMQ_CONN = 'rmq_prod'\n"
+            "def factory():\n"
+            "    @rmq_trigger(queue='q', conn_id=RMQ_CONN)\n"
+            "    @dag(dag_id='d')\n"
+            "    def f():\n"
+            "        pass\n"
+            "    return f\n"
+        )
+        param, reason = self._single(_read_call(src))
+        assert param == "conn_id"
+        assert "'RMQ_CONN' is not a constant" in reason
+
+    def test_literals_in_a_nested_function_are_read(self):
+        src = (
+            "def factory():\n"
+            "    @rmq_trigger(queue='q', conn_id='rmq_prod')\n"
+            "    @dag(dag_id='d')\n"
+            "    def f():\n"
+            "        pass\n"
+            "    return f\n"
+        )
+        read = _read_call(src)
+        assert read.kwargs == {"queue": "q", "conn_id": "rmq_prod"}
+        assert read.unreadable == []
+
+    def test_mutated_constant(self):
+        prelude = "FILTER = {'body.type': 'paid'}\nFILTER['body.type'] = 'free'\n"
+        param, reason = self._single(_read_call(_decorated(
+            "rmq_trigger(queue='q', filter_data=FILTER)", prelude
+        )))
+        assert param == "filter_data"
+        assert "'FILTER' is not a constant" in reason
+
+    def test_mutated_constant_in_unpacking(self):
+        prelude = "OPTS = {'queue': 'q'}\nOPTS['queue'] = 'r'\n"
+        param, reason = self._single(_read_call(_decorated("rmq_trigger(**OPTS)", prelude)))
+        assert param == "**OPTS"
+        assert "'OPTS' is not a constant" in reason
+
+
+# ---------------------------------------------------------------------------
+# _usable_constants
+# ---------------------------------------------------------------------------
+
+
+class TestUsableConstants:
+    SRC = (
+        "A = 'a'\n"
+        "def f():\n"
+        "    def inner():\n"
+        "        pass\n"
+        "B = 'b'\n"
+        "def g():\n"
+        "    pass\n"
+    )
+
+    def _functions(self):
+        tree = ast.parse(self.SRC)
+        module_constants, module_scope_ids = _collect_module_constants(tree)
+        funcs = {
+            node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+        return funcs, module_constants, module_scope_ids
+
+    def test_only_constants_above_the_function(self):
+        funcs, module_constants, ids = self._functions()
+        assert _usable_constants(funcs["f"], module_constants, ids) == {"A": "a"}
+        assert _usable_constants(funcs["g"], module_constants, ids) == {"A": "a", "B": "b"}
+
+    def test_nested_function_gets_none(self):
+        funcs, module_constants, ids = self._functions()
+        assert _usable_constants(funcs["inner"], module_constants, ids) == {}
