@@ -8,6 +8,10 @@ verdict of ``_read_file_triggers`` — lives here. Nothing here logs: a file the
 scan cannot read fully comes back as a list of problems, and the caller
 reports them.
 
+The decorator runs the same reading on its own call site at import time
+(``_verify_static_readability``) and raises ``RMQTriggerNotStaticError`` when
+the scan would not see the subscriptions the decorator builds.
+
 The module depends only on the standard library and ``subscription_builder``, so
 it can be imported inside the DAG processor without pulling in the watcher's
 runtime modules (``listener``, ``consumer``, ``models``, ``runner``) and their
@@ -19,6 +23,7 @@ from __future__ import annotations
 import ast
 import copy
 import enum
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, NamedTuple, TypeGuard
@@ -948,3 +953,199 @@ def _read_file_triggers(tree: ast.Module) -> _FileRead:
     if problems:
         return _FileRead([], problems)
     return _FileRead(subscriptions, [])
+
+
+# ---------------------------------------------------------------------------
+# Checking a decorator call against the scan
+# ---------------------------------------------------------------------------
+
+# Keys the watcher adds to every stored row itself; the decorator's subscriptions
+# do not carry them.
+_ROW_KEYS = frozenset({"dag_id", "group_key"})
+
+_MISSING = object()
+
+
+class RMQTriggerNotStaticError(ValueError):
+    """The watcher's scan would not see the subscriptions an ``@rmq_trigger`` call builds.
+
+    Raised by the decorator while the DAG file is imported, so the DAG processor
+    records an import error for the file instead of running DAGs the watcher
+    would serve with other arguments, or not at all.
+    """
+
+
+def _watcher_scans(path: str, dags_folder: str) -> bool:
+    """Tell whether the watcher's ``glob(DAGS_FOLDER/**/*.py)`` lists ``path``.
+
+    The file must end in ``.py``, lie inside ``dags_folder``, and no component of
+    its path below the folder — the file name included — may start with a dot:
+    ``glob`` skips hidden directories and files such as ``.x.py``. Both paths go
+    through ``os.path.abspath`` only, without resolving symlinks, because
+    ``glob`` returns the paths below the folder as they are spelled there.
+    """
+    if not path.endswith(".py"):
+        return False
+    prefix = os.path.join(os.path.abspath(dags_folder), "")
+    full = os.path.abspath(path)
+    if not full.startswith(prefix):
+        return False
+    below = full[len(prefix):]
+    return not any(part.startswith(".") for part in below.split(os.sep))
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    """Compare two argument values the way the stored row would tell them apart.
+
+    Scalars are equal only with the same exact type, so ``1``, ``1.0`` and
+    ``True`` differ. Lists and tuples compare element by element, sets by
+    members. Dicts compare by key sets — a key matches only a key of the same
+    type — and the values under matching keys; keys are never sorted, so a dict
+    with keys of mixed types compares without error.
+    """
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, (list, tuple)):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
+    if isinstance(a, (set, frozenset)):
+        return len(a) == len(b) and all(any(_same_value(x, y) for y in b) for x in a)
+    if isinstance(a, dict):
+        if len(a) != len(b):
+            return False
+        for key_a, value_a in a.items():
+            key_b = next((k for k in b if _same_value(key_a, k)), _MISSING)
+            if key_b is _MISSING or not _same_value(value_a, b[key_b]):
+                return False
+        return True
+    return bool(a == b)
+
+
+def _subscription_differences(static: list[dict], runtime: list[dict]) -> list[str]:
+    """List the fields in which the scan's subscriptions differ from the decorator's."""
+    if len(static) != len(runtime):
+        return [(
+            f"the watcher builds {len(static)} subscription(s), the decorator "
+            f"builds {len(runtime)}"
+        )]
+    differences: list[str] = []
+    for index, (static_sub, runtime_sub) in enumerate(zip(static, runtime), start=1):
+        keys = [k for k in static_sub if k not in _ROW_KEYS]
+        keys += [k for k in runtime_sub if k not in _ROW_KEYS and k not in static_sub]
+        for key in keys:
+            read = static_sub.get(key, _MISSING)
+            given = runtime_sub.get(key, _MISSING)
+            if read is not _MISSING and given is not _MISSING and _same_value(read, given):
+                continue
+            read_text = "nothing" if read is _MISSING else repr(read)
+            given_text = "nothing" if given is _MISSING else repr(given)
+            differences.append(
+                f"subscription {index}, {key}: the watcher reads {read_text}, "
+                f"the decorator receives {given_text}"
+            )
+    return differences
+
+
+def _find_trigger_call(
+    tree: ast.Module, lineno: int
+) -> tuple[_FunctionNode, dict[str, Any], ast.Call] | None:
+    """Find the ``@rmq_trigger(...)`` decorator whose lines span ``lineno``.
+
+    The function, its ``_usable_constants`` and the call are returned; ``None``
+    when no ``rmq_trigger(...)`` call in any ``decorator_list`` covers the line.
+    """
+    for func, constants in _iter_trigger_functions(tree):
+        for decorator in func.decorator_list:
+            if not _is_rmq_trigger_call(decorator):
+                continue
+            end = decorator.end_lineno or decorator.lineno
+            if decorator.lineno <= lineno <= end:
+                return func, constants, decorator
+    return None
+
+
+def _verify_static_readability(
+    path: str,
+    lineno: int,
+    dag_id: str,
+    runtime_subs: list[dict],
+    dags_folder: str,
+) -> None:
+    """Check that the watcher's scan reads this ``rmq_trigger(...)`` call as the decorator does.
+
+    ``path`` and ``lineno`` are the call site of ``rmq_trigger(...)``, ``dag_id``
+    the DAG it decorates and ``runtime_subs`` the subscriptions
+    ``build_subscriptions`` made from the arguments the decorator received.
+    In order:
+
+    1. the watcher must scan the file (``_watcher_scans`` against
+       ``dags_folder``);
+    2. the file must read and parse (``_read_and_parse``), and
+       ``_read_file_triggers`` must find no problem anywhere in it — any problem
+       would make the watcher refuse every subscription of the file;
+    3. an ``rmq_trigger(...)`` call in a ``decorator_list`` must span ``lineno``;
+    4. the ``dag_id`` the scan resolves for that function must be ``dag_id``;
+    5. the subscriptions the scan builds from that call must match
+       ``runtime_subs`` field by field (``_same_value``), leaving out the
+       ``dag_id``/``group_key`` keys the watcher adds to its rows.
+
+    :raises RMQTriggerNotStaticError: The first check that fails, with its reason.
+    """
+    where = f"@rmq_trigger(...) at {path}:{lineno} on DAG {dag_id!r}"
+
+    if not _watcher_scans(path, dags_folder):
+        raise RMQTriggerNotStaticError(
+            f"{where} is in a file the RMQ watcher does not scan, so the watcher "
+            "never registers its subscriptions. The watcher reads only *.py files "
+            f"inside DAGS_FOLDER ({dags_folder}) with no directory or file name "
+            "starting with '.' below it; declare @rmq_trigger(...) above @dag(...) "
+            "in such a DAG file."
+        )
+
+    try:
+        tree = _read_and_parse(path)
+    except Exception as exc:
+        raise RMQTriggerNotStaticError(
+            f"{where}: the RMQ watcher cannot read this file "
+            f"({type(exc).__name__}: {exc}), so it never registers its "
+            "subscriptions."
+        ) from exc
+
+    file_read = _read_file_triggers(tree)
+    if file_read.problems:
+        listed = "\n".join(f"- {problem}" for problem in file_read.problems)
+        raise RMQTriggerNotStaticError(
+            f"{where}: the RMQ watcher cannot read every @rmq_trigger of this file "
+            "statically and refuses all of its subscriptions:\n"
+            f"{listed}\n"
+            "Arguments and dag_id must be literals or constants assigned once at "
+            "the top level of this file above the decorated function."
+        )
+
+    found = _find_trigger_call(tree, lineno)
+    if found is None:
+        raise RMQTriggerNotStaticError(
+            f"{where}: rmq_trigger is called through a name the RMQ watcher does "
+            "not recognize. The watcher sees only the form @rmq_trigger(...) "
+            "above @dag(...) on a function of the DAG file; import rmq_trigger "
+            "from airflow_provider_rmq.watcher.decorators under its own name."
+        )
+    func, constants, call = found
+
+    static_dag_id = _static_dag_id(func, constants)
+    if static_dag_id != dag_id:
+        raise RMQTriggerNotStaticError(
+            f"{where}: the RMQ watcher reads dag_id={static_dag_id!r} for this "
+            f"call, but it decorates the DAG {dag_id!r}."
+        )
+
+    static_subs = build_subscriptions(
+        dag_id=dag_id, **_read_rmq_trigger_call(call, constants).kwargs
+    )
+    differences = _subscription_differences(static_subs, runtime_subs)
+    if differences:
+        listed = "\n".join(f"- {difference}" for difference in differences)
+        raise RMQTriggerNotStaticError(
+            f"{where}: the RMQ watcher reads other arguments from the file than "
+            f"the decorator receives:\n{listed}\n"
+            "A constant the call uses must keep its value until the DAG is built."
+        )
