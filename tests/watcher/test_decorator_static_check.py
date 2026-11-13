@@ -549,3 +549,93 @@ class TestWholeFileFails:
         assert "ValueError: 'cooldown' must be >= 0." in error
         assert "RMQTriggerNotStaticError" not in error
         assert not bag.dags
+
+
+def _watcher_errors(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "ERROR" and r.name == "airflow_provider_rmq.watcher.listener"
+    ]
+
+
+class TestWatcherAndDecoratorReadTheSameFile:
+    """One DAG file seen by both processes: the watcher's scan and the DAG import."""
+
+    @staticmethod
+    def _scan(path: Path, caplog) -> list[dict]:
+        import logging
+
+        from airflow_provider_rmq.watcher.listener import RMQWatcherListener
+
+        with caplog.at_level(logging.WARNING):
+            result = RMQWatcherListener()._extract_subscriptions_from_file(str(path))
+        assert result is not None
+        return result
+
+    def test_constants_give_the_watcher_the_decorators_subscriptions(self, dags_folder, caplog):
+        path = _write(dags_folder, "shared.py", """
+            QUEUE = "orders"
+            RMQ_CONN = "rmq_prod"
+            FILTER = {"filter_headers": {"type": "paid"}}
+            RMQ_OPTS = {"conn_id": "rmq_eu", "cooldown": 10}
+
+            @rmq_trigger(QUEUE, None, RMQ_CONN, FILTER, 30)
+            @rmq_trigger(queues=["payments", "refunds"], **RMQ_OPTS)
+            @dag(dag_id="shared_dag", schedule=None, start_date=START)
+            def shared_dag():
+                pass
+
+            shared_dag()
+        """)
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert not bag.import_errors
+        assert _watcher_errors(caplog) == []
+        imported = _subs(bag, "shared_dag")
+        stored_fields = [
+            {k: v for k, v in row.items() if k not in ("dag_id", "group_key")}
+            for row in scanned
+        ]
+        by_queue = sorted(stored_fields, key=lambda s: s["queue_name"])
+        assert by_queue == sorted(imported, key=lambda s: s["queue_name"])
+        assert {row["dag_id"] for row in scanned} == {"shared_dag"}
+        orders = next(s for s in by_queue if s["queue_name"] == "orders")
+        assert (orders["conn_id"], orders["filter_data"], orders["cooldown"]) == (
+            "rmq_prod",
+            {"filter_headers": {"type": "paid"}},
+            30,
+        )
+
+    def test_an_unreadable_argument_fails_in_both_processes(self, dags_folder, caplog):
+        path = _write(dags_folder, "broken.py", """
+            import os
+
+            @rmq_trigger(queue="good.q")
+            @dag(dag_id="good_dag", schedule=None, start_date=START)
+            def good_dag():
+                pass
+
+            good_dag()
+
+            @rmq_trigger(queue="bad.q", conn_id=os.environ.get("RMQ_CONN", "rmq_prod"))
+            @dag(dag_id="bad_dag", schedule=None, start_date=START)
+            def bad_dag():
+                pass
+
+            bad_dag()
+        """)
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert scanned == []
+        [error_log] = _watcher_errors(caplog)
+        assert str(path) in error_log
+        assert "conn_id cannot be read" in error_log
+
+        import_error = _import_error(bag, path)
+        assert "RMQTriggerNotStaticError" in import_error
+        assert STEP_3 in import_error
+        assert "conn_id cannot be read" in import_error
+        assert not bag.dags

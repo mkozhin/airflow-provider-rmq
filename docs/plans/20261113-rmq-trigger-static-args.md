@@ -532,15 +532,15 @@ watcher продолжает регистрировать. Это закрыва
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] нелитеральный, но статически читаемый аргумент даёт подписку с правильным
+- [x] нелитеральный, но статически читаемый аргумент даёт подписку с правильным
       значением
-- [ ] нечитаемый аргумент: watcher не строит ни одной подписки файла и пишет ERROR, файл
+- [x] нечитаемый аргумент: watcher не строит ни одной подписки файла и пишет ERROR, файл
       не импортируется, плашка «Broken DAG» с понятным текстом
-- [ ] вызов из файла, который watcher не сканирует, — ошибка импорта
-- [ ] позиционные `conn_id`/`filter_data`/`cooldown` читаются
-- [ ] DAG'и с литералами во вложенных фабриках и под модульным `if` работают как прежде
-- [ ] run full test suite: `pytest tests/ -q`
-- [ ] `ruff check airflow_provider_rmq tests` и `mypy airflow_provider_rmq` не добавляют
+- [x] вызов из файла, который watcher не сканирует, — ошибка импорта
+- [x] позиционные `conn_id`/`filter_data`/`cooldown` читаются
+- [x] DAG'и с литералами во вложенных фабриках и под модульным `if` работают как прежде
+- [x] run full test suite: `pytest tests/ -q`
+- [x] `ruff check airflow_provider_rmq tests` и `mypy airflow_provider_rmq` не добавляют
       новых замечаний
 
 ### Task 8: [Final] Update documentation
