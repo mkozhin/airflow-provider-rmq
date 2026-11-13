@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import functools
+import sys
 from typing import Any
 
+from airflow_provider_rmq.watcher.dag_file_scan import _verify_static_readability
 from airflow_provider_rmq.watcher.subscription_builder import (
     build_subscriptions,
     has_exchange_conflict,
@@ -176,6 +178,11 @@ def rmq_trigger(
     Subscriptions page), and a WARNING is logged the next time the file is
     re-scanned.
     """
+    # The call site of rmq_trigger(...): the file and line the watcher's scan has
+    # to find this call at, checked once the decorated DAG exists.
+    caller = sys._getframe(1)
+    call_file, call_line = caller.f_code.co_filename, caller.f_lineno
+    del caller
 
     def _attach(dag_obj):
         new_subs = build_subscriptions(
@@ -190,6 +197,14 @@ def rmq_trigger(
             filter_data=filter_data,
             cooldown=cooldown,
             ack_unmatched=ack_unmatched,
+        )
+
+        # DAGS_FOLDER of the Airflow process importing the DAG file, read when
+        # the DAG is built.
+        from airflow import settings
+
+        _verify_static_readability(
+            call_file, call_line, dag_obj.dag_id, new_subs, settings.DAGS_FOLDER
         )
 
         if not hasattr(dag_obj, "_rmq_subscriptions"):

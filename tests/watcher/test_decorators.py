@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock
 
 import pytest
 
+from airflow_provider_rmq.watcher import decorators
+from airflow_provider_rmq.watcher.dag_file_scan import RMQTriggerNotStaticError
 from airflow_provider_rmq.watcher.decorators import rmq_trigger
+
+
+@pytest.fixture(autouse=True)
+def static_check(monkeypatch):
+    """Replace the decorator's static-readability check and return the stand-in.
+
+    The tests here apply ``rmq_trigger(...)`` to DAG objects directly, a form the
+    watcher's scan never reads, so the real check would reject every one of
+    them; the check itself runs in ``test_decorator_static_check.py``.
+    """
+    check = MagicMock(return_value=None)
+    monkeypatch.setattr(decorators, "_verify_static_readability", check)
+    return check
 
 
 def _make_dag(dag_id="test_dag", schedule=None):
@@ -341,3 +357,75 @@ class TestRmqTriggerTaskFlowFactory:
     def test_invalid_input_string_raises_type_error(self):
         with pytest.raises(TypeError, match="DAG instance or a callable"):
             rmq_trigger(queue="orders")("not a dag or callable")
+
+
+class TestRmqTriggerStaticCheckCall:
+    """What ``_attach`` hands to ``_verify_static_readability`` and when."""
+
+    def test_check_receives_call_site_dag_id_subscriptions_and_dags_folder(
+        self, static_check, monkeypatch
+    ):
+        from airflow import settings
+
+        monkeypatch.setattr(settings, "DAGS_FOLDER", "/opt/airflow/dags")
+        dag = _make_dag(dag_id="checked_dag")
+        line = sys._getframe().f_lineno + 1
+        rmq_trigger(queue="orders", conn_id="rmq_eu")(dag)
+
+        static_check.assert_called_once()
+        path, lineno, dag_id, subs, dags_folder = static_check.call_args.args
+        assert path == __file__
+        assert lineno == line
+        assert dag_id == "checked_dag"
+        assert subs == dag._rmq_subscriptions
+        assert dags_folder == "/opt/airflow/dags"
+
+    def test_factory_check_runs_at_factory_call_with_decoration_call_site(self, static_check):
+        dag = _make_dag(dag_id="factory_dag")
+
+        def factory():
+            return dag
+
+        line = sys._getframe().f_lineno + 1
+        wrapped = rmq_trigger(queue="orders")(factory)
+        static_check.assert_not_called()
+
+        wrapped()
+
+        static_check.assert_called_once()
+        path, lineno, dag_id, _subs, _folder = static_check.call_args.args
+        assert (path, lineno, dag_id) == (__file__, line, "factory_dag")
+
+    def test_multiline_call_site_line_lies_within_the_call(self, static_check):
+        dag = _make_dag()
+        first = sys._getframe().f_lineno + 1
+        rmq_trigger(
+            queue="orders",
+            conn_id="rmq_eu",
+        )(dag)
+        last = first + 3
+
+        lineno = static_check.call_args.args[1]
+        assert first <= lineno <= last
+
+    def test_builder_error_surfaces_before_the_check(self, static_check):
+        dag = _make_dag()
+        with pytest.raises(ValueError, match="'cooldown' must be >= 0"):
+            rmq_trigger(queue="orders", cooldown=-1)(dag)
+        static_check.assert_not_called()
+
+    def test_check_error_propagates_and_leaves_dag_untouched(self, static_check):
+        static_check.side_effect = RMQTriggerNotStaticError("not static")
+        dag = _make_dag()
+        with pytest.raises(RMQTriggerNotStaticError, match="not static"):
+            rmq_trigger(queue="orders")(dag)
+        assert not hasattr(dag, "_rmq_subscriptions")
+
+    def test_each_stacked_call_is_checked_with_its_own_line(self, static_check):
+        dag = _make_dag()
+        first = sys._getframe().f_lineno + 1
+        rmq_trigger(queue="q1")(dag)
+        rmq_trigger(queue="q2")(dag)
+
+        lines = [call.args[1] for call in static_check.call_args_list]
+        assert lines == [first, first + 1]

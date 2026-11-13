@@ -43,9 +43,18 @@ def _rmq_trigger_example_dag_files() -> list[Path]:
 
 @pytest.fixture(scope="module")
 def dagbag():
+    """The example DAGs loaded the way Airflow loads them from ``DAGS_FOLDER``.
+
+    ``@rmq_trigger`` accepts a call only in a file the watcher scans, so
+    ``DAGS_FOLDER`` is the folder being loaded; the decorator's static check runs
+    on every example as it is.
+    """
+    from airflow import settings
     from airflow.models.dagbag import DagBag
 
-    return DagBag(dag_folder=str(EXAMPLE_DAGS_DIR), include_examples=False, safe_mode=False)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(settings, "DAGS_FOLDER", str(EXAMPLE_DAGS_DIR))
+        return DagBag(dag_folder=str(EXAMPLE_DAGS_DIR), include_examples=False, safe_mode=False)
 
 
 class TestExampleDagsImportCleanly:
@@ -84,3 +93,24 @@ class TestExampleDagsImportCleanly:
             assert any(
                 Path(p).name == path.name for p in dag_file_paths
             ), f"{path.name} produced no DAGs in the DagBag"
+
+
+class TestExampleDagsOutsideDagsFolder:
+    def test_loading_another_folder_than_dags_folder_is_an_import_error(self, tmp_path):
+        """A ``DagBag`` over a folder that is not ``DAGS_FOLDER`` — a CI check that
+        does not set it — reports every ``@rmq_trigger`` file as broken, because the
+        watcher would never scan those files."""
+        from airflow import settings
+        from airflow.models.dagbag import DagBag
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(settings, "DAGS_FOLDER", str(tmp_path))
+            bag = DagBag(
+                dag_folder=str(EXAMPLE_DAGS_DIR), include_examples=False, safe_mode=False
+            )
+
+        errors = {Path(path).name: text for path, text in bag.import_errors.items()}
+        for path in _rmq_trigger_example_dag_files():
+            assert path.name in errors, f"{path.name} imported outside DAGS_FOLDER"
+            assert "RMQTriggerNotStaticError" in errors[path.name]
+            assert "in a file the RMQ watcher does not scan" in errors[path.name]

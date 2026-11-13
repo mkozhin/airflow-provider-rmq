@@ -499,14 +499,14 @@ watcher продолжает регистрировать. Это закрыва
 - Modify: `tests/watcher/test_example_dags_dagbag.py`
 - Create: `tests/watcher/test_decorator_static_check.py`
 
-- [ ] `rmq_trigger` захватывает `(filename, f_lineno)` вызывающего кадра
-- [ ] `_attach`: подписки из фактических аргументов (его `ValueError` без изменений) →
+- [x] `rmq_trigger` захватывает `(filename, f_lineno)` вызывающего кадра
+- [x] `_attach`: подписки из фактических аргументов (его `ValueError` без изменений) →
       `_verify_static_readability` → дальше с подписками из фактических аргументов
-- [ ] autouse-фикстура в `test_decorators.py`, подменяющая
+- [x] autouse-фикстура в `test_decorators.py`, подменяющая
       `decorators._verify_static_readability`, для прямых вызовов `rmq_trigger(...)(dag)`
-- [ ] тесты через `DagBag` подменяют `airflow.settings.DAGS_FOLDER` на папку, которую
+- [x] тесты через `DagBag` подменяют `airflow.settings.DAGS_FOLDER` на папку, которую
       грузят (`tmp_path`), — без этого шаг 2 отвергает каждый файл
-- [ ] тесты через `DagBag` на файлах в `tmp_path`: литералы, константы, вложенная
+- [x] тесты через `DagBag` на файлах в `tmp_path`: литералы, константы, вложенная
       фабрика, DAG под модульным `if` импортируются; f-строка, вызов, импортированная
       константа, мутированная константа, декоратор в цикле, `dag_id` из импорта,
       `rmq_trigger(...)(dag)` в DAG-файле, `rmq_trigger as rt` (в том числе
@@ -515,20 +515,20 @@ watcher продолжает регистрировать. Это закрыва
       неизвестный ключ — import error с текстом шага 3 (перечень проблем файла);
       `@trig(...)` при `from helper import trig`, где `helper.py` вне `DAGS_FOLDER`
       переэкспортирует `rmq_trigger`, — import error с текстом шага 4
-- [ ] тест: TaskFlow-фабрика, константа которой меняется между строкой декоратора и
+- [x] тест: TaskFlow-фабрика, константа которой меняется между строкой декоратора и
       вызовом `my_dag()`, — import error
-- [ ] тест: фабрика с `@rmq_trigger` в модуле вне `DAGS_FOLDER`, вызванная из DAG-файла, —
+- [x] тест: фабрика с `@rmq_trigger` в модуле вне `DAGS_FOLDER`, вызванная из DAG-файла, —
       import error «файл не сканируется watcher'ом»
-- [ ] тест: файл с двумя DAG'ами, один нечитаем, — import error всего файла, `DagBag` не
+- [x] тест: файл с двумя DAG'ами, один нечитаем, — import error всего файла, `DagBag` не
       содержит ни одного из них
-- [ ] тест: невалидный литерал (`cooldown=-1`) даёт import error с текстом
+- [x] тест: невалидный литерал (`cooldown=-1`) даёт import error с текстом
       `build_subscriptions`, а не `RMQTriggerNotStaticError`
-- [ ] фикстура `dagbag` в `tests/watcher/test_example_dags_dagbag.py` подменяет
+- [x] фикстура `dagbag` в `tests/watcher/test_example_dags_dagbag.py` подменяет
       `airflow.settings.DAGS_FOLDER` на `EXAMPLE_DAGS_DIR`; проверку
       `_verify_static_readability` не подменяет — все примеры проходят её как есть
-- [ ] тест: `DagBag` по папке примеров без подмены `DAGS_FOLDER` даёт import error «файл не
+- [x] тест: `DagBag` по папке примеров без подмены `DAGS_FOLDER` даёт import error «файл не
       сканируется watcher'ом» — так пользователь видит ненастроенный CI
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 7: Verify acceptance criteria
 
