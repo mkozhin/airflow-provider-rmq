@@ -9,8 +9,12 @@ from airflow_provider_rmq.watcher.dag_file_scan import (
     _collect_module_constants,
     _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
+    _iter_trigger_functions,
+    _read_and_parse,
+    _read_file_triggers,
     _read_rmq_trigger_call,
     _resolve_static,
+    _static_dag_id,
     _Unresolved,
     _usable_constants,
 )
@@ -549,3 +553,194 @@ class TestUsableConstants:
     def test_nested_function_gets_none(self):
         funcs, module_constants, ids = self._functions()
         assert _usable_constants(funcs["inner"], module_constants, ids) == {}
+
+
+# ---------------------------------------------------------------------------
+# Reading a whole file
+# ---------------------------------------------------------------------------
+
+
+def _file_read(src: str):
+    return _read_file_triggers(ast.parse(src))
+
+
+class TestReadAndParse:
+    def test_utf8_bom_is_accepted(self, tmp_path):
+        path = tmp_path / "bom.py"
+        path.write_bytes(b"\xef\xbb\xbfX = 'x'\n")
+        tree = _read_and_parse(str(path))
+        assert isinstance(tree.body[0], ast.Assign)
+
+    def test_pep263_declaration_is_honoured(self, tmp_path):
+        path = tmp_path / "latin1.py"
+        path.write_bytes(b"# -*- coding: latin-1 -*-\nX = '\xe9'\n")
+        tree = _read_and_parse(str(path))
+        assert _collect_module_constants(tree)[0]["X"][0] == "é"
+
+    def test_undecodable_source_raises_syntax_error(self, tmp_path):
+        path = tmp_path / "bad.py"
+        path.write_bytes(b"X = '\xff'\n")
+        with pytest.raises(SyntaxError):
+            _read_and_parse(str(path))
+
+    def test_missing_file_raises_os_error(self, tmp_path):
+        with pytest.raises(OSError):
+            _read_and_parse(str(tmp_path / "absent.py"))
+
+    def test_filename_is_carried_into_the_tree_errors(self, tmp_path):
+        path = tmp_path / "broken.py"
+        path.write_text("def (:\n")
+        with pytest.raises(SyntaxError) as exc_info:
+            _read_and_parse(str(path))
+        assert exc_info.value.filename == str(path)
+
+
+class TestIterTriggerFunctions:
+    def test_only_functions_with_an_rmq_trigger_call(self):
+        tree = ast.parse(
+            "A = 'a'\n"
+            "@rmq_trigger(queue='q')\n@dag()\ndef with_trigger(): pass\n"
+            "@dag()\ndef without_trigger(): pass\n"
+            "def factory():\n"
+            "    @rmq_trigger(queue='n')\n    @dag()\n    def nested(): pass\n"
+        )
+        found = {func.name: constants for func, constants in _iter_trigger_functions(tree)}
+        assert found == {"with_trigger": {"A": "a"}, "nested": {}}
+
+
+class TestStaticDagId:
+    def _func(self, src: str):
+        tree = ast.parse(src)
+        func = tree.body[-1]
+        assert isinstance(func, ast.FunctionDef)
+        return func
+
+    def test_literal(self):
+        assert _static_dag_id(self._func("@dag(dag_id='x')\ndef f(): pass\n"), {}) == "x"
+
+    def test_constant(self):
+        func = self._func("@dag(dag_id=D)\ndef f(): pass\n")
+        assert _static_dag_id(func, {"D": "from_const"}) == "from_const"
+
+    def test_no_dag_id_falls_back_to_function_name(self):
+        assert _static_dag_id(self._func("@dag()\ndef f(): pass\n"), {}) == "f"
+
+    def test_unresolvable_is_none(self):
+        assert _static_dag_id(self._func("@dag(dag_id=f'{X}')\ndef f(): pass\n"), {}) is None
+
+    def test_no_dag_decorator_is_none(self):
+        assert _static_dag_id(self._func("@rmq_trigger(queue='q')\ndef f(): pass\n"), {}) is None
+
+
+class TestReadFileTriggers:
+    def test_readable_file_gives_rows_with_dag_id_and_group_key(self):
+        read = _file_read(
+            "RMQ_CONN = 'rmq_prod'\n"
+            "COOLDOWN = 30\n"
+            "@rmq_trigger(queue='q', conn_id=RMQ_CONN, cooldown=COOLDOWN)\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        )
+        assert read.problems == []
+        assert len(read.subscriptions) == 1
+        sub = read.subscriptions[0]
+        assert (sub["dag_id"], sub["conn_id"], sub["cooldown"], sub["group_key"]) == (
+            "d", "rmq_prod", 30, "d",
+        )
+
+    def test_one_problem_empties_the_whole_file(self):
+        read = _file_read(
+            "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n"
+            "@rmq_trigger(queue=get_queue())\n@dag(dag_id='b')\ndef b(): pass\n"
+        )
+        assert read.subscriptions == []
+        assert len(read.problems) == 1
+        assert "dag_id='b'" in read.problems[0]
+
+    def test_builder_refusal_carries_the_builder_text(self):
+        read = _file_read(
+            "@rmq_trigger(queue='a')\n"
+            "@rmq_trigger(queue='b', cooldown=-1)\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        )
+        assert read.subscriptions == []
+        assert "'cooldown' must be >= 0" in read.problems[0]
+
+    def test_unresolvable_dag_id_is_a_problem(self):
+        read = _file_read(
+            "@rmq_trigger(queue='a')\n@dag(dag_id=make_id())\ndef a(): pass\n"
+        )
+        assert read.subscriptions == []
+        assert "cannot statically resolve dag_id" in read.problems[0]
+        assert "'a'" in read.problems[0]
+
+    def test_unresolvable_dag_id_without_rmq_trigger_is_no_problem(self):
+        read = _file_read(
+            "@dag(dag_id=make_id())\ndef other(): pass\n"
+            "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n"
+        )
+        assert read.problems == []
+        assert [s["dag_id"] for s in read.subscriptions] == ["a"]
+
+    def test_rmq_trigger_below_dag_is_a_problem(self):
+        read = _file_read("@dag(dag_id='a')\n@rmq_trigger(queue='a')\ndef a(): pass\n")
+        assert read.subscriptions == []
+        assert any("placed below @dag(...)" in p for p in read.problems)
+
+    @pytest.mark.parametrize(
+        ("src", "expected"),
+        [
+            ("rmq_trigger(queue='b')(DAG('B'))\n", "the name rmq_trigger"),
+            ("from m import rmq_trigger as rt\n", "imported as 'rt'"),
+            ("import m.rmq_trigger as rt\n", "imported as 'rt'"),
+            ("rt = decorators.rmq_trigger\n", "the attribute .rmq_trigger"),
+            ("RMQ = partial(rmq_trigger, conn_id='c')\n", "the name rmq_trigger"),
+            ("helper(rmq_trigger)\n", "the name rmq_trigger"),
+            ("@rmq_trigger\n@dag(dag_id='b')\ndef b(): pass\n", "the name rmq_trigger"),
+            ("@rmq_trigger(queue='b')\nclass B: pass\n", "the name rmq_trigger"),
+            ("@rmq_trigger(queue='b')(x)\n@dag(dag_id='b')\ndef b(): pass\n",
+             "the name rmq_trigger"),
+            ("def rmq_trigger(**kw): pass\n", "defines its own rmq_trigger"),
+        ],
+    )
+    def test_mentions_the_scan_cannot_follow(self, src, expected):
+        read = _file_read(
+            "@rmq_trigger(queue='a')\n@dag(dag_id='a')\ndef a(): pass\n" + src
+        )
+        assert read.subscriptions == []
+        assert any(expected in p for p in read.problems), read.problems
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n",
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger as rmq_trigger\n",
+            "from airflow_provider_rmq.watcher import decorators\n",
+            "NAME = 'rmq_trigger'\n",
+        ],
+    )
+    def test_mentions_the_scan_follows(self, src):
+        read = _file_read(
+            src + "@rmq_trigger(queue='a')\n@decorators.rmq_trigger(queue='b')\n"
+            "@dag(dag_id='a')\ndef a(): pass\n"
+        )
+        assert read.problems == []
+        assert [s["queue_name"] for s in read.subscriptions] == ["a", "b"]
+
+    def test_nested_factory_and_module_if_with_literals(self):
+        read = _file_read(
+            "def make():\n"
+            "    @rmq_trigger(queue='n')\n    @dag(dag_id='nested')\n    def nested(): pass\n"
+            "    return nested()\n"
+            "if ENABLED:\n"
+            "    @rmq_trigger(queue='i')\n    @dag(dag_id='under_if')\n    def under_if(): pass\n"
+        )
+        assert read.problems == []
+        assert sorted((s["dag_id"], s["queue_name"]) for s in read.subscriptions) == [
+            ("nested", "n"), ("under_if", "i"),
+        ]
+
+    def test_file_without_rmq_trigger_is_empty_and_clean(self):
+        read = _file_read("@dag(dag_id='a')\ndef a(): pass\n")
+        assert read == ([], [])

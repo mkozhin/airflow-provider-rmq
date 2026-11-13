@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 import glob
 import logging
@@ -27,9 +26,8 @@ from airflow_provider_rmq.utils.metrics import incr
 from airflow_provider_rmq.watcher import runner as _runner
 from airflow_provider_rmq.watcher.consumer import RMQConsumerManager
 from airflow_provider_rmq.watcher.dag_file_scan import (
-    _collect_module_constants,
-    _parse_rmq_trigger_decorator,
-    _resolve_function_dag_id,
+    _read_and_parse,
+    _read_file_triggers,
 )
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -40,7 +38,6 @@ from airflow_provider_rmq.watcher.models import (
     is_schema_ready,
     upsert_subscription,
 )
-from airflow_provider_rmq.watcher.subscription_builder import has_exchange_conflict
 from airflow_provider_rmq.watcher.tunables import (
     CYCLE_TIMEOUT_VAR,
     DEFAULT_RECONCILE_INTERVAL,
@@ -1341,9 +1338,10 @@ class RMQWatcherListener:
     def _extract_subscriptions_from_file(self, path: str) -> list[dict] | None:
         """Extract @rmq_trigger subscriptions from a DAG file via AST parsing.
 
-        The reading of the parsed file — constants, ``dag_id`` and the
-        ``rmq_trigger(...)`` calls — is done by the functions of ``dag_file_scan.py``;
-        this method reads the file, parses it and assembles the file's subscriptions.
+        Reading and parsing the file (``dag_file_scan._read_and_parse``) and reading
+        the parsed file (``dag_file_scan._read_file_triggers``) are done by
+        ``dag_file_scan.py``; this method maps their outcomes onto what the scan
+        records for the file and logs what the operator needs to know.
 
         AST parsing never executes the file and imports nothing, so no DAG code runs
         in the watcher process. The scan runs in a worker of the cycle pool under a
@@ -1354,47 +1352,27 @@ class RMQWatcherListener:
         blocking any other thread of the process that imports one of them. Parsing
         the source leaves nothing to wait on but the file read itself.
 
-        dag_id is resolved from the explicit dag_id= argument of @dag(...) via
-        ``dag_file_scan._extract_dag_id_from_decorators``'s three-way contract: a string
-        literal or a simple module-level string constant assigned earlier in
-        the file (``DAG_NAME = 'x'`` then ``dag_id=DAG_NAME``) resolves
-        directly; a recognized ``@dag(...)`` call with no dag_id= at all (or
-        a falsy resolved value) falls back to the decorated function's name,
-        matching Airflow's own default; anything else that cannot be
-        statically proven (a non-literal expression not found among the
-        file's module constants, a truthy non-string literal, or no
-        recognized ``@dag(...)`` call among the decorators at all — e.g. an
-        aliased import) is treated as unresolved: the subscription is
-        **not** registered, and a WARNING is logged if — and only if —
-        ``@rmq_trigger`` is actually present on the same function (an
-        unresolvable dag_id= with no @rmq_trigger is not this plugin's
-        concern and stays silent). Module constants are never handed to a
-        nested function's decorators (a DAG declared inside a factory
-        function): a local binding of the same name could shadow the
-        module-level one, so guessing would be unsafe there too.
+        The file is refused whole: if any ``@rmq_trigger`` of it cannot be read
+        statically — an argument that is not a literal or a readable constant of the
+        file, a ``dag_id`` that cannot be proven, arguments ``build_subscriptions``
+        refuses, a second ``exchange=`` subscription on one DAG, ``@rmq_trigger``
+        below ``@dag(...)``, or a mention of ``rmq_trigger`` other than as a decorator
+        call on a function — not one subscription of the file is registered, and an
+        ERROR names the file and every problem with its DAG, parameter and reason.
+        The decorator raises on the same file at import time, which takes every DAG
+        of the file out of Airflow; a subscription kept for a neighbouring DAG would
+        consume for a DAG Airflow no longer runs. Rows the file registered before go
+        the counted-miss way, like those of a removed decorator.
 
-        Multiple ``@rmq_trigger(exchange=...)`` decorators on the same DAG are
-        not supported (see ``subscription_builder.has_exchange_conflict`` /
-        Technical Details → "Стекинг exchange= на одном DAG" in the plan). The
-        decorator raises ``ValueError`` for this case (it can abort the
-        decorator call); the AST parser cannot abort a DAG import, so it logs a
-        WARNING and skips the duplicate, keeping the first one parsed.
+        Defense in depth: the reading of the parsed file is wrapped in a broad
+        ``except Exception``. A bug that lets an unexpected exception out of it must
+        cost this one DAG file's subscriptions for the cycle, not crash the entire
+        reconcile cycle for every other DAG, so it answers ``None``.
 
-        Defense in depth: the whole function body is wrapped in a broad
-        ``except Exception`` (in addition to the read/parse-specific except
-        below). ``dag_file_scan._parse_rmq_trigger_decorator`` already turns validation
-        failures from ``build_subscriptions`` into a graceful per-decorator
-        WARNING+skip via its own ``except ValueError`` — but if a future bug
-        ever lets an unexpected exception type leak past that (e.g. a
-        non-str/non-list literal reaching a helper that isn't guarded yet),
-        it must still only cost this one DAG file's subscriptions, not crash
-        the entire reconcile cycle for every other DAG, so it too answers
-        ``None``.
-
-        :returns: The file's subscriptions, or ``None`` when the content was read but
-            did not yield a parse — content that does not decode, that the parser
-            refuses in any of its ways, or anything the broad guard around the walk
-            catches.
+        :returns: The file's subscriptions — an empty list for a file read and parsed
+            but refused — or ``None`` when the content was read but did not yield a
+            parse (content that does not decode, that the parser refuses in any of
+            its ways, or anything the broad guard around the reading catches).
         :raises OSError: The file gave no access at all. The two answers are kept
             apart because ``_scan_subscriptions`` records the file's mtime only
             after a failed parse: a parse happened means the content was read and
@@ -1404,59 +1382,24 @@ class RMQWatcherListener:
             remembered mtime would be a lie.
         """
         try:
-            with open(path, encoding="utf-8") as f:
-                source = f.read()
-        except UnicodeDecodeError as exc:
-            log.warning("Failed to decode DAG file %s: %s", path, exc)
-            return None
-
-        try:
-            tree = ast.parse(source, filename=path)
+            tree = _read_and_parse(path)
+        except OSError:
+            raise
         except Exception as exc:  # noqa: BLE001 - the caller's contract is OSError alone
             # Every way the parser has of refusing the content it was handed lands
-            # here: a syntax error, the ``ValueError: source code string cannot contain
-            # null bytes`` of a file caught mid-write or of a binary one under a ``.py``
-            # name, the ``RecursionError`` of a deeply nested one. All of them say the
-            # same thing to the caller — the content was read and did not yield a parse
-            # — and the one exception this method may raise is the ``OSError`` of a file
-            # that gave no access, which a caller counting misses reads differently.
+            # here: a syntax error, source that does not decode, the ``ValueError:
+            # source code string cannot contain null bytes`` of a file caught
+            # mid-write or of a binary one under a ``.py`` name, the
+            # ``RecursionError`` of a deeply nested one. All of them say the same
+            # thing to the caller — the content was read and did not yield a parse —
+            # and the one exception this method may raise is the ``OSError`` of a
+            # file that gave no access, which a caller counting misses reads
+            # differently.
             log.warning("Failed to parse DAG file %s: %r", path, exc)
             return None
 
         try:
-            # module_constants: {name: (value, lineno)}; module_scope_function_ids:
-            # id() of functions whose decorators are evaluated in module scope, so a
-            # nested function (or a method) — which could be shadowed by a
-            # local/class-scope binding of the same name, making the module value
-            # simply wrong — never gets handed the module-level constant map. See
-            # this method's docstring above and dag_file_scan._resolve_function_dag_id.
-            module_constants, module_scope_function_ids = _collect_module_constants(tree)
-
-            result: list[dict] = []
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                dag_id = _resolve_function_dag_id(
-                    node, module_constants, module_scope_function_ids, path
-                )
-                if dag_id is None:
-                    continue
-                dag_subs: list[dict] = []
-                for decorator in node.decorator_list:
-                    for sub in _parse_rmq_trigger_decorator(decorator, dag_id):
-                        if has_exchange_conflict(dag_subs, [sub]):
-                            log.warning(
-                                "rmq_trigger: dag_id=%s already has an exchange= subscription — "
-                                "skipping duplicate (stacking multiple exchange= decorators on one "
-                                "DAG is not supported)",
-                                dag_id,
-                            )
-                            continue
-                        sub["dag_id"] = dag_id
-                        sub["group_key"] = dag_id if sub.get("cooldown", 0) > 0 else None
-                        dag_subs.append(sub)
-                result.extend(dag_subs)
-            return result
+            read = _read_file_triggers(tree)
         except Exception:
             log.exception(
                 "Unexpected error extracting @rmq_trigger subscriptions from DAG file %s — "
@@ -1464,6 +1407,18 @@ class RMQWatcherListener:
                 path,
             )
             return None
+
+        if read.problems:
+            log.error(
+                "rmq_trigger: DAG file %s cannot be read statically, so no subscription "
+                "of this file is registered. Arguments of @rmq_trigger and dag_id= of "
+                "@dag(...) must be literals or constants assigned at the top level of "
+                "this file, and @rmq_trigger must be a decorator call directly above "
+                "@dag(...):\n%s",
+                path, "\n".join(f"  - {problem}" for problem in read.problems),
+            )
+            return []
+        return read.subscriptions
 
     # ------------------------------------------------------------------
     # DB synchronisation

@@ -427,28 +427,28 @@ watcher продолжает регистрировать. Это закрыва
 - Modify: `tests/watcher/test_listener.py`
 - Modify: `tests/watcher/test_dag_file_scan.py`
 
-- [ ] `_read_and_parse`, `_iter_trigger_functions`, `_static_dag_id`,
+- [x] `_read_and_parse`, `_iter_trigger_functions`, `_static_dag_id`,
       `_read_function_triggers`, `_read_file_triggers` в `dag_file_scan.py`;
       `_resolve_function_dag_id`, `_parse_rmq_trigger_decorator`,
       `_warn_unreadable_kwarg`, `_UNREADABLE_KWARG_OUTCOMES` заменяются ими
-- [ ] `_read_function_triggers`: нечитаемый вызов, конфликт стекинга `exchange=` или
+- [x] `_read_function_triggers`: нечитаемый вызов, конфликт стекинга `exchange=` или
       отказ `build_subscriptions` — проблема с причиной (для билдера — его текст)
-- [ ] `_read_and_parse` читает байты и разбирает `ast.parse(raw_bytes, filename=path)`
-- [ ] `_read_file_triggers`: проблема хоть одной функции, нерезолвимый `dag_id` на
+- [x] `_read_and_parse` читает байты и разбирает `ast.parse(raw_bytes, filename=path)`
+- [x] `_read_file_triggers`: проблема хоть одной функции, нерезолвимый `dag_id` на
       функции с `@rmq_trigger`, упоминание имени `rmq_trigger` или атрибута
       `.rmq_trigger` иначе, чем как `func` вызова в `decorator_list` функции (импорт под
       собственным именем допустим), `rmq_trigger` ниже `dag` в `decorator_list` — ни одной
       подписки файла
-- [ ] docstring `_extract_subscriptions_from_file` и комментарии, ссылающиеся на
+- [x] docstring `_extract_subscriptions_from_file` и комментарии, ссылающиеся на
       `_parse_rmq_trigger_decorator` (`_is_rmq_trigger_call`, проверка в
       `_extract_dag_id_from_decorators`), описывают отказ всему файлу и ERROR
-- [ ] `_extract_subscriptions_from_file` работает через новые функции; при проблемах —
+- [x] `_extract_subscriptions_from_file` работает через новые функции; при проблемах —
       ERROR с путём, `dag_id`, параметрами и причинами и пустой список (не `None`);
       сообщение про нерезолвимый `dag_id` не советует заводить подписку в UI
-- [ ] переписать тесты, ожидавшие регистрацию с умолчанием, пропуск одного вызова при
+- [x] переписать тесты, ожидавшие регистрацию с умолчанием, пропуск одного вызова при
       отказе `build_subscriptions` и тест конфликта стекинга `exchange=` (первый вызов
       остаётся) на ожидание отказа всего файла и ERROR
-- [ ] тесты: `conn_id=RMQ_CONN` (константа файла) даёт подписку с `conn_id="rmq_prod"`;
+- [x] тесты: `conn_id=RMQ_CONN` (константа файла) даёт подписку с `conn_id="rmq_prod"`;
       `conn_id=get_conn()` — ни одной; два стековых вызова, читаемый и нечитаемый, — ни
       одной подписки файла; стековые `queue="a"` и `queue="b", cooldown=-1` — ни одной, в
       ERROR текст билдера; файл с двумя DAG'ами, один из которых нечитаем, — ни одной
@@ -459,10 +459,10 @@ watcher продолжает регистрировать. Это закрыва
       `decorator_list` проходят; DAG с `@dag` над `@rmq_trigger` рядом с читаемым DAG'ом —
       ни одной подписки файла; файл в UTF-8 с BOM разбирается; вложенная фабрика с
       литералами и DAG под модульным `if` дают подписки как прежде
-- [ ] тест через `_sync_to_db`: строки файла, в котором один декоратор стал нечитаемым,
+- [x] тест через `_sync_to_db`: строки файла, в котором один декоратор стал нечитаемым,
       считают промахи и удаляются по истечении `_ABSENT_GRACE_CYCLES`, как строки
       удалённого декоратора
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 5: Чистая проверка читаемости вызова
 

@@ -29,7 +29,7 @@ from airflow_provider_rmq.watcher.dag_file_scan import (
     _collect_module_constants,
     _extract_dag_id_from_decorators,
     _is_rmq_trigger_call,
-    _parse_rmq_trigger_decorator,
+    _read_function_triggers,
 )
 from airflow_provider_rmq.watcher.listener import (
     CYCLE_TIMEOUT_VAR,
@@ -894,22 +894,43 @@ class TestUnreadableFileHold:
 
     def test_undecodable_content_answers_none(self, tmp_path):
         dag_file = tmp_path / "latin1.py"
-        dag_file.write_bytes(b"# \xff\xfe not utf-8\n")
+        dag_file.write_bytes(b"x = '\xff\xfe not utf-8'\n")
         listener = RMQWatcherListener()
 
         assert listener._extract_subscriptions_from_file(str(dag_file)) is None
 
     def test_undecodable_content_is_logged(self, tmp_path, caplog):
         dag_file = tmp_path / "latin1.py"
-        dag_file.write_bytes(b"# \xff\xfe not utf-8\n")
+        dag_file.write_bytes(b"x = '\xff\xfe not utf-8'\n")
         listener = RMQWatcherListener()
 
         with caplog.at_level(logging.WARNING,
                              logger=_LISTENER_LOG):
             listener._extract_subscriptions_from_file(str(dag_file))
 
-        assert any("Failed to decode DAG file" in r.getMessage() for r in caplog.records), \
+        assert any("Failed to parse DAG file" in r.getMessage() for r in caplog.records), \
             [r.getMessage() for r in caplog.records]
+
+    def test_source_is_decoded_the_way_an_import_decodes_it(self, tmp_path):
+        """Bytes are handed to the parser as they are, so the BOM, a PEP 263
+        declaration and non-UTF-8 bytes inside a comment (which Python's own import
+        accepts) read exactly as the DAG processor reads them."""
+        trigger = (
+            b"@rmq_trigger(queue='q')\n"
+            b"@dag(dag_id='d')\n"
+            b"def d(): pass\n"
+        )
+        variants = {
+            "bom.py": b"\xef\xbb\xbf" + trigger,
+            "latin1.py": b"# -*- coding: latin-1 -*-\nNAME = '\xe9'\n" + trigger,
+            "comment.py": b"# \xff\xfe not utf-8\n" + trigger,
+        }
+        listener = RMQWatcherListener()
+        for name, content in variants.items():
+            dag_file = tmp_path / name
+            dag_file.write_bytes(content)
+            result = listener._extract_subscriptions_from_file(str(dag_file))
+            assert [s["queue_name"] for s in result] == ["q"], name
 
     def test_a_parse_failure_and_an_io_failure_leave_different_mtimes(self):
         parsed, io = self._listener(), self._listener()
@@ -1788,7 +1809,9 @@ class TestExtractSubscriptionsFromFile:
         # cooldown defaults to 0 → group_key is None, same rule as queue= mode
         assert sub["group_key"] is None
 
-    def test_two_exchange_decorators_on_same_function_second_skipped(self, tmp_path, caplog):
+    def test_two_exchange_decorators_on_same_function_refuse_the_file(self, tmp_path, caplog):
+        # The decorator raises on the second exchange= call at import, so the scan
+        # keeps neither of them.
         dag_file = tmp_path / "double_exchange_dag.py"
         dag_file.write_text(
             "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
@@ -1802,15 +1825,16 @@ class TestExtractSubscriptionsFromFile:
         with caplog.at_level(logging.WARNING):
             result = listener._extract_subscriptions_from_file(str(dag_file))
 
-        assert len(result) == 1
-        # ast.walk visits decorator_list in source order — first decorator parsed wins
-        assert result[0]["exchange"] == "exchange.one"
-        assert any("double_exchange_dag" in r.message for r in caplog.records)
+        assert result == []
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert "double_exchange_dag" in errors[0]
+        assert "second exchange=" in errors[0]
 
     def test_unexpected_exception_during_extraction_answers_none_not_raises(self, tmp_path):
-        # Regression: if _parse_rmq_trigger_decorator (or build_subscriptions)
-        # ever lets an unexpected exception type leak past its own
-        # except ValueError, _extract_subscriptions_from_file must still not
+        # Regression: if _read_file_triggers (or build_subscriptions) ever lets
+        # an unexpected exception type leak past its own handling,
+        # _extract_subscriptions_from_file must still not
         # raise — one malformed DAG file must never crash the whole reconcile
         # cycle for every other DAG (see _main's broad except Exception,
         # which would otherwise skip _sync_to_db/reconcile() for ALL DAGs).
@@ -1824,7 +1848,7 @@ class TestExtractSubscriptionsFromFile:
         )
         listener = RMQWatcherListener()
         with patch(
-            "airflow_provider_rmq.watcher.listener._parse_rmq_trigger_decorator",
+            "airflow_provider_rmq.watcher.listener._read_file_triggers",
             side_effect=AttributeError("boom"),
         ):
             result = listener._extract_subscriptions_from_file(str(dag_file))
@@ -1843,7 +1867,7 @@ class TestExtractSubscriptionsFromFile:
         )
         listener = RMQWatcherListener()
         with caplog.at_level(logging.ERROR), patch(
-            "airflow_provider_rmq.watcher.listener._parse_rmq_trigger_decorator",
+            "airflow_provider_rmq.watcher.listener._read_file_triggers",
             side_effect=TypeError("boom"),
         ):
             result = listener._extract_subscriptions_from_file(str(dag_file))
@@ -1854,6 +1878,11 @@ class TestExtractSubscriptionsFromFile:
 # ---------------------------------------------------------------------------
 # _extract_subscriptions_from_file — unresolved dag_id contract (Task 3)
 # ---------------------------------------------------------------------------
+
+
+def _errors(caplog) -> list[str]:
+    """Messages of the ERROR records ``caplog`` captured."""
+    return [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
 
 
 class TestExtractSubscriptionsUnresolvedDagId:
@@ -1884,9 +1913,9 @@ class TestExtractSubscriptionsUnresolvedDagId:
         with caplog.at_level(logging.WARNING):
             result = listener._extract_subscriptions_from_file(str(dag_file))
         assert result == []
-        assert any("data_proc" in r.message for r in caplog.records)
+        assert any("data_proc" in m for m in _errors(caplog))
 
-    def test_unresolvable_dag_id_with_rmq_trigger_skips_and_warns(self, tmp_path, caplog):
+    def test_unresolvable_dag_id_with_rmq_trigger_refuses_with_an_error(self, tmp_path, caplog):
         dag_file = tmp_path / "unresolvable_dag.py"
         dag_file.write_text(
             "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
@@ -1899,15 +1928,32 @@ class TestExtractSubscriptionsUnresolvedDagId:
         with caplog.at_level(logging.WARNING):
             result = listener._extract_subscriptions_from_file(str(dag_file))
         assert result == []
-        assert any(
-            r.levelname == "WARNING"
-            and str(dag_file) in r.message
-            and "unresolvable_dag" in r.message
-            and "UI" in r.message
-            for r in caplog.records
-        )
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert str(dag_file) in errors[0]
+        assert "unresolvable_dag" in errors[0]
+        assert "cannot statically resolve dag_id" in errors[0]
 
-    def test_kwargs_unpacking_skips_and_warns(self, tmp_path, caplog):
+    def test_unresolvable_dag_id_error_does_not_send_the_operator_to_the_ui(
+        self, tmp_path, caplog
+    ):
+        # Such a DAG does not import, so a subscription made by hand on the
+        # Subscriptions page would consume for a DAG Airflow does not run.
+        dag_file = tmp_path / "unresolvable_dag.py"
+        dag_file.write_text(
+            "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+            "from airflow.decorators import dag\n"
+            "@rmq_trigger(queue='q')\n"
+            "@dag(dag_id=f'prefix_{1+1}')\n"
+            "def unresolvable_dag(): pass\n"
+        )
+        listener = RMQWatcherListener()
+        with caplog.at_level(logging.WARNING):
+            listener._extract_subscriptions_from_file(str(dag_file))
+        assert "UI" not in caplog.text
+        assert "Subscriptions page" not in caplog.text
+
+    def test_kwargs_unpacking_refuses_with_an_error(self, tmp_path, caplog):
         dag_file = tmp_path / "kwargs_unpacking_dag.py"
         dag_file.write_text(
             "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
@@ -1921,13 +1967,10 @@ class TestExtractSubscriptionsUnresolvedDagId:
         with caplog.at_level(logging.WARNING):
             result = listener._extract_subscriptions_from_file(str(dag_file))
         assert result == []
-        assert any(
-            r.levelname == "WARNING"
-            and str(dag_file) in r.message
-            and "kwargs_dag" in r.message
-            and "UI" in r.message
-            for r in caplog.records
-        )
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert str(dag_file) in errors[0]
+        assert "kwargs_dag" in errors[0]
 
     def test_unresolvable_dag_id_without_rmq_trigger_stays_silent(self, tmp_path, caplog):
         dag_file = tmp_path / "no_trigger_dag.py"
@@ -1959,11 +2002,13 @@ class TestExtractSubscriptionsUnresolvedDagId:
         with caplog.at_level(logging.WARNING):
             result = listener._extract_subscriptions_from_file(str(dag_file))
         assert result == []
-        assert any("early_dag" in r.message for r in caplog.records)
+        assert any("early_dag" in m for m in _errors(caplog))
 
-    def test_unresolvable_function_does_not_drop_other_subscriptions_in_same_file(
+    def test_unresolvable_function_refuses_every_subscription_of_the_file(
         self, tmp_path, caplog
     ):
+        # The decorator breaks the import of the whole file, so the resolvable
+        # neighbour's DAG is gone from Airflow too and must not keep a consumer.
         dag_file = tmp_path / "mixed_dag.py"
         dag_file.write_text(
             "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
@@ -1980,11 +2025,11 @@ class TestExtractSubscriptionsUnresolvedDagId:
         listener = RMQWatcherListener()
         with caplog.at_level(logging.WARNING):
             result = listener._extract_subscriptions_from_file(str(dag_file))
-        assert len(result) == 1
-        assert result[0]["dag_id"] == "resolved_id"
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
-        assert "unresolvable_dag" in warnings[0].message
+        assert result == []
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert "unresolvable_dag" in errors[0]
+        assert "'resolvable_dag'" not in errors[0]
 
     def test_exchange_subscription_with_resolved_constant(self, tmp_path):
         dag_file = tmp_path / "exchange_const_dag.py"
@@ -2003,12 +2048,12 @@ class TestExtractSubscriptionsUnresolvedDagId:
         assert sub["dag_id"] == "real_id"
         assert sub["queue_name"] == "rmq_watcher.sub.real_id"
 
-    def test_aliased_dag_decorator_not_recognized_skips_and_warns(self, tmp_path, caplog):
+    def test_aliased_dag_decorator_not_recognized_refuses_with_an_error(self, tmp_path, caplog):
         # `dag` imported under an alias is not matched by the `is_dag`
         # predicate (Name(id="dag")/Attribute(attr="dag") only) — no
         # recognized @dag(...) call exists among the decorators at all, so
-        # this must yield _UNRESOLVED_DAG_ID (skip + warn), NOT silent
-        # registration under the function name.
+        # the dag_id is unresolved and the file is refused, NOT registered
+        # under the function name.
         dag_file = tmp_path / "aliased_dag.py"
         dag_file.write_text(
             "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
@@ -2022,7 +2067,214 @@ class TestExtractSubscriptionsUnresolvedDagId:
         with caplog.at_level(logging.WARNING):
             result = listener._extract_subscriptions_from_file(str(dag_file))
         assert result == []
-        assert any("aliased_function" in r.message for r in caplog.records)
+        assert any("aliased_function" in m for m in _errors(caplog))
+
+
+# ---------------------------------------------------------------------------
+# _extract_subscriptions_from_file — a file is read whole or refused whole
+# ---------------------------------------------------------------------------
+
+_IMPORTS = (
+    "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+    "from airflow.decorators import dag\n"
+)
+
+#: A DAG the scan reads on its own; the cases below put something beside it.
+_READABLE_DAG = (
+    "@rmq_trigger(queue='good_q')\n"
+    "@dag(dag_id='good')\n"
+    "def good(): pass\n"
+)
+
+
+class TestExtractSubscriptionsFileRefusal:
+    @staticmethod
+    def _extract(tmp_path, source: str, caplog=None):
+        dag_file = tmp_path / "dag.py"
+        dag_file.write_text(source)
+        listener = RMQWatcherListener()
+        if caplog is None:
+            return listener._extract_subscriptions_from_file(str(dag_file))
+        with caplog.at_level(logging.WARNING):
+            return listener._extract_subscriptions_from_file(str(dag_file))
+
+    def test_file_constant_conn_id_is_read(self, tmp_path):
+        result = self._extract(tmp_path, _IMPORTS + (
+            "RMQ_CONN = 'rmq_prod'\n"
+            "@rmq_trigger(queue='q', conn_id=RMQ_CONN)\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        ))
+        assert [(s["queue_name"], s["conn_id"]) for s in result] == [("q", "rmq_prod")]
+
+    def test_positional_arguments_through_constants_are_read(self, tmp_path):
+        result = self._extract(tmp_path, _IMPORTS + (
+            "QUEUE = 'orders'\n"
+            "RMQ_CONN = 'rmq_prod'\n"
+            "FILTER = {'body.type': 'paid'}\n"
+            "@rmq_trigger(QUEUE, None, RMQ_CONN, FILTER, 30)\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        ))
+        assert len(result) == 1
+        assert result[0]["queue_name"] == "orders"
+        assert result[0]["conn_id"] == "rmq_prod"
+        assert result[0]["filter_data"] == {"body.type": "paid"}
+        assert result[0]["cooldown"] == 30
+        assert result[0]["group_key"] == "d"
+
+    def test_call_conn_id_registers_nothing_and_logs_an_error(self, tmp_path, caplog):
+        dag_file_source = _IMPORTS + (
+            "@rmq_trigger(queue='q', conn_id=get_conn())\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        )
+        assert self._extract(tmp_path, dag_file_source, caplog) == []
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert str(tmp_path / "dag.py") in errors[0]
+        assert "dag_id='d'" in errors[0]
+        assert "conn_id cannot be read" in errors[0]
+        assert "a function call" in errors[0]
+
+    def test_stacked_readable_and_unreadable_calls_register_nothing(self, tmp_path, caplog):
+        result = self._extract(tmp_path, _IMPORTS + (
+            "@rmq_trigger(queue='a')\n"
+            "@rmq_trigger(queue='b', cooldown=COOLDOWN)\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        ), caplog)
+        assert result == []
+        assert "cooldown cannot be read" in _errors(caplog)[0]
+
+    def test_stacked_call_the_builder_refuses_registers_nothing(self, tmp_path, caplog):
+        result = self._extract(tmp_path, _IMPORTS + (
+            "@rmq_trigger(queue='a')\n"
+            "@rmq_trigger(queue='b', cooldown=-1)\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        ), caplog)
+        assert result == []
+        assert "'cooldown' must be >= 0" in _errors(caplog)[0]
+
+    def test_one_unreadable_dag_refuses_its_readable_neighbour(self, tmp_path, caplog):
+        result = self._extract(tmp_path, _IMPORTS + _READABLE_DAG + (
+            "@rmq_trigger(queue='bad_q', filter_data=load_filter())\n"
+            "@dag(dag_id='bad')\n"
+            "def bad(): pass\n"
+        ), caplog)
+        assert result == []
+        errors = _errors(caplog)
+        assert len(errors) == 1
+        assert "dag_id='bad'" in errors[0]
+        assert "dag_id='good'" not in errors[0]
+
+    @pytest.mark.parametrize(
+        "beside",
+        [
+            pytest.param(
+                "from airflow import DAG\nrmq_trigger(queue='b')(DAG('B'))\n",
+                id="direct-call-on-a-dag",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher.decorators import rmq_trigger as rt\n"
+                "@rt(queue='b')\n@dag(dag_id='b')\ndef b(): pass\n",
+                id="alias-used",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher.decorators import rmq_trigger as rt\n",
+                id="alias-unused",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher import decorators\n"
+                "rt = decorators.rmq_trigger\n",
+                id="attribute-alias",
+            ),
+            pytest.param(
+                "from functools import partial\n"
+                "RMQ = partial(rmq_trigger, conn_id='rmq_prod')\n",
+                id="partial",
+            ),
+            pytest.param(
+                "@dag(dag_id='b')\n@rmq_trigger(queue='b')\ndef b(): pass\n",
+                id="rmq-trigger-below-dag",
+            ),
+        ],
+    )
+    def test_a_mention_the_scan_cannot_follow_refuses_the_file(
+        self, tmp_path, caplog, beside
+    ):
+        result = self._extract(tmp_path, _IMPORTS + _READABLE_DAG + beside, caplog)
+        assert result == []
+        assert len(_errors(caplog)) == 1
+
+    def test_rmq_trigger_below_dag_is_named_in_the_error(self, tmp_path, caplog):
+        self._extract(tmp_path, _IMPORTS + (
+            "@dag(dag_id='b')\n"
+            "@rmq_trigger(queue='b')\n"
+            "def b(): pass\n"
+        ), caplog)
+        assert "placed below @dag(...)" in _errors(caplog)[0]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param(
+                "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+                "from airflow.decorators import dag\n"
+                "@rmq_trigger(queue='q')\n@dag(dag_id='d')\ndef d(): pass\n",
+                id="import-under-own-name",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher import decorators\n"
+                "from airflow.decorators import dag\n"
+                "@decorators.rmq_trigger(queue='q')\n@dag(dag_id='d')\ndef d(): pass\n",
+                id="attribute-in-decorator-list",
+            ),
+            pytest.param(
+                "from airflow_provider_rmq.watcher.decorators import rmq_trigger as rmq_trigger\n"
+                "from airflow.decorators import dag\n"
+                "@rmq_trigger(queue='q')\n@dag(dag_id='d')\ndef d(): pass\n",
+                id="import-as-own-name",
+            ),
+        ],
+    )
+    def test_forms_the_scan_follows_are_read(self, tmp_path, caplog, source):
+        result = self._extract(tmp_path, source, caplog)
+        assert [s["queue_name"] for s in result] == ["q"]
+        assert _errors(caplog) == []
+
+    def test_nested_factory_and_module_if_with_literals_read_as_before(self, tmp_path, caplog):
+        result = self._extract(tmp_path, _IMPORTS + (
+            "import os\n"
+            "def make_dag():\n"
+            "    @rmq_trigger(queue='nested_q', cooldown=10)\n"
+            "    @dag(dag_id='nested')\n"
+            "    def nested(): pass\n"
+            "    return nested()\n"
+            "make_dag()\n"
+            "if os.environ.get('ENV') != 'test':\n"
+            "    @rmq_trigger(queues=['a', 'b'])\n"
+            "    @dag(dag_id='under_if')\n"
+            "    def under_if(): pass\n"
+            "    under_if()\n"
+        ), caplog)
+        assert sorted((s["dag_id"], s["queue_name"]) for s in result) == [
+            ("nested", "nested_q"),
+            ("under_if", "a"),
+            ("under_if", "b"),
+        ]
+        assert _errors(caplog) == []
+
+    def test_a_refused_file_answers_an_empty_list_not_none(self, tmp_path):
+        """The file was read and parsed, so its mtime is kept like any parsed file's:
+        it is not re-read on every cycle, and its rows go the counted-miss way."""
+        result = self._extract(tmp_path, _IMPORTS + (
+            "@rmq_trigger(queue=QUEUE)\n"
+            "@dag(dag_id='d')\n"
+            "def d(): pass\n"
+        ))
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -2733,13 +2985,25 @@ class TestIsRmqTriggerCall:
 
 
 # ---------------------------------------------------------------------------
-# _parse_rmq_trigger_decorator — новые параметры queues и cooldown
+# _read_function_triggers — one decorator call, queue and cooldown parameters
 # ---------------------------------------------------------------------------
 
+def _read_decorator(src: str, dag_id: str = "test_dag"):
+    """Read one decorator call string placed above ``@dag(dag_id=...)`` on a function."""
+    tree = ast.parse(f"@{src}\n@dag(dag_id={dag_id!r})\ndef f(): pass\n")
+    func = tree.body[0]
+    assert isinstance(func, ast.FunctionDef)
+    return _read_function_triggers(func, {}, dag_id)
+
+
 def _parse_decorator(src: str, dag_id: str = "test_dag") -> list[dict]:
-    """Parse a decorator call string and return subscription dicts."""
-    node = ast.parse(src, mode="eval").body
-    return _parse_rmq_trigger_decorator(node, dag_id)
+    """Subscription dicts of one decorator call string, empty when it is refused."""
+    return _read_decorator(src, dag_id).subscriptions
+
+
+def _problems(src: str, dag_id: str = "test_dag") -> str:
+    """All problems of one decorator call string, as one text."""
+    return "\n".join(_read_decorator(src, dag_id).problems)
 
 
 class TestParseRmqTriggerDecorator:
@@ -2771,17 +3035,27 @@ class TestParseRmqTriggerDecorator:
         result = _parse_decorator("rmq_trigger(queue='q')")
         assert result[0]["cooldown"] == 0
 
+    def test_dag_id_and_group_key_are_set_on_every_row(self):
+        result = _parse_decorator("rmq_trigger(queues=['a', 'b'], cooldown=60)", "my_dag")
+        assert [(d["dag_id"], d["group_key"]) for d in result] == [
+            ("my_dag", "my_dag"),
+            ("my_dag", "my_dag"),
+        ]
+
     def test_non_rmq_trigger_returns_empty_list(self):
-        result = _parse_decorator("some_other_decorator(queue='q')")
-        assert result == []
+        read = _read_decorator("some_other_decorator(queue='q')")
+        assert read.subscriptions == []
+        assert read.problems == []
 
-    def test_no_queue_or_queues_returns_empty_list(self):
-        result = _parse_decorator("rmq_trigger(conn_id='rmq')")
-        assert result == []
+    def test_no_queue_or_queues_is_refused_by_the_builder(self):
+        read = _read_decorator("rmq_trigger(conn_id='rmq')")
+        assert read.subscriptions == []
+        assert "the arguments are refused" in "\n".join(read.problems)
 
-    def test_non_literal_queues_skipped_returns_empty(self):
-        result = _parse_decorator("rmq_trigger(queues=SOME_VAR)")
-        assert result == []
+    def test_non_literal_queues_is_a_problem(self):
+        read = _read_decorator("rmq_trigger(queues=SOME_VAR)")
+        assert read.subscriptions == []
+        assert "queues cannot be read" in "\n".join(read.problems)
 
     def test_conn_id_propagated_to_all_entries(self):
         result = _parse_decorator("rmq_trigger(queues=['a', 'b'], conn_id='my_conn')")
@@ -2797,6 +3071,15 @@ class TestParseRmqTriggerDecorator:
         result = _parse_decorator("rmq_trigger('my_queue')")
         assert len(result) == 1
         assert result[0]["queue_name"] == "my_queue"
+
+    def test_positional_conn_id_filter_data_and_cooldown_parsed(self):
+        result = _parse_decorator(
+            "rmq_trigger('q', None, 'rmq_prod', {'body.type': 'paid'}, 30)"
+        )
+        assert len(result) == 1
+        assert result[0]["conn_id"] == "rmq_prod"
+        assert result[0]["filter_data"] == {"body.type": "paid"}
+        assert result[0]["cooldown"] == 30
 
     def test_attribute_access_rmq_trigger(self):
         result = _parse_decorator("decorators.rmq_trigger(queue='q')")
@@ -2815,163 +3098,86 @@ class TestParseRmqTriggerDecorator:
         result = _parse_decorator("rmq_trigger(queue='q')")
         assert result[0]["ack_unmatched"] is False
 
-    def test_non_literal_ack_unmatched_falls_back_to_the_default(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator(
-                "rmq_trigger(queue='q', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
-            )
-        assert result[0]["ack_unmatched"] is False
+    def test_non_literal_ack_unmatched_is_refused_not_defaulted(self):
+        read = _read_decorator("rmq_trigger(queue='q', ack_unmatched=ACK_UNMATCHED)")
+        assert read.subscriptions == []
+        assert "ack_unmatched cannot be read" in "\n".join(read.problems)
 
-    def test_non_literal_kwarg_is_warned_about_by_dag_queue_and_parameter(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator(
-                "rmq_trigger(queue='orders', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
-            )
-        assert "ack_unmatched" in caplog.text
-        assert "my_dag" in caplog.text
-        assert "orders" in caplog.text
+    def test_problem_names_dag_line_parameter_and_reason(self):
+        text = _problems("rmq_trigger(queue='orders', conn_id=get_conn())", dag_id="my_dag")
+        assert "dag_id='my_dag'" in text
+        assert "line 1" in text
+        assert "conn_id cannot be read" in text
+        assert "a function call" in text
 
-    def test_a_registered_subscription_is_named_as_such_in_the_warning(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator(
-                "rmq_trigger(queue='orders', ack_unmatched=ACK_UNMATCHED)", dag_id="my_dag"
-            )
-        assert "registered with that parameter's default" in caplog.text
+    def test_non_literal_queue_selector_is_a_problem(self):
+        read = _read_decorator("rmq_trigger(queue=QUEUE_CONST)", dag_id="my_dag")
+        assert read.subscriptions == []
+        assert "queue cannot be read" in "\n".join(read.problems)
 
-    def test_a_lost_queue_selector_says_no_subscription_is_registered(self, caplog):
-        """The two outcomes are not the same one: readme documents the difference, and
-        a line about a working subscription would point at one that does not exist."""
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator("rmq_trigger(queue=QUEUE_CONST)", dag_id="my_dag")
-        assert result == []
-        assert "no subscription is registered" in caplog.text
-        assert "registered with that parameter's default" not in caplog.text
+    def test_an_unreadable_argument_skips_the_build(self):
+        """The arguments that were read do not say what the decorator receives, so the
+        builder is not asked about them: the problem is the unreadable argument."""
+        text = _problems("rmq_trigger(exchange='ex', routing_key_ids=REPORT_IDS)")
+        assert "routing_key_ids cannot be read" in text
+        assert "the arguments are refused" not in text
 
-    def test_a_build_the_builder_refuses_is_not_called_registered(self, caplog):
-        """The queue selector is readable, so the call names a queue — and the build
-        still produces no row, because an exchange with no routing keys does not
-        build. The operator diagnosing a DAG that never fires must not be told a
-        subscription is running on a default."""
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator(
-                "rmq_trigger(exchange='ex', routing_key_ids=REPORT_IDS)", dag_id="my_dag"
-            )
-        assert result == []
-        assert "registered with that parameter's default" not in caplog.text
-        assert "no subscription is registered" in caplog.text
-        assert "at least one of 'routing_keys' or 'routing_key_ids'" in caplog.text
+    def test_unreadable_cooldown_beside_a_buildable_exchange_call_is_refused(self):
+        read = _read_decorator(
+            "rmq_trigger(exchange='ex', routing_keys=['a.b'], cooldown=COOLDOWN)"
+        )
+        assert read.subscriptions == []
+        assert "cooldown cannot be read" in "\n".join(read.problems)
 
-    def test_a_readable_exchange_call_that_builds_is_called_registered(self, caplog):
-        """The same call with the routing keys readable does build, so the unreadable
-        cooldown leaves a working subscription — the other half of the same split."""
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator(
-                "rmq_trigger(exchange='ex', routing_keys=['a.b'], cooldown=COOLDOWN)",
-                dag_id="my_dag",
-            )
-        assert len(result) == 1
-        assert "registered with that parameter's default" in caplog.text
-        assert "no subscription is registered" not in caplog.text
+    def test_dict_unpacking_of_an_unknown_name_is_a_problem(self):
+        read = _read_decorator("rmq_trigger(**opts)", dag_id="my_dag")
+        assert read.subscriptions == []
+        assert "**opts cannot be read" in "\n".join(read.problems)
 
-    def test_dict_unpacking_alone_says_no_subscription_is_registered(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
-        assert result == []
-        assert "no subscription is registered" in caplog.text
+    def test_dict_unpacking_beside_a_literal_queue_is_refused(self):
+        read = _read_decorator("rmq_trigger(queue='orders', **opts)")
+        assert read.subscriptions == []
+        assert "**opts cannot be read" in "\n".join(read.problems)
 
-    def test_a_non_literal_positional_queue_is_warned_about(self, caplog):
-        """``@rmq_trigger(QUEUE_CONST)`` drops the subscription as silently as any
-        keyword did before the diagnostic covered it."""
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator("rmq_trigger(QUEUE_CONST)", dag_id="my_dag")
-        assert result == []
-        assert "my_dag" in caplog.text
-        assert "'queue'" in caplog.text
-        assert "no subscription is registered" in caplog.text
+    def test_a_non_literal_positional_queue_is_a_problem(self):
+        read = _read_decorator("rmq_trigger(QUEUE_CONST)", dag_id="my_dag")
+        assert read.subscriptions == []
+        assert "queue cannot be read" in "\n".join(read.problems)
 
-    def test_a_queues_argument_that_is_not_a_list_does_not_break_the_warning(self, caplog):
-        """``queues=5`` passes ``literal_eval`` and is not iterable — the label falls
-        back rather than raising a TypeError that would demote the whole file."""
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator(
-                "rmq_trigger(queues=5, cooldown=COOLDOWN)", dag_id="my_dag"
-            )
-        assert result == []
-        assert "<unresolved>" in caplog.text
+    def test_a_queues_argument_that_is_not_a_list_does_not_break_the_report(self):
+        read = _read_decorator("rmq_trigger(queues=5, cooldown=COOLDOWN)")
+        assert read.subscriptions == []
+        assert "cooldown cannot be read" in "\n".join(read.problems)
 
-    def test_non_literal_cooldown_is_warned_about_too(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator("rmq_trigger(queue='q', cooldown=COOLDOWN)")
-        assert result[0]["cooldown"] == 0
-        assert "cooldown" in caplog.text
-
-    def test_literal_kwargs_produce_no_warning(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator("rmq_trigger(queue='q', cooldown=60, ack_unmatched=True)")
-        assert caplog.records == []
+    def test_literal_kwargs_produce_no_problem(self):
+        read = _read_decorator("rmq_trigger(queue='q', cooldown=60, ack_unmatched=True)")
+        assert read.problems == []
 
     def test_non_bool_ack_unmatched_skipped_returns_empty(self):
         result = _parse_decorator("rmq_trigger(queue='q', ack_unmatched='yes')")
         assert result == []
 
-    def test_non_bool_ack_unmatched_logs_warning(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator("rmq_trigger(queue='q', ack_unmatched='yes')")
-        assert "ack_unmatched" in caplog.text
-
-    def test_dict_unpacking_returns_empty_and_warns(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
-        assert result == []
-        assert "my_dag" in caplog.text
-        assert "**kwargs" in caplog.text
-
-    def test_dict_unpacking_beside_a_literal_queue_warns_too(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            result = _parse_decorator("rmq_trigger(queue='orders', **opts)", dag_id="my_dag")
-        assert result[0]["ack_unmatched"] is False
-        assert "orders" in caplog.text
-        assert "**kwargs" in caplog.text
-
-    def test_unpacking_beside_a_literal_does_not_claim_nothing_was_read(self, caplog):
-        """The line names the queue it read, so it cannot also say it read nothing —
-        an operator told the call was unreadable whole goes looking for the wrong
-        cause. It also cannot say "that parameter's default": the unpacking names no
-        parameter for that to point at."""
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator("rmq_trigger(queue='orders', **opts)", dag_id="my_dag")
-        assert "reads no parameter from this call at all" not in caplog.text
-        assert "that parameter's default" not in caplog.text
-        assert "cannot read the arguments it carries" in caplog.text
-        assert "every argument the dict carries" in caplog.text
-
-    def test_unpacking_alone_does_say_nothing_was_read(self, caplog):
-        """The other half of the same split: with no literal beside it the call really
-        is unreadable whole, and the wording says so."""
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator("rmq_trigger(**opts)", dag_id="my_dag")
-        assert "reads no parameter from this call at all" in caplog.text
+    def test_non_bool_ack_unmatched_problem_carries_the_builder_text(self):
+        assert "ack_unmatched" in _problems("rmq_trigger(queue='q', ack_unmatched='yes')")
 
     def test_negative_cooldown_skipped_returns_empty(self):
         result = _parse_decorator("rmq_trigger(queue='q', cooldown=-1)")
         assert result == []
 
-    def test_negative_cooldown_logs_warning(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator("rmq_trigger(queue='q', cooldown=-1)", dag_id="neg_dag")
-        assert any("neg_dag" in r.message for r in caplog.records)
+    def test_negative_cooldown_problem_names_the_dag_and_the_builder_text(self):
+        text = _problems("rmq_trigger(queue='q', cooldown=-1)", dag_id="neg_dag")
+        assert "neg_dag" in text
+        assert "'cooldown' must be >= 0" in text
 
     def test_string_cooldown_skipped_returns_empty(self):
-        # A typo'd literal like cooldown="abc" passes ast.literal_eval (it's a
-        # valid string literal) but is semantically invalid — must be skipped
-        # gracefully, not raise an uncaught TypeError out of this function.
+        # A typo'd literal like cooldown="abc" is a valid string literal but
+        # semantically invalid — refused by the builder, not raised out of here.
         result = _parse_decorator("rmq_trigger(queue='q', cooldown='abc')")
         assert result == []
 
-    def test_string_cooldown_logs_warning(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator("rmq_trigger(queue='q', cooldown='abc')", dag_id="str_cooldown_dag")
-        assert any("str_cooldown_dag" in r.message for r in caplog.records)
+    def test_string_cooldown_problem_names_the_dag(self):
+        text = _problems("rmq_trigger(queue='q', cooldown='abc')", dag_id="str_cooldown_dag")
+        assert "str_cooldown_dag" in text
 
     def test_list_cooldown_skipped_returns_empty(self):
         result = _parse_decorator("rmq_trigger(queue='q', cooldown=[1, 2])")
@@ -2993,14 +3199,36 @@ class TestParseRmqTriggerDecorator:
         result = _parse_decorator("rmq_trigger(queues=['a', 2])")
         assert result == []
 
-    def test_queues_with_non_string_items_logs_warning(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator("rmq_trigger(queues=[1, 2, 3])", dag_id="bad_queues_dag")
-        assert any("bad_queues_dag" in r.message for r in caplog.records)
+    def test_queues_with_non_string_items_problem_names_the_dag(self):
+        assert "bad_queues_dag" in _problems(
+            "rmq_trigger(queues=[1, 2, 3])", dag_id="bad_queues_dag"
+        )
+
+    def test_stacked_calls_each_contribute_rows(self):
+        tree = ast.parse(
+            "@rmq_trigger(queue='a')\n"
+            "@rmq_trigger(queue='b', cooldown=30)\n"
+            "@dag(dag_id='d')\n"
+            "def f(): pass\n"
+        )
+        read = _read_function_triggers(tree.body[0], {}, "d")
+        assert read.problems == []
+        assert [s["queue_name"] for s in read.subscriptions] == ["a", "b"]
+
+    def test_stacked_readable_and_unreadable_calls_report_the_unreadable_one(self):
+        tree = ast.parse(
+            "@rmq_trigger(queue='a')\n"
+            "@rmq_trigger(queue='b', conn_id=get_conn())\n"
+            "@dag(dag_id='d')\n"
+            "def f(): pass\n"
+        )
+        read = _read_function_triggers(tree.body[0], {}, "d")
+        assert len(read.problems) == 1
+        assert "line 2" in read.problems[0]
 
 
 # ---------------------------------------------------------------------------
-# _parse_rmq_trigger_decorator — exchange-mode (Task 2)
+# _read_function_triggers — exchange-mode
 # ---------------------------------------------------------------------------
 
 
@@ -3055,8 +3283,6 @@ class TestParseRmqTriggerDecoratorExchange:
         result = _parse_decorator(
             "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=SOME_VAR)"
         )
-        # routing_key_ids not extracted (non-literal) → neither routing_keys nor
-        # routing_key_ids present → build_subscriptions raises → skipped
         assert result == []
 
     def test_non_literal_routing_keys_skipped(self):
@@ -3065,14 +3291,15 @@ class TestParseRmqTriggerDecoratorExchange:
         )
         assert result == []
 
-    def test_non_literal_routing_key_status_falls_back_to_default(self):
-        # routing_key_status is non-literal → not extracted → build_subscriptions
-        # falls back to its own default ("*"); routing_key_ids is still literal
-        result = _parse_decorator(
+    def test_non_literal_routing_key_status_is_refused_not_defaulted(self):
+        # A wildcard default would bind more routing keys than the decorator asks
+        # for, so the call is refused rather than built from the rest.
+        read = _read_decorator(
             "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
             "routing_key_status=SOME_VAR)"
         )
-        assert result[0]["routing_keys"] == ["abc123.*"]
+        assert read.subscriptions == []
+        assert "routing_key_status cannot be read" in "\n".join(read.problems)
 
     def test_exchange_and_queue_mutex_violation_skipped(self):
         result = _parse_decorator(
@@ -3098,8 +3325,8 @@ class TestParseRmqTriggerDecoratorExchange:
 
     def test_exchange_empty_routing_key_status_list_skipped(self):
         # routing_key_status=[] collapses the routing_key_ids cross-product to
-        # an empty set — build_subscriptions raises ValueError, which must be
-        # caught and turned into a graceful skip, not propagate.
+        # an empty set — build_subscriptions raises ValueError, which becomes a
+        # problem, not an exception out of the reader.
         result = _parse_decorator(
             "rmq_trigger(exchange='jetstat.airflow', routing_key_ids=['abc123'], "
             "routing_key_status=[])"
@@ -3107,21 +3334,16 @@ class TestParseRmqTriggerDecoratorExchange:
         assert result == []
 
     def test_non_string_exchange_skipped_returns_empty(self):
-        # exchange=123 is a valid ast.literal_eval() result (an int literal)
-        # but semantically invalid — must be turned into a graceful WARNING+
-        # skip by build_subscriptions raising ValueError, not propagate as an
-        # uncaught AttributeError from exchange.startswith(...). An uncaught
-        # exception here would crash the whole reconcile cycle, not just this
-        # DAG (see _extract_subscriptions_from_file's broad except Exception).
+        # exchange=123 is a valid literal but semantically invalid — refused by
+        # build_subscriptions, not raised as an AttributeError from
+        # exchange.startswith(...).
         result = _parse_decorator("rmq_trigger(exchange=123, routing_keys=['a.b'])")
         assert result == []
 
-    def test_non_string_exchange_logs_warning(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            _parse_decorator(
-                "rmq_trigger(exchange=123, routing_keys=['a.b'])", dag_id="bad_exchange_dag"
-            )
-        assert any("bad_exchange_dag" in r.message for r in caplog.records)
+    def test_non_string_exchange_problem_names_the_dag(self):
+        assert "bad_exchange_dag" in _problems(
+            "rmq_trigger(exchange=123, routing_keys=['a.b'])", dag_id="bad_exchange_dag"
+        )
 
     def test_non_str_non_list_routing_key_status_skipped_returns_empty(self):
         # routing_key_status=123 must not reach list(routing_key_status) and
@@ -3135,7 +3357,7 @@ class TestParseRmqTriggerDecoratorExchange:
         # Forgetting list brackets (routing_keys="literal.string" instead of
         # routing_keys=["literal.string"]) must not silently expand into
         # one-character wildcard routing keys — build_subscriptions rejects
-        # non-list routing_keys with ValueError, which is caught here.
+        # non-list routing_keys with ValueError.
         result = _parse_decorator(
             "rmq_trigger(exchange='ex', routing_keys='literal.string')"
         )
@@ -3147,6 +3369,18 @@ class TestParseRmqTriggerDecoratorExchange:
             "routing_key_ids='670f877702775c2de8325b1f')"
         )
         assert result == []
+
+    def test_second_exchange_call_on_one_dag_is_a_problem(self):
+        tree = ast.parse(
+            "@rmq_trigger(exchange='exchange.one', routing_keys=['a.b'])\n"
+            "@rmq_trigger(exchange='exchange.two', routing_keys=['c.d'])\n"
+            "@dag(dag_id='d')\n"
+            "def f(): pass\n"
+        )
+        read = _read_function_triggers(tree.body[0], {}, "d")
+        assert len(read.problems) == 1
+        assert "second exchange=" in read.problems[0]
+        assert "rmq_watcher.sub.d" in read.problems[0]
 
 
 # ---------------------------------------------------------------------------
@@ -5503,6 +5737,15 @@ _DAG_WITHOUT_TRIGGER = (
     "def d(): pass\n"
 )
 
+#: The same DAG with the decorator's queue made unreadable — the scan refuses the file.
+_DAG_WITH_UNREADABLE_TRIGGER = (
+    "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+    "from airflow.decorators import dag\n"
+    "@rmq_trigger(queue='q', conn_id=get_conn())\n"
+    "@dag(dag_id='d')\n"
+    "def d(): pass\n"
+)
+
 #: A file caught mid-write: readable, unparseable.
 _DAG_HALF_WRITTEN = "from airflow.decorators import dag\n@dag(dag_id='d'\n"
 
@@ -5685,6 +5928,27 @@ class TestScanMissEndToEnd:
         _record_dag(dagmodel_engine, is_active=True)
 
         _write_dag_file(dag_file, _DAG_WITHOUT_TRIGGER, mtime=2000)
+        for miss in range(1, _ABSENT_GRACE_CYCLES + 1):
+            await e2e_listener._run_cycle()
+            row = _snapshot(dagmodel_engine)
+            assert row is not None, f"deleted after {miss} miss(es)"
+            assert row["absent_cycles"] == miss
+
+        await e2e_listener._run_cycle()
+        assert _snapshot(dagmodel_engine) is None
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_decorator_goes_the_way_of_a_removed_one(
+        self, e2e_listener, dagmodel_engine, tmp_path
+    ):
+        """A file the scan refuses answers no subscriptions, and the rows it
+        registered before count misses exactly like those of a removed decorator."""
+        dag_file = tmp_path / "d.py"
+        _write_dag_file(dag_file, _DAG_WITH_TRIGGER, mtime=1000)
+        await e2e_listener._run_cycle()
+        _record_dag(dagmodel_engine, is_active=True)
+
+        _write_dag_file(dag_file, _DAG_WITH_UNREADABLE_TRIGGER, mtime=2000)
         for miss in range(1, _ABSENT_GRACE_CYCLES + 1):
             await e2e_listener._run_cycle()
             row = _snapshot(dagmodel_engine)
