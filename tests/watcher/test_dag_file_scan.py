@@ -1472,6 +1472,89 @@ class TestReadFileTriggers:
             read.problems
         )
 
+    @pytest.mark.parametrize("name", ["dag", "rmq_trigger"])
+    @pytest.mark.parametrize(
+        ("factory", "after"),
+        [
+            pytest.param(
+                "def make():\n"
+                "    def middle():\n"
+                "        @rmq_trigger(queue='a')\n        @dag(dag_id='a')\n        def a(): pass\n"
+                "        return a()\n"
+                "    return middle\n",
+                "m = make()\n{name} = None\nm()\n",
+                id="two-level-factory",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    yield a()\n",
+                "made = make()\n{name} = None\nlist(made)\n",
+                id="generator-factory",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    yield from [a()]\n",
+                "made = make()\n{name} = None\nlist(made)\n",
+                id="yield-from-factory",
+            ),
+            pytest.param(
+                "async def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n",
+                "made = make()\n{name} = None\nimport asyncio\nasyncio.run(made)\n",
+                id="async-factory",
+            ),
+            pytest.param(
+                "@register\n"
+                "def make():\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n",
+                "make()\n{name} = None\nfor factory in FACTORIES:\n    factory()\n",
+                id="decorated-factory",
+            ),
+            pytest.param(
+                "def make():\n"
+                "    class Holder:\n"
+                "        @rmq_trigger(queue='a')\n        @dag(dag_id='a')\n        def a(): pass\n"
+                "    return Holder.a()\n",
+                "make()\n{name} = None\n",
+                id="class-between-the-factory-and-the-function",
+            ),
+        ],
+    )
+    def test_a_factory_whose_call_may_not_run_the_def_counts_bindings_below(
+        self, factory, after, name
+    ):
+        read = _file_read(factory + after.format(name=name))
+        assert read.subscriptions == []
+        assert any(f"{name} is not bound by one absolute import alone" in p for p in read.problems), (
+            read.problems
+        )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(
+                "    def numbers():\n        yield 1\n"
+                "    @rmq_trigger(queue='a')\n    @dag(dag_id='a')\n    def a(): pass\n"
+                "    return a()\n",
+                id="generator-nested-in-the-factory",
+            ),
+            pytest.param(
+                "    for _ in range(1):\n"
+                "        @rmq_trigger(queue='a')\n        @dag(dag_id='a')\n        def a(): pass\n"
+                "    return a()\n",
+                id="def-in-a-loop-of-the-factory",
+            ),
+        ],
+    )
+    def test_a_plain_factory_running_the_def_in_its_call_keeps_bindings_below_out(self, body):
+        read = _file_read("def make():\n" + body + "made = make()\ndag = None\n")
+        assert read.problems == []
+        assert [(s["dag_id"], s["queue_name"]) for s in read.subscriptions] == [("a", "a")]
+
     def test_import_below_the_decorated_function_is_not_seen(self):
         read = _read_file_triggers(ast.parse(
             _TRIGGER_IMPORTS

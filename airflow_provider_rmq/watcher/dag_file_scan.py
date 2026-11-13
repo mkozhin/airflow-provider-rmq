@@ -483,8 +483,9 @@ class _NameOrigins:
       before the decorator. The module bindings that run only after the
       decorators are left out (``_runs_after_decorators``): for a function at
       module level, outside any loop, those at or below its ``def`` line; for a
-      function nested in a factory — a ``def`` at module level, outside any
-      loop — those at or below the factory's ``def`` line when the file calls the
+      function defined directly in a factory — a plain ``def`` at module level,
+      outside any loop, with no decorator, not ``async`` and not a generator —
+      those at or below the factory's ``def`` line when the file calls the
       factory by its name, only by its name, and every such call runs once
       before them (``dag = create_dag()`` below the factory, a
       ``with DAG(...) as dag:`` below its last call).
@@ -584,6 +585,26 @@ class _NameOrigins:
             getattr(binding, "lineno", 0), getattr(binding, "col_offset", 0)
         )
 
+    def _runs_nested_def_in_call(self, top: _FunctionNode, func: _FunctionNode) -> bool:
+        """Tell whether a call of the factory ``top`` runs the ``def`` of ``func`` before it returns.
+
+        That holds when ``func`` is defined directly in the body of ``top`` —
+        no function or class between them, whose body would run at some other
+        time — and ``top`` is a plain ``def``: a call of an ``async def`` or of a
+        generator (a ``yield`` in its own scope) only creates an object that
+        runs the body later, and a decorator on ``top`` may keep the factory and
+        call it again at any time.
+        """
+        return (
+            isinstance(top, ast.FunctionDef)
+            and not top.decorator_list
+            and self._owner(func)[0] is top
+            and not any(
+                isinstance(node, (ast.Yield, ast.YieldFrom))
+                for node in _scope_nodes(top.body)
+            )
+        )
+
     def _runs_after_decorators(
         self, binding: ast.AST, top: _FunctionNode, func: _FunctionNode
     ) -> bool:
@@ -591,23 +612,27 @@ class _NameOrigins:
 
         ``top`` is the function at module level, outside any loop, that ``func``
         is or is nested in. The decorators of ``func`` run when ``top`` is
-        defined (``top`` is ``func``) or each time it is called, so a binding
-        above the ``def`` of ``top`` runs before them. A binding at or below it
-        runs after them when ``top`` is ``func``, and when ``top`` is a factory
-        the file mentions at least once, every mention being a call
-        (``_is_called``) that runs once before the binding
-        (``_runs_once_before``). Any other mention — ``make = create_dag``,
-        ``FACTORIES.append(create_dag)``, ``register(create_dag)`` — hands the
-        factory to code that may call it after the binding, and a factory its
-        file never mentions is there for another file to import and call after
-        the whole module has run; then the binding counts. A ``:=`` binding is
-        never left out: an expression may evaluate it before the call it is
-        written after.
+        defined (``top`` is ``func``) or when code inside ``top`` runs, so a
+        binding above the ``def`` of ``top`` runs before them. A binding at or
+        below it runs after them when ``top`` is ``func``. When ``top`` is a
+        factory, the binding runs after them only when a call of the factory
+        runs the ``def`` of ``func`` before returning
+        (``_runs_nested_def_in_call``) and the file mentions the factory at
+        least once, every mention being a call (``_is_called``) that runs once
+        before the binding (``_runs_once_before``). Any other mention —
+        ``make = create_dag``, ``FACTORIES.append(create_dag)``,
+        ``register(create_dag)`` — hands the factory to code that may call it
+        after the binding, and a factory its file never mentions is there for
+        another file to import and call after the whole module has run; then
+        the binding counts. A ``:=`` binding is never left out: an expression
+        may evaluate it before the call it is written after.
         """
         if getattr(binding, "lineno", 0) < top.lineno:
             return False
         if top is func:
             return True
+        if not self._runs_nested_def_in_call(top, func):
+            return False
         if isinstance(self._parents.get(id(binding)), ast.NamedExpr):
             return False
         mentions = self._mentions.get(top.name, [])

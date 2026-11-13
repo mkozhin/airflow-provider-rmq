@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/dag_file_scan.py:1058
+where: airflow_provider_rmq/watcher/dag_file_scan.py:1080
 added: 2026-08-08
 ---
 # AST-резолвинг `dag_id` не покрывает сложные и динамические случаи
@@ -8,10 +8,10 @@ added: 2026-08-08
 **Контекст.** Watcher читает DAG-файлы через `ast`, не исполняя их (DAG-код в процессе
 watcher'а не исполняется: зависший импорт занял бы воркер пула цикла и держал бы import
 lock'и модулей). Чтение файла живёт в `airflow_provider_rmq/watcher/dag_file_scan.py`:
-`_read_file_triggers` (`dag_file_scan.py:1310`) собирает подписки файла, а `dag_id` для
-каждой функции с `@rmq_trigger` вычисляет `_static_dag_id` (`dag_file_scan.py:1058`). Тот
+`_read_file_triggers` (`dag_file_scan.py:1337`) собирает подписки файла, а `dag_id` для
+каждой функции с `@rmq_trigger` вычисляет `_static_dag_id` (`dag_file_scan.py:1080`). Тот
 же код при импорте DAG-файла прогоняет декоратор (`_verify_static_readability`,
-`dag_file_scan.py:1500`).
+`dag_file_scan.py:1539`).
 
 Резолвится строковый литерал (`dag_id='my_dag'`) и строковая константа файла
 (`DAG_NAME = 'my_dag'` → `dag_id=DAG_NAME`, присвоенная ровно один раз на верхнем

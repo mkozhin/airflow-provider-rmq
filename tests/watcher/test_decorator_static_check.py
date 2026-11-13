@@ -1000,6 +1000,92 @@ class TestWatcherAndDecoratorReadTheSameFile:
         assert "TypeError" in _import_error(bag, path)
         assert not bag.dags
 
+    @pytest.mark.parametrize(
+        ("body", "import_failure"),
+        [
+            pytest.param(
+                """
+                def outer():
+                    def create_orders_dag():
+                        @rmq_trigger(queue="orders")
+                        @dag(dag_id="orders_dag", schedule=None, start_date=START)
+                        def orders_dag():
+                            pass
+
+                        return orders_dag()
+
+                    return create_orders_dag
+
+                create = outer()
+                dag = None
+                create()
+                """,
+                "TypeError",
+                id="two-level-factory",
+            ),
+            pytest.param(
+                """
+                def create_orders_dags():
+                    @rmq_trigger(queue="orders")
+                    @dag(dag_id="orders_dag", schedule=None, start_date=START)
+                    def orders_dag():
+                        pass
+
+                    yield orders_dag()
+
+                made = create_orders_dags()
+                dag = None
+                list(made)
+                """,
+                "TypeError",
+                id="generator-factory",
+            ),
+            pytest.param(
+                """
+                from airflow import DAG
+
+                FACTORIES = []
+
+                def register(factory):
+                    FACTORIES.append(factory)
+                    return factory
+
+                @register
+                def create_orders_dag():
+                    @rmq_trigger(queue="orders")
+                    @dag(dag_id="orders_dag", schedule=None, start_date=START)
+                    def orders_dag():
+                        pass
+
+                    return orders_dag()
+
+                create_orders_dag()
+
+                with DAG("legacy_dag", schedule=None, start_date=START) as dag:
+                    pass
+
+                for factory in FACTORIES:
+                    factory()
+                """,
+                "RMQTriggerNotStaticError",
+                id="registered-factory",
+            ),
+        ],
+    )
+    def test_a_factory_whose_call_may_not_run_the_dag_def_fails_in_both_processes(
+        self, dags_folder, caplog, body, import_failure
+    ):
+        path = _write(dags_folder, "deferred_factory.py", body)
+        bag = _load(dags_folder)
+        scanned = self._scan(path, caplog)
+
+        assert scanned == []
+        [error_log] = _watcher_errors(caplog)
+        assert "dag is not bound by one absolute import alone" in error_log
+
+        assert import_failure in _import_error(bag, path)
+        assert not bag.dags
+
     def test_a_factory_its_file_never_calls_with_dag_rebound_below_fails_in_both_processes(
         self, dags_folder, caplog, monkeypatch
     ):
