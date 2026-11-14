@@ -513,9 +513,13 @@ async def match_and_ack(
     sleeps 0.1 s to prevent a hot redelivery loop on classic queues.
 
     Note:
-        On quorum queues (RabbitMQ 4.x default), the broker enforces a delivery-limit
-        of 20 by default — a message returned to the queue is dead-lettered after 20
-        redeliveries. Use dedicated queues per DAG to avoid unintended message loss.
+        A message is returned to the queue with ``basic.nack``. On a quorum queue of
+        RabbitMQ 4.0–4.2 each such return counts against ``delivery-limit`` (20 by
+        default), and the message is dead-lettered or dropped once it is reached. On
+        RabbitMQ 4.3+ ``delivery-limit`` counts only ``basic.reject`` and failed
+        deliveries, so the message keeps coming back to the queue. Use dedicated
+        queues per DAG: a foreign message on a shared queue is lost on 4.0–4.2 and
+        circulates without end on 4.3+.
     """
     verdict, reason = match(message, msg_filter)
     if verdict is FilterVerdict.MATCH:

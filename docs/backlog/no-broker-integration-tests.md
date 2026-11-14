@@ -74,7 +74,10 @@ dead-lettering на подтверждении, возврат в очередь
 5. удаление очереди под consumer'ом: `basic.cancel` от брокера, тег исчезает
    из канала, строка становится `error`, а после повторного создания очереди
    — `listening`;
-6. quorum-очередь с `delivery-limit=3`: поведение при трёх nack подряд;
+6. quorum-очередь с `delivery-limit=3`: поведение при трёх nack подряд —
+   на RabbitMQ 4.0–4.2 сообщение уходит в dead-letter или удаляется, на 4.3+
+   остаётся в очереди и приходит снова (растёт `x-acquired-count`, а не
+   `x-delivery-count`);
 7. Management API: `GET /api/consumers` видит наш тег с точным именем; без
    тега `management` — 401 и переход на passive declare;
 8. resource alarm (`rabbitmqctl set_vm_memory_high_watermark 0.0001`):

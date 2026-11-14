@@ -14,12 +14,15 @@ When to use push vs pull
 Quorum queue warning (RabbitMQ 4.0+)
 --------------------------------------
 At the default ``ack_unmatched=False`` a rejected message is NACKed with
-``requeue=True``, and RabbitMQ 4.0+ enforces a default redelivery limit of
-**20** for quorum queues. After 20 redeliveries the message is dead-lettered
-or dropped. If heavy filtering is expected, use a dedicated queue for the
+``requeue=True`` (``basic.nack``). On a quorum queue of RabbitMQ 4.0–4.2 every
+such redelivery counts against ``delivery-limit`` (**20** by default), and once
+it is reached the message is dead-lettered or dropped. On RabbitMQ 4.3+
+``delivery-limit`` counts only ``basic.reject`` and failed deliveries, so a
+rejected message goes back to the head of the queue and is evaluated again,
+indefinitely. If heavy filtering is expected, use a dedicated queue for the
 specific message type — with ``ack_unmatched=True`` on it, where a rejected
 message is acknowledged and never redelivered, so the limit is out of the
-picture — or raise the ``delivery-limit`` policy on the queue.
+picture. A ``delivery-limit`` policy on the queue helps only on 4.0–4.2.
 
 message_wait_timeout
 --------------------

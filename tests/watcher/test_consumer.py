@@ -2284,11 +2284,12 @@ class TestConsumeFireQueue:
         """A fire event is the only record that a cooldown window expired.
 
         A trigger that fails requeues it, and without a growing pause the broker hands
-        it straight back: at one redelivery per reconnect delay the default delivery
-        limit of a quorum queue is spent in under two minutes, after which the event is
-        dead-lettered — and ``rmq_watcher.fire`` is declared with no dead-letter exchange,
-        so the DAG run it stood for is simply gone. The sibling paths grew a backoff for
-        exactly this.
+        it straight back. On a quorum queue of RabbitMQ 4.0–4.2, at one redelivery per
+        reconnect delay, the default delivery limit is spent in under two minutes, after
+        which the event is dead-lettered — and ``rmq_watcher.fire`` is declared with no
+        dead-letter exchange, so the DAG run it stood for is simply gone. On RabbitMQ
+        4.3+ the limit is untouched and the event comes back at full speed instead. The
+        sibling paths grew a backoff for exactly this.
         """
         manager = _make_manager()
         msg = _make_fire_message()
@@ -4587,8 +4588,8 @@ class TestPublishConnection:
         """The pending queue is declared x-max-length=1 with x-overflow=reject-publish,
         so a broker that nacks the publish is saying the cooldown window for this dag_id
         is already open. That is the ordinary case while a window runs: requeueing would
-        redeliver the same message for the whole window and burn the quorum-queue
-        delivery limit on it."""
+        redeliver the same message for the whole window, and on a quorum queue of
+        RabbitMQ 4.0–4.2 spend its delivery limit as well."""
         publish_channel = _make_live_channel()
         publish_channel.default_exchange.publish = AsyncMock(
             side_effect=aio_pika.exceptions.DeliveryError(None, MagicMock())
@@ -4985,8 +4986,9 @@ class TestConsumptionKeepsGoing:
     async def test_a_publish_that_keeps_failing_pauses_longer_each_time(self, manager):
         """A broker under a resource alarm holds publishes for as long as the alarm
         lasts. Without a growing pause the requeued delivery comes back every reconnect
-        delay and burns the quorum-queue delivery limit, after which the broker drops the
-        very message the requeue was meant to keep."""
+        delay: on a quorum queue of RabbitMQ 4.0–4.2 that spends its delivery limit,
+        after which the broker drops the very message the requeue was meant to keep, and
+        on RabbitMQ 4.3+ it spins at full speed."""
         queue = MagicMock()
         queue.iterator.side_effect = lambda **kw: _QueueIterCtx([_make_fake_message(b"o")])
         connection = _make_live_connection(channel=_make_live_channel(queue=queue))
@@ -7985,9 +7987,10 @@ class TestImmediateDeliveryAcknowledgement:
 
     @pytest.mark.asyncio
     async def test_repeated_failures_grow_the_pause_up_to_the_cap(self, manager):
-        """A steady trigger failure must not turn into a hot redelivery loop: the
-        default delivery-limit of a quorum queue is 20, which 0.1 s pauses burn in
-        seconds."""
+        """A steady trigger failure must not turn into a hot redelivery loop: on a
+        quorum queue of RabbitMQ 4.0–4.2 the default delivery-limit of 20 is spent by
+        0.1 s pauses in seconds, and on RabbitMQ 4.3+ the requeue spins at full
+        speed."""
         delays = []
         done = asyncio.Event()
         messages = [_make_fake_message(b"x", message_id=f"m{i}") for i in range(8)]
@@ -8360,10 +8363,11 @@ class TestADagWithoutASerializedVersion:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("count", [10, 20])
     async def test_every_tenth_delivery_in_a_row_is_a_warning(self, manager, count):
-        """A quorum queue can spend the delivery-limit of the message before the
-        streak reaches its bound, and the log line is then the only trace left — which
-        is why it says which DAG, how long it has been waiting and that the delivery
-        went back, and why it says it at a level a filtered log keeps."""
+        """A quorum queue of RabbitMQ 4.0–4.2 can spend the delivery-limit of the
+        message before the streak reaches its bound, and the log line is then the only
+        trace left — which is why it says which DAG, how long it has been waiting and
+        that the delivery went back, and why it says it at a level a filtered log
+        keeps."""
         state = self._state(manager)
         with patch(f"{_CONSUMER_MODULE}.log") as log, \
              patch(f"{_CONSUMER_MODULE}.asyncio.sleep", new_callable=AsyncMock):

@@ -29,11 +29,14 @@ class RMQTrigger(BaseTrigger):
 
     Note:
         With ``ack_unmatched`` off, a non-matching message is NACKed with
-        requeue=True. RabbitMQ 4.0+ enforces a default redelivery limit of 20 for
-        quorum queues (the default in 4.x clusters) — after 20 redeliveries the
-        message is dead-lettered or dropped. If heavy filtering is expected, use a
-        dedicated queue with ``ack_unmatched=True``, or raise the delivery-limit
-        policy. With ``ack_unmatched`` on the message is acknowledged instead and
+        requeue=True (``basic.nack``). On a quorum queue of RabbitMQ 4.0–4.2 every
+        such redelivery counts against ``delivery-limit`` (20 by default), and once it
+        is reached the message is dead-lettered or dropped. On RabbitMQ 4.3+
+        ``delivery-limit`` counts only ``basic.reject`` and failed deliveries, so a
+        non-matching message goes back to the head of the queue and is evaluated
+        again, indefinitely. If heavy filtering is expected, use a dedicated queue
+        with ``ack_unmatched=True``; a ``delivery-limit`` policy helps only on
+        4.0–4.2. With ``ack_unmatched`` on the message is acknowledged instead and
         never redelivered, so the limit is out of the picture.
     """
 

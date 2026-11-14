@@ -187,18 +187,23 @@ _RUN_ID_HASH_LEN = 32
 #: Backoff for a delivery whose trigger failed: doubling from the first second up to a
 #: minute, reset by the next success. The 0.1 s of ``nack_and_sleep`` paces the return of
 #: a message the filter rejected while ``ack_unmatched`` is off, and of one it could not
-#: be evaluated on at all; it is far too short here — ~10 redeliveries per second burn
-#: the default delivery-limit of 20 on a quorum queue in about two seconds, and the
-#: message is dead-lettered by the very mechanism meant to keep it.
+#: be evaluated on at all; it is far too short here. On a quorum queue of RabbitMQ
+#: 4.0–4.2, where every requeueing nack counts against ``delivery-limit``, ~10
+#: redeliveries per second spend the default limit of 20 in about two seconds, and the
+#: message is dead-lettered by the very mechanism meant to keep it. On RabbitMQ 4.3+ a
+#: requeueing nack leaves ``delivery-limit`` untouched, and the pause is what keeps the
+#: requeue from spinning at full speed.
 _TRIGGER_BACKOFF_START = 1.0
 _TRIGGER_BACKOFF_MAX = 60.0
 
 #: Backoff for a delivery whose cooldown placeholder could not be published, doubling
 #: from the first second up to a minute and reset by the next successful publish. A
 #: broker under a resource alarm holds publishes for as long as the alarm lasts, and
-#: without a growing pause the same delivery comes back every reconnect delay and burns
-#: the quorum-queue delivery limit — after which the broker dead-letters or drops the
-#: very message the requeue was meant to keep.
+#: without a growing pause the same delivery comes back every reconnect delay. On a
+#: quorum queue of RabbitMQ 4.0–4.2 each return spends one unit of ``delivery-limit``,
+#: after which the broker dead-letters or drops the very message the requeue was meant
+#: to keep; on RabbitMQ 4.3+ the limit is untouched and the pause keeps the requeue
+#: from spinning at full speed.
 _PUBLISH_BACKOFF_START = 1.0
 _PUBLISH_BACKOFF_MAX = 60.0
 
@@ -3401,10 +3406,12 @@ class RMQConsumerManager:
                 )
                 await state.write(_SUB_ERROR, last_error=_not_ready_text(exc))
             else:
-                # A quorum queue drops the delivery once its delivery-limit is spent,
-                # which can happen before the streak reaches the limit above, so every
-                # tenth line is raised to WARNING: it is then the only trace the warmup
-                # leaves.
+                # A quorum queue of RabbitMQ 4.0–4.2 drops the delivery once its
+                # delivery-limit is spent, which can happen before the streak reaches
+                # the limit above, so every tenth line is raised to WARNING: it is then
+                # the only trace the warmup leaves. On RabbitMQ 4.3+ the requeueing
+                # nack leaves delivery-limit untouched, and a long enough warmup takes
+                # the streak to its bound.
                 log.log(
                     logging.WARNING if state.not_ready_streak % 10 == 0 else logging.INFO,
                     "DAG %s of subscription %d is not serialized yet, %d deliveries in "
@@ -3458,10 +3465,11 @@ class RMQConsumerManager:
         so a rejection means the cooldown for this dag_id is already counting down and a
         second placeholder would add nothing. That is the ordinary case while a cooldown
         window is open, and the delivery is acknowledged — requeueing it would redeliver
-        the same message for the whole window and burn the quorum-queue delivery limit on
-        it. The rejection frame carries no reason, so a queue whose own process failed
-        rejects the publish in exactly the same words and costs this one event; the log
-        line names both readings, at a level that survives the default configuration.
+        the same message for the whole window, and on a quorum queue of RabbitMQ 4.0–4.2
+        spend its delivery limit as well. The rejection frame carries no reason, so a
+        queue whose own process failed rejects the publish in exactly the same words and
+        costs this one event; the log line names both readings, at a level that survives
+        the default configuration.
 
         A broker that *returns* the publish says the opposite: the pending queue is
         missing, so nothing is counting down and nothing will ever fire this window. The
@@ -3649,9 +3657,11 @@ class RMQConsumerManager:
         A trigger that fails puts the fire event back on the queue and pauses for a
         growing interval before the next one. The pause is what keeps the event: a fire
         event is the only record that a cooldown window expired, ``rmq_watcher.fire`` is
-        declared with no dead-letter exchange, and a redelivery every reconnect delay
-        spends the default delivery limit of a quorum queue in about a hundred seconds —
-        after which the broker drops the message the requeue was meant to keep.
+        declared with no dead-letter exchange, and on a quorum queue of RabbitMQ 4.0–4.2
+        a redelivery every reconnect delay spends the default delivery limit in about a
+        hundred seconds — after which the broker drops the message the requeue was meant
+        to keep. On RabbitMQ 4.3+ a requeueing nack leaves the limit untouched, and the
+        pause keeps the event from coming back at full speed.
 
         The fire consumer reports the failure as its own status for the same reason a
         subscription does: the connection is fine and the iterator keeps running, so
