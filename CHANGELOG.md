@@ -7,13 +7,13 @@
 - `rmq_trigger` must be imported from the provider and `dag` from Airflow (`airflow.decorators` or `airflow.models.dag`). Wrappers, aliases, `import *` and decorators placed below `@rmq_trigger` are rejected.
 - The watcher lists DAG files the way Airflow does: `.airflowignore` is respected, hidden files and directories are scanned, zip archives are not read.
 - `@rmq_trigger` in a file outside `DAGS_FOLDER` or excluded by `.airflowignore` fails the import. Tests and CI that build a `DagBag` must set `DAGS_FOLDER` to the same folder.
-- Docs: quorum-queue redelivery notes distinguish RabbitMQ 4.0–4.2, where a requeueing nack spends `delivery-limit`, from 4.3+, where it does not.
 
 ### Fixed
 - Unreadable `@rmq_trigger` arguments are no longer silently replaced by defaults.
 - An unreadable subdirectory of `DAGS_FOLDER` no longer drops its subscriptions silently: it is logged and its files are held like unreadable files.
 
 ### Upgrade notes
+- RabbitMQ 4.3 or newer is required: on earlier versions a requeueing nack spends a quorum queue's `delivery-limit`, so redelivered messages can be dead-lettered or dropped.
 - Before rollout, check the production DAG folder for: files that will now fail to import, `.py` files in hidden directories, heavy directories (`.git`, `.venv`, `node_modules`) that belong in `.airflowignore`, and `@rmq_trigger` factories under `.airflowignore`.
 
 ## v2.6.0

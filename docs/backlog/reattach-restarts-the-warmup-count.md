@@ -33,5 +33,4 @@ added: 2026-09-01
 второй вопрос: что снимает такую отметку, если доставок больше не приходит.
 Пока это не решено, порог остаётся привязанным к прицеплению.
 
-Соседние пункты про тот же прогрев: [[warmup-loses-the-message-invisibly]],
-[[cooldown-dag-never-serialized-invisible]].
+Соседний пункт про тот же прогрев: [[cooldown-dag-never-serialized-invisible]].

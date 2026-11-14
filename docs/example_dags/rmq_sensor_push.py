@@ -11,18 +11,15 @@ When to use push vs pull
 * **pull** (default) — prefer when simplicity is more important than latency,
   or when filter logic causes many NACKs (see quorum queue note below).
 
-Quorum queue warning (RabbitMQ 4.0+)
---------------------------------------
+Quorum queue note
+-----------------
 At the default ``ack_unmatched=False`` a rejected message is NACKed with
-``requeue=True`` (``basic.nack``). On a quorum queue of RabbitMQ 4.0–4.2 every
-such redelivery counts against ``delivery-limit`` (**20** by default), and once
-it is reached the message is dead-lettered or dropped. On RabbitMQ 4.3+
-``delivery-limit`` counts only ``basic.reject`` and failed deliveries, so a
-rejected message goes back to the head of the queue and is evaluated again,
-indefinitely. If heavy filtering is expected, use a dedicated queue for the
-specific message type — with ``ack_unmatched=True`` on it, where a rejected
-message is acknowledged and never redelivered, so the limit is out of the
-picture. A ``delivery-limit`` policy on the queue helps only on 4.0–4.2.
+``requeue=True`` (``basic.nack``). A quorum queue's ``delivery-limit`` counts
+only ``basic.reject`` and failed deliveries, so a rejected message goes back to
+the head of the queue and is evaluated again, indefinitely. If heavy filtering
+is expected, use a dedicated queue for the specific message type with
+``ack_unmatched=True`` on it, where a rejected message is acknowledged and
+never redelivered.
 
 message_wait_timeout
 --------------------

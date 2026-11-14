@@ -510,16 +510,13 @@ async def match_and_ack(
     A message the filter rejected goes to :func:`handle_miss`, which acknowledges it when
     ``ack_unmatched`` is on and returns it to the queue otherwise. A message the filter
     could not be evaluated on is always returned to the queue, after which the call
-    sleeps 0.1 s to prevent a hot redelivery loop on classic queues.
+    sleeps 0.1 s to prevent a hot redelivery loop.
 
     Note:
-        A message is returned to the queue with ``basic.nack``. On a quorum queue of
-        RabbitMQ 4.0–4.2 each such return counts against ``delivery-limit`` (20 by
-        default), and the message is dead-lettered or dropped once it is reached. On
-        RabbitMQ 4.3+ ``delivery-limit`` counts only ``basic.reject`` and failed
-        deliveries, so the message keeps coming back to the queue. Use dedicated
-        queues per DAG: a foreign message on a shared queue is lost on 4.0–4.2 and
-        circulates without end on 4.3+.
+        A message is returned to the queue with ``basic.nack``, which a quorum queue
+        does not count against ``delivery-limit``, so the message keeps coming back to
+        the queue. Use dedicated queues per DAG: a foreign message on a shared queue
+        circulates without end.
     """
     verdict, reason = match(message, msg_filter)
     if verdict is FilterVerdict.MATCH:
