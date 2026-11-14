@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
-import glob
 import logging
 import os
 import re
@@ -25,6 +24,11 @@ from airflow_provider_rmq.utils.amqp import call_with_timeout
 from airflow_provider_rmq.utils.executor import BoundedExecutor
 from airflow_provider_rmq.watcher import listener as listener_module
 from airflow_provider_rmq.watcher.dag_file_scan import _READABLE_FILE_REMEDY
+from airflow_provider_rmq.watcher.dag_folder_listing import (
+    DagFolderListing,
+    DagFolderListingError,
+    list_dag_files,
+)
 from airflow_provider_rmq.watcher.listener import (
     CYCLE_TIMEOUT_VAR,
     RECONCILE_INTERVAL_VAR,
@@ -58,6 +62,11 @@ from airflow_provider_rmq.watcher.runner import (
 
 
 _LISTENER_LOG = "airflow_provider_rmq.watcher.listener"
+
+
+def _listing(*files: str) -> DagFolderListing:
+    """A walk of the DAG folder that listed ``files`` and read every directory."""
+    return DagFolderListing(set(files), {}, set())
 
 
 def _make_session_ctx(existing_subs=None):
@@ -204,7 +213,7 @@ class TestScanSubscriptions:
         listener = self._listener()
         files = ["/dags/dag1.py", "/dags/dag2.py"]
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files", return_value=_listing(*files)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]) as mock_ex:
             listener._scan_subscriptions()
@@ -215,7 +224,7 @@ class TestScanSubscriptions:
         listener = self._listener()
         files = ["/dags/dag1.py"]
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files", return_value=_listing(*files)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]) as mock_ex:
             listener._scan_subscriptions()  # first run
@@ -228,7 +237,7 @@ class TestScanSubscriptions:
         files = ["/dags/dag1.py"]
         mtime_values = iter([1000.0, 2000.0])
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files", return_value=_listing(*files)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=mtime_values), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]) as mock_ex:
@@ -242,8 +251,8 @@ class TestScanSubscriptions:
         kept = "/dags/dag1.py"
         deleted = "/dags/dag2.py"
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=[kept, deleted]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(kept, deleted)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
@@ -253,7 +262,7 @@ class TestScanSubscriptions:
         listener._read_failures[deleted] = 1
 
         # Second scan: one of the two files is gone, the other is still there
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[kept]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files", return_value=_listing(kept)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
@@ -273,8 +282,8 @@ class TestScanSubscriptions:
             "filter_data": {"filter_headers": {"type": "new_order"}},
         }
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=["/dags/orders.py"]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing("/dags/orders.py")), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[expected]):
             result = listener._scan_subscriptions()
@@ -284,8 +293,8 @@ class TestScanSubscriptions:
     def test_scan_subscriptions_ignores_dags_without_attribute(self):
         listener = self._listener()
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=["/dags/plain.py"]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing("/dags/plain.py")), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
             result = listener._scan_subscriptions()
@@ -311,7 +320,7 @@ class TestScanSubscriptions:
         healthy = "/dags/healthy.py"
         files = [file, healthy]
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files", return_value=_listing(*files)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file",
                           return_value=[{"dag_id": "d", "queue_name": "q"}]):
@@ -320,7 +329,7 @@ class TestScanSubscriptions:
         def fake_extract(path):
             return None if path == file else [{"dag_id": "h", "queue_name": "hq"}]
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files", return_value=_listing(*files)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime", return_value=2000.0), \
              patch.object(
                  listener, "_extract_subscriptions_from_file", side_effect=fake_extract
@@ -412,8 +421,8 @@ class TestUnreadableFileHold:
                 raise error
             return None if result is None else list(result)
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=[_HELD_FILE, _HEALTHY_FILE]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(_HELD_FILE, _HEALTHY_FILE)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=fake_getmtime), \
              patch.object(listener, "_extract_subscriptions_from_file",
@@ -613,8 +622,8 @@ class TestUnreadableFileHold:
         assert _HELD_FILE not in listener._last_mtimes
         assert _HELD_FILE in listener._cached_subs
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=[_HEALTHY_FILE]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(_HEALTHY_FILE)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0):
             listener._scan_subscriptions()
@@ -634,8 +643,8 @@ class TestEveryFileUnreadable:
         """A listener whose cache holds one parse of every file of ``_FILES``."""
         listener = RMQWatcherListener()
         listener._get_dags_folder = MagicMock(return_value="/dags")
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(self._FILES)), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(*self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file",
@@ -644,8 +653,8 @@ class TestEveryFileUnreadable:
         return listener
 
     def _scan_all_stale(self, listener):
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(self._FILES)), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(*self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=OSError("stale handle")):
             return listener._scan_subscriptions()
@@ -674,8 +683,8 @@ class TestEveryFileUnreadable:
     def test_one_file_that_still_reads_makes_the_listing_trustworthy(self):
         listener = self._listener()
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(self._FILES)), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(*self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=lambda path: 2000.0 if path == _HEALTHY_FILE
                    else (_ for _ in ()).throw(OSError("stale handle"))), \
@@ -709,8 +718,8 @@ class TestEveryFileUnreadable:
         assert listener._untrusted_scan_streak == 0
 
     def _scan_all_unparseable(self, listener):
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(self._FILES)), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(*self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=2000.0), \
              patch.object(listener, "_extract_subscriptions_from_file",
@@ -750,8 +759,8 @@ class TestEveryFileUnreadable:
             with pytest.raises(_UntrustedScan):
                 self._scan_all_stale(listener)
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(self._FILES)), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(*self._FILES)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0):
             listener._scan_subscriptions()
@@ -794,7 +803,7 @@ class TestCollapsedListing:
                 raise OSError("stale handle")
             return mtime
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=files), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files", return_value=_listing(*files)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=fake_getmtime), \
              patch.object(listener, "_extract_subscriptions_from_file",
@@ -879,7 +888,7 @@ class TestCollapsedListing:
 
 
 # ---------------------------------------------------------------------------
-# An empty glob is distrusted for a bounded number of cycles
+# An empty listing is distrusted for a bounded number of cycles
 # ---------------------------------------------------------------------------
 
 class TestEmptyScanDistrust:
@@ -888,8 +897,8 @@ class TestEmptyScanDistrust:
         listener = RMQWatcherListener()
         listener._get_dags_folder = MagicMock(return_value="/dags")
         subs = [{"dag_id": "d", "queue_name": "q"}]
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=list(files)), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing(*files)), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=subs):
@@ -897,10 +906,10 @@ class TestEmptyScanDistrust:
         return listener
 
     def _scan_empty(self, listener):
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob", return_value=[]):
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files", return_value=_listing()):
             return listener._scan_subscriptions()
 
-    def test_empty_glob_between_two_full_ones_is_untrusted(self):
+    def test_empty_listing_between_two_full_ones_is_untrusted(self):
         listener = self._warm_listener()
         mtimes = dict(listener._last_mtimes)
         cached = {path: list(subs) for path, subs in listener._cached_subs.items()}
@@ -926,7 +935,7 @@ class TestEmptyScanDistrust:
         # the distrust has nothing to compare the emptiness against.
         assert self._scan_empty(listener) == []
 
-    def test_a_non_empty_glob_resets_the_streak(self):
+    def test_a_non_empty_listing_resets_the_streak(self):
         listener = self._warm_listener()
 
         for _ in range(_UNTRUSTED_SCAN_LIMIT):
@@ -934,8 +943,8 @@ class TestEmptyScanDistrust:
                 self._scan_empty(listener)
         assert listener._untrusted_scan_streak == _UNTRUSTED_SCAN_LIMIT
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=["/dags/dag1.py"]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing("/dags/dag1.py")), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0):
             listener._scan_subscriptions()
@@ -946,7 +955,7 @@ class TestEmptyScanDistrust:
             with pytest.raises(_UntrustedScan):
                 self._scan_empty(listener)
 
-    def test_empty_glob_on_a_cold_cache_is_distrusted_too(self):
+    def test_empty_listing_on_a_cold_cache_is_distrusted_too(self):
         """A scheduler restarting into a folder git-sync has not populated yet.
 
         The folder exists and lists, so nothing above this check objects, and the
@@ -987,8 +996,8 @@ class TestEmptyScanDistrust:
                 self._scan_empty(listener)
         assert self._scan_empty(listener) == []
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=["/dags/dag1.py"]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing("/dags/dag1.py")), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=OSError("stale handle")):
             for _ in range(_UNTRUSTED_SCAN_LIMIT):
@@ -1004,8 +1013,8 @@ class TestEmptyScanDistrust:
         gives the emptiness after it the whole budget once more.
         """
         listener = self._warm_listener()
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=["/dags/dag1.py"]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing("/dags/dag1.py")), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    side_effect=OSError("stale handle")):
             for _ in range(_UNTRUSTED_SCAN_LIMIT + _UNREADABLE_FILE_LIMIT + 1):
@@ -1015,8 +1024,8 @@ class TestEmptyScanDistrust:
                     pass
         assert listener._last_mtimes == {}
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=["/dags/dag1.py"]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing("/dags/dag1.py")), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=1000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
@@ -1091,8 +1100,8 @@ class TestEmptyScanDistrust:
                 self._scan_empty(listener)
         self._scan_empty(listener)
 
-        with patch("airflow_provider_rmq.watcher.listener.glob.glob",
-                   return_value=["/dags/dag1.py"]), \
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing("/dags/dag1.py")), \
              patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
                    return_value=2000.0), \
              patch.object(listener, "_extract_subscriptions_from_file", return_value=[]):
@@ -1128,7 +1137,7 @@ class TestGetDagsFolder:
             assert listener._get_dags_folder() == str(tmp_path)
 
     def test_empty_folder_is_returned_too(self, tmp_path):
-        # An honestly empty directory is the truth about the code and must reach glob.
+        # An honestly empty directory is the truth about the code and must reach the walk.
         listener = RMQWatcherListener()
 
         with patch("airflow.settings.DAGS_FOLDER", str(tmp_path)):
@@ -1150,17 +1159,16 @@ class TestGetDagsFolder:
              pytest.raises(_UntrustedScan, match="empty"):
             listener._get_dags_folder()
 
-    def test_empty_setting_keeps_glob_from_running(self):
-        # glob.glob("/**/*.py", recursive=True) is a walk of the whole filesystem
-        # from the root inside a worker of the cycle pool.
+    def test_empty_setting_keeps_the_walk_from_running(self):
+        # A setting that names no folder is turned away before the folder is walked.
         listener = RMQWatcherListener()
 
         with patch("airflow.settings.DAGS_FOLDER", ""), \
-             patch("airflow_provider_rmq.watcher.listener.glob.glob") as mock_glob, \
+             patch("airflow_provider_rmq.watcher.listener.list_dag_files") as mock_listing, \
              pytest.raises(_UntrustedScan):
             listener._scan_subscriptions()
 
-        mock_glob.assert_not_called()
+        mock_listing.assert_not_called()
 
     def test_missing_directory_raises_untrusted_scan(self, tmp_path):
         listener = RMQWatcherListener()
@@ -1175,9 +1183,9 @@ class TestGetDagsFolder:
         reason="root reads a directory whatever its mode says, so there is no unlistable folder to build",
     )
     def test_unlistable_directory_raises_untrusted_scan(self, tmp_path):
-        # os.path.isdir says True for a directory with no read permission and glob
-        # returns [] for it, so the explicit listability check is the only thing
-        # telling it apart from an honestly empty folder.
+        # os.path.isdir says True for a directory with no read permission, and the
+        # walk lists no file of it: the folder is unreadable, not empty, and the
+        # listability check turns it away before the walk.
         folder = tmp_path / "dags"
         folder.mkdir()
         (folder / "dag1.py").write_text("")
@@ -1186,7 +1194,9 @@ class TestGetDagsFolder:
 
         try:
             assert os.path.isdir(str(folder))
-            assert glob.glob(os.path.join(str(folder), "**", "*.py"), recursive=True) == []
+            listing = list_dag_files(str(folder))
+            assert listing.files == set()
+            assert set(listing.unreadable_dirs) == {str(folder)}
             with patch("airflow.settings.DAGS_FOLDER", str(folder)):
                 # The distrust has no limit: an unreadable folder never becomes truth.
                 for _ in range(5):
@@ -1247,6 +1257,352 @@ class TestGetDagsFolder:
 
         assert listener._last_mtimes == mtimes
         assert listener._cached_subs == cached
+
+
+# ---------------------------------------------------------------------------
+# _scan_subscriptions on a real DAG folder — what the walk lists, and the
+# directories it cannot read
+# ---------------------------------------------------------------------------
+
+_needs_permissions = pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root reads a directory whatever its mode says, so there is no unreadable one to build",
+)
+
+
+def _dag_source(dag_id: str) -> str:
+    """A DAG file with one ``@rmq_trigger`` subscription, for the DAG ``dag_id``."""
+    return (
+        "from airflow_provider_rmq.watcher.decorators import rmq_trigger\n"
+        "from airflow.decorators import dag\n"
+        f"@rmq_trigger(queue='q_{dag_id}')\n"
+        f"@dag(dag_id='{dag_id}')\n"
+        "def d(): pass\n"
+    )
+
+
+def _put_dag(path: Path, dag_id: str) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_dag_source(dag_id))
+    return str(path)
+
+
+def _dag_ids(result: list[dict]) -> set[str]:
+    return {sub["dag_id"] for sub in result}
+
+
+class TestScanOfTheDagFolder:
+    """The walk decides which files the scan reads, and a directory it cannot read
+    holds the previous parse of the files under it the way an unreadable file does."""
+
+    @pytest.fixture(autouse=True)
+    def default_syntax(self, monkeypatch):
+        monkeypatch.delenv("AIRFLOW__CORE__DAG_IGNORE_FILE_SYNTAX", raising=False)
+
+    @pytest.fixture
+    def folder(self, tmp_path):
+        path = tmp_path / "dags"
+        path.mkdir()
+        for dag_id in ("a", "b", "c"):
+            _put_dag(path / f"{dag_id}.py", dag_id)
+        return path
+
+    @pytest.fixture
+    def chmod(self):
+        """``chmod`` that gives the path its access back after the test."""
+        changed: list[Path] = []
+
+        def _chmod(path: Path, mode: int) -> None:
+            changed.append(path)
+            os.chmod(path, mode)
+
+        yield _chmod
+        for path in reversed(changed):
+            os.chmod(path, 0o755)
+
+    @staticmethod
+    def _scan(listener, dags_folder) -> list[dict]:
+        with patch("airflow.settings.DAGS_FOLDER", str(dags_folder)):
+            return listener._scan_subscriptions()
+
+    @staticmethod
+    def _warnings(caplog, text: str) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and text in r.getMessage()
+        ]
+
+    @_needs_permissions
+    def test_a_subdirectory_turning_unreadable_holds_the_previous_parse(
+        self, folder, chmod, caplog
+    ):
+        held = _put_dag(folder / "sub" / "s.py", "s")
+        listener = RMQWatcherListener()
+        assert _dag_ids(self._scan(listener, folder)) == {"a", "b", "c", "s"}
+
+        chmod(folder / "sub", 0)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=_LISTENER_LOG), \
+             patch.object(listener, "_file_unreadable",
+                          wraps=listener._file_unreadable) as spy:
+            result = self._scan(listener, folder)
+
+        assert _dag_ids(result) == {"a", "b", "c", "s"}
+        assert held in listener._cached_subs
+        assert listener._untrusted_scan_streak == 0
+        # The file counts in the listing once, as one file that did not read.
+        assert [c.args[0] for c in spy.call_args_list] == [held]
+        dir_warnings = self._warnings(caplog, "cannot be read")
+        assert len(dir_warnings) == 1
+        assert str(folder / "sub") in dir_warnings[0].getMessage()
+        hold_warnings = self._warnings(caplog, "holding its previous parse")
+        assert len(hold_warnings) == 1
+        assert held in hold_warnings[0].getMessage()
+
+    @_needs_permissions
+    def test_the_next_cycle_under_an_unreadable_subdirectory_drops_its_subscriptions(
+        self, folder, chmod
+    ):
+        held = _put_dag(folder / "sub" / "s.py", "s")
+        listener = RMQWatcherListener()
+        self._scan(listener, folder)
+        chmod(folder / "sub", 0)
+
+        for _ in range(_UNREADABLE_FILE_LIMIT):
+            assert "s" in _dag_ids(self._scan(listener, folder))
+        result = self._scan(listener, folder)
+
+        assert _dag_ids(result) == {"a", "b", "c"}
+        assert listener._cached_subs[held] == []
+        assert listener._untrusted_scan_streak == 0
+
+    @_needs_permissions
+    def test_a_subdirectory_reading_again_is_reported_and_its_files_reread(
+        self, folder, chmod, caplog
+    ):
+        held = _put_dag(folder / "sub" / "s.py", "s")
+        listener = RMQWatcherListener()
+        self._scan(listener, folder)
+        chmod(folder / "sub", 0)
+        for _ in range(_UNREADABLE_FILE_LIMIT + 1):
+            self._scan(listener, folder)
+        assert "s" not in _dag_ids(self._scan(listener, folder))
+
+        os.chmod(folder / "sub", 0o755)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=_LISTENER_LOG):
+            result = self._scan(listener, folder)
+
+        assert "s" in _dag_ids(result)
+        assert held in listener._last_mtimes
+        assert held not in listener._read_failures
+        assert listener._unreadable_dirs == set()
+        infos = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and "readable again" in r.getMessage()
+        ]
+        assert infos == [
+            f"RMQ Watcher: DAG folder directory {folder / 'sub'} is readable again"
+        ]
+
+    @_needs_permissions
+    def test_a_directory_unreadable_from_the_start_blocks_nothing(
+        self, folder, chmod, caplog
+    ):
+        _put_dag(folder / "lost+found" / "x.py", "x")
+        chmod(folder / "lost+found", 0)
+        listener = RMQWatcherListener()
+
+        with caplog.at_level(logging.DEBUG, logger=_LISTENER_LOG):
+            first = self._scan(listener, folder)
+            second = self._scan(listener, folder)
+
+        assert _dag_ids(first) == _dag_ids(second) == {"a", "b", "c"}
+        assert listener._untrusted_scan_streak == 0
+        dir_warnings = self._warnings(caplog, "cannot be read")
+        assert [r.getMessage().split(" cannot")[0] for r in dir_warnings] == [
+            f"RMQ Watcher: DAG folder directory {folder / 'lost+found'}"
+        ]
+        assert self._warnings(caplog, "did not read") == []
+        assert any(
+            r.levelno == logging.DEBUG and "still cannot be read" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @_needs_permissions
+    def test_a_large_unreadable_subtree_makes_the_listing_untrusted(self, folder, chmod):
+        for n in range(6):
+            _put_dag(folder / "big" / f"s{n}.py", f"s{n}")
+        listener = RMQWatcherListener()
+        self._scan(listener, folder)
+        cached = {path: list(subs) for path, subs in listener._cached_subs.items()}
+
+        chmod(folder / "big", 0)
+        with pytest.raises(_UntrustedScan, match="directories that cannot be read") as exc:
+            self._scan(listener, folder)
+
+        assert repr(str(folder / "big")) in str(exc.value)
+        assert listener._cached_subs == cached
+
+    @_needs_permissions
+    def test_an_unreadable_ignore_file_of_the_root_is_an_untrusted_scan(
+        self, folder, chmod
+    ):
+        listener = RMQWatcherListener()
+        self._scan(listener, folder)
+        ignore_file = folder / ".airflowignore"
+        ignore_file.write_text("nothing\n")
+        chmod(ignore_file, 0)
+        listener._untrusted_scan_streak = 2
+
+        with pytest.raises(_UntrustedScan, match="cannot be listed"):
+            self._scan(listener, folder)
+
+        # Like a folder that cannot be listed at all: the streak neither grows nor
+        # restarts.
+        assert listener._untrusted_scan_streak == 2
+
+    def test_a_listing_error_is_an_untrusted_scan(self, folder):
+        os.symlink(folder, folder / "loop")
+        listener = RMQWatcherListener()
+        listener._untrusted_scan_streak = 2
+
+        with pytest.raises(_UntrustedScan, match="cannot be listed by Airflow's rules"):
+            self._scan(listener, folder)
+
+        assert listener._untrusted_scan_streak == 2
+
+    def test_a_listing_error_carries_its_cause(self):
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   side_effect=DagFolderListingError("bad pattern")), \
+             pytest.raises(_UntrustedScan, match="bad pattern") as exc:
+            listener._scan_subscriptions()
+
+        assert isinstance(exc.value.__cause__, DagFolderListingError)
+
+    def test_a_file_under_airflowignore_gives_no_subscription(self, folder):
+        (folder / ".airflowignore").write_text("copies\n")
+        _put_dag(folder / "copies" / "a_copy.py", "a_copy")
+        listener = RMQWatcherListener()
+
+        assert _dag_ids(self._scan(listener, folder)) == {"a", "b", "c"}
+
+    def test_a_file_in_a_hidden_directory_gives_its_subscription(self, folder):
+        _put_dag(folder / ".hidden" / "h.py", "h")
+        _put_dag(folder / ".dotted.py", "dotted")
+        listener = RMQWatcherListener()
+
+        assert _dag_ids(self._scan(listener, folder)) == {"a", "b", "c", "h", "dotted"}
+
+    @_needs_permissions
+    def test_a_trailing_slash_on_the_folder_matches_paths_under_an_unreadable_directory(
+        self, folder, chmod
+    ):
+        _put_dag(folder / "sub" / "s.py", "s")
+        listener = RMQWatcherListener()
+        dags_folder = os.path.join(str(folder), "")
+        self._scan(listener, dags_folder)
+        cached = set(listener._cached_subs)
+
+        chmod(folder / "sub", 0)
+        result = self._scan(listener, dags_folder)
+
+        assert "s" in _dag_ids(result)
+        assert set(listener._cached_subs) == cached
+
+    @_needs_permissions
+    def test_a_symlinked_directory_whose_target_turns_unreachable_holds_its_files(
+        self, folder, tmp_path, chmod, caplog
+    ):
+        outside = tmp_path / "outside"
+        _put_dag(outside / "target" / "t.py", "t")
+        os.symlink(outside / "target", folder / "link")
+        listener = RMQWatcherListener()
+        assert "t" in _dag_ids(self._scan(listener, folder))
+        held = str(folder / "link" / "t.py")
+        assert held in listener._cached_subs
+
+        chmod(outside, 0)
+        with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+            result = self._scan(listener, folder)
+
+        assert "t" in _dag_ids(result)
+        assert str(folder / "link") in listener._unreadable_dirs
+        assert len(self._warnings(caplog, "holding its previous parse")) == 1
+
+    @_needs_permissions
+    @pytest.mark.parametrize("where", ["", "sub"])
+    def test_a_py_entry_that_cannot_be_examined_is_an_error_of_that_file_alone(
+        self, folder, tmp_path, chmod, caplog, where
+    ):
+        """``is_file()`` fails on a ``.py`` symlink into a directory without access."""
+        locked = tmp_path / "locked"
+        _put_dag(locked / "x.py", "x")
+        _put_dag(folder / "sub" / "s.py", "s")
+        entry = folder / where / "x.py"
+        os.symlink(locked / "x.py", entry)
+        listener = RMQWatcherListener()
+        assert _dag_ids(self._scan(listener, folder)) == {"a", "b", "c", "s", "x"}
+
+        chmod(locked, 0)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+            result = self._scan(listener, folder)
+
+        assert _dag_ids(result) == {"a", "b", "c", "s", "x"}
+        assert listener._unreadable_dirs == set()
+        assert listener._untrusted_scan_streak == 0
+        assert self._warnings(caplog, "cannot be read") == []
+        hold_warnings = self._warnings(caplog, "holding its previous parse")
+        assert [str(entry) in r.getMessage() for r in hold_warnings] == [True]
+
+    @_needs_permissions
+    def test_a_child_left_behind_by_a_parent_turning_unreadable_is_not_reported_read(
+        self, folder, chmod, caplog
+    ):
+        _put_dag(folder / "sub" / "inner" / "i.py", "i")
+        chmod(folder / "sub" / "inner", 0)
+        listener = RMQWatcherListener()
+        self._scan(listener, folder)
+        assert listener._unreadable_dirs == {str(folder / "sub" / "inner")}
+
+        chmod(folder / "sub", 0)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=_LISTENER_LOG):
+            self._scan(listener, folder)
+
+        assert listener._unreadable_dirs == {str(folder / "sub")}
+        assert not any("readable again" in r.getMessage() for r in caplog.records)
+
+
+class TestUntrustedListingReason:
+    def test_the_reason_names_the_directories_that_cannot_be_read(self):
+        reason = listener_module._untrusted_listing_reason(
+            "/dags", {"/dags/a.py", "/dags/sub/s.py"}, 1, 4, [],
+            ["/dags/sub"],
+        )
+
+        assert "directories that cannot be read: '/dags/sub'" in reason
+
+    def test_a_long_list_of_directories_is_cut_to_a_count(self):
+        dirs = [f"/dags/d{n}" for n in range(listener_module._UNREADABLE_DIRS_NAMED + 3)]
+
+        reason = listener_module._untrusted_listing_reason(
+            "/dags", {"/dags/a.py"}, 1, 4, [], dirs,
+        )
+
+        assert reason.count("'/dags/d") == listener_module._UNREADABLE_DIRS_NAMED
+        assert reason.endswith(" and 3 more")
+
+    def test_a_listing_with_every_directory_read_names_none(self):
+        reason = listener_module._untrusted_listing_reason(
+            "/dags", {"/dags/a.py"}, 1, 4, [],
+        )
+
+        assert "directories" not in reason
 
 
 # ---------------------------------------------------------------------------
@@ -3311,7 +3667,7 @@ class TestUntrustedScan:
         with _cycle_patches(manager, db_subs=db_subs):
             listener._scan_subscriptions = MagicMock(return_value=scanned)
             await listener._run_cycle()
-            listener._scan_subscriptions = MagicMock(side_effect=_UntrustedScan("empty glob"))
+            listener._scan_subscriptions = MagicMock(side_effect=_UntrustedScan("empty listing"))
             await listener._run_cycle()
 
         assert listener._last_good_scan == scanned
@@ -5128,7 +5484,7 @@ class TestScanMissEndToEnd:
     """
 
     @pytest.mark.asyncio
-    async def test_disabled_row_survives_an_empty_glob_between_two_full_scans(
+    async def test_disabled_row_survives_an_empty_listing_between_two_full_scans(
         self, e2e_listener, dagmodel_engine, tmp_path
     ):
         dag_file = tmp_path / "d.py"

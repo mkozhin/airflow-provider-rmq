@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import glob
 import logging
 import os
 import site
@@ -11,6 +10,7 @@ import sysconfig
 import threading
 import time
 import traceback
+from collections.abc import Collection
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,10 @@ from airflow_provider_rmq.watcher.dag_file_scan import (
     _READABLE_FILE_REMEDY,
     _read_and_parse,
     _read_file_triggers,
+)
+from airflow_provider_rmq.watcher.dag_folder_listing import (
+    DagFolderListingError,
+    list_dag_files,
 )
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
@@ -118,6 +122,11 @@ _DELETED_ROWS_REMEMBERED = 256
 #: acked and dropped. Patience here is paid for in messages, so there is exactly as
 #: much of it as a file being written needs.
 _UNREADABLE_FILE_LIMIT = 1
+
+#: Directories the reason of a distrusted listing names before it only counts the rest:
+#: a permission change applied to a whole tree can make many directories unreadable at
+#: once, and one log line has room for the first few of them.
+_UNREADABLE_DIRS_NAMED = 5
 
 #: Seconds allowed for the manager to stop before the loop is torn down anyway.
 _STOP_TIMEOUT = 30.0
@@ -266,13 +275,15 @@ def _untrusted_listing_reason(
     readable: int,
     baseline: int | None,
     failures: list[tuple[str, Exception | str, float | None]],
+    unreadable_dirs: Collection[str] = (),
 ) -> str:
     """Phrase what about this listing of ``dags_folder`` keeps it from being believed.
 
     The four shapes a distrusted listing takes — a folder that named nothing, one
     whose every file refused, one that read whole but came back smaller than the
     folder is known to have been, and one that both shrank and lost files — followed
-    by the first failure behind it when there is one.
+    by the directories the walk could not read when there are any, and by the first
+    failure behind it when there is one.
     """
     if not current_files:
         what = f"the DAG folder {dags_folder!r} listed no files"
@@ -292,6 +303,13 @@ def _untrusted_listing_reason(
             f"{dags_folder!r} listed could be read, against "
             f"{baseline} the folder is known to have held"
         )
+    if unreadable_dirs:
+        named = sorted(unreadable_dirs)
+        what += ", directories that cannot be read: " + ", ".join(
+            repr(path) for path in named[:_UNREADABLE_DIRS_NAMED]
+        )
+        if len(named) > _UNREADABLE_DIRS_NAMED:
+            what += f" and {len(named) - _UNREADABLE_DIRS_NAMED} more"
     if failures:
         what += f", first reason: {failures[0][1]!r}"
     return what
@@ -423,6 +441,10 @@ class RMQWatcherListener:
         self._last_mtimes: dict[str, float] = {}   # filepath → mtime
         self._cached_subs: dict[str, list[dict]] = {}  # filepath → list[sub dict]
         self._read_failures: dict[str, int] = {}  # filepath → failed reads in a row
+        # Directories of the DAG folder the last walk could not read. The next walk
+        # is handed them to report which of them read again, and the log tells a
+        # directory that has just become unreadable from one that stays so.
+        self._unreadable_dirs: set[str] = set()
         # Listings in a row the cycle would not read as a statement about the code,
         # counted so that the distrust expires at ``_UNTRUSTED_SCAN_LIMIT`` instead of
         # lasting forever: a folder of files nobody can read is a filesystem talking,
@@ -1127,16 +1149,18 @@ class RMQWatcherListener:
         Scheduler parses DAGs from — and every one of the checks below turns a bad
         value into :class:`_UntrustedScan` instead of a scan result:
 
-        - an empty value is expensive on its own: the caller joins it into a glob
-          pattern, and ``glob.glob("/**/*.py", recursive=True)`` walks the whole
-          filesystem from the root inside a worker of the cycle pool;
+        - an empty value names no folder at all, which is a broken setting rather
+          than a folder that holds no DAG files;
         - a missing directory is not a statement about the code either — it is what a
           git-sync symlink swap looks like for the second it lasts;
         - listability is checked explicitly, because ``os.path.isdir`` answers ``True``
-          for a directory with no read permission while ``glob`` swallows the
-          ``OSError`` and returns an empty list. Without this check an unreadable
-          folder is indistinguishable from an honestly empty one, which the scan is
-          required to take as the truth.
+          for a directory with no read permission. Such a folder is turned away here,
+          before the walk starts, so that it is never mistaken for an honestly empty
+          one, which the scan is required to take as the truth.
+
+        The walk in :meth:`_scan_subscriptions` reads the folder once more and turns
+        away the same way a folder it finds unreadable — its ``.airflowignore``
+        included — or one Airflow's rules cannot list.
         """
         try:
             from airflow import settings as airflow_settings
@@ -1160,30 +1184,54 @@ class RMQWatcherListener:
     def _scan_subscriptions(self) -> list[dict]:
         """Incrementally scan DAG files for @rmq_trigger subscriptions using mtime.
 
-        On a stable deployment (no file changes) this costs only N mtime syscalls.
-        Changed or new files are re-parsed; deleted files are evicted from the cache.
-        Memory is bounded to the number of current DAG files on disk.
+        The files are those Airflow loads (:func:`list_dag_files`): every ``.py`` file
+        of the folder, hidden files and directories included, less what an
+        ``.airflowignore`` excludes. On a stable deployment (no file changes) this
+        costs the walk and N mtime syscalls. Changed or new files are re-parsed;
+        deleted files are evicted from the cache. Memory is bounded to the number of
+        current DAG files on disk.
+
+        A subdirectory the walk cannot read hides its files, not their absence: every
+        file the cache knows under it is accounted for as one more file of the listing
+        that did not read, exactly as an unreadable file is. Its previous parse is held
+        for ``_UNREADABLE_FILE_LIMIT`` cycles (:meth:`_file_unreadable`), it counts
+        against the share of the listing that read, and once the hold runs out its keys
+        go the ordinary counted-miss way. The directory itself is reported once, when
+        it becomes unreadable, and once more when a walk reads it again.
 
         :raises _UntrustedScan: The DAG folder is not a source the scan can be trusted
-            from, or too little of the listing it produced could be read for the result
-            to be a statement about the code (see :data:`_TRUSTED_SCAN_FRACTION`).
-            Nothing the sync step would count misses against is touched before that
-            verdict: the folder is checked first, the per-file failures are held back
-            until the whole listing has been tried, and the eviction of paths the
-            listing no longer names waits for the verdict too — so a listing that lost
-            a subtree to a permission error leaves the previous parse of it intact.
+            from — its root or the root's ``.airflowignore`` cannot be read, or
+            Airflow's rules cannot list it — or too little of the listing it produced
+            could be read for the result to be a statement about the code (see
+            :data:`_TRUSTED_SCAN_FRACTION`). Nothing the sync step would count misses
+            against is touched before that verdict: the folder is checked first, the
+            per-file failures are held back until the whole listing has been tried,
+            and the eviction of cached paths the listing does not name waits for the
+            verdict too.
         """
         # The streak below counts listings, and a folder that produces none at all — it
-        # vanished under a git-sync swap, or refuses to be listed — leaves it untouched:
-        # such an outage neither spends the budget nor refills it. Refilling it would let
-        # a folder alternating between unlistable and degraded hold the distrust for as
-        # long as it keeps alternating, and the sync step, deletions and new
-        # subscriptions alike, would never run again on such an installation.
+        # vanished under a git-sync swap, refuses to be listed, or cannot be listed by
+        # Airflow's rules — leaves it untouched: such an outage neither spends the
+        # budget nor refills it. Refilling it would let a folder alternating between
+        # unlistable and degraded hold the distrust for as long as it keeps alternating,
+        # and the sync step, deletions and new subscriptions alike, would never run
+        # again on such an installation.
         dags_folder = self._get_dags_folder()
+        try:
+            listing = list_dag_files(dags_folder, self._unreadable_dirs)
+        except DagFolderListingError as exc:
+            raise _UntrustedScan(
+                f"the DAG folder {dags_folder!r} cannot be listed by Airflow's rules: {exc}"
+            ) from exc
+        root = os.path.normpath(dags_folder)
+        for dir_path, dir_error in listing.unreadable_dirs.items():
+            if os.path.normpath(dir_path) == root:
+                raise _UntrustedScan(
+                    f"the DAG folder {dags_folder!r} cannot be listed: {dir_error!r}"
+                ) from dir_error
+        self._report_unreadable_dirs(listing.unreadable_dirs, listing.recovered)
 
-        current_files = set(
-            glob.glob(os.path.join(dags_folder, "**", "*.py"), recursive=True)
-        )
+        current_files = set(listing.files)
 
         # Re-parse changed or new files. Failures are collected rather than applied as
         # they are met: how much of the listing read is what decides whether the listing
@@ -1195,8 +1243,8 @@ class RMQWatcherListener:
             try:
                 mtime = os.path.getmtime(path)
             except OSError as exc:
-                # The file is in the glob but gives no stat — permissions, a stale NFS
-                # handle. Nothing is known about its content, so no mtime is kept.
+                # The file is in the listing but gives no stat — permissions, a stale
+                # NFS handle. Nothing is known about its content, so no mtime is kept.
                 failures.append((path, exc, None))
                 continue
             if mtime == self._last_mtimes.get(path):
@@ -1215,6 +1263,22 @@ class RMQWatcherListener:
             self._read_failures.pop(path, None)
             self._cached_subs[path] = subs
             self._last_mtimes[path] = mtime
+
+        # Files the cache knows under a directory the walk could not read are files of
+        # this listing that did not read, each added once, with the directory's error
+        # and no mtime, since nothing is known about their content.
+        if listing.unreadable_dirs:
+            prefixes = [
+                (os.path.join(dir_path, ""), dir_error)
+                for dir_path, dir_error in listing.unreadable_dirs.items()
+            ]
+            known = set(self._last_mtimes) | set(self._cached_subs) | set(self._read_failures)
+            for path in sorted(known - current_files):
+                for prefix, dir_error in prefixes:
+                    if path.startswith(prefix):
+                        current_files.add(path)
+                        failures.append((path, dir_error, None))
+                        break
 
         readable = len(current_files) - len(failures)
         baseline = self._trusted_file_count
@@ -1245,7 +1309,8 @@ class RMQWatcherListener:
             self._trusted_listing_read_nothing = bool(current_files) and not readable
         else:
             what = _untrusted_listing_reason(
-                dags_folder, current_files, readable, baseline, failures
+                dags_folder, current_files, readable, baseline, failures,
+                listing.unreadable_dirs,
             )
             self._untrusted_scan_streak += 1
             if self._untrusted_scan_streak <= _UNTRUSTED_SCAN_LIMIT:
@@ -1286,6 +1351,36 @@ class RMQWatcherListener:
         for subs in self._cached_subs.values():
             result.extend(subs)
         return result
+
+    def _report_unreadable_dirs(
+        self, unreadable_dirs: dict[str, Exception], recovered: set[str]
+    ) -> None:
+        """Log the directories of this walk that cannot be read, and those read again.
+
+        A directory gets a WARNING in the walk that first finds it unreadable and a
+        DEBUG line in every walk after it that still does; the files under it get
+        their own lines from :meth:`_file_unreadable`. A directory of the previous
+        walk that this one read without error gets an INFO line. One that left the
+        set any other way — deleted, excluded by an ``.airflowignore``, or under a
+        parent that cannot be read itself — is not reported: nothing is known about
+        whether it reads.
+        """
+        for dir_path, dir_error in sorted(unreadable_dirs.items()):
+            if dir_path in self._unreadable_dirs:
+                log.debug(
+                    "RMQ Watcher: DAG folder directory %s still cannot be read (%r)",
+                    dir_path, dir_error,
+                )
+            else:
+                log.warning(
+                    "RMQ Watcher: DAG folder directory %s cannot be read (%r) — the DAG "
+                    "files the watcher knows under it count as unreadable files until "
+                    "it reads again",
+                    dir_path, dir_error,
+                )
+        for dir_path in sorted(recovered):
+            log.info("RMQ Watcher: DAG folder directory %s is readable again", dir_path)
+        self._unreadable_dirs = set(unreadable_dirs)
 
     def _file_unreadable(
         self, path: str, reason: Exception | str, mtime: float | None

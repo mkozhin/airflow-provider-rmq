@@ -262,25 +262,25 @@
 - Modify: `airflow_provider_rmq/watcher/listener.py`
 - Modify: `tests/watcher/test_listener.py`
 
-- [ ] заменить `glob.glob(...)` на `list_dag_files(dags_folder)`; `DagFolderListingError` и
+- [x] заменить `glob.glob(...)` на `list_dag_files(dags_folder)`; `DagFolderListingError` и
       нечитаемый корень → `_UntrustedScan` до вердикта; убрать неиспользуемый `import glob`
-- [ ] после цикла stat/parse добавить известные пути под каждым нечитаемым каталогом в
+- [x] после цикла stat/parse добавить известные пути под каждым нечитаемым каталогом в
       `current_files` и в `failures` (ошибка каталога, mtime `None`) — ровно один раз, без stat
       и разбора
-- [ ] `self._unreadable_dirs` как `recheck` и логирование: WARNING при появлении каталога,
+- [x] `self._unreadable_dirs` как `recheck` и логирование: WARNING при появлении каталога,
       DEBUG пока он нечитаем, INFO только для `recovered`
-- [ ] `_untrusted_listing_reason`: назвать нечитаемые каталоги в причине, когда они есть
-- [ ] привести к тому, что код гарантирует, docstring'и `_get_dags_folder` и
+- [x] `_untrusted_listing_reason`: назвать нечитаемые каталоги в причине, когда они есть
+- [x] привести к тому, что код гарантирует, docstring'и `_get_dags_folder` и
       `_scan_subscriptions` (нечитаемый подкаталог: прежний разбор его файлов держится как у
       нечитаемого файла; `.airflowignore`; скрытые файлы) и комментарий в `listener.py:1198`
       («The file is in the glob»)
-- [ ] тестовый хелпер `_listing(*files)` → `DagFolderListing(set(files), {})`; перевести патчи
+- [x] тестовый хелпер `_listing(*files)` → `DagFolderListing(set(files), {})`; перевести патчи
       `listener.glob.glob` на `listener.list_dag_files` без изменения смысла тестов;
       переименовать в формулировки про листинг: `test_empty_glob_*` (903, 929, 949, 5131), 882,
       1131; `test_empty_setting_keeps_glob_from_running` (1153-1163) проверяет, что
       `list_dag_files` не вызывается; тест 1178-1189, проверяющий поведение самого
       `glob.glob`, переписать на нечитаемый корень/подкаталог через новый обход
-- [ ] новые тесты: подкаталог с ранее разобранным файлом становится нечитаемым → подписки этого
+- [x] новые тесты: подкаталог с ранее разобранным файлом становится нечитаемым → подписки этого
       цикла на месте, WARNING по каталогу и «holding its previous parse» по файлу, путь не
       вытеснен, файл посчитан в доле один раз; следующий цикл → подписки сброшены
       (counted-miss); доступ вернулся → INFO, файл перечитан; каталог нечитаем со старта →
@@ -293,7 +293,7 @@
       `.py`, на котором падает `is_file()`, в корне или в подкаталоге — ошибка только этого
       файла, соседи и доверие скана не затронуты; дочерний нечитаемый каталог под ставшим
       нечитаемым родителем не даёт INFO «readable again»
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 3: Проверка декоратора без правила точки
 
