@@ -7,7 +7,6 @@ decorator built are passed in directly.
 
 from __future__ import annotations
 
-import glob
 import os
 import textwrap
 import zipfile
@@ -23,6 +22,10 @@ from airflow_provider_rmq.watcher.dag_file_scan import (
     _subscription_differences,
     _verify_static_readability,
     _watcher_scans,
+)
+from airflow_provider_rmq.watcher.dag_folder_listing import (
+    DagFolderListingError,
+    list_dag_files,
 )
 from airflow_provider_rmq.watcher.subscription_builder import build_subscriptions
 
@@ -107,17 +110,14 @@ class TestSameValue:
 class TestWatcherScans:
     @pytest.mark.parametrize(
         "rel",
-        ["a.py", "sub/b.py", "sub/deeper/c.py"],
+        ["a.py", "sub/b.py", "sub/deeper/c.py", ".x.py", "sub/.y.py", ".hidden/a.py",
+         "sub/.hidden/b.py"],
     )
     def test_python_file_inside_the_folder_is_scanned(self, dags_folder, rel):
         assert _watcher_scans(str(dags_folder / rel), str(dags_folder))
 
-    @pytest.mark.parametrize(
-        "rel",
-        [".x.py", "sub/.y.py", ".hidden/a.py", "sub/.hidden/b.py", "a.txt", "a.pyc",
-         "sub/a.py.bak"],
-    )
-    def test_hidden_or_non_python_file_is_not_scanned(self, dags_folder, rel):
+    @pytest.mark.parametrize("rel", ["a.txt", "a.pyc", "sub/a.py.bak", ".py"])
+    def test_non_python_file_is_not_scanned(self, dags_folder, rel):
         assert not _watcher_scans(str(dags_folder / rel), str(dags_folder))
 
     def test_file_outside_the_folder_is_not_scanned(self, dags_folder, tmp_path):
@@ -130,6 +130,15 @@ class TestWatcherScans:
         assert _watcher_scans(str(folder / "a.py"), str(folder) + os.sep)
         assert _watcher_scans(str(folder / "sub" / ".." / "a.py"), str(folder))
 
+    def test_file_excluded_by_airflowignore_is_not_scanned(self, tmp_path, dags_folder):
+        self._tree(tmp_path, ["dags/a.py", "dags/common/factory.py", "dags/sub/skip_me.py"])
+        (dags_folder / ".airflowignore").write_text("common\n")
+        (dags_folder / "sub" / ".airflowignore").write_text("skip_\n")
+
+        assert _watcher_scans(str(dags_folder / "a.py"), str(dags_folder))
+        assert not _watcher_scans(str(dags_folder / "common" / "factory.py"), str(dags_folder))
+        assert not _watcher_scans(str(dags_folder / "sub" / "skip_me.py"), str(dags_folder))
+
     @staticmethod
     def _tree(tmp_path, rels):
         for rel in rels:
@@ -139,8 +148,8 @@ class TestWatcherScans:
 
     @staticmethod
     def _listed_and_scanned(tmp_path, dags_folder):
-        """What the watcher's glob lists, and which spelling of every file the check scans."""
-        listed = set(glob.glob(os.path.join(str(dags_folder), "**", "*.py"), recursive=True))
+        """What the watcher's listing holds, and which spelling of every file the check scans."""
+        listed = list_dag_files(str(dags_folder)).files
         everything = {
             os.path.join(root, name)
             for root, _dirs, names in os.walk(tmp_path, followlinks=True)
@@ -148,7 +157,7 @@ class TestWatcherScans:
         }
         return listed, {p for p in everything if _watcher_scans(p, str(dags_folder))}
 
-    def test_agrees_with_the_watcher_glob(self, tmp_path, dags_folder):
+    def test_agrees_with_the_watcher_listing(self, tmp_path, dags_folder):
         self._tree(tmp_path, [
             "dags/a.py", "dags/sub/b.py", "dags/sub/deeper/c.py",
             "dags/.x.py", "dags/sub/.y.py", "dags/.hidden/a.py", "dags/sub/.hidden/b.py",
@@ -159,9 +168,29 @@ class TestWatcherScans:
         listed, scanned = self._listed_and_scanned(tmp_path, dags_folder)
 
         assert scanned == listed
-        assert len(listed) == 3
+        assert len(listed) == 7
 
-    def test_agrees_with_the_glob_through_a_symlinked_subdirectory(self, tmp_path, dags_folder):
+    def test_agrees_with_the_listing_under_airflowignore(self, tmp_path, dags_folder):
+        self._tree(tmp_path, [
+            "dags/a.py", "dags/common/factory.py", "dags/sub/b.py", "dags/sub/skip_me.py",
+            "dags/sub/deeper/c.py", "dags/sub/deeper/skip_too.py", "dags/.hidden/d.py",
+        ])
+        (dags_folder / ".airflowignore").write_text("common\n# a comment\n")
+        (dags_folder / "sub" / ".airflowignore").write_text("skip_\n")
+
+        listed, scanned = self._listed_and_scanned(tmp_path, dags_folder)
+
+        assert scanned == listed
+        assert listed == {
+            str(dags_folder / "a.py"),
+            str(dags_folder / "sub" / "b.py"),
+            str(dags_folder / "sub" / "deeper" / "c.py"),
+            str(dags_folder / ".hidden" / "d.py"),
+        }
+
+    def test_agrees_with_the_listing_through_a_symlinked_subdirectory(
+        self, tmp_path, dags_folder,
+    ):
         self._tree(tmp_path, ["dags/a.py", "shared/b.py", "shared/.c.py", "hidden_src/d.py"])
         (dags_folder / "linked").symlink_to(tmp_path / "shared", target_is_directory=True)
         (dags_folder / ".linked").symlink_to(tmp_path / "hidden_src", target_is_directory=True)
@@ -169,26 +198,31 @@ class TestWatcherScans:
         listed, scanned = self._listed_and_scanned(tmp_path, dags_folder)
 
         assert scanned == listed
-        assert listed == {str(dags_folder / "a.py"), str(dags_folder / "linked" / "b.py")}
+        assert listed == {
+            str(dags_folder / "a.py"),
+            str(dags_folder / "linked" / "b.py"),
+            str(dags_folder / "linked" / ".c.py"),
+            str(dags_folder / ".linked" / "d.py"),
+        }
         assert not _watcher_scans(str(tmp_path / "shared" / "b.py"), str(dags_folder))
 
-    def test_agrees_with_the_glob_through_a_symlinked_dags_folder(self, tmp_path):
+    def test_agrees_with_the_listing_through_a_symlinked_dags_folder(self, tmp_path):
         self._tree(tmp_path, ["real_dags/a.py", "real_dags/sub/b.py", "real_dags/.x.py"])
         link = tmp_path / "dags_link"
         link.symlink_to(tmp_path / "real_dags", target_is_directory=True)
 
         listed, scanned = self._listed_and_scanned(tmp_path, link)
 
-        # The glob lists the link's spelling; the check also recognizes the real
+        # The listing gives the link's spelling; the check also recognizes the real
         # path of the same files, the spelling a module imported through a
         # sys.path entry naming the real folder carries.
-        assert listed == {str(link / "a.py"), str(link / "sub" / "b.py")}
+        assert listed == {str(link / "a.py"), str(link / "sub" / "b.py"), str(link / ".x.py")}
         assert listed <= scanned
         assert {os.path.realpath(p) for p in scanned} == {
             os.path.realpath(p) for p in listed
         }
         assert _watcher_scans(str(tmp_path / "real_dags" / "a.py"), str(link))
-        assert not _watcher_scans(str(tmp_path / "real_dags" / ".x.py"), str(link))
+        assert _watcher_scans(str(tmp_path / "real_dags" / ".x.py"), str(link))
 
     def test_real_path_of_the_folder_matches_a_symlinked_spelling(self, tmp_path):
         real = tmp_path / "real_dags"
@@ -196,11 +230,11 @@ class TestWatcherScans:
         link = tmp_path / "dags_link"
         link.symlink_to(real, target_is_directory=True)
         assert _watcher_scans(str(link / "a.py"), str(real))
-        assert not _watcher_scans(str(link / ".hidden" / "a.py"), str(real))
+        assert _watcher_scans(str(link / ".hidden" / "a.py"), str(real))
 
     def test_file_inside_a_zip_in_the_folder_counts_as_scanned(self, dags_folder):
-        # The glob never lists it; the check refuses it one step later, when the
-        # file does not open (TestFileTheWatcherCannotRead).
+        # The check refuses it one step later, when the file does not open
+        # (TestFileTheWatcherCannotRead).
         assert _watcher_scans(str(dags_folder / "pkg.zip" / "dag.py"), str(dags_folder))
 
 
@@ -346,15 +380,32 @@ class TestFileTheWatcherDoesNotScan:
             _verify(path, "simple", dags_folder, queue="q")
         assert str(dags_folder) in str(exc.value)
 
-    def test_file_in_a_hidden_directory(self, dags_folder):
+    def test_file_in_a_hidden_directory_is_scanned(self, dags_folder):
         path = _write(dags_folder, ".hidden/simple.py", _SIMPLE)
-        with pytest.raises(RMQTriggerNotStaticError, match="does not scan"):
-            _verify(path, "simple", dags_folder, queue="q")
+        _verify(path, "simple", dags_folder, queue="q")
 
-    def test_file_name_starting_with_a_dot(self, dags_folder):
+    def test_file_name_starting_with_a_dot_is_scanned(self, dags_folder):
         path = _write(dags_folder, ".simple.py", _SIMPLE)
-        with pytest.raises(RMQTriggerNotStaticError, match="does not scan"):
+        _verify(path, "simple", dags_folder, queue="q")
+
+    def test_file_excluded_by_airflowignore(self, dags_folder):
+        path = _write(dags_folder, "common/simple.py", _SIMPLE)
+        (dags_folder / ".airflowignore").write_text("common\n")
+        with pytest.raises(RMQTriggerNotStaticError, match="does not scan") as exc:
             _verify(path, "simple", dags_folder, queue="q")
+        assert ".airflowignore does not exclude" in str(exc.value)
+        assert "starting with" not in str(exc.value)
+
+    def test_ignore_rules_that_cannot_be_applied(self, dags_folder, monkeypatch):
+        monkeypatch.setenv("AIRFLOW__CORE__DAG_IGNORE_FILE_SYNTAX", "glob")
+        path = _write(dags_folder, "simple.py", _SIMPLE)
+        (dags_folder / ".airflowignore").write_text("!\n")
+        with pytest.raises(
+            RMQTriggerNotStaticError, match="cannot tell whether it scans this file",
+        ) as exc:
+            _verify(path, "simple", dags_folder, queue="q")
+        assert isinstance(exc.value.__cause__, DagFolderListingError)
+        assert ".airflowignore cannot be applied" in str(exc.value)
 
     def test_check_runs_before_the_file_is_read(self, tmp_path, dags_folder):
         missing = str(tmp_path / "elsewhere" / "missing.py")

@@ -304,13 +304,13 @@
 - Modify: `tests/watcher/test_decorator_static_check.py`
 - Modify: `tests/watcher/test_dag_file_scan.py`
 
-- [ ] `_watcher_scans` / `_is_scanned_below`: «`.py` внутри DAGS_FOLDER (abspath, затем
+- [x] `_watcher_scans` / `_is_scanned_below`: «`.py` внутри DAGS_FOLDER (abspath, затем
       realpath) и `is_listed`», без правила точки; `dag_folder_listing` импортируется внутри
       функции; `DagFolderListingError` → `RMQTriggerNotStaticError` с причиной
-- [ ] текст шага 1 в `_verify_static_readability` по Technical Details
-- [ ] docstring `rmq_trigger` в `decorators.py` (189-191): файл, который сканирует watcher, —
+- [x] текст шага 1 в `_verify_static_readability` по Technical Details
+- [x] docstring `rmq_trigger` в `decorators.py` (189-191): файл, который сканирует watcher, —
       `.py` в DAGS_FOLDER, не отсеянный `.airflowignore`; без правила точки
-- [ ] `test_static_readability.py`: перевести на настоящее время тесты правила точки —
+- [x] `test_static_readability.py`: перевести на настоящее время тесты правила точки —
       параметры `.x.py` и `.hidden/a.py` (117-121), исключение `.linked` (164-173), 189-190,
       199, `test_file_in_a_hidden_directory` и `test_file_name_starting_with_a_dot` (349-357)
       → True; убрать glob-комментарий 201-203; сверку перевести с glob на `list_dag_files`:
@@ -318,15 +318,15 @@
       симлинк-подкаталога; для симлинк-DAGS_FOLDER — `listed <= scanned` и равенство по
       realpath, как сейчас (ветка realpath в `_watcher_scans` по замыслу принимает оба
       написания); добавить: файл под `.airflowignore` → False
-- [ ] `test_decorator_static_check.py:578`: имя и docstring в настоящем времени («DagBag loads
+- [x] `test_decorator_static_check.py:578`: имя и docstring в настоящем времени («DagBag loads
       a hidden folder and the watcher reads its subscription»), проверка — загрузка без ошибки и
       совпадение подписок; добавить `DagBag` на папке с `.airflowignore`: игнорируемый файл не
       импортируется, остальные грузятся; DAG-файл, импортирующий фабрику с `@rmq_trigger` из
       игнорируемого `common/`, → Broken DAG с «does not scan»; та же фабрика в неигнорируемом
       каталоге → грузится
-- [ ] footprint-тест (`test_dag_file_scan.py:48`): после свежего импорта `dag_file_scan` в
+- [x] footprint-тест (`test_dag_file_scan.py:48`): после свежего импорта `dag_file_scan` в
       `sys.modules` нет ни `airflow`, ни `airflow_provider_rmq.watcher.dag_folder_listing`
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 4: Verify acceptance criteria
 - [ ] нечитаемый подкаталог виден в логе (WARNING по каталогу) и держит прежний разбор, как

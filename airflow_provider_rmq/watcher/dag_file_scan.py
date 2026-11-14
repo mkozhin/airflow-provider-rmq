@@ -14,10 +14,12 @@ the scan would not see the subscriptions the decorator builds. That check reads
 each file once per version of it on disk (``_analyse_file``), however many
 ``@rmq_trigger`` calls of the file it is asked about.
 
-The module depends only on the standard library and ``subscription_builder``, so
-it can be imported inside the DAG processor without pulling in the watcher's
-runtime modules (``listener``, ``consumer``, ``models``, ``runner``) and their
-third-party dependencies.
+At module level the module depends only on the standard library and
+``subscription_builder``, so it can be imported inside the DAG processor without
+pulling in Airflow or the watcher's runtime modules (``listener``, ``consumer``,
+``models``, ``runner``) and their third-party dependencies. The decorator's check
+imports ``dag_folder_listing`` when it runs, from a DAG file that already
+imported Airflow.
 """
 
 from __future__ import annotations
@@ -1417,35 +1419,30 @@ class RMQTriggerNotStaticError(ValueError):
     """
 
 
-def _is_scanned_below(path: str, folder: str) -> bool:
-    """Tell whether ``path`` lies inside ``folder`` with no dot-leading component below it."""
-    prefix = os.path.join(folder, "")
-    if not path.startswith(prefix):
-        return False
-    below = path[len(prefix):]
-    return not any(part.startswith(".") for part in below.split(os.sep))
-
-
 def _watcher_scans(path: str, dags_folder: str) -> bool:
-    """Tell whether the watcher's ``glob(DAGS_FOLDER/**/*.py)`` reads the file at ``path``.
+    """Tell whether the watcher's listing of ``dags_folder`` includes the file at ``path``.
 
-    The file must end in ``.py``, lie inside ``dags_folder``, and no component of
-    its path below the folder — the file name included — may start with a dot:
-    ``glob`` skips hidden directories and files such as ``.x.py``.
+    The file must be a ``.py`` file inside ``dags_folder`` that the folder's
+    ``.airflowignore`` files do not exclude — the set of files Airflow loads
+    (``dag_folder_listing.is_listed``). Hidden files and directories count like
+    any other.
 
     Both paths are compared through ``os.path.abspath`` first, which keeps the
-    spelling ``glob`` lists the files under (it follows symlinked directories
+    spelling the listing gives the files under (it follows symlinked directories
     below the folder without resolving them). A module imported through another
     spelling of the same folder — a ``sys.path`` entry naming the folder's real
     path, or another symlink to it — is then compared through
     ``os.path.realpath`` of both, so the file the watcher reads is recognized
     whichever way the import reached it.
+
+    The listing module is imported here: it is needed only once a DAG file that
+    already imported Airflow calls the decorator.
+
+    :raises DagFolderListingError: The ignore rules cannot be read or applied.
     """
-    if not path.endswith(".py"):
-        return False
-    if _is_scanned_below(os.path.abspath(path), os.path.abspath(dags_folder)):
-        return True
-    return _is_scanned_below(os.path.realpath(path), os.path.realpath(dags_folder))
+    from airflow_provider_rmq.watcher.dag_folder_listing import is_listed
+
+    return is_listed(path, dags_folder)
 
 
 def _same_value(a: Any, b: Any) -> bool:
@@ -1565,13 +1562,21 @@ def _verify_static_readability(
     """
     where = f"@rmq_trigger(...) at {path}:{lineno} on DAG {dag_id!r}"
 
-    if not _watcher_scans(path, dags_folder):
+    from airflow_provider_rmq.watcher.dag_folder_listing import DagFolderListingError
+
+    try:
+        scanned = _watcher_scans(path, dags_folder)
+    except DagFolderListingError as exc:
+        raise RMQTriggerNotStaticError(
+            f"{where}: the RMQ watcher cannot tell whether it scans this file "
+            f"({exc}), so it may never register its subscriptions."
+        ) from exc
+    if not scanned:
         raise RMQTriggerNotStaticError(
             f"{where} is in a file the RMQ watcher does not scan, so the watcher "
             "never registers its subscriptions. The watcher reads only *.py files "
-            f"inside DAGS_FOLDER ({dags_folder}) with no directory or file name "
-            "starting with '.' below it; declare @rmq_trigger(...) above @dag(...) "
-            "in such a DAG file."
+            f"inside DAGS_FOLDER ({dags_folder}) that .airflowignore does not "
+            "exclude; declare @rmq_trigger(...) above @dag(...) in such a DAG file."
         )
 
     try:

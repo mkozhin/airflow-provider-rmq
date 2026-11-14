@@ -187,8 +187,10 @@ def rmq_trigger(
     of the whole file, when:
 
     * the file is not one the watcher scans — a ``*.py`` file inside
-      ``DAGS_FOLDER`` with no directory or file name below it starting with
-      ``.``;
+      ``DAGS_FOLDER`` that ``.airflowignore`` does not exclude, the files
+      Airflow loads; this is the file of the ``rmq_trigger(...)`` call, so a
+      factory module under an ignored directory fails the DAG file that
+      imports it;
     * any ``@rmq_trigger`` of the file cannot be read, ``rmq_trigger`` is
       mentioned other than as a decorator call on a function, is not imported
       from ``airflow_provider_rmq.watcher.decorators`` (a same-named wrapper

@@ -52,14 +52,17 @@ def _dag_id_of_last_function(src: str):
 class TestDagFileScanImportFootprint:
     def test_importing_the_scan_module_leaves_the_watcher_runtime_unloaded(self):
         """The decorator imports ``dag_file_scan`` inside the DAG processor, so the
-        module must not drag in the listener, the consumer, the runner, the ORM
-        models, ``aio_pika`` or ``httpx``. A fresh interpreter is the only place where
-        ``sys.modules`` says what one import pulled in."""
+        module must not drag in Airflow, the DAG folder listing, the listener, the
+        consumer, the runner, the ORM models, ``aio_pika`` or ``httpx``. A fresh
+        interpreter is the only place where ``sys.modules`` says what one import
+        pulled in."""
         probe = (
             "import sys\n"
             "import airflow_provider_rmq.watcher.dag_file_scan\n"
             "loaded = [\n"
             "    name for name in (\n"
+            "        'airflow',\n"
+            "        'airflow_provider_rmq.watcher.dag_folder_listing',\n"
             "        'airflow_provider_rmq.watcher.listener',\n"
             "        'airflow_provider_rmq.watcher.consumer',\n"
             "        'airflow_provider_rmq.watcher.models',\n"

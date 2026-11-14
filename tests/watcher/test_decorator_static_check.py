@@ -574,8 +574,87 @@ class TestCallSiteOutsideTheScannedFiles:
         assert "rmq_static_check_factories.py" in error
         assert not bag.dags
 
-    def test_file_in_a_hidden_folder(self, dags_folder):
-        """``DagBag`` loads a hidden folder the watcher's glob skips."""
+    def test_factory_under_an_ignored_directory(self, dags_folder, dags_package):
+        """A DAG file that imports an ``@rmq_trigger`` factory from a directory
+        ``.airflowignore`` excludes fails: the call site is a file the watcher
+        does not scan."""
+        dags_package("rmq_static_common", "factory", _FACTORY)
+        (dags_folder / ".airflowignore").write_text("rmq_static_common\n")
+        path = _write(dags_folder, "uses_common.py", """
+            from rmq_static_common.factory import build
+
+            COMMON_DAG = build()
+        """)
+        bag = _load(dags_folder)
+
+        error = _import_error(bag, path)
+        assert "RMQTriggerNotStaticError" in error
+        assert NOT_SCANNED in error
+        assert "factory.py" in error
+        assert ".airflowignore does not exclude" in error
+        assert not bag.dags
+
+    def test_factory_under_a_listed_directory(self, dags_folder, dags_package):
+        dags_package("rmq_static_common", "factory", _FACTORY)
+        _write(dags_folder, "uses_common.py", """
+            from rmq_static_common.factory import build
+
+            COMMON_DAG = build()
+        """)
+        bag = _load(dags_folder)
+
+        assert not bag.import_errors
+        assert _subs(bag, "common_dag")[0]["queue_name"] == "common.q"
+
+
+_FACTORY = """
+    from datetime import datetime
+
+    from airflow.decorators import dag
+    from airflow_provider_rmq.watcher.decorators import rmq_trigger
+
+
+    def build():
+        @rmq_trigger(queue="common.q")
+        @dag(dag_id="common_dag", schedule=None, start_date=datetime(2024, 1, 1))
+        def common_dag():
+            pass
+
+        return common_dag()
+"""
+
+
+@pytest.fixture
+def dags_package(dags_folder, monkeypatch):
+    """Write a package inside ``DAGS_FOLDER`` that DAG files import, as Airflow puts
+    the folder on ``sys.path``.
+
+    Returns ``write(package, module, source)``; the package leaves ``sys.modules``
+    after the test.
+    """
+    monkeypatch.syspath_prepend(str(dags_folder))
+    written: list[str] = []
+
+    def write(package: str, module: str, source: str) -> None:
+        folder = dags_folder / package
+        folder.mkdir(exist_ok=True)
+        (folder / "__init__.py").write_text("", encoding="utf-8")
+        (folder / f"{module}.py").write_text(textwrap.dedent(source), encoding="utf-8")
+        importlib.invalidate_caches()
+        written.extend([package, f"{package}.{module}"])
+
+    yield write
+    for name in written:
+        sys.modules.pop(name, None)
+
+
+class TestDagBagListsTheFolderAsTheWatcher:
+    def test_hidden_folder_loads_and_the_watcher_reads_its_subscription(
+        self, dags_folder, caplog,
+    ):
+        """``DagBag`` loads a hidden folder and the watcher reads its subscription."""
+        from airflow_provider_rmq.watcher.dag_folder_listing import list_dag_files
+
         hidden = dags_folder / ".hidden"
         hidden.mkdir()
         path = _write(hidden, "hidden.py", """
@@ -588,8 +667,47 @@ class TestCallSiteOutsideTheScannedFiles:
         """)
         bag = _load(dags_folder)
 
-        error = _import_error(bag, path)
-        assert NOT_SCANNED in error
+        assert not bag.import_errors
+        assert str(path) in list_dag_files(str(dags_folder)).files
+        scanned = TestWatcherAndDecoratorReadTheSameFile._scan(path, caplog)
+        assert [
+            {k: v for k, v in row.items() if k not in ("dag_id", "group_key")}
+            for row in scanned
+        ] == _subs(bag, "hidden_dag")
+        assert [row["dag_id"] for row in scanned] == ["hidden_dag"]
+
+    def test_ignored_file_is_not_imported_and_the_rest_loads(self, dags_folder):
+        from airflow_provider_rmq.watcher.dag_folder_listing import list_dag_files
+
+        (dags_folder / "skipped").mkdir()
+        ignored = _write(dags_folder / "skipped", "ignored.py", """
+            raise RuntimeError("an ignored DAG file is imported")
+
+            @rmq_trigger(queue="ignored.q")
+            @dag(dag_id="ignored_dag", schedule=None, start_date=START)
+            def ignored_dag():
+                pass
+
+            ignored_dag()
+        """)
+        kept = _write(dags_folder, "kept.py", """
+            @rmq_trigger(queue="kept.q")
+            @dag(dag_id="kept_dag", schedule=None, start_date=START)
+            def kept_dag():
+                pass
+
+            kept_dag()
+        """)
+        (dags_folder / ".airflowignore").write_text("skipped\n")
+        bag = _load(dags_folder)
+
+        assert not bag.import_errors
+        assert set(bag.dags) == {"kept_dag"}
+        assert list_dag_files(str(dags_folder)).files == {str(kept)}
+        # The ignored file raises when imported, so no import error means DagBag
+        # never imported it.
+        assert {Path(stat.file).name for stat in bag.dagbag_stats} == {kept.name}
+        assert ignored.exists()
 
 
 class TestOneParsePerFile:
