@@ -214,16 +214,16 @@
 - Create: `airflow_provider_rmq/watcher/dag_folder_listing.py`
 - Create: `tests/watcher/test_dag_folder_listing.py`
 
-- [ ] `DagFolderListing`, `DagFolderListingError`, `list_dag_files(dags_folder, recheck)` и
+- [x] `DagFolderListing`, `DagFolderListingError`, `list_dag_files(dags_folder, recheck)` и
       `is_listed(path, dags_folder)` по Technical Details; импорт `airflow.configuration.conf`,
       правил `airflow.utils.file` и `re2` внутри функций
-- [ ] docstring модуля: обход повторяет `_find_path_from_directory`; отличия — ошибки ввода-вывода
+- [x] docstring модуля: обход повторяет `_find_path_from_directory`; отличия — ошибки ввода-вывода
       делают каталог нечитаемым, берутся только `.py`, zip и `safe_mode` не повторяются
-- [ ] тесты успеха: плоская папка, вложенные каталоги, скрытые файл (`.x.py`) и каталог
+- [x] тесты успеха: плоская папка, вложенные каталоги, скрытые файл (`.x.py`) и каталог
       (`.hidden/`) входят, `.airflowignore` regexp и glob (с `!`-отрицанием), вложенный
       `.airflowignore` наследует правила родителя, симлинк на каталог проходится; файл с именем
       ровно `.py`, битый симлинк `.py` и `.zip` не входят; `DAGS_FOLDER` со слешем на конце
-- [ ] тесты ошибок (skip под root): каталог 000, 644 и 311 → в `unreadable_dirs`, соседние
+- [x] тесты ошибок (skip под root): каталог 000, 644 и 311 → в `unreadable_dirs`, соседние
       файлы на месте, цикл не падает; нечитаемый `.airflowignore` → каталог в
       `unreadable_dirs`, его файлов нет; симлинк на каталог, у цели которого предок потерял `x`
       → симлинк в `unreadable_dirs`; `.py`-симлинк в каталог 000 рядом с нормальными файлами
@@ -234,7 +234,7 @@
       имя не в UTF-8 под regexp-`.airflowignore` → `DagFolderListingError`; glob-синтаксис с
       паттерном `name/` и симлинк-каталог с недоступной целью → он в `unreadable_dirs`, обход
       не падает
-- [ ] тест инварианта, две части:
+- [x] тест инварианта, две части:
       - перебор: для дерева со всеми видами записей (файл `.py`, файл не `.py`, каталог,
         симлинк-каталог, `.airflowignore`) и обоих синтаксисов, с glob-паттерном на `/`, по
         очереди подменять `Path.is_file`, `Path.is_dir`, `os.stat`, `os.lstat`, `open` так,
@@ -248,13 +248,13 @@
         `/` на подкаталоге и на симлинк-записи → путь в `unreadable_dirs`; собственный
         `os.stat` обхода на симлинк-записи → путь в `unreadable_dirs`; `open` файла
         `.airflowignore` → его каталог в `unreadable_dirs`
-- [ ] тесты `is_listed`: файл в корне, во вложенном каталоге, под игнорируемым каталогом, сам
+- [x] тесты `is_listed`: файл в корне, во вложенном каталоге, под игнорируемым каталогом, сам
       игнорируемый файл, отрицание в glob, вне DAGS_FOLDER, через realpath симлинк-DAGS_FOLDER
       с непустым regexp- и glob-`.airflowignore` (и игнорируемый, и не игнорируемый файл); сверка с
       `list_dag_files` по Testing Strategy
-- [ ] тест сверки по Testing Strategy: оба синтаксиса против `find_path_from_directory` с
+- [x] тест сверки по Testing Strategy: оба синтаксиса против `find_path_from_directory` с
       явным `ignore_file_syntax`, синтаксис по умолчанию против `list_py_file_paths`
-- [ ] run tests - must pass before next task
+- [x] run tests - must pass before next task
 
 ### Task 2: `_scan_subscriptions` на новом обходе, нечитаемые каталоги как нечитаемые файлы
 
