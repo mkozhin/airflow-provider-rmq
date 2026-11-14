@@ -207,7 +207,7 @@ reconcile-цикл, тот же паттерн, что в `_ensure_fire_infrastr
 ### Клиент Management API
 
 Новый extra в Airflow Connection: `management_url`. **Текущее реальное значение —
-`https://mb.realcombi.mgcom.ru` (без префикса `/rabbitmq`)**: хотя в `rabbitmq.conf` задан
+`https://rabbitmq.example.com` (без префикса `/rabbitmq`)**: хотя в `rabbitmq.conf` задан
 `management.path_prefix = /rabbitmq`, монтирование этого файла в `rabbitmq/docker-compose.yml`
 сейчас закомментировано (зафиксировано как критичная находка в `docs/audit_report.md`
 репозитория `rabbitmq`), так что на живом сервере path_prefix не применяется и Management API
@@ -650,7 +650,7 @@ Task 1–5 + N-1 + N независимо от того, сделан Task 6 и�
   Variable `rmq_watcher_reconcile_interval`), убедиться через RabbitMQ Management UI, что
   `rmq_watcher.sub.<dag_id>` существует и забинжена на `jetstat.airflow` с ожидаемыми ключами
 - отправить настоящий (или реплеенный) Jetstat-вебхук с этим id/status на штатный эндпоинт
-  `https://mb.realcombi.mgcom.ru/webhooks/jetstat` (Benthos зеркалирует каждый такой вебхук в
+  `https://rabbitmq.example.com/webhooks/jetstat` (Benthos зеркалирует каждый такой вебхук в
   `jetstat.airflow` — отдельный URL не нужен) и убедиться, что DAG run запустился с
   `conf["routing_key"] == "<id>.<status>"`
 - удалить декоратор, задеплоить, убедиться что в логах появился WARNING про orphaned

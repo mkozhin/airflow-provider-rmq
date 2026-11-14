@@ -21,16 +21,16 @@ class TestGetManagementUrl:
         assert get_management_url(conn) is None
 
     def test_returns_url_when_set(self):
-        conn = FakeAirflowConnection(extra='{"management_url": "https://mb.realcombi.mgcom.ru"}')
-        assert get_management_url(conn) == "https://mb.realcombi.mgcom.ru"
+        conn = FakeAirflowConnection(extra='{"management_url": "https://rabbitmq.example.com"}')
+        assert get_management_url(conn) == "https://rabbitmq.example.com"
 
     def test_strips_trailing_slash(self):
-        conn = FakeAirflowConnection(extra='{"management_url": "https://mb.realcombi.mgcom.ru/"}')
-        assert get_management_url(conn) == "https://mb.realcombi.mgcom.ru"
+        conn = FakeAirflowConnection(extra='{"management_url": "https://rabbitmq.example.com/"}')
+        assert get_management_url(conn) == "https://rabbitmq.example.com"
 
     def test_strips_multiple_trailing_slashes(self):
-        conn = FakeAirflowConnection(extra='{"management_url": "https://mb.realcombi.mgcom.ru//"}')
-        assert get_management_url(conn) == "https://mb.realcombi.mgcom.ru"
+        conn = FakeAirflowConnection(extra='{"management_url": "https://rabbitmq.example.com//"}')
+        assert get_management_url(conn) == "https://rabbitmq.example.com"
 
     def test_returns_none_when_empty_string(self):
         conn = FakeAirflowConnection(extra='{"management_url": ""}')
@@ -69,7 +69,7 @@ class TestGetCurrentBindings:
         async with _client_with_response(handler) as client:
             result = await get_current_bindings(
                 client,
-                "https://mb.realcombi.mgcom.ru",
+                "https://rabbitmq.example.com",
                 "/",
                 "rmq_watcher.sub.my_dag",
                 "jetstat.airflow",
@@ -92,7 +92,7 @@ class TestGetCurrentBindings:
         async with _client_with_response(handler) as client:
             result = await get_current_bindings(
                 client,
-                "https://mb.realcombi.mgcom.ru",
+                "https://rabbitmq.example.com",
                 "/",
                 "rmq_watcher.sub.my_dag",
                 "jetstat.airflow",
@@ -113,7 +113,7 @@ class TestGetCurrentBindings:
         async with _client_with_response(handler) as client:
             result = await get_current_bindings(
                 client,
-                "https://mb.realcombi.mgcom.ru",
+                "https://rabbitmq.example.com",
                 "/",
                 "rmq_watcher.sub.my_dag",
                 "jetstat.airflow",
@@ -129,7 +129,7 @@ class TestGetCurrentBindings:
         async with _client_with_response(handler) as client:
             result = await get_current_bindings(
                 client,
-                "https://mb.realcombi.mgcom.ru",
+                "https://rabbitmq.example.com",
                 "/",
                 "rmq_watcher.sub.my_dag",
                 "jetstat.airflow",
@@ -148,14 +148,14 @@ class TestGetCurrentBindings:
         async with _client_with_response(handler) as client:
             await get_current_bindings(
                 client,
-                "https://mb.realcombi.mgcom.ru",
+                "https://rabbitmq.example.com",
                 "/",
                 "rmq_watcher.sub.my_dag",
                 "jetstat.airflow",
                 ("guest", "guest"),
             )
         assert captured["url"] == (
-            "https://mb.realcombi.mgcom.ru/api/queues/%2F/rmq_watcher.sub.my_dag/bindings"
+            "https://rabbitmq.example.com/api/queues/%2F/rmq_watcher.sub.my_dag/bindings"
         )
 
     @pytest.mark.asyncio
@@ -167,7 +167,7 @@ class TestGetCurrentBindings:
             with pytest.raises(httpx.HTTPStatusError):
                 await get_current_bindings(
                     client,
-                    "https://mb.realcombi.mgcom.ru",
+                    "https://rabbitmq.example.com",
                     "/",
                     "rmq_watcher.sub.my_dag",
                     "jetstat.airflow",
@@ -183,7 +183,7 @@ class TestGetCurrentBindings:
             with pytest.raises(httpx.HTTPStatusError):
                 await get_current_bindings(
                     client,
-                    "https://mb.realcombi.mgcom.ru",
+                    "https://rabbitmq.example.com",
                     "/",
                     "rmq_watcher.sub.my_dag",
                     "jetstat.airflow",
@@ -201,7 +201,7 @@ class TestGetCurrentBindings:
         async with _client_with_response(handler) as client:
             await get_current_bindings(
                 client,
-                "https://mb.realcombi.mgcom.ru",
+                "https://rabbitmq.example.com",
                 "/",
                 "rmq_watcher.sub.my_dag",
                 "jetstat.airflow",
@@ -238,7 +238,7 @@ class TestGetQueueConsumers:
 
         async with _client_with_response(handler) as client:
             result = await get_queue_consumers(
-                client, "https://mb.realcombi.mgcom.ru", "/", ("guest", "guest"),
+                client, "https://rabbitmq.example.com", "/", ("guest", "guest"),
             )
         assert result == {
             "orders": {"rmq_watcher.host.1.7", "some.other.client"},
@@ -252,7 +252,7 @@ class TestGetQueueConsumers:
 
         async with _client_with_response(handler) as client:
             result = await get_queue_consumers(
-                client, "https://mb.realcombi.mgcom.ru", "/", ("guest", "guest"),
+                client, "https://rabbitmq.example.com", "/", ("guest", "guest"),
             )
         assert result == {}
 
@@ -270,7 +270,7 @@ class TestGetQueueConsumers:
 
         async with _client_with_response(handler) as client:
             result = await get_queue_consumers(
-                client, "https://mb.realcombi.mgcom.ru", "/", ("guest", "guest"),
+                client, "https://rabbitmq.example.com", "/", ("guest", "guest"),
             )
         assert result == {"orders": {"rmq_watcher.host.1.7"}}
 
@@ -285,9 +285,9 @@ class TestGetQueueConsumers:
 
         async with _client_with_response(handler) as client:
             await get_queue_consumers(
-                client, "https://mb.realcombi.mgcom.ru", "/", ("admin", "s3cr3t"),
+                client, "https://rabbitmq.example.com", "/", ("admin", "s3cr3t"),
             )
-        assert captured["url"] == "https://mb.realcombi.mgcom.ru/api/consumers/%2F"
+        assert captured["url"] == "https://rabbitmq.example.com/api/consumers/%2F"
         assert captured["auth_header"].startswith("Basic ")
 
     @pytest.mark.asyncio
@@ -298,5 +298,5 @@ class TestGetQueueConsumers:
         async with _client_with_response(handler) as client:
             with pytest.raises(httpx.HTTPStatusError):
                 await get_queue_consumers(
-                    client, "https://mb.realcombi.mgcom.ru", "/", ("guest", "guest"),
+                    client, "https://rabbitmq.example.com", "/", ("guest", "guest"),
                 )

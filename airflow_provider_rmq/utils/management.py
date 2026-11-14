@@ -31,7 +31,7 @@ async def get_current_bindings(
 
     :param client: Shared ``httpx.AsyncClient`` used to issue the request.
     :param management_url: Management API base URL (no trailing slash), e.g.
-        ``https://mb.realcombi.mgcom.ru``.
+        ``https://rabbitmq.example.com``.
     :param vhost: RabbitMQ vhost (as resolved from ``conn_info.schema or "/"``).
     :param queue: Queue name whose bindings are being inspected.
     :param exchange: Source exchange to filter bindings by — bindings whose
@@ -59,7 +59,7 @@ async def get_queue_consumers(
 
     :param client: Shared ``httpx.AsyncClient`` used to issue the request.
     :param management_url: Management API base URL (no trailing slash), e.g.
-        ``https://mb.realcombi.mgcom.ru``.
+        ``https://rabbitmq.example.com``.
     :param vhost: RabbitMQ vhost (as resolved from ``conn_info.schema or "/"``).
     :param auth: ``(login, password)`` tuple for HTTP basic auth.
     :returns: ``{queue_name: {consumer_tag, ...}}`` for every consumer the reply

@@ -35,7 +35,7 @@ Python **3.10.14**, CeleryExecutor, брокер Redis, метабаза Postgre
   метабазы. Его ответы не говорят о состоянии процесса шедулера;
 - основной цикл `scheduler_job_runner` не пишет в лог ни одной строки;
 - поток watcher'а работает как обычно: раз в минуту `Using connection ID 'rabbitmq'`
-  и `HTTP Request: GET https://mb.realcombi.mgcom.ru/api/consumers/realcom "200 OK"`,
+  и `HTTP Request: GET https://rabbitmq.example.com/api/consumers/realcom "200 OK"`,
   а также предупреждения `amqp.py:366 … missed the filter`.
 
 Живость самого процесса шедулера доказывают строки watcher'а: процесс жив, основной
