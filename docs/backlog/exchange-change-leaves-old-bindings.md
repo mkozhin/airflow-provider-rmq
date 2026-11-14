@@ -14,7 +14,7 @@ added: 2026-08-30
 сверку попадают только биндинги нового exchange'а: недостающие добавляются,
 лишние на **прежнем** exchange не видны и не удаляются. Прежний exchange нигде не
 хранится — метаданные exchange-подписки берутся из текущего скана
-(`exchange_meta`, `listener.py:878`).
+(`exchange_meta`, `listener.py:879`).
 
 Трасса. DAG в exchange-режиме переключают с `jetstat` на `jetstat_v2`. Имя
 очереди — `rmq_watcher.sub.{dag_id}` — не меняется, orphan-трекинг ключуется по

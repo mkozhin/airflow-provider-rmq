@@ -3,7 +3,8 @@
 Both the decorator (``decorators.py``) and the AST parser (``dag_file_scan.py``)
 need to validate the same ``queue``/``queues``/``exchange`` arguments and
 build the same shape of subscription dict, from two different extraction
-paths (real Python values vs. ``ast.literal_eval`` results). This module is
+paths (real Python values vs. values ``dag_file_scan._resolve_static`` reads
+from the source). This module is
 the single place where those rules live — see
 ``docs/plans/20260619-exchange-trigger-subscriptions.md`` Technical Details
 → "Валидация декоратора" for the full rationale.
@@ -72,8 +73,8 @@ def build_subscriptions(
     if cooldown < 0:
         raise ValueError("'cooldown' must be >= 0.")
 
-    # ValueError, like every other rejection here: the AST scan catches it and
-    # records the subscription as skipped.
+    # ValueError, like every other rejection here: the AST scan reports it as a
+    # problem of the file and refuses every subscription in that file.
     if not isinstance(ack_unmatched, bool):
         raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
 

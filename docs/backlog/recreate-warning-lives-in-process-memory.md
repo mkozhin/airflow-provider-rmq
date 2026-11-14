@@ -1,22 +1,22 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:473
+where: airflow_provider_rmq/watcher/listener.py:474
 added: 2026-09-03
 ---
 # След пересоздания подписки живёт в памяти процесса и теряется на рестарте
 
 **Симптом.** Когда скан пересоздаёт строку, которую сам же ранее удалил,
 `_sync_to_db` пишет WARNING с именем подписки и с тем, каким цикл прочитал её
-флаг `enabled` (`airflow_provider_rmq/watcher/listener.py:1687-1698`). Знание об
-этом держит `_deleted_dag_file_rows` (`listener.py:473`) — словарь в памяти
+флаг `enabled` (`airflow_provider_rmq/watcher/listener.py:1683-1694`). Знание об
+этом держит `_deleted_dag_file_rows` (`listener.py:474`) — словарь в памяти
 процесса watcher'а, ограниченный `_DELETED_ROWS_REMEMBERED = 256` записями
-(`listener.py:111`, вытеснение в `_remember_deleted_row`, `listener.py:1534`).
+(`listener.py:112`, вытеснение в `_remember_deleted_row`, `listener.py:1530`).
 `absent_cycles` при этом лежит в базе и переживает что угодно; несимметричен именно
-след. Docstring `_sync_to_db` (`listener.py:1562-1568`) это ограничение называет.
+след. Docstring `_sync_to_db` (`listener.py:1558-1564`) это ограничение называет.
 
 Процесс watcher'а — дочерний процесс шедулера: шедулер запускает его один раз при
 старте и останавливает при своей остановке, а упавший цикл (`_run_loop`,
-`listener.py:753`) пересоздаёт только event loop. Время жизни словаря поэтому
+`listener.py:754`) пересоздаёт только event loop. Время жизни словаря поэтому
 совпадает со временем жизни шедулера.
 
 **Когда следа не будет.**

@@ -1,15 +1,15 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:1184
+where: airflow_provider_rmq/watcher/listener.py:1185
 added: 2026-09-02
 ---
 # Скан подписок читает файлы, которые сам Airflow не загружает
 
-**Контекст.** `_scan_subscriptions` (`airflow_provider_rmq/watcher/listener.py:1159`)
-берёт папку из `airflow.settings.DAGS_FOLDER` (`_get_dags_folder`, `listener.py:1122`)
+**Контекст.** `_scan_subscriptions` (`airflow_provider_rmq/watcher/listener.py:1160`)
+берёт папку из `airflow.settings.DAGS_FOLDER` (`_get_dags_folder`, `listener.py:1123`)
 — того же источника, что и шедулер, — а список файлов в ней собирает через
 `glob.glob(os.path.join(dags_folder, "**", "*.py"), recursive=True)`
-(`listener.py:1183-1185`). Airflow для того же использует
+(`listener.py:1184-1186`). Airflow для того же использует
 `airflow.utils.file.list_py_file_paths`, и у него
 другой набор: он учитывает `.airflowignore` в каждой директории (синтаксис по
 `[core] dag_ignore_file_syntax`, regexp или glob), читает `.zip`-пакеты и в

@@ -136,9 +136,9 @@ def rmq_trigger(
 
           rabbitmqadmin delete queue name=rmq_watcher.pending.<dag_id>
 
-    ``group_key`` is NOT set by the decorator; it is set by the listener where
-    the dag_id is known (``group_key = dag_id`` when ``cooldown > 0``, else
-    ``None``).
+    ``group_key`` is NOT set by the decorator; the watcher's DAG-file scan
+    (``dag_file_scan._read_function_triggers``) sets it where the dag_id is
+    known (``group_key = dag_id`` when ``cooldown > 0``, else ``None``).
 
     Best practice: use a dedicated queue per DAG trigger (e.g.
     ``orders.airflow-trigger`` separate from ``orders``) to avoid interference

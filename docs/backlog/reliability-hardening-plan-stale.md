@@ -19,8 +19,8 @@ watcher-child-process иначе, чем он описывает. Исполня
 `thread.join(timeout=5)`; лидер-лок встраивается в `listener._main` и
 передаётся при graceful stop. Watcher же — дочерний процесс шедулера
 (ADR-0008): `before_stopping` вызывает `_stop_child()`
-(`watcher/listener.py:531-532`), а `_run_loop`/`_main` (`listener.py:753`,
-`:1375`) исполняются в потоке `rmq-watcher` внутри этого процесса
+(`watcher/listener.py:532-533`), а `_run_loop`/`_main` (`listener.py:754`,
+`:777`) исполняются в потоке `rmq-watcher` внутри этого процесса
 (`watcher/runner.py:469`). Шаги задачи 11 к этому не применимы, а дизайн
 лидер-лока должен исходить из того, что лок держит процесс watcher'а: по одному
 на каждую реплику шедулера, с его собственной остановкой по SIGTERM и гибелью
@@ -39,7 +39,7 @@ watcher-child-process иначе, чем он описывает. Исполня
 | 6–7. защита `source` и takeover-warning | не сделано → [[ui-subscription-taken-over-by-scan]] |
 | 8. at-least-once, `DagRunAlreadyExists`, детерминированный `run_id` | сделано (`_build_run_id` и `_sync_trigger`, `watcher/consumer.py:249-305`) |
 | 9. валидация cooldown `conn_id` | частично: ERROR при разъезде есть (`_report_split_cooldown`, `watcher/consumer.py:1663`), исключения лишних подписок из активного набора и `error` в их строках нет |
-| 10. вынос I/O и БД в executor | сделано, двумя пулами `BoundedExecutor` (`watcher/listener.py:727-731`) |
+| 10. вынос I/O и БД в executor | сделано, двумя пулами `BoundedExecutor` (`watcher/listener.py:728-732`) |
 | 11. graceful stop, диагностика `on_starting` | сделано в форме дочернего процесса (`_stop_child`, `_waker`, `watcher/runner.py`); шаги плана описывают поток |
 | 12–13. лидер-лок через exclusive-очередь | не сделано; на него ссылается [[status-cache-stale-across-replicas]] как на одно из двух направлений |
 | 14. statsd-метрики | сделано в другом составе: `dag_triggered`, `consumer_attached`, `consumer_restarted`, `cycle_completed`, `cycle_timed_out`, `cycle_step_timed_out`, `cycle_step_skipped`, `tasks_abandoned`, `filter_missed`, `filter_errored`, `sync_superseded`; нет `consumer_reconnect`, `orphan_detected` |
