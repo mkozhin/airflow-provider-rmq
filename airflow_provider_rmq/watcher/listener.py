@@ -1152,15 +1152,13 @@ class RMQWatcherListener:
         - an empty value names no folder at all, which is a broken setting rather
           than a folder that holds no DAG files;
         - a missing directory is not a statement about the code either — it is what a
-          git-sync symlink swap looks like for the second it lasts;
-        - listability is checked explicitly, because ``os.path.isdir`` answers ``True``
-          for a directory with no read permission. Such a folder is turned away here,
-          before the walk starts, so that it is never mistaken for an honestly empty
-          one, which the scan is required to take as the truth.
+          git-sync symlink swap looks like for the second it lasts.
 
-        The walk in :meth:`_scan_subscriptions` reads the folder once more and turns
-        away the same way a folder it finds unreadable — its ``.airflowignore``
-        included — or one Airflow's rules cannot list.
+        Whether the folder can be listed is the walk's to tell:
+        :meth:`_scan_subscriptions` turns away a folder whose root the walk cannot
+        read — ``os.path.isdir`` answers ``True`` for a directory with no read
+        permission, and such a folder must never pass for an honestly empty one,
+        which the scan is required to take as the truth.
         """
         try:
             from airflow import settings as airflow_settings
@@ -1172,13 +1170,6 @@ class RMQWatcherListener:
             raise _UntrustedScan("the DAG folder setting is empty")
         if not os.path.isdir(dags_folder):
             raise _UntrustedScan(f"the DAG folder {dags_folder!r} is not a directory")
-        try:
-            with os.scandir(dags_folder) as entries:
-                next(entries, None)
-        except OSError as exc:
-            raise _UntrustedScan(
-                f"the DAG folder {dags_folder!r} cannot be listed: {exc!r}"
-            ) from exc
         return dags_folder
 
     def _scan_subscriptions(self) -> list[dict]:
@@ -1223,13 +1214,14 @@ class RMQWatcherListener:
             raise _UntrustedScan(
                 f"the DAG folder {dags_folder!r} cannot be listed by Airflow's rules: {exc}"
             ) from exc
-        root = os.path.normpath(dags_folder)
-        for dir_path, dir_error in listing.unreadable_dirs.items():
-            if os.path.normpath(dir_path) == root:
-                raise _UntrustedScan(
-                    f"the DAG folder {dags_folder!r} cannot be listed: {dir_error!r}"
-                ) from dir_error
+        # The walk spells the root exactly as it was given.
+        root_error = listing.unreadable_dirs.get(dags_folder)
+        if root_error is not None:
+            raise _UntrustedScan(
+                f"the DAG folder {dags_folder!r} cannot be listed: {root_error!r}"
+            ) from root_error
         self._report_unreadable_dirs(listing.unreadable_dirs, listing.recovered)
+        self._unreadable_dirs = set(listing.unreadable_dirs)
 
         current_files = set(listing.files)
 
@@ -1239,6 +1231,8 @@ class RMQWatcherListener:
         # tried. Applying them first would drop the keys of the installation from a scan
         # the sync step counts misses against.
         failures: list[tuple[str, Exception | str, float | None]] = []
+        # Listed paths that give no stat, with their error: nothing tells what they are.
+        unexamined: dict[str, Exception] = {}
         for path in current_files:
             try:
                 mtime = os.path.getmtime(path)
@@ -1246,6 +1240,7 @@ class RMQWatcherListener:
                 # The file is in the listing but gives no stat — permissions, a stale
                 # NFS handle. Nothing is known about its content, so no mtime is kept.
                 failures.append((path, exc, None))
+                unexamined[path] = exc
                 continue
             if mtime == self._last_mtimes.get(path):
                 # A stat that answered is evidence the previous failure is over, and
@@ -1265,20 +1260,14 @@ class RMQWatcherListener:
             self._last_mtimes[path] = mtime
 
         # Files the cache knows under a directory the walk could not read are files of
-        # this listing that did not read, each added once, with the directory's error
-        # and no mtime, since nothing is known about their content.
-        if listing.unreadable_dirs:
-            prefixes = [
-                (os.path.join(dir_path, ""), dir_error)
-                for dir_path, dir_error in listing.unreadable_dirs.items()
-            ]
-            known = set(self._last_mtimes) | set(self._cached_subs) | set(self._read_failures)
-            for path in sorted(known - current_files):
-                for prefix, dir_error in prefixes:
-                    if path.startswith(prefix):
-                        current_files.add(path)
-                        failures.append((path, dir_error, None))
-                        break
+        # this listing that did not read. A listed ``.py`` path that gives no stat
+        # counts as such a directory: it may be a symlinked directory named ``*.py``
+        # whose target went out of reach.
+        hidden = self._paths_hidden_by(
+            {**unexamined, **listing.unreadable_dirs}, current_files
+        )
+        current_files.update(path for path, _, _ in hidden)
+        failures.extend(hidden)
 
         readable = len(current_files) - len(failures)
         baseline = self._trusted_file_count
@@ -1340,7 +1329,7 @@ class RMQWatcherListener:
         # not only the one holding mtimes: an I/O failure drops the mtime and keeps the
         # other two, and a file deleted in that state would otherwise stay in them for
         # the process's life.
-        for path in set(self._last_mtimes) | set(self._cached_subs) | set(self._read_failures):
+        for path in self._known_paths():
             if path not in current_files:
                 self._last_mtimes.pop(path, None)
                 self._cached_subs.pop(path, None)
@@ -1351,6 +1340,34 @@ class RMQWatcherListener:
         for subs in self._cached_subs.values():
             result.extend(subs)
         return result
+
+    def _known_paths(self) -> set[str]:
+        """Every path the scan cache holds an entry for, in any of its dicts."""
+        return set(self._last_mtimes) | set(self._cached_subs) | set(self._read_failures)
+
+    def _paths_hidden_by(
+        self, hidden_by: dict[str, Exception], current_files: set[str]
+    ) -> list[tuple[str, Exception | str, float | None]]:
+        """The failures of the cached files under a directory the walk could not read.
+
+        Such a file is a file of the listing that did not read: it gets the error of
+        the first directory of ``hidden_by`` it sits under and no mtime, since nothing
+        is known about its content. Files already in ``current_files`` are not
+        repeated. The result is in path order.
+        """
+        if not hidden_by:
+            return []
+        prefixes = [
+            (os.path.join(dir_path, ""), dir_error)
+            for dir_path, dir_error in hidden_by.items()
+        ]
+        hidden: list[tuple[str, Exception | str, float | None]] = []
+        for path in sorted(self._known_paths() - current_files):
+            for prefix, dir_error in prefixes:
+                if path.startswith(prefix):
+                    hidden.append((path, dir_error, None))
+                    break
+        return hidden
 
     def _report_unreadable_dirs(
         self, unreadable_dirs: dict[str, Exception], recovered: set[str]
@@ -1380,7 +1397,6 @@ class RMQWatcherListener:
                 )
         for dir_path in sorted(recovered):
             log.info("RMQ Watcher: DAG folder directory %s is readable again", dir_path)
-        self._unreadable_dirs = set(unreadable_dirs)
 
     def _file_unreadable(
         self, path: str, reason: Exception | str, mtime: float | None

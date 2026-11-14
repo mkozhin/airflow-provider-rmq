@@ -8,7 +8,9 @@ deny anything.
 from __future__ import annotations
 
 import builtins
+import contextlib
 import errno
+import inspect
 import locale
 import os
 import zipfile
@@ -17,14 +19,14 @@ from unittest.mock import patch
 
 import pytest
 
+from airflow_provider_rmq.watcher import dag_folder_listing
 from airflow_provider_rmq.watcher.dag_folder_listing import (
     DagFolderListing,
     DagFolderListingError,
     is_listed,
     list_dag_files,
 )
-
-SYNTAX_ENV = "AIRFLOW__CORE__DAG_IGNORE_FILE_SYNTAX"
+from tests.watcher.conftest import set_ignore_file_syntax
 
 needs_permissions = pytest.mark.skipif(
     hasattr(os, "geteuid") and os.geteuid() == 0,
@@ -37,12 +39,6 @@ def folder(tmp_path):
     path = tmp_path / "dags"
     path.mkdir()
     return path
-
-
-@pytest.fixture(autouse=True)
-def default_syntax(monkeypatch):
-    """Every test starts from the default ``dag_ignore_file_syntax``."""
-    monkeypatch.delenv(SYNTAX_ENV, raising=False)
 
 
 @pytest.fixture
@@ -64,10 +60,6 @@ def _touch(base: Path, rel: str, content: str = "") -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return str(path)
-
-
-def _set_syntax(monkeypatch, syntax: str) -> None:
-    monkeypatch.setenv(SYNTAX_ENV, syntax)
 
 
 def _files(base: Path, *rels: str) -> set[str]:
@@ -113,7 +105,7 @@ class TestListing:
         assert list_dag_files(str(folder)).files == _files(folder, "a.py")
 
     def test_glob_ignore_file_with_negation(self, folder, monkeypatch):
-        _set_syntax(monkeypatch, "glob")
+        set_ignore_file_syntax(monkeypatch, "glob")
         _touch(folder, ".airflowignore", "*.tmp.py\n!keep.tmp.py\nignored_dir/\n")
         _touch(folder, "a.py")
         _touch(folder, "drop.tmp.py")
@@ -222,7 +214,7 @@ class TestUnreadable:
     def test_glob_directory_pattern_on_a_symlinked_directory_that_cannot_be_reached(
         self, folder, tmp_path, chmod, monkeypatch
     ):
-        _set_syntax(monkeypatch, "glob")
+        set_ignore_file_syntax(monkeypatch, "glob")
         _touch(folder, ".airflowignore", "cache/\n")
         _touch(tmp_path, "outside/parent/target/q.py")
         (folder / "link").symlink_to(tmp_path / "outside/parent/target")
@@ -291,14 +283,14 @@ class TestListingErrors:
             list_dag_files(str(folder))
 
     def test_unsupported_syntax(self, folder, monkeypatch):
-        _set_syntax(monkeypatch, "Glob")
+        set_ignore_file_syntax(monkeypatch, "Glob")
         _touch(folder, "a.py")
 
         with pytest.raises(DagFolderListingError, match="'Glob' is not supported"):
             list_dag_files(str(folder))
 
     def test_invalid_glob_pattern(self, folder, monkeypatch):
-        _set_syntax(monkeypatch, "glob")
+        set_ignore_file_syntax(monkeypatch, "glob")
         _touch(folder, ".airflowignore", "!\n")
         _touch(folder, "a.py")
 
@@ -362,9 +354,39 @@ def _raising(original, target: str):
     return fake
 
 
+class _EntryFailingIsDir:
+    """A ``DirEntry`` whose ``is_dir()`` raises ``OSError(EIO)``."""
+
+    def __init__(self, entry: os.DirEntry) -> None:
+        self._entry = entry
+
+    def __getattr__(self, name: str):
+        return getattr(self._entry, name)
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        raise OSError(errno.EIO, "injected", self._entry.path)
+
+
+def _failing_entry_is_dir(target: str):
+    """Patch ``os.scandir`` so that the entry at ``target`` fails its ``is_dir()``."""
+    real_scandir = os.scandir
+
+    @contextlib.contextmanager
+    def fake(path):
+        with real_scandir(path) as entries:
+            yield [
+                _EntryFailingIsDir(entry) if entry.path == target else entry
+                for entry in entries
+            ]
+
+    return patch.object(os, "scandir", fake)
+
+
 def _patchers(target: str):
     """One patch per file-system call of the walk, raising on ``target``."""
     return {
+        "os.scandir": patch.object(os, "scandir", _raising(os.scandir, target)),
+        "DirEntry.is_dir": _failing_entry_is_dir(target),
         "Path.is_file": patch.object(Path, "is_file", _raising(Path.is_file, target)),
         "Path.is_dir": patch.object(Path, "is_dir", _raising(Path.is_dir, target)),
         "os.stat": patch.object(os, "stat", _raising(os.stat, target)),
@@ -376,18 +398,18 @@ def _patchers(target: str):
 class TestInvariant:
     @pytest.mark.parametrize("syntax", ["regexp", "glob"])
     def test_only_the_listing_error_leaves_the_walk(self, tmp_path, monkeypatch, syntax):
-        _set_syntax(monkeypatch, syntax)
+        set_ignore_file_syntax(monkeypatch, syntax)
         folder = tmp_path / "dags"
         folder.mkdir()
         targets = _invariant_tree(folder, tmp_path / "outside", syntax)
 
+        # An I/O error on one path is an error of that path: none of them makes the
+        # whole listing fail, the listing error included.
         for target in targets:
             for name, patcher in _patchers(target).items():
                 with patcher:
                     try:
                         list_dag_files(str(folder))
-                    except DagFolderListingError:
-                        pass
                     except Exception as exc:
                         raise AssertionError(f"{name} raising on {target} leaks {exc!r}") from exc
 
@@ -406,7 +428,7 @@ class TestInvariant:
 
     @pytest.mark.parametrize("rel", ["sub", "link", "flink"])
     def test_is_dir_error_inside_a_glob_directory_pattern(self, tmp_path, monkeypatch, rel):
-        _set_syntax(monkeypatch, "glob")
+        set_ignore_file_syntax(monkeypatch, "glob")
         folder = tmp_path / "dags"
         folder.mkdir()
         _invariant_tree(folder, tmp_path / "outside", "glob")
@@ -417,16 +439,67 @@ class TestInvariant:
 
         assert set(listing.unreadable_dirs) == {target}
 
-    def test_own_stat_error_on_a_symlink_entry(self, tmp_path):
+    def test_own_stat_error_on_a_symlink_entry_that_failed_is_dir(self, tmp_path):
         folder = tmp_path / "dags"
         folder.mkdir()
         _invariant_tree(folder, tmp_path / "outside", "regexp")
         target = str(folder / "flink")
 
-        with _patchers(target)["os.stat"]:
+        patchers = _patchers(target)
+        with patchers["DirEntry.is_dir"], patchers["os.stat"]:
             listing = list_dag_files(str(folder))
 
         assert set(listing.unreadable_dirs) == {target}
+
+    @pytest.mark.parametrize("rel", ["notes.txt", "flink"])
+    def test_an_entry_that_failed_is_dir_but_stats_is_not_a_directory(self, tmp_path, rel):
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        _invariant_tree(folder, tmp_path / "outside", "regexp")
+
+        with _patchers(str(folder / rel))["DirEntry.is_dir"]:
+            listing = list_dag_files(str(folder))
+
+        assert listing.unreadable_dirs == {}
+
+    def test_an_entry_whose_is_dir_answered_is_not_examined_again(self, tmp_path):
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        _invariant_tree(folder, tmp_path / "outside", "regexp")
+
+        with patch.object(
+            dag_folder_listing, "_unidentified_dir_error",
+            wraps=dag_folder_listing._unidentified_dir_error,
+        ) as examine:
+            list_dag_files(str(folder))
+
+        examine.assert_not_called()
+
+    def test_recheck_reports_an_entry_read_again(self, tmp_path):
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        _invariant_tree(folder, tmp_path / "outside", "regexp")
+        target = str(folder / "flink")
+
+        with _patchers(target)["DirEntry.is_dir"], _patchers(target)["os.stat"]:
+            first = list_dag_files(str(folder))
+        second = list_dag_files(str(folder), recheck=set(first.unreadable_dirs))
+
+        assert set(first.unreadable_dirs) == {target}
+        assert second.unreadable_dirs == {}
+        assert second.recovered == {target}
+
+    @pytest.mark.parametrize("rel", ["", "sub"])
+    def test_scandir_error_on_a_directory(self, tmp_path, rel):
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        _invariant_tree(folder, tmp_path / "outside", "regexp")
+        directory = str(folder / rel) if rel else str(folder)
+
+        with _patchers(directory)["os.scandir"]:
+            listing = list_dag_files(str(folder))
+
+        assert set(listing.unreadable_dirs) == {directory}
 
     @pytest.mark.parametrize("rel", ["", "sub"])
     def test_open_error_on_an_ignore_file(self, tmp_path, rel):
@@ -463,7 +536,7 @@ class TestIsListed:
         assert is_listed(_touch(folder, "sub/keep.py"), str(folder)) is True
 
     def test_glob_negation(self, folder, monkeypatch):
-        _set_syntax(monkeypatch, "glob")
+        set_ignore_file_syntax(monkeypatch, "glob")
         _touch(folder, ".airflowignore", "*.tmp.py\n!keep.tmp.py\n")
         assert is_listed(_touch(folder, "keep.tmp.py"), str(folder)) is True
         assert is_listed(_touch(folder, "drop.tmp.py"), str(folder)) is False
@@ -479,7 +552,7 @@ class TestIsListed:
         [("regexp", "ignored_dir\nskip_.*\n"), ("glob", "ignored_dir/\nskip_*\n")],
     )
     def test_through_the_real_path_of_a_symlinked_folder(self, tmp_path, monkeypatch, syntax, ignore):
-        _set_syntax(monkeypatch, syntax)
+        set_ignore_file_syntax(monkeypatch, syntax)
         real = tmp_path / "real"
         real.mkdir()
         link = tmp_path / "link"
@@ -490,6 +563,90 @@ class TestIsListed:
         assert is_listed(_touch(real, "sub/skip_me.py"), str(link)) is False
         assert is_listed(_touch(real, "ignored_dir/b.py"), str(link)) is False
 
+    @pytest.mark.parametrize(
+        "rel", [".x.py", "sub/.y.py", ".hidden/a.py", "sub/.hidden/b.py", "sub/deeper/c.py"],
+    )
+    def test_hidden_and_nested_files_are_listed(self, folder, rel):
+        assert is_listed(str(folder / rel), str(folder)) is True
+
+    @pytest.mark.parametrize("rel", ["a.pyc", "sub/a.py.bak", ".py"])
+    def test_names_that_are_not_py_files(self, folder, rel):
+        assert is_listed(str(folder / rel), str(folder)) is False
+
+    def test_paths_that_only_share_the_folder_name_as_a_prefix(self, folder, tmp_path):
+        assert is_listed(str(tmp_path / "dags2" / "a.py"), str(folder)) is False
+        assert is_listed(str(tmp_path / "dags.py"), str(folder)) is False
+
+    def test_folder_with_a_trailing_separator_or_dots_in_its_own_path(self, tmp_path):
+        folder = tmp_path / ".airflow" / "dags"
+        assert is_listed(str(folder / "a.py"), str(folder) + os.sep) is True
+        assert is_listed(str(folder / "sub" / ".." / "a.py"), str(folder)) is True
+
+    def test_file_inside_a_zip_in_the_folder_counts_as_listed(self, folder):
+        # The decorator refuses it one step later, when the file does not open.
+        assert is_listed(str(folder / "pkg.zip" / "dag.py"), str(folder)) is True
+
+    def test_real_path_of_the_folder_matches_a_symlinked_spelling(self, tmp_path):
+        real = tmp_path / "real_dags"
+        real.mkdir()
+        link = tmp_path / "dags_link"
+        link.symlink_to(real, target_is_directory=True)
+
+        assert is_listed(str(link / "a.py"), str(real)) is True
+        assert is_listed(str(link / ".hidden" / "a.py"), str(real)) is True
+
+    @staticmethod
+    def _listed_and_recognized(tmp_path, folder):
+        """The walk's listing, and every spelling of every file that ``is_listed`` takes."""
+        listed = list_dag_files(str(folder)).files
+        everything = {
+            os.path.join(root, name)
+            for root, _dirs, names in os.walk(tmp_path, followlinks=True)
+            for name in names
+        }
+        return listed, {p for p in everything if is_listed(p, str(folder))}
+
+    def test_agrees_with_the_listing_over_every_file_on_disk(self, tmp_path, folder):
+        for rel in (
+            "dags/a.py", "dags/sub/b.py", "dags/.x.py", "dags/.hidden/a.py",
+            "dags/a.txt", "outside.py", "dags2/a.py",
+        ):
+            _touch(tmp_path, rel)
+
+        listed, recognized = self._listed_and_recognized(tmp_path, folder)
+
+        assert recognized == listed
+        assert listed == _files(folder, "a.py", "sub/b.py", ".x.py", ".hidden/a.py")
+
+    def test_agrees_with_the_listing_through_a_symlinked_subdirectory(self, tmp_path, folder):
+        for rel in ("dags/a.py", "shared/b.py", "shared/.c.py", "hidden_src/d.py"):
+            _touch(tmp_path, rel)
+        (folder / "linked").symlink_to(tmp_path / "shared", target_is_directory=True)
+        (folder / ".linked").symlink_to(tmp_path / "hidden_src", target_is_directory=True)
+
+        listed, recognized = self._listed_and_recognized(tmp_path, folder)
+
+        assert recognized == listed
+        assert listed == _files(folder, "a.py", "linked/b.py", "linked/.c.py", ".linked/d.py")
+        assert is_listed(str(tmp_path / "shared" / "b.py"), str(folder)) is False
+
+    def test_agrees_with_the_listing_through_a_symlinked_folder(self, tmp_path):
+        for rel in ("real_dags/a.py", "real_dags/sub/b.py", "real_dags/.x.py"):
+            _touch(tmp_path, rel)
+        link = tmp_path / "dags_link"
+        link.symlink_to(tmp_path / "real_dags", target_is_directory=True)
+
+        listed, recognized = self._listed_and_recognized(tmp_path, link)
+
+        # The listing gives the link's spelling; is_listed also recognizes the real
+        # path of the same files, the spelling a module imported through a sys.path
+        # entry naming the real folder carries.
+        assert listed == _files(link, "a.py", "sub/b.py", ".x.py")
+        assert listed <= recognized
+        assert {os.path.realpath(p) for p in recognized} == {
+            os.path.realpath(p) for p in listed
+        }
+
     def test_unreadable_ignore_file_raises(self, folder, monkeypatch):
         path = _touch(folder, "sub/a.py")
         _touch(folder, "sub/.airflowignore", "x\n")
@@ -499,19 +656,19 @@ class TestIsListed:
             is_listed(path, str(folder))
 
     def test_unsupported_syntax_raises(self, folder, monkeypatch):
-        _set_syntax(monkeypatch, "Regexp")
+        set_ignore_file_syntax(monkeypatch, "Regexp")
         with pytest.raises(DagFolderListingError):
             is_listed(_touch(folder, "a.py"), str(folder))
 
     def test_invalid_glob_pattern_raises(self, folder, monkeypatch):
-        _set_syntax(monkeypatch, "glob")
+        set_ignore_file_syntax(monkeypatch, "glob")
         _touch(folder, ".airflowignore", "\\\n")
         with pytest.raises(DagFolderListingError):
             is_listed(_touch(folder, "a.py"), str(folder))
 
     @pytest.mark.parametrize("syntax", ["regexp", "glob"])
     def test_agrees_with_the_listing(self, tmp_path, monkeypatch, syntax):
-        _set_syntax(monkeypatch, syntax)
+        set_ignore_file_syntax(monkeypatch, syntax)
         folder = tmp_path / "dags"
         folder.mkdir()
         _comparison_tree(folder, tmp_path / "outside", syntax, locked=False)
@@ -535,11 +692,15 @@ class TestIsListed:
 
 _IGNORE_FILES = {
     "regexp": {
-        ".airflowignore": "ignored_dir\nskip_.*\\.py\n# a comment line\ndrop\\.tmp\n",
+        # "[" is an invalid regexp: Airflow logs it and skips the line.
+        ".airflowignore": "ignored_dir\nskip_.*\\.py\n# a comment line\ndrop\\.tmp\n[\n",
         "sub/.airflowignore": "local_.*\n",
     },
     "glob": {
-        ".airflowignore": "ignored_dir/\nskip_*.py\n# a comment line\n*.tmp.py\n!keep.tmp.py\n",
+        ".airflowignore": (
+            "ignored_dir/\nskip_*.py\n# a comment line\n*.tmp.py\n!keep.tmp.py\n"
+            "sub/deep/*.py\n"
+        ),
         "sub/.airflowignore": "local_*\n",
     },
 }
@@ -550,8 +711,8 @@ def _comparison_tree(folder: Path, outside: Path, syntax: str, *, locked: bool) 
         _touch(folder, rel, content)
     for rel in (
         "a.py", ".x.py", ".hidden/h.py", "skip_me.py", "keep.tmp.py", "drop.tmp.py",
-        "ignored_dir/i.py", "sub/b.py", "sub/local_c.py", "sub/deep/d.py", "notes.txt",
-        ".py", "pkg.py/inner.py", "locked/l.py",
+        "ignored_dir/i.py", "sub/b.py", "sub/local_c.py", "sub/skip_x.py", "sub/deep/d.py",
+        "notes.txt", ".py", "pkg.py/inner.py", "locked/l.py",
     ):
         _touch(folder, rel)
     _touch(outside, "o.py")
@@ -582,7 +743,7 @@ class TestAgreesWithAirflow:
 
     @pytest.mark.parametrize("syntax", ["regexp", "glob"])
     def test_same_files_as_find_path_from_directory(self, tree, tmp_path, monkeypatch, syntax):
-        _set_syntax(monkeypatch, syntax)
+        set_ignore_file_syntax(monkeypatch, syntax)
         _comparison_tree(tree, tmp_path / "outside", syntax, locked=True)
 
         listing = list_dag_files(str(tree))
@@ -590,10 +751,18 @@ class TestAgreesWithAirflow:
         assert listing.files == _airflow_py_files(tree, syntax)
         assert str(tree / "a.py") in listing.files
 
-    def test_same_files_as_list_py_file_paths_with_the_default_syntax(self, tree, tmp_path):
-        from airflow.utils.file import list_py_file_paths
+    def test_same_files_as_list_py_file_paths_with_the_default_syntax(
+        self, tree, tmp_path, monkeypatch
+    ):
+        from airflow.utils.file import find_path_from_directory, list_py_file_paths
 
-        _comparison_tree(tree, tmp_path / "outside", "regexp", locked=True)
+        # Airflow reads its default syntax once, when airflow.utils.file is imported;
+        # the walk is given the same one.
+        syntax = inspect.signature(find_path_from_directory).parameters[
+            "ignore_file_syntax"
+        ].default
+        set_ignore_file_syntax(monkeypatch, syntax)
+        _comparison_tree(tree, tmp_path / "outside", syntax, locked=True)
 
         listing = list_dag_files(str(tree))
 

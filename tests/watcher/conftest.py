@@ -45,6 +45,25 @@ def fresh_file_analyses(monkeypatch):
     monkeypatch.setattr(dag_file_scan, "_analyses", {})
 
 
+#: Environment variable that sets ``[core] dag_ignore_file_syntax``.
+IGNORE_FILE_SYNTAX_ENV = "AIRFLOW__CORE__DAG_IGNORE_FILE_SYNTAX"
+
+
+def set_ignore_file_syntax(monkeypatch, syntax: str) -> None:
+    """Set ``[core] dag_ignore_file_syntax`` for the rest of the test."""
+    monkeypatch.setenv(IGNORE_FILE_SYNTAX_ENV, syntax)
+
+
+@pytest.fixture(autouse=True)
+def default_ignore_file_syntax(monkeypatch):
+    """Every test starts from the default ``[core] dag_ignore_file_syntax``.
+
+    The walk of the DAG folder and the decorator's check read the setting from the
+    environment, and the ``.airflowignore`` files the tests write use its syntax.
+    """
+    monkeypatch.delenv(IGNORE_FILE_SYNTAX_ENV, raising=False)
+
+
 @pytest.fixture
 def dags_folder(tmp_path, monkeypatch):
     """A ``DAGS_FOLDER`` under ``tmp_path``, set on ``airflow.settings``.

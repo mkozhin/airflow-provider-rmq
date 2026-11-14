@@ -1,19 +1,21 @@
 """The set of DAG files in ``DAGS_FOLDER``, listed by the rules Airflow loads them by.
 
 :func:`list_dag_files` walks the folder the way
-``airflow.utils.file._find_path_from_directory`` does: ``os.walk`` with
-``followlinks=True``, an ``.airflowignore`` in every directory read with the syntax
-of ``[core] dag_ignore_file_syntax`` and inherited by the directories below, Airflow's
-own ignore rules (``_RegexpIgnoreRule`` / ``_GlobIgnoreRule``), and a symlink loop
-taken as a failure of the whole listing. Hidden files and directories are listed like
-any other, as Airflow loads them.
+``airflow.utils.file._find_path_from_directory`` does: top-down, following symlinked
+directories, entries sorted into directories and the rest as ``os.walk`` with
+``followlinks=True`` sorts them, an ``.airflowignore`` in every directory read with the
+syntax of ``[core] dag_ignore_file_syntax`` and inherited by the directories below,
+Airflow's own ignore rules (``_RegexpIgnoreRule`` / ``_GlobIgnoreRule``), and a symlink
+loop taken as a failure of the whole listing. Hidden files and directories are listed
+like any other, as Airflow loads them.
 
 The listing differs from Airflow's in what it does with errors and in what it keeps:
 
 - an I/O error on a directory itself — listing it, reading its ``.airflowignore``,
   following a symlink to it — makes that directory unreadable
-  (:attr:`DagFolderListing.unreadable_dirs`) and the walk goes on. Airflow's walk has
-  no ``onerror``: it drops such a directory silently, or fails as a whole;
+  (:attr:`DagFolderListing.unreadable_dirs`) and the walk goes on. Airflow's
+  ``os.walk`` has no ``onerror``: it drops such a directory silently, or fails as a
+  whole;
 - an I/O error on a single ``.py`` entry keeps the entry in the listing, so the reader
   of the file meets the error on that file alone;
 - only ``.py`` files are listed. Zip archives and the ``safe_mode`` heuristic of
@@ -31,6 +33,7 @@ Airflow and ``re2`` are imported inside the functions: the module is imported by
 decorator's check inside the DAG processor, where only a DAG file that already
 imported Airflow reaches it.
 """
+
 from __future__ import annotations
 
 import errno
@@ -41,7 +44,10 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 #: Name of the ignore file Airflow reads in every directory of the DAG folder.
-IGNORE_FILE_NAME = ".airflowignore"
+_IGNORE_FILE_NAME = ".airflowignore"
+
+#: A compiled Airflow ignore rule. Airflow's ``_IgnoreRule`` protocol is private.
+_Rule = Any
 
 #: ``os.stat`` errors on a symlink that say its target does not exist as a directory.
 _MISSING_TARGET_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
@@ -52,9 +58,11 @@ class DagFolderListing(NamedTuple):
 
     #: ``.py`` files Airflow loads, spelled ``os.path.join(root, name)`` from the folder.
     files: set[str]
-    #: Directories the walk could not read, in the same spelling, with their error.
+    #: Directories the walk could not read, in the same spelling, with their error. A
+    #: symlink whose target cannot be reached is one of them even when it points to a
+    #: file: nothing tells the two apart while the target is out of reach.
     unreadable_dirs: dict[str, Exception]
-    #: Directories of the ``recheck`` argument that this walk read without error.
+    #: Entries of the ``recheck`` argument that this walk read without error.
     recovered: set[str]
 
 
@@ -86,7 +94,9 @@ def _ignore_rule_type() -> Any:
     )
 
 
-def _with_ignore_file(directory: Path, base_dir: Path, inherited: list, rule_type: Any) -> list:
+def _with_ignore_file(
+    directory: Path, base_dir: Path, inherited: list[_Rule], rule_type: Any
+) -> list[_Rule]:
     """Rules in force in ``directory``: ``inherited`` plus its own ``.airflowignore``.
 
     Lines are read, stripped of comments, compiled and de-duplicated the way
@@ -94,9 +104,9 @@ def _with_ignore_file(directory: Path, base_dir: Path, inherited: list, rule_typ
     caller to decide what an unreadable ignore file means; any other error is one
     Airflow fails on too and becomes :class:`DagFolderListingError`.
     """
-    ignore_file_path = directory / IGNORE_FILE_NAME
+    ignore_file_path = directory / _IGNORE_FILE_NAME
     if not ignore_file_path.is_file():
-        return list(inherited)
+        return inherited
     try:
         import re2
 
@@ -108,12 +118,12 @@ def _with_ignore_file(directory: Path, base_dir: Path, inherited: list, rule_typ
         raise
     except Exception as exc:
         raise DagFolderListingError(f"{ignore_file_path} cannot be applied: {exc!r}") from exc
-    rules = list(inherited) + [rule for rule in compiled if rule is not None]
+    rules = inherited + [rule for rule in compiled if rule is not None]
     # The order of the rules is kept: with negation, a later rule overrides an earlier one.
     return list(dict.fromkeys(rules))
 
 
-def _matches(rule_type: Any, path: Path, rules: list) -> bool:
+def _matches(rule_type: Any, path: Path, rules: list[_Rule]) -> bool:
     """Whether ``rules`` exclude ``path``; ``OSError`` propagates, the rest is fatal."""
     try:
         return bool(rule_type.match(path, rules))
@@ -125,14 +135,36 @@ def _matches(rule_type: Any, path: Path, rules: list) -> bool:
         ) from exc
 
 
-def _unidentified_dir_error(path: str) -> OSError | None:
-    """The error of an entry ``os.walk`` listed as a file but that may be a directory.
+def _read_directory(path: str) -> tuple[list[str], list[str], set[str]]:
+    """The entries of ``path``, sorted the way ``os.walk(followlinks=True)`` sorts them.
 
-    ``os.walk`` files every entry whose ``is_dir()`` raised under the files and never
-    enters it: a symlink to a directory whose target cannot be reached, an entry on
-    a stale or failing mount. The entry is examined again: a symlink or a directory
-    whose ``stat`` fails for a reason other than a missing target is a directory the
-    walk could not read. A dangling symlink or a symlink loop is not a directory.
+    Returns the subdirectories (symlinks to directories included), the other entries,
+    and the names among the other entries whose ``is_dir()`` raised: ``os.walk`` files
+    such an entry under the files without knowing what it is, and so does this
+    function. An ``OSError`` listing the directory propagates.
+    """
+    subdirs: list[str] = []
+    names: list[str] = []
+    unidentified: set[str] = set()
+    with os.scandir(path) as entries:
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+                unidentified.add(entry.name)
+            (subdirs if is_dir else names).append(entry.name)
+    return subdirs, names, unidentified
+
+
+def _unidentified_dir_error(path: str) -> OSError | None:
+    """The error of an entry whose ``is_dir()`` raised, when it may be a directory.
+
+    Such an entry is filed under the files and never entered: a symlink whose target
+    cannot be reached, an entry on a stale or failing mount. It is examined again: a
+    symlink or a directory whose ``stat`` fails for a reason other than a missing
+    target is a directory the walk could not read. A dangling symlink or a symlink
+    loop is not a directory.
     """
     try:
         lstat_result = os.lstat(path)
@@ -150,19 +182,20 @@ def _unidentified_dir_error(path: str) -> OSError | None:
 def list_dag_files(dags_folder: str, recheck: AbstractSet[str] = frozenset()) -> DagFolderListing:
     """List the ``.py`` files of ``dags_folder`` that Airflow loads.
 
-    ``recheck`` holds the directories an earlier listing found unreadable; those this
+    ``recheck`` holds the entries an earlier listing found unreadable; those this
     walk reads without error come back in :attr:`DagFolderListing.recovered`.
 
     Errors are handled at three levels, and every I/O call of the walk belongs to one:
 
-    - a directory: its ``.airflowignore`` (presence, reading) and the rules compiled
-      from it. An ``OSError`` makes the directory unreadable, and none of its files or
-      subdirectories is listed — what it excludes is unknown;
+    - a directory: listing it, its ``.airflowignore`` (presence, reading) and the
+      rules compiled from it. An ``OSError`` makes the directory unreadable, and none
+      of its files or subdirectories is listed — what it excludes is unknown;
     - a subdirectory: matching it against the rules and resolving it for loop
       detection. An ``OSError`` makes that subdirectory unreadable;
     - an entry: matching it and checking that it is a file. An ``OSError`` on a
       ``.py`` entry keeps it in the listing; on any other entry it makes the entry an
-      unreadable directory (see :func:`_unidentified_dir_error`).
+      unreadable directory, and so does an entry whose ``is_dir()`` raised while the
+      directory was listed (see :func:`_unidentified_dir_error`).
 
     Raises :class:`DagFolderListingError` where Airflow's walk fails as a whole.
     """
@@ -171,31 +204,29 @@ def list_dag_files(dags_folder: str, recheck: AbstractSet[str] = frozenset()) ->
     files: set[str] = set()
     unreadable_dirs: dict[str, Exception] = {}
     recovered: set[str] = set()
-    # Rules inherited by each directory, keyed by its resolved path, as in Airflow.
-    patterns_by_dir: dict[Path, list] = {}
+    # Directories still to walk, each with the rules it inherits, taken depth-first in
+    # the order os.walk enters them.
+    pending: list[tuple[str, list[_Rule]]] = [(dags_folder, [])]
+    # Resolved paths of the subdirectories entered, for loop detection as in Airflow.
+    entered: set[Path] = set()
 
-    def on_walk_error(exc: OSError) -> None:
-        unreadable_dirs[str(exc.filename) if exc.filename is not None else dags_folder] = exc
-
-    for root, dirs, names in os.walk(dags_folder, followlinks=True, onerror=on_walk_error):
+    while pending:
+        root, inherited = pending.pop()
         root_path = Path(root)
 
         # Directory level.
         try:
-            inherited = patterns_by_dir.get(root_path.resolve(), [])
+            subdirs, names, unidentified = _read_directory(root)
             patterns = _with_ignore_file(root_path, base_dir, inherited, rule_type)
         except OSError as exc:
             unreadable_dirs[root] = exc
-            dirs[:] = []
             continue
-        except RuntimeError as exc:
-            raise DagFolderListingError(f"{root} cannot be resolved: {exc!r}") from exc
         if root in recheck:
             recovered.add(root)
 
         # Subdirectory level.
-        kept: list[str] = []
-        for subdir in dirs:
+        kept: list[tuple[str, list[_Rule]]] = []
+        for subdir in subdirs:
             subdir_path = root_path / subdir
             try:
                 if _matches(rule_type, subdir_path, patterns):
@@ -206,18 +237,18 @@ def list_dag_files(dags_folder: str, recheck: AbstractSet[str] = frozenset()) ->
                 continue
             except RuntimeError as exc:
                 raise DagFolderListingError(f"{subdir_path} cannot be resolved: {exc!r}") from exc
-            if resolved in patterns_by_dir:
+            if resolved in entered:
                 raise DagFolderListingError(
                     f"the DAG folder {dags_folder} has a symlink loop: {resolved} is "
                     "reached more than once"
                 )
-            patterns_by_dir[resolved] = list(patterns)
-            kept.append(subdir)
-        dirs[:] = kept
+            entered.add(resolved)
+            kept.append((os.path.join(root, subdir), patterns))
+        pending.extend(reversed(kept))
 
         # Entry level.
         for name in names:
-            if name == IGNORE_FILE_NAME:
+            if name == _IGNORE_FILE_NAME:
                 continue
             entry = os.path.join(root, name)
             entry_path = Path(entry)
@@ -236,9 +267,11 @@ def list_dag_files(dags_folder: str, recheck: AbstractSet[str] = frozenset()) ->
                 else:
                     unreadable_dirs[entry] = exc
                 continue
-            error = _unidentified_dir_error(entry)
+            error = _unidentified_dir_error(entry) if name in unidentified else None
             if error is not None:
                 unreadable_dirs[entry] = error
+            elif entry in recheck:
+                recovered.add(entry)
 
     return DagFolderListing(files, unreadable_dirs, recovered)
 

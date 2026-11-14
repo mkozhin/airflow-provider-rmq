@@ -1419,32 +1419,6 @@ class RMQTriggerNotStaticError(ValueError):
     """
 
 
-def _watcher_scans(path: str, dags_folder: str) -> bool:
-    """Tell whether the watcher's listing of ``dags_folder`` includes the file at ``path``.
-
-    The file must be a ``.py`` file inside ``dags_folder`` that the folder's
-    ``.airflowignore`` files do not exclude — the set of files Airflow loads
-    (``dag_folder_listing.is_listed``). Hidden files and directories count like
-    any other.
-
-    Both paths are compared through ``os.path.abspath`` first, which keeps the
-    spelling the listing gives the files under (it follows symlinked directories
-    below the folder without resolving them). A module imported through another
-    spelling of the same folder — a ``sys.path`` entry naming the folder's real
-    path, or another symlink to it — is then compared through
-    ``os.path.realpath`` of both, so the file the watcher reads is recognized
-    whichever way the import reached it.
-
-    The listing module is imported here: it is needed only once a DAG file that
-    already imported Airflow calls the decorator.
-
-    :raises DagFolderListingError: The ignore rules cannot be read or applied.
-    """
-    from airflow_provider_rmq.watcher.dag_folder_listing import is_listed
-
-    return is_listed(path, dags_folder)
-
-
 def _same_value(a: Any, b: Any) -> bool:
     """Compare two argument values the way the stored row would tell them apart.
 
@@ -1547,8 +1521,9 @@ def _verify_static_readability(
     ``build_subscriptions`` made from the arguments the decorator received.
     In order:
 
-    1. the watcher must scan the file (``_watcher_scans`` against
-       ``dags_folder``);
+    1. the watcher must scan the file: ``dag_folder_listing.is_listed`` against
+       ``dags_folder``, which recognizes the file through the folder's spelling and
+       through its real path alike;
     2. the file must read and parse, and ``_read_file_triggers`` must find no
        problem anywhere in it — any problem would make the watcher refuse every
        subscription of the file (``_analyse_file``, once per version of the
@@ -1562,10 +1537,15 @@ def _verify_static_readability(
     """
     where = f"@rmq_trigger(...) at {path}:{lineno} on DAG {dag_id!r}"
 
-    from airflow_provider_rmq.watcher.dag_folder_listing import DagFolderListingError
+    # Imported here: the listing is needed only once a DAG file that already
+    # imported Airflow calls the decorator.
+    from airflow_provider_rmq.watcher.dag_folder_listing import (
+        DagFolderListingError,
+        is_listed,
+    )
 
     try:
-        scanned = _watcher_scans(path, dags_folder)
+        scanned = is_listed(path, dags_folder)
     except DagFolderListingError as exc:
         raise RMQTriggerNotStaticError(
             f"{where}: the RMQ watcher cannot tell whether it scans this file "

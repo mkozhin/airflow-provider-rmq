@@ -1182,26 +1182,31 @@ class TestGetDagsFolder:
         os.geteuid() == 0,
         reason="root reads a directory whatever its mode says, so there is no unlistable folder to build",
     )
-    def test_unlistable_directory_raises_untrusted_scan(self, tmp_path):
+    @pytest.mark.parametrize("trailing", ["", os.sep], ids=["plain", "trailing-separator"])
+    def test_unlistable_directory_raises_untrusted_scan(self, tmp_path, trailing):
         # os.path.isdir says True for a directory with no read permission, and the
-        # walk lists no file of it: the folder is unreadable, not empty, and the
-        # listability check turns it away before the walk.
+        # walk lists no file of it: the folder is unreadable, not empty, and the scan
+        # turns it away on the walk's report of its root.
         folder = tmp_path / "dags"
         folder.mkdir()
         (folder / "dag1.py").write_text("")
         folder.chmod(0o111)
         listener = RMQWatcherListener()
+        dags_folder = str(folder) + trailing
 
         try:
-            assert os.path.isdir(str(folder))
-            listing = list_dag_files(str(folder))
+            assert os.path.isdir(dags_folder)
+            listing = list_dag_files(dags_folder)
             assert listing.files == set()
-            assert set(listing.unreadable_dirs) == {str(folder)}
-            with patch("airflow.settings.DAGS_FOLDER", str(folder)):
+            assert set(listing.unreadable_dirs) == {dags_folder}
+            with patch("airflow.settings.DAGS_FOLDER", dags_folder):
+                assert listener._get_dags_folder() == dags_folder
                 # The distrust has no limit: an unreadable folder never becomes truth.
                 for _ in range(5):
                     with pytest.raises(_UntrustedScan, match="cannot be listed"):
-                        listener._get_dags_folder()
+                        listener._scan_subscriptions()
+            assert listener._untrusted_scan_streak == 0
+            assert listener._unreadable_dirs == set()
         finally:
             folder.chmod(0o755)
 
@@ -1294,10 +1299,6 @@ def _dag_ids(result: list[dict]) -> set[str]:
 class TestScanOfTheDagFolder:
     """The walk decides which files the scan reads, and a directory it cannot read
     holds the previous parse of the files under it the way an unreadable file does."""
-
-    @pytest.fixture(autouse=True)
-    def default_syntax(self, monkeypatch):
-        monkeypatch.delenv("AIRFLOW__CORE__DAG_IGNORE_FILE_SYNTAX", raising=False)
 
     @pytest.fixture
     def folder(self, tmp_path):
@@ -1430,7 +1431,9 @@ class TestScanOfTheDagFolder:
         )
 
     @_needs_permissions
-    def test_a_large_unreadable_subtree_makes_the_listing_untrusted(self, folder, chmod):
+    def test_a_large_unreadable_subtree_makes_the_listing_untrusted(
+        self, folder, chmod, caplog
+    ):
         for n in range(6):
             _put_dag(folder / "big" / f"s{n}.py", f"s{n}")
         listener = RMQWatcherListener()
@@ -1438,11 +1441,54 @@ class TestScanOfTheDagFolder:
         cached = {path: list(subs) for path, subs in listener._cached_subs.items()}
 
         chmod(folder / "big", 0)
-        with pytest.raises(_UntrustedScan, match="directories that cannot be read") as exc:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=_LISTENER_LOG), \
+             pytest.raises(_UntrustedScan, match="directories that cannot be read") as exc:
             self._scan(listener, folder)
 
         assert repr(str(folder / "big")) in str(exc.value)
         assert listener._cached_subs == cached
+        # The directory is reported in the cycle that finds it, distrusted or not, and
+        # only at DEBUG in the cycles after it.
+        assert len(self._warnings(caplog, "cannot be read")) == 1
+        assert listener._unreadable_dirs == {str(folder / "big")}
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=_LISTENER_LOG), \
+             pytest.raises(_UntrustedScan):
+            self._scan(listener, folder)
+        assert self._warnings(caplog, "cannot be read") == []
+        assert any(
+            r.levelno == logging.DEBUG and "still cannot be read" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @_needs_permissions
+    def test_a_large_subtree_that_stays_unreadable_ends_in_the_miss_count(
+        self, folder, chmod
+    ):
+        for n in range(6):
+            _put_dag(folder / "big" / f"s{n}.py", f"s{n}")
+        big_ids = {f"s{n}" for n in range(6)}
+        listener = RMQWatcherListener()
+        self._scan(listener, folder)
+        chmod(folder / "big", 0)
+
+        for _ in range(_UNTRUSTED_SCAN_LIMIT):
+            with pytest.raises(_UntrustedScan):
+                self._scan(listener, folder)
+        # The budget runs out: the listing is believed, and the files under the
+        # directory hold their previous parse for the cycles an unreadable file does.
+        given_in = self._scan(listener, folder)
+        assert listener._untrusted_scan_streak == 0
+        assert big_ids <= _dag_ids(given_in)
+        for _ in range(_UNREADABLE_FILE_LIMIT - 1):
+            assert big_ids <= _dag_ids(self._scan(listener, folder))
+
+        result = self._scan(listener, folder)
+
+        assert _dag_ids(result) == {"a", "b", "c"}
+        assert listener._untrusted_scan_streak == 0
+        assert listener._unreadable_dirs == {str(folder / "big")}
 
     @_needs_permissions
     def test_an_unreadable_ignore_file_of_the_root_is_an_untrusted_scan(
@@ -1459,8 +1505,9 @@ class TestScanOfTheDagFolder:
             self._scan(listener, folder)
 
         # Like a folder that cannot be listed at all: the streak neither grows nor
-        # restarts.
+        # restarts, and the root is not reported as a directory of the folder.
         assert listener._untrusted_scan_streak == 2
+        assert listener._unreadable_dirs == set()
 
     def test_a_listing_error_is_an_untrusted_scan(self, folder):
         os.symlink(folder, folder / "loop")
@@ -1576,6 +1623,69 @@ class TestScanOfTheDagFolder:
 
         assert listener._unreadable_dirs == {str(folder / "sub")}
         assert not any("readable again" in r.getMessage() for r in caplog.records)
+
+
+class TestFilesUnderAnUnreadableDirectory:
+    """The cache's paths under a directory the walk could not read join the listing
+    as files that did not read; built on a mocked walk, independent of the uid."""
+
+    @staticmethod
+    def _warm(listener, paths):
+        for path in paths:
+            listener._cached_subs[path] = [{"dag_id": os.path.basename(path)}]
+            listener._last_mtimes[path] = 1.0
+
+    def test_only_paths_under_the_directory_are_held_and_each_once(self):
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+        held = ["/dags/sub/s.py", "/dags/sub/deeper/d.py"]
+        sibling = "/dags/sub_other/o.py"
+        self._warm(listener, [*held, sibling])
+        error = PermissionError(13, "denied", "/dags/sub")
+        listing = DagFolderListing({"/dags/a.py"}, {"/dags/sub": error}, set())
+
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=listing), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   return_value=5.0), \
+             patch.object(listener, "_extract_subscriptions_from_file", return_value=[]), \
+             patch.object(listener, "_file_unreadable",
+                          wraps=listener._file_unreadable) as spy:
+            listener._scan_subscriptions()
+
+        assert sorted(c.args[0] for c in spy.call_args_list) == sorted(held)
+        assert all(c.args[1] is error for c in spy.call_args_list)
+        assert all(c.args[2] is None for c in spy.call_args_list)
+        for path in held:
+            assert path in listener._cached_subs
+        # A sibling whose name starts with the directory's is not under it.
+        assert sibling not in listener._cached_subs
+
+    def test_paths_under_a_listed_py_entry_that_gives_no_stat_are_held(self):
+        """A symlinked directory named ``*.py`` whose target went out of reach is
+        listed as a ``.py`` file; the files known under it are held, not evicted."""
+        listener = RMQWatcherListener()
+        listener._get_dags_folder = MagicMock(return_value="/dags")
+        under = "/dags/pkg.py/d.py"
+        self._warm(listener, ["/dags/a.py", under])
+        error = PermissionError(13, "denied", "/dags/pkg.py")
+
+        def getmtime(path):
+            if path == "/dags/pkg.py":
+                raise error
+            return 1.0
+
+        with patch("airflow_provider_rmq.watcher.listener.list_dag_files",
+                   return_value=_listing("/dags/a.py", "/dags/pkg.py")), \
+             patch("airflow_provider_rmq.watcher.listener.os.path.getmtime",
+                   side_effect=getmtime), \
+             patch.object(listener, "_file_unreadable",
+                          wraps=listener._file_unreadable) as spy:
+            listener._scan_subscriptions()
+
+        assert sorted(c.args[0] for c in spy.call_args_list) == ["/dags/pkg.py", under]
+        assert under in listener._cached_subs
+        assert listener._unreadable_dirs == set()
 
 
 class TestUntrustedListingReason:

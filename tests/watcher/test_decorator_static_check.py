@@ -680,7 +680,7 @@ class TestDagBagListsTheFolderAsTheWatcher:
         from airflow_provider_rmq.watcher.dag_folder_listing import list_dag_files
 
         (dags_folder / "skipped").mkdir()
-        ignored = _write(dags_folder / "skipped", "ignored.py", """
+        _write(dags_folder / "skipped", "ignored.py", """
             raise RuntimeError("an ignored DAG file is imported")
 
             @rmq_trigger(queue="ignored.q")
@@ -707,7 +707,6 @@ class TestDagBagListsTheFolderAsTheWatcher:
         # The ignored file raises when imported, so no import error means DagBag
         # never imported it.
         assert {Path(stat.file).name for stat in bag.dagbag_stats} == {kept.name}
-        assert ignored.exists()
 
 
 class TestOneParsePerFile:
