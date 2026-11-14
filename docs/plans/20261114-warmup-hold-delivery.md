@@ -2,9 +2,9 @@
 
 ## Overview
 - Пока DAG-процессор не наполнил `serialized_dag`, `trigger_dag` отвечает `DagNotFound`, и
-  `_handle_immediate_delivery` делает `nack(requeue=True)` с растущей паузой. На quorum-очереди
-  с `delivery-limit` (по умолчанию 20 на RabbitMQ 4.x; на 3.x — только если его задаёт
-  политика) каждый такой возврат тратит единицу бюджета перевыдач. Прогрев в 13.5 минут — это
+  `_handle_immediate_delivery` делает `nack(requeue=True)` с растущей паузой. Целевая ветка
+  брокера — RabbitMQ 4.x (в проде 4.4): у quorum-очереди `delivery-limit` по умолчанию 20, и
+  каждый такой возврат тратит единицу бюджета перевыдач. Прогрев в 13.5 минут — это
   около двадцати возвратов, и сообщение, лежавшее в очереди на старте шедулера, брокер
   отправляет в DLX или удаляет. Строка подписки всё это время показывает `listening`, счётчик
   `_NOT_READY_LIMIT = 25` до порога не доходит, и единственный след — WARNING на каждой десятой
@@ -195,8 +195,10 @@
         неподтверждённой, триггер повторяется с растущей паузой, строка `listening`;
       - «Boundary of the silence» — удерживаемая доставка не тратит `delivery-limit`; порог —
         25 попыток или 20 минут; возврат доставки при закрытии канала, `consumer_timeout` или
-        остановке consumer'а (aio-pika возвращает весь буфер) — расход `delivery-limit` зависит
-        от версии RabbitMQ, ссылка на сценарий live-verification; fire-очередь classic и
+        остановке consumer'а (aio-pika возвращает весь буфер) — описать поведение RabbitMQ 4.x
+        (какой счётчик растёт: `x-delivery-count` или `x-acquired-count`) только так, как его
+        подтвердит сценарий live-verification на 4.4, со ссылкой на сценарий; до проверки на
+        стенде в тексте ничего об этом не утверждать; fire-очередь classic и
         `delivery-limit` не имеет, кроме vhost с типом очереди по умолчанию quorum;
       - «`prefetch` is deliberately not set» — время удержания вычитается из
         `consumer_timeout` для всего неподтверждённого окна; при большом бэклоге поднять
@@ -218,16 +220,16 @@
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
 
-**Manual verification** (стенд, RabbitMQ той же версии, что в проде; Airflow 2.9.1):
+**Manual verification** (стенд на RabbitMQ 4.4, как в проде; Airflow 2.9.1):
 - сценарий из `docs/live-verification.md`: удержание не увеличивает `x-delivery-count`,
   сообщение не уходит в DLX, DAG-ран создаётся после прогрева.
 - `consumer_timeout`: удержание дольше него (маленький `consumer_timeout` на стенде) → брокер
   закрывает канал, consumer продолжает на новом канале, доставка не запускает DAG дважды;
-  записать, увеличивает ли такой возврат счётчик доставок на этой версии RabbitMQ.
+  записать, какой счётчик увеличивает такой возврат на 4.4 (`x-delivery-count` или
+  `x-acquired-count`), и внести результат в readme.
 
-**Прод:**
-- версия RabbitMQ и тип очередей подписок (quorum/classic, `delivery-limit` из политики): на
-  3.x у quorum-очереди `delivery-limit` по умолчанию нет — от этого зависит, был ли дефект
-  реальным для прода.
+**Прод (RabbitMQ 4.4):**
+- тип очередей подписок (quorum/classic) и `delivery-limit` из политик: у quorum-очереди без
+  политики он 20.
 - `consumer_timeout` брокера и `x-consumer-timeout` политик очередей подписок: если меньше 30
   минут — порог удержания 20 минут его съедает; поднять или учесть.
