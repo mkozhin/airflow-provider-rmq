@@ -135,36 +135,39 @@ def _matches(rule_type: Any, path: Path, rules: list[_Rule]) -> bool:
         ) from exc
 
 
-def _read_directory(path: str) -> tuple[list[str], list[str], set[str]]:
+def _read_directory(path: str) -> tuple[list[str], list[str], dict[str, OSError]]:
     """The entries of ``path``, sorted the way ``os.walk(followlinks=True)`` sorts them.
 
     Returns the subdirectories (symlinks to directories included), the other entries,
-    and the names among the other entries whose ``is_dir()`` raised: ``os.walk`` files
-    such an entry under the files without knowing what it is, and so does this
-    function. An ``OSError`` listing the directory propagates.
+    and the names among the other entries whose ``is_dir()`` raised, each with that
+    error: ``os.walk`` files such an entry under the files without knowing what it is,
+    and so does this function. An ``OSError`` listing the directory propagates.
     """
     subdirs: list[str] = []
     names: list[str] = []
-    unidentified: set[str] = set()
+    unidentified: dict[str, OSError] = {}
     with os.scandir(path) as entries:
         for entry in entries:
             try:
                 is_dir = entry.is_dir()
-            except OSError:
+            except OSError as exc:
                 is_dir = False
-                unidentified.add(entry.name)
+                unidentified[entry.name] = exc
             (subdirs if is_dir else names).append(entry.name)
     return subdirs, names, unidentified
 
 
-def _unidentified_dir_error(path: str) -> OSError | None:
+def _unidentified_dir_error(path: str, is_dir_error: OSError) -> OSError | None:
     """The error of an entry whose ``is_dir()`` raised, when it may be a directory.
 
     Such an entry is filed under the files and never entered: a symlink whose target
     cannot be reached, an entry on a stale or failing mount. It is examined again: a
     symlink or a directory whose ``stat`` fails for a reason other than a missing
-    target is a directory the walk could not read. A dangling symlink or a symlink
-    loop is not a directory.
+    target is a directory the walk could not read, with the error of that ``stat``.
+    One whose ``stat`` succeeds and shows a directory is a directory the walk did not
+    enter either, with ``is_dir_error``: it stays unread this walk, as in Airflow's,
+    and the next walk reads it again. A dangling symlink, a symlink loop and an entry
+    that stats as anything other than a directory are not directories.
     """
     try:
         lstat_result = os.lstat(path)
@@ -173,10 +176,10 @@ def _unidentified_dir_error(path: str) -> OSError | None:
     if not (stat.S_ISLNK(lstat_result.st_mode) or stat.S_ISDIR(lstat_result.st_mode)):
         return None
     try:
-        os.stat(path)
+        stat_result = os.stat(path)
     except OSError as exc:
         return None if exc.errno in _MISSING_TARGET_ERRNOS else exc
-    return None
+    return is_dir_error if stat.S_ISDIR(stat_result.st_mode) else None
 
 
 def list_dag_files(dags_folder: str, recheck: AbstractSet[str] = frozenset()) -> DagFolderListing:
@@ -267,7 +270,7 @@ def list_dag_files(dags_folder: str, recheck: AbstractSet[str] = frozenset()) ->
                 else:
                     unreadable_dirs[entry] = exc
                 continue
-            error = _unidentified_dir_error(entry) if name in unidentified else None
+            error = _unidentified_dir_error(entry, unidentified[name]) if name in unidentified else None
             if error is not None:
                 unreadable_dirs[entry] = error
             elif entry in recheck:

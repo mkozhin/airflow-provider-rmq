@@ -462,6 +462,42 @@ class TestInvariant:
 
         assert listing.unreadable_dirs == {}
 
+    @pytest.mark.parametrize(("rel", "below"), [("sub", "sub/b.py"), ("link", "link/z.py")])
+    def test_an_entry_that_failed_is_dir_but_stats_as_a_directory_is_held(self, tmp_path, rel, below):
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        _invariant_tree(folder, tmp_path / "outside", "regexp")
+        target = str(folder / rel)
+
+        with _patchers(target)["DirEntry.is_dir"]:
+            listing = list_dag_files(str(folder))
+
+        assert set(listing.unreadable_dirs) == {target}
+        error = listing.unreadable_dirs[target]
+        assert isinstance(error, OSError)
+        assert error.errno == errno.EIO
+        assert error.filename == target
+        # The entry is not entered this walk; its siblings are listed.
+        assert str(folder / below) not in listing.files
+        assert str(folder / "a.py") in listing.files
+        other = "link/z.py" if rel == "sub" else "sub/b.py"
+        assert str(folder / other) in listing.files
+
+    def test_an_entry_held_after_its_is_dir_failed_is_read_by_the_next_walk(self, tmp_path):
+        folder = tmp_path / "dags"
+        folder.mkdir()
+        _invariant_tree(folder, tmp_path / "outside", "regexp")
+        target = str(folder / "sub")
+
+        with _patchers(target)["DirEntry.is_dir"]:
+            first = list_dag_files(str(folder))
+        second = list_dag_files(str(folder), recheck=set(first.unreadable_dirs))
+
+        assert set(first.unreadable_dirs) == {target}
+        assert second.unreadable_dirs == {}
+        assert second.recovered == {target}
+        assert str(folder / "sub/b.py") in second.files
+
     def test_an_entry_whose_is_dir_answered_is_not_examined_again(self, tmp_path):
         folder = tmp_path / "dags"
         folder.mkdir()

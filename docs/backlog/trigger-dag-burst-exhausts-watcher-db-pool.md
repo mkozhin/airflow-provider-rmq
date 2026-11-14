@@ -19,7 +19,7 @@ watcher его не делит, но на каждый шедулер к баз�
 overflow 10 reached`.
 
 Что watcher делает с базой на одну доставку в immediate-режиме, всё в потоках
-пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:171`), куда их
+пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:180`), куда их
 отправляют `_trigger_dag` и `_trigger_fire_dag` через `self._executor.run`
 (`consumer.py:3729-3772`):
 

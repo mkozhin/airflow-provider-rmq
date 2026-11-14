@@ -1,22 +1,22 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/listener.py:1233
+where: airflow_provider_rmq/watcher/listener.py:1286
 added: 2026-09-02
 ---
 # Первому перечислению процесса нечего противопоставить
 
-**Симптом.** `_trusted_file_count` (`airflow_provider_rmq/watcher/listener.py:443`)
+**Симптом.** `_trusted_file_count` (`airflow_provider_rmq/watcher/listener.py:465`)
 — отметка в памяти процесса watcher'а, и пока она `None`, доля прочитанного не
 считается: перечисление принимается, если в нём прочитался хотя бы один файл
-(`_scan_subscriptions`, ветка `baseline is None`, `listener.py:1227-1233`). Шедулер,
+(`_scan_subscriptions`, ветка `baseline is None`, `listener.py:1280-1286`). Шедулер,
 стартовавший в полусмонтированный том DAG'ов или в середину git-sync-выкладки,
 доверяет перечислению из одного файла на установке из ста, и `_sync_to_db` с этого
 же цикла считает промахи всем остальным ключам. Через `_ABSENT_GRACE_CYCLES + 1`
 циклов такого состояния строки удаляются. Ограничение описано в комментарии к
-`_TRUSTED_SCAN_FRACTION` (`listener.py:98-104`).
+`_TRUSTED_SCAN_FRACTION` (`listener.py:102-108`).
 
 Watcher — дочерний процесс, который шедулер запускает один раз при своём старте;
-упавший цикл (`_run_loop`, `listener.py:754`) пересоздаёт только event loop, а
+упавший цикл (`_run_loop`, `listener.py:776`) пересоздаёт только event loop, а
 объект listener'а с отметкой остаётся тем же. Холодный старт поэтому один на каждый
 старт шедулера.
 
