@@ -329,40 +329,57 @@
 - [x] run tests - must pass before next task
 
 ### Task 4: Verify acceptance criteria
-- [ ] нечитаемый подкаталог виден в логе (WARNING по каталогу) и держит прежний разбор, как
+- [x] нечитаемый подкаталог виден в логе (WARNING по каталогу) и держит прежний разбор, как
       нечитаемый файл; ни одна ошибка ввода-вывода обхода не роняет цикл
-- [ ] файл под `.airflowignore` не даёт подписку; скрытый файл даёт; zip даёт Broken DAG;
+      (`TestScanOfTheDagFolder::test_a_subdirectory_turning_unreadable_holds_the_previous_parse`,
+      `test_the_next_cycle_under_an_unreadable_subdirectory_drops_its_subscriptions`,
+      `test_a_subdirectory_reading_again_is_reported_and_its_files_reread`;
+      `TestInvariant::test_only_the_listing_error_leaves_the_walk`, `TestUnreadable`;
+      `test_a_listing_error_is_an_untrusted_scan`,
+      `test_untrusted_scan_skips_sync_but_reaches_reconcile`)
+- [x] файл под `.airflowignore` не даёт подписку; скрытый файл даёт; zip даёт Broken DAG;
       фабрика с `@rmq_trigger` под `.airflowignore` даёт Broken DAG
-- [ ] ошибка на одном файле остаётся ошибкой файла; симлинк-каталог с недоступной целью
+      (`test_a_file_under_airflowignore_gives_no_subscription`,
+      `test_a_file_in_a_hidden_directory_gives_its_subscription`,
+      `test_hidden_folder_loads_and_the_watcher_reads_its_subscription`,
+      `test_dag_file_inside_a_zip`, `test_factory_under_an_ignored_directory`,
+      `test_factory_under_a_listed_directory`)
+- [x] ошибка на одном файле остаётся ошибкой файла; симлинк-каталог с недоступной целью
       держит прежний разбор
-- [ ] набор файлов совпадает с Airflow (тесты сверки зелёные для обоих синтаксисов)
-- [ ] run full test suite: `.venv/bin/python -m pytest -q`
-- [ ] `ruff check` и `mypy` по затронутым файлам: счётчики не выше базовых (120 / 32)
+      (`test_a_py_entry_that_cannot_be_examined_is_an_error_of_that_file_alone`,
+      `test_a_symlinked_directory_whose_target_turns_unreachable_holds_its_files`,
+      `TestInvariant::test_is_file_error_on_a_py_file_keeps_it_listed`)
+- [x] набор файлов совпадает с Airflow (тесты сверки зелёные для обоих синтаксисов)
+      (`TestAgreesWithAirflow::test_same_files_as_find_path_from_directory` [regexp, glob],
+      `test_same_files_as_list_py_file_paths_with_the_default_syntax`)
+- [x] run full test suite: `.venv/bin/python -m pytest -q` (2086 passed, 1 skipped)
+- [x] `ruff check` и `mypy` по затронутым файлам: счётчики не выше базовых (120 / 32)
+      (ветка и `main`: ruff 129 / mypy 32, по файлам совпадают)
 
 ### Task 5: [Final] Update documentation
-- [ ] `readme.md` и `readme_ru.md` (синхронно): абзац «`@rmq_trigger` must also sit in a file
+- [x] `readme.md` и `readme_ru.md` (синхронно): абзац «`@rmq_trigger` must also sit in a file
       the watcher scans» — набор файлов как у Airflow (`.airflowignore`, скрытые входят), zip
       не читается и даёт Broken DAG, `might_contain_dag_callable` не повторяется; `@rmq_trigger`
       в файле под `.airflowignore` (фабрика в `common/`) даёт Broken DAG, прямой импорт такого
       файла внутри DAGS_FOLDER тоже; поведение при
       нечитаемом подкаталоге; новый `.airflowignore`, скрывающий больше половины папки,
       проходит `_UNTRUSTED_SCAN_LIMIT` недоверенных циклов, как любое реальное сокращение
-- [ ] `CHANGELOG.md` v2.7.0: Changed — скрытые файлы и каталоги читаются, файлы под
+- [x] `CHANGELOG.md` v2.7.0: Changed — скрытые файлы и каталоги читаются, файлы под
       `.airflowignore` нет, `@rmq_trigger` в файле под `.airflowignore` обрывает импорт; Fixed —
       нечитаемый подкаталог виден в логе и держит прежний разбор своих файлов, как нечитаемый
       файл; переписать пункт про правило точки
-- [ ] `docs/adr/0009-rmq-trigger-static-check-at-import.md`: переписать в настоящем времени
+- [x] `docs/adr/0009-rmq-trigger-static-check-at-import.md`: переписать в настоящем времени
       пункт про скрытый каталог и файл с точкой (78-79)
-- [ ] `docs/adr/0010-watcher-lists-dag-folder-like-airflow.md`: свой обход вместо
+- [x] `docs/adr/0010-watcher-lists-dag-folder-like-airflow.md`: свой обход вместо
       `list_py_file_paths` (нет `onerror`), приватные правила Airflow (сверены для 2.9.1 и
       2.11.2), zip, `safe_mode` и `might_contain_dag_callable` не повторяются; декоратор
       применяет `.airflowignore` к файлу вызова (фабрика в игнорируемом каталоге), цена —
       прямой импорт игнорируемого файла внутри DAGS_FOLDER падает
-- [ ] `CONTEXT.md`: уточнить «Trusted scan» про нечитаемые подкаталоги
-- [ ] `docs/live-verification.md`: шаг ручной проверки (chmod подкаталога, `.airflowignore`)
-- [ ] `git rm` `docs/backlog/unreadable-subdir-passes-as-trusted.md` и
+- [x] `CONTEXT.md`: уточнить «Trusted scan» про нечитаемые подкаталоги
+- [x] `docs/live-verification.md`: шаг ручной проверки (chmod подкаталога, `.airflowignore`)
+- [x] `git rm` `docs/backlog/unreadable-subdir-passes-as-trusted.md` и
       `docs/backlog/scan-ignores-airflowignore.md`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/` (left in place - the harness moves the plan after all phases finish)
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
