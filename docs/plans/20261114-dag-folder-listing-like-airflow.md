@@ -13,13 +13,18 @@
 - Решение: собственный обход папки, повторяющий `airflow.utils.file._find_path_from_directory`
   (`os.walk(followlinks=True)`, `.airflowignore` в каждом каталоге, синтаксис из
   `[core] dag_ignore_file_syntax`, правила Airflow `_RegexpIgnoreRule` / `_GlobIgnoreRule`).
-  Любая ошибка ввода-вывода на каталоге делает этот каталог нечитаемым, а не роняет цикл.
+  Ошибка ввода-вывода на самом каталоге (листинг, `.airflowignore`, симлинк-каталог с
+  недоступной целью) делает этот каталог нечитаемым; ошибка на отдельном файле остаётся
+  ошибкой этого файла; ни одна ошибка обхода не роняет цикл.
+- Декоратор применяет тот же `.airflowignore` к файлу, где вызван `@rmq_trigger`: фабрика в
+  игнорируемом каталоге, которую импортирует DAG-файл, даёт Broken DAG «the RMQ watcher does
+  not scan this file», а не молча теряет подписки.
 - Нечитаемый каталог: файлы, которые watcher раньше видел под ним, идут той же дорогой, что
   нечитаемый файл (`_file_unreadable`). Прежний разбор держится `_UNREADABLE_FILE_LIMIT` циклов
   с WARNING, файлы входят в долю для вердикта доверия, дальше их ключи уходят обычным
   counted-miss. Сам каталог получает WARNING один раз, когда становится нечитаемым, и INFO,
-  когда снова читается. Каталог, нечитаемый с самого старта (`lost+found`), ничего не
-  блокирует.
+  когда обход снова его прочитал. Каталог, нечитаемый с самого старта (`lost+found`), ничего
+  не блокирует.
 
 ## Context (from discovery)
 - `airflow_provider_rmq/watcher/listener.py`: `_get_dags_folder` (проверка корня),
@@ -38,13 +43,25 @@
 - Python 3.10: `Path.is_file()` / `is_dir()` глотают только ENOENT, ENOTDIR, EBADF, ELOOP;
   в каталоге с `r` без `x` они бросают `PermissionError`, на ESTALE/EIO — `OSError`.
   `GitWildMatchPattern` бросает `GitIgnorePatternError` (`ValueError`) на строках вроде `!`, `\`.
+  `_RegexpIgnoreRule.match` (re2) бросает `UnicodeEncodeError` на имени не в UTF-8.
+- `os.walk(followlinks=True)` в 3.10: `onerror` вызывается только при сбое `scandir(top)`.
+  Если `entry.is_dir()` бросает `OSError` (симлинк на каталог с недоступной целью, ESTALE/EIO,
+  файловая система с DT_UNKNOWN), запись молча попадает в список файлов, и в неё не заходят.
+- Airflow `find_dag_file_paths` ловит исключение `path.is_file()` пофайлово («Error while
+  examining») и пропускает только этот файл.
+- Фабрика с `@rmq_trigger` в отдельном модуле, который импортирует DAG-файл, — поддерживаемый
+  случай (readme, ADR 0009, `rmq_static_check_factories` в
+  `tests/watcher/test_decorator_static_check.py`). Проверка декоратора идёт по файлу вызова
+  `rmq_trigger(...)`, то есть по фабрике.
 - Тесты: `tests/watcher/test_listener.py` патчит `listener.glob.glob` (~38 мест);
   `tests/watcher/test_static_readability.py` сверяет `_watcher_scans` с glob;
   `tests/watcher/test_decorator_static_check.py:578` тестирует скрытую папку как отказ;
   footprint-тест импорта — `tests/watcher/test_dag_file_scan.py:48`.
 - Ограничение: `dag_file_scan.py` импортирует только stdlib + `subscription_builder` (он
-  выполняется в DAG processor при каждом импорте). Новый обход живёт отдельно и импортирует
-  `airflow` лениво, внутри функции, как `_get_dags_folder`.
+  выполняется в DAG processor при каждом импорте) на уровне модуля. Новый обход живёт
+  отдельно и импортирует `airflow` лениво, внутри функции, как `_get_dags_folder`;
+  `_watcher_scans` импортирует `dag_folder_listing` тоже внутри функции — к этому моменту
+  DAG-файл уже импортировал `airflow`.
 
 ## Development Approach
 - **testing approach**: Regular (code first, then tests)
@@ -62,9 +79,13 @@
 - обход тестируется на реальных каталогах в `tmp_path`: каталоги с правами 000, 644 (`r` без
   `x`) и 311 (`x` без `r`) — такие тесты пропускаются под root, где `chmod` не отнимает доступ;
   `.airflowignore` в обоих синтаксисах, вложенные `.airflowignore`, отрицание `!` в
-  glob-синтаксисе, невалидный glob-паттерн, `.airflowignore` не в UTF-8, симлинк на каталог,
-  цикл симлинков, скрытые файлы, файл с именем ровно `.py`, битый симлинк `.py`, `.zip` рядом,
+  glob-синтаксисе, невалидный glob-паттерн, `.airflowignore` не в UTF-8, имя файла не в UTF-8
+  под regexp-`.airflowignore`, симлинк на каталог, симлинк на каталог с недоступной целью,
+  `.py`-симлинк в каталог 000 рядом с нормальными файлами (в корне и в подкаталоге), цикл
+  симлинков, скрытые файлы, файл с именем ровно `.py`, битый симлинк `.py`, `.zip` рядом,
   `DAGS_FOLDER` со слешем на конце.
+- сверка обхода и проверки декоратора: на том же дереве для каждого `.py`-файла
+  `is_listed(path, folder)` равно `path in list_dag_files(folder).files`.
 - сверка с Airflow, главный тест на расхождение: для каждого синтаксиса набор `files` нового
   обхода равен `{p for p in find_path_from_directory(folder, ".airflowignore",
   ignore_file_syntax=syntax) if Path(p).is_file() and Path(p).suffix == ".py"}`; синтаксис
@@ -93,10 +114,14 @@
   `dag_ignore_file_syntax`, невалидный glob-паттерн, `.airflowignore` не в UTF-8), и нечитаемый
   корень (включая его `.airflowignore`) становятся `_UntrustedScan` до вердикта, как сбой корня
   в `_get_dags_folder`: счётчик недоверия не тратится и не пополняется.
-- Декоратор: `_watcher_scans` сводится к «`.py` внутри DAGS_FOLDER» (abspath, затем realpath).
-  Правило про точку уходит. `.airflowignore` декоратор не читает: такой файл Airflow не
-  импортирует, DAG-а нет, рассогласования нет, а прямой импорт тестовой копии (pytest, CI)
-  продолжает работать.
+- Декоратор: `_watcher_scans` — «`.py` внутри DAGS_FOLDER (abspath, затем realpath) и не
+  отсеян `.airflowignore`». Правило про точку уходит. Отсев считает
+  `dag_folder_listing.is_listed(path, dags_folder)` по цепочке каталогов от DAGS_FOLDER до
+  файла теми же правилами, что и обход; `dag_file_scan` импортирует его лениво, внутри
+  функции, так что импорт `dag_file_scan` по-прежнему не тянет `airflow`. Так фабрика в
+  игнорируемом каталоге даёт Broken DAG. Цена: прямой импорт игнорируемого файла внутри
+  DAGS_FOLDER (pytest на тестовой копии в `tests/` под `.airflowignore`) тоже падает;
+  `DagBag` такие файлы не импортирует.
 - zip: остаётся отказ. Watcher архивы не читает, `@rmq_trigger` в zip падает Broken DAG
   («cannot read this file»), это документируется.
 - `safe_mode` Airflow не повторяется: файл, который принимает `_read_file_triggers`,
@@ -109,24 +134,43 @@
 - `DagFolderListing` (NamedTuple): `files: set[str]` (пути в написании обхода:
   `os.path.join(root, name)` от `dags_folder`); `unreadable_dirs: dict[str, Exception]` (путь
   каталога в том же написании → ошибка).
+  `recovered: set[str]` — каталоги из переданного `recheck`, которые обход в этот раз прочитал
+  без ошибки.
+- `list_dag_files(dags_folder, recheck=frozenset())`; `recheck` — нечитаемые каталоги прошлого
+  цикла.
 - `DagFolderListingError(Exception)` — один класс, причина в сообщении.
 - Обход `os.walk(dags_folder, followlinks=True, onerror=...)`; `onerror` кладёт
-  `exc.filename` в `unreadable_dirs`. Для каждого `root` вся работа каталога — в одном
-  `try/except OSError`, файлы набираются в локальный список и добавляются в `files` только при
-  успехе:
-  - `<root>/.airflowignore`: `is_file()`, `open`, `read()`; строки — `ifile.read().split("\n")`,
-    комментарии срезаются `re2.sub(r"\s*#.*", "", line)`, как у Airflow;
-  - правила компилируются `rule_type.compile(line, Path(dags_folder), ignore_file_path)`,
-    `None` отбрасывается, дубли удаляются с сохранением порядка, наследование по
-    `patterns_by_dir[Path(root).resolve()]` — всё как в `_find_path_from_directory`;
-  - отсев подкаталогов `rule_type.match(Path(root) / sd, patterns)`; повтор
-    `(Path(root) / sd).resolve()` в `patterns_by_dir` → `DagFolderListingError` (цикл);
-  - файл берётся, если имя не `.airflowignore`, `Path(name).suffix == ".py"`, не отсеян
-    правилами и `Path(...).is_file()`;
-  - `OSError` в любом из шагов → `unreadable_dirs[root] = exc`, `dirs[:] = []`, файлы каталога
-    не берутся (что в нём игнорировать и какие файлы в нём есть, неизвестно);
-  - `ValueError` из `compile` (невалидный паттерн) и `UnicodeDecodeError` при чтении
-    `.airflowignore` → `DagFolderListingError`: Airflow на этом же падает и не получает списка.
+  `exc.filename` в `unreadable_dirs`. Для каждого `root` — три уровня ошибок:
+  - **уровень каталога**, в одном `try/except OSError`: `<root>/.airflowignore` (`is_file()`,
+    `open`, `read()`; строки — `ifile.read().split("\n")`, комментарии срезаются
+    `re2.sub(r"\s*#.*", "", line)`, как у Airflow), компиляция правил
+    `rule_type.compile(line, Path(dags_folder), ignore_file_path)` (`None` отбрасывается, дубли
+    удаляются с сохранением порядка, наследование по `patterns_by_dir[Path(root).resolve()]` —
+    всё как в `_find_path_from_directory`). `OSError` → `unreadable_dirs[root] = exc`,
+    `dirs[:] = []`, файлы каталога не берутся: что в нём игнорировать, неизвестно;
+  - **уровень подкаталога**: отсев `rule_type.match(Path(root) / sd, patterns)`; `OSError` из
+    `match` (`is_dir()` у glob-паттерна на `/`) → этот подкаталог в `unreadable_dirs` и убран из
+    `dirs`; повтор `(Path(root) / sd).resolve()` в `patterns_by_dir` → `DagFolderListingError`
+    (цикл);
+  - **уровень записи**: каждая запись из `files` `os.walk`, не отсеянная правилами:
+    - имя с `Path(name).suffix == ".py"` (и не `.airflowignore`): `Path(...).is_file()` True →
+      в `files`; `OSError` из `is_file()` или из `match` → тоже в `files`, чтобы `getmtime` в
+      `_scan_subscriptions` провалился и повёл файл путём `_file_unreadable`, как сейчас;
+      False (битый симлинк, каталог с именем `x.py`) → не берётся;
+    - остальные записи: `os.path.islink(p)` или `os.lstat(p)` показывает каталог → `os.stat(p)`;
+      `OSError` с errno не из ENOENT/ENOTDIR/ELOOP (и `OSError` самого `lstat`, кроме ENOENT)
+      → `unreadable_dirs[p] = exc`: это каталог, в который `os.walk` не зашёл, потому что не
+      смог его опознать. ENOENT/ENOTDIR/ELOOP — битая ссылка, такой каталог не существует;
+  - каталог из `recheck`, прочитанный без ошибки уровня каталога, → `recovered`;
+  - любое исключение, кроме `OSError`, из чтения `.airflowignore`, `compile` или `match`
+    (`ValueError` на невалидном паттерне, `UnicodeDecodeError` / `UnicodeEncodeError`) →
+    `DagFolderListingError`: Airflow на этом же падает и не получает списка.
+- `is_listed(path, dags_folder) -> bool` для декоратора: путь — `.py` под DAGS_FOLDER в
+  написании abspath, иначе realpath (как `_watcher_scans`); цепочка каталогов от DAGS_FOLDER
+  до каталога файла, на каждом шаге читается `.airflowignore` и дополняются наследуемые
+  правила, проверяется, что каталог не отсеян правилами родителя; в конце — что не отсеян сам
+  файл. Ошибка чтения `.airflowignore` или неизвестный синтаксис → `DagFolderListingError`,
+  декоратор превращает её в `RMQTriggerNotStaticError` с причиной.
 - Синтаксис: `conf.get("core", "DAG_IGNORE_FILE_SYNTAX", fallback="regexp")`, сравнение с
   учётом регистра, как у Airflow; `glob` → `_GlobIgnoreRule`, `regexp` или пусто →
   `_RegexpIgnoreRule`, иначе `DagFolderListingError`.
@@ -137,10 +181,12 @@
   - «путь под каталогом»: `path.startswith(os.path.join(dir_path, ""))`, как в
     `_is_scanned_below`; пути в кэше и каталоги из обхода в одном написании, потому что оба
     получены от одного обхода (`DAGS_FOLDER` со слешем на конце покрыт тестом);
-  - `self._unreadable_dirs: set[str]` прошлого цикла: каталог, впервые попавший в набор, →
-    WARNING с ошибкой; оставшийся → DEBUG; выпавший → INFO «readable again».
+  - `self._unreadable_dirs: set[str]` прошлого цикла передаётся как `recheck`: каталог, впервые
+    попавший в набор, → WARNING с ошибкой; оставшийся → DEBUG; из `recovered` → INFO «readable
+    again»; выпавший иначе (удалён, игнорируется, ушёл под нечитаемого предка) → только
+    убирается из набора, без сообщения о восстановлении.
 - Сообщение `_verify_static_readability` шаг 1: «The watcher reads only *.py files inside
-  DAGS_FOLDER (<folder>)», без фразы про точку.
+  DAGS_FOLDER (<folder>) that .airflowignore does not exclude», без фразы про точку.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории.
@@ -155,9 +201,9 @@
 - Create: `airflow_provider_rmq/watcher/dag_folder_listing.py`
 - Create: `tests/watcher/test_dag_folder_listing.py`
 
-- [ ] `DagFolderListing`, `DagFolderListingError`, `list_dag_files(dags_folder)` по Technical
-      Details; импорт `airflow.configuration.conf`, правил `airflow.utils.file` и `re2` внутри
-      функции
+- [ ] `DagFolderListing`, `DagFolderListingError`, `list_dag_files(dags_folder, recheck)` и
+      `is_listed(path, dags_folder)` по Technical Details; импорт `airflow.configuration.conf`,
+      правил `airflow.utils.file` и `re2` внутри функций
 - [ ] docstring модуля: обход повторяет `_find_path_from_directory`; отличия — ошибки ввода-вывода
       делают каталог нечитаемым, берутся только `.py`, zip и `safe_mode` не повторяются
 - [ ] тесты успеха: плоская папка, вложенные каталоги, скрытые файл (`.x.py`) и каталог
@@ -166,8 +212,16 @@
       ровно `.py`, битый симлинк `.py` и `.zip` не входят; `DAGS_FOLDER` со слешем на конце
 - [ ] тесты ошибок (skip под root): каталог 000, 644 и 311 → в `unreadable_dirs`, соседние
       файлы на месте, цикл не падает; нечитаемый `.airflowignore` → каталог в
-      `unreadable_dirs`, его файлов нет; цикл симлинков, неизвестный синтаксис, невалидный
-      glob-паттерн, `.airflowignore` не в UTF-8 → `DagFolderListingError`
+      `unreadable_dirs`, его файлов нет; симлинк на каталог, у цели которого предок потерял `x`
+      → симлинк в `unreadable_dirs`; `.py`-симлинк в каталог 000 рядом с нормальными файлами
+      (в корне и в подкаталоге) → он в `files`, соседи в `files`, каталог не в
+      `unreadable_dirs`; битый симлинк без `.py` → ничего; `recheck` с каталогом, который снова
+      читается, → он в `recovered`, с каталогом под новым нечитаемым предком → нет; цикл
+      симлинков, неизвестный синтаксис, невалидный glob-паттерн, `.airflowignore` не в UTF-8,
+      имя не в UTF-8 под regexp-`.airflowignore` → `DagFolderListingError`
+- [ ] тесты `is_listed`: файл в корне, во вложенном каталоге, под игнорируемым каталогом, сам
+      игнорируемый файл, отрицание в glob, вне DAGS_FOLDER, через realpath; сверка с
+      `list_dag_files` по Testing Strategy
 - [ ] тест сверки по Testing Strategy: оба синтаксиса против `find_path_from_directory` с
       явным `ignore_file_syntax`, синтаксис по умолчанию против `list_py_file_paths`
 - [ ] run tests - must pass before next task
@@ -183,8 +237,8 @@
 - [ ] после цикла stat/parse добавить известные пути под каждым нечитаемым каталогом в
       `current_files` и в `failures` (ошибка каталога, mtime `None`) — ровно один раз, без stat
       и разбора
-- [ ] `self._unreadable_dirs` и логирование: WARNING при появлении каталога, DEBUG пока он
-      нечитаем, INFO при восстановлении
+- [ ] `self._unreadable_dirs` как `recheck` и логирование: WARNING при появлении каталога,
+      DEBUG пока он нечитаем, INFO только для `recovered`
 - [ ] `_untrusted_listing_reason`: назвать нечитаемые каталоги в причине, когда они есть
 - [ ] привести к тому, что код гарантирует, docstring'и `_get_dags_folder` и
       `_scan_subscriptions` (нечитаемый подкаталог: прежний разбор его файлов держится как у
@@ -204,31 +258,42 @@
       поддерево роняет долю → `_UntrustedScan` с именем каталога в причине; нечитаемый
       `.airflowignore` корня и `DagFolderListingError` → `_UntrustedScan`, счётчик недоверия не
       тронут; файл под `.airflowignore` не даёт подписку; файл в скрытом каталоге даёт;
-      `DAGS_FOLDER` со слешем на конце сопоставляет пути под нечитаемым каталогом
+      `DAGS_FOLDER` со слешем на конце сопоставляет пути под нечитаемым каталогом; симлинк на
+      каталог, цель которого стала недоступна, держит прежний разбор файлов под ним; один
+      `.py`, на котором падает `is_file()`, в корне или в подкаталоге — ошибка только этого
+      файла, соседи и доверие скана не затронуты; дочерний нечитаемый каталог под ставшим
+      нечитаемым родителем не даёт INFO «readable again»
 - [ ] run tests - must pass before next task
 
 ### Task 3: Проверка декоратора без правила точки
 
 **Files:**
 - Modify: `airflow_provider_rmq/watcher/dag_file_scan.py`
+- Modify: `airflow_provider_rmq/watcher/decorators.py`
 - Modify: `tests/watcher/test_static_readability.py`
 - Modify: `tests/watcher/test_decorator_static_check.py`
 - Modify: `tests/watcher/test_dag_file_scan.py`
 
-- [ ] `_watcher_scans` / `_is_scanned_below`: «`.py` внутри DAGS_FOLDER» (abspath, затем
-      realpath), без правила точки; docstring говорит, почему `.airflowignore` не учитывается
-- [ ] текст шага 1 в `_verify_static_readability` без фразы про точку
+- [ ] `_watcher_scans` / `_is_scanned_below`: «`.py` внутри DAGS_FOLDER (abspath, затем
+      realpath) и `is_listed`», без правила точки; `dag_folder_listing` импортируется внутри
+      функции; `DagFolderListingError` → `RMQTriggerNotStaticError` с причиной
+- [ ] текст шага 1 в `_verify_static_readability` по Technical Details
+- [ ] docstring `rmq_trigger` в `decorators.py` (189-191): файл, который сканирует watcher, —
+      `.py` в DAGS_FOLDER, не отсеянный `.airflowignore`; без правила точки
 - [ ] `test_static_readability.py`: перевести на настоящее время тесты правила точки —
       параметры `.x.py` и `.hidden/a.py` (117-121), исключение `.linked` (164-173), 189-190,
       199, `test_file_in_a_hidden_directory` и `test_file_name_starting_with_a_dot` (349-357)
-      → теперь True; убрать glob-комментарий 201-203; сверку перевести с glob на
-      `list_dag_files`: на деревьях без `.airflowignore` `scanned == listed` (включая
-      симлинк-подкаталог и симлинк-DAGS_FOLDER), с `.airflowignore` — односторонне «каждый
-      файл листинга сканируется»; добавить: файл под `.airflowignore` → True
+      → True; убрать glob-комментарий 201-203; сверку перевести с glob на `list_dag_files`:
+      `scanned == listed` для простого дерева, дерева с `.airflowignore` и
+      симлинк-подкаталога; для симлинк-DAGS_FOLDER — `listed <= scanned` и равенство по
+      realpath, как сейчас (ветка realpath в `_watcher_scans` по замыслу принимает оба
+      написания); добавить: файл под `.airflowignore` → False
 - [ ] `test_decorator_static_check.py:578`: имя и docstring в настоящем времени («DagBag loads
       a hidden folder and the watcher reads its subscription»), проверка — загрузка без ошибки и
       совпадение подписок; добавить `DagBag` на папке с `.airflowignore`: игнорируемый файл не
-      импортируется, остальные грузятся
+      импортируется, остальные грузятся; DAG-файл, импортирующий фабрику с `@rmq_trigger` из
+      игнорируемого `common/`, → Broken DAG с «does not scan»; та же фабрика в неигнорируемом
+      каталоге → грузится
 - [ ] footprint-тест (`test_dag_file_scan.py:48`): после свежего импорта `dag_file_scan` в
       `sys.modules` нет ни `airflow`, ни `airflow_provider_rmq.watcher.dag_folder_listing`
 - [ ] run tests - must pass before next task
@@ -236,7 +301,10 @@
 ### Task 4: Verify acceptance criteria
 - [ ] нечитаемый подкаталог виден в логе (WARNING по каталогу) и держит прежний разбор, как
       нечитаемый файл; ни одна ошибка ввода-вывода обхода не роняет цикл
-- [ ] файл под `.airflowignore` не даёт подписку; скрытый файл даёт; zip даёт Broken DAG
+- [ ] файл под `.airflowignore` не даёт подписку; скрытый файл даёт; zip даёт Broken DAG;
+      фабрика с `@rmq_trigger` под `.airflowignore` даёт Broken DAG
+- [ ] ошибка на одном файле остаётся ошибкой файла; симлинк-каталог с недоступной целью
+      держит прежний разбор
 - [ ] набор файлов совпадает с Airflow (тесты сверки зелёные для обоих синтаксисов)
 - [ ] run full test suite: `.venv/bin/python -m pytest -q`
 - [ ] `ruff check` и `mypy` по затронутым файлам: счётчики не выше базовых (120 / 32)
@@ -244,18 +312,22 @@
 ### Task 5: [Final] Update documentation
 - [ ] `readme.md` и `readme_ru.md` (синхронно): абзац «`@rmq_trigger` must also sit in a file
       the watcher scans» — набор файлов как у Airflow (`.airflowignore`, скрытые входят), zip
-      не читается и даёт Broken DAG, `might_contain_dag_callable` не повторяется; поведение при
+      не читается и даёт Broken DAG, `might_contain_dag_callable` не повторяется; `@rmq_trigger`
+      в файле под `.airflowignore` (фабрика в `common/`) даёт Broken DAG, прямой импорт такого
+      файла внутри DAGS_FOLDER тоже; поведение при
       нечитаемом подкаталоге; новый `.airflowignore`, скрывающий больше половины папки,
       проходит `_UNTRUSTED_SCAN_LIMIT` недоверенных циклов, как любое реальное сокращение
 - [ ] `CHANGELOG.md` v2.7.0: Changed — скрытые файлы и каталоги читаются, файлы под
-      `.airflowignore` нет; Fixed — нечитаемый подкаталог виден в логе и держит прежний разбор
-      своих файлов, как нечитаемый файл; переписать пункт про правило точки
+      `.airflowignore` нет, `@rmq_trigger` в файле под `.airflowignore` обрывает импорт; Fixed —
+      нечитаемый подкаталог виден в логе и держит прежний разбор своих файлов, как нечитаемый
+      файл; переписать пункт про правило точки
 - [ ] `docs/adr/0009-rmq-trigger-static-check-at-import.md`: переписать в настоящем времени
       пункт про скрытый каталог и файл с точкой (78-79)
 - [ ] `docs/adr/0010-watcher-lists-dag-folder-like-airflow.md`: свой обход вместо
       `list_py_file_paths` (нет `onerror`), приватные правила Airflow (сверены для 2.9.1 и
-      2.11.2), zip, `safe_mode` и `might_contain_dag_callable` не повторяются, декоратор не
-      читает `.airflowignore`
+      2.11.2), zip, `safe_mode` и `might_contain_dag_callable` не повторяются; декоратор
+      применяет `.airflowignore` к файлу вызова (фабрика в игнорируемом каталоге), цена —
+      прямой импорт игнорируемого файла внутри DAGS_FOLDER падает
 - [ ] `CONTEXT.md`: уточнить «Trusted scan» про нечитаемые подкаталоги
 - [ ] `docs/live-verification.md`: шаг ручной проверки (chmod подкаталога, `.airflowignore`)
 - [ ] `git rm` `docs/backlog/unreadable-subdir-passes-as-trusted.md` и
@@ -278,4 +350,9 @@
 - тяжёлые скрытые каталоги внутри DAGS_FOLDER (`.git`, `.venv`, `.tox`, `node_modules`):
   watcher не применяет `safe_mode`, поэтому разберёт каждый `.py` в них, и первый цикл может
   выйти за `_STEP_TIMEOUT`. Добавить их в `.airflowignore` до выкатки.
-- файлы с `@rmq_trigger` под `.airflowignore`: их подписки (если были) уйдут counted-miss.
+- файлы с `@rmq_trigger` под `.airflowignore`: DAG-файлы — их подписки (если были) уйдут
+  counted-miss; модули-фабрики, которые импортируют DAG-файлы, — эти DAG-файлы станут Broken DAG.
+  Найти до выкатки и вынести фабрики из игнорируемых каталогов (или убрать каталог из
+  `.airflowignore`).
+- тесты и CI, импортирующие напрямую файл с `@rmq_trigger` под `.airflowignore` внутри
+  DAGS_FOLDER, начнут падать на импорте.
