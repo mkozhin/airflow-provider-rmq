@@ -157,20 +157,32 @@
       в `files`; `OSError` из `is_file()` или из `match` → тоже в `files`, чтобы `getmtime` в
       `_scan_subscriptions` провалился и повёл файл путём `_file_unreadable`, как сейчас;
       False (битый симлинк, каталог с именем `x.py`) → не берётся;
-    - остальные записи: `os.path.islink(p)` или `os.lstat(p)` показывает каталог → `os.stat(p)`;
-      `OSError` с errno не из ENOENT/ENOTDIR/ELOOP (и `OSError` самого `lstat`, кроме ENOENT)
-      → `unreadable_dirs[p] = exc`: это каталог, в который `os.walk` не зашёл, потому что не
-      смог его опознать. ENOENT/ENOTDIR/ELOOP — битая ссылка, такой каталог не существует;
+    - остальные записи: `OSError` из `match` → `unreadable_dirs[p] = exc` (glob-паттерн на `/`
+      зовёт `is_dir()`, и на симлинк-каталоге с недоступной целью он падает раньше всего
+      остального); дальше `os.path.islink(p)` или `os.lstat(p)` показывает каталог →
+      `os.stat(p)`; `OSError` с errno не из ENOENT/ENOTDIR/ELOOP (и `OSError` самого `lstat`,
+      кроме ENOENT) → `unreadable_dirs[p] = exc`: это каталог, в который `os.walk` не зашёл,
+      потому что не смог его опознать. ENOENT/ENOTDIR/ELOOP — битая ссылка, такой каталог не
+      существует;
   - каталог из `recheck`, прочитанный без ошибки уровня каталога, → `recovered`;
   - любое исключение, кроме `OSError`, из чтения `.airflowignore`, `compile` или `match`
     (`ValueError` на невалидном паттерне, `UnicodeDecodeError` / `UnicodeEncodeError`) →
     `DagFolderListingError`: Airflow на этом же падает и не получает списка.
+  - **инвариант**: из `list_dag_files` выходит только `DagFolderListingError`. Каждый
+    `OSError` обхода принадлежит одному из трёх уровней выше и превращается в нечитаемый
+    каталог или в файл, который провалится на `getmtime`; ни один вызов файловой системы
+    (`is_file`, `is_dir`, `stat`, `lstat`, `open`, `match`, `resolve`) не стоит вне такого
+    уровня.
 - `is_listed(path, dags_folder) -> bool` для декоратора: путь — `.py` под DAGS_FOLDER в
-  написании abspath, иначе realpath (как `_watcher_scans`); цепочка каталогов от DAGS_FOLDER
+  написании abspath, иначе realpath (как `_watcher_scans`). Выбранное написание задаёт базу
+  для всего вызова: в ветке realpath правила компилируются с `base_dir =
+  Path(os.path.realpath(dags_folder))`, и путь, и каталоги цепочки тоже в realpath, иначе
+  `relative_to` у regexp-правил бросает `ValueError`; цепочка каталогов от DAGS_FOLDER
   до каталога файла, на каждом шаге читается `.airflowignore` и дополняются наследуемые
   правила, проверяется, что каталог не отсеян правилами родителя; в конце — что не отсеян сам
-  файл. Ошибка чтения `.airflowignore` или неизвестный синтаксис → `DagFolderListingError`,
-  декоратор превращает её в `RMQTriggerNotStaticError` с причиной.
+  файл. Любой `OSError` (чтение `.airflowignore`, `is_dir()` внутри `match`), исключение
+  `compile`/`match` и неизвестный синтаксис → `DagFolderListingError`; из `is_listed`
+  выходит только оно, декоратор превращает его в `RMQTriggerNotStaticError` с причиной.
 - Синтаксис: `conf.get("core", "DAG_IGNORE_FILE_SYNTAX", fallback="regexp")`, сравнение с
   учётом регистра, как у Airflow; `glob` → `_GlobIgnoreRule`, `regexp` или пусто →
   `_RegexpIgnoreRule`, иначе `DagFolderListingError`.
@@ -218,9 +230,18 @@
       `unreadable_dirs`; битый симлинк без `.py` → ничего; `recheck` с каталогом, который снова
       читается, → он в `recovered`, с каталогом под новым нечитаемым предком → нет; цикл
       симлинков, неизвестный синтаксис, невалидный glob-паттерн, `.airflowignore` не в UTF-8,
-      имя не в UTF-8 под regexp-`.airflowignore` → `DagFolderListingError`
+      имя не в UTF-8 под regexp-`.airflowignore` → `DagFolderListingError`; glob-синтаксис с
+      паттерном `name/` и симлинк-каталог с недоступной целью → он в `unreadable_dirs`, обход
+      не падает
+- [ ] тест инварианта: для дерева со всеми видами записей (файл `.py`, файл не `.py`,
+      каталог, симлинк-каталог, `.airflowignore`) и обоих синтаксисов, с glob-паттерном на `/`,
+      по очереди подменять `Path.is_file`, `Path.is_dir`, `os.stat`, `os.lstat`, `open` так,
+      чтобы они бросали `OSError` на одном пути; `list_dag_files` не бросает ничего, кроме
+      `DagFolderListingError`, а затронутый путь оказывается в `files` или под одним из
+      `unreadable_dirs`
 - [ ] тесты `is_listed`: файл в корне, во вложенном каталоге, под игнорируемым каталогом, сам
-      игнорируемый файл, отрицание в glob, вне DAGS_FOLDER, через realpath; сверка с
+      игнорируемый файл, отрицание в glob, вне DAGS_FOLDER, через realpath симлинк-DAGS_FOLDER
+      с непустым regexp- и glob-`.airflowignore` (и игнорируемый, и не игнорируемый файл); сверка с
       `list_dag_files` по Testing Strategy
 - [ ] тест сверки по Testing Strategy: оба синтаксиса против `find_path_from_directory` с
       явным `ignore_file_syntax`, синтаксис по умолчанию против `list_py_file_paths`
