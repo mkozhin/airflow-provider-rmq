@@ -211,10 +211,10 @@
 - [x] прогнать `.venv/bin/pytest integration/ -q` — должно пройти
 
 ### Task 5: Verify acceptance criteria
-- [ ] все требования из Overview реализованы
-- [ ] `.venv/bin/pytest tests/ -q` и `.venv/bin/pytest integration/ -q` проходят
-- [ ] `ruff check` и `mypy` по изменённым файлам не дают новых замечаний относительно `main`
-- [ ] grep по `airflow_provider_rmq/` и `docs/example_dags/`: `global_qos` брокеру нигде не
+- [x] все требования из Overview реализованы
+- [x] `.venv/bin/pytest tests/ -q` и `.venv/bin/pytest integration/ -q` проходят
+- [x] `ruff check` и `mypy` по изменённым файлам не дают новых замечаний относительно `main`
+- [x] grep по `airflow_provider_rmq/` и `docs/example_dags/`: `global_qos` брокеру нигде не
   передаётся, non-durable non-exclusive declare нет
 
 ### Task 6: [Final] Документация, CHANGELOG и бэклог
