@@ -53,7 +53,7 @@ class AmqpTimeouts:
     rpc: float
 
 
-def read_number(
+def _read_number(
     extras: dict[str, Any],
     key: str,
     default: Any,
@@ -108,7 +108,7 @@ def read_heartbeat(extras: dict[str, Any], default: int = DEFAULT_HEARTBEAT) -> 
     to express is a mistake, and reading it as the opt-out would silently turn off the
     detection the caller was asking to tighten.
     """
-    value = read_number(extras, HEARTBEAT_KEY, default, float, 0)
+    value = _read_number(extras, HEARTBEAT_KEY, default, float, 0)
     raw = extras.get(HEARTBEAT_KEY, value)
     if 0 < value < 1:
         log.warning(
@@ -139,7 +139,7 @@ def read_blocked_connection_timeout(extras: dict[str, Any], default: float) -> f
     back to ``default`` with a WARNING. ``0`` is accepted and logged as a WARNING,
     because pika drops the connection as soon as the broker blocks it.
     """
-    value = read_number(extras, BLOCKED_CONNECTION_TIMEOUT_KEY, default, float, 0)
+    value = _read_number(extras, BLOCKED_CONNECTION_TIMEOUT_KEY, default, float, 0)
     if value == 0:
         log.warning(
             "RMQ connection extra %r=0 drops the connection as soon as the broker "
@@ -165,10 +165,10 @@ def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
     """
     extras = conn_info.extra_dejson
     return AmqpTimeouts(
-        connect=read_number(
+        connect=_read_number(
             extras, CONNECT_TIMEOUT_KEY, DEFAULT_CONNECT_TIMEOUT, float, _MIN_TIMEOUT
         ),
-        rpc=read_number(extras, RPC_TIMEOUT_KEY, DEFAULT_RPC_TIMEOUT, float, _MIN_TIMEOUT),
+        rpc=_read_number(extras, RPC_TIMEOUT_KEY, DEFAULT_RPC_TIMEOUT, float, _MIN_TIMEOUT),
     )
 
 

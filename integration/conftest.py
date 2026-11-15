@@ -166,10 +166,15 @@ class BrokerScratch:
         self,
         suffix: str,
         *,
-        durable: bool = False,
+        durable: bool = True,
         arguments: dict[str, Any] | None = None,
     ) -> str:
-        """Declare a queue named after *suffix* and return its full name."""
+        """Declare a queue named after *suffix* and return its full name.
+
+        The queue is durable by default: RabbitMQ 4.3+ refuses non-durable,
+        non-exclusive queues unless the deprecated ``transient_nonexcl_queues``
+        feature is permitted on the broker.
+        """
         name = self.register_queue(self.name(suffix))
         channel = self._connection.channel()
         try:
