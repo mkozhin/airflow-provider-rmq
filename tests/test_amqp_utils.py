@@ -16,6 +16,7 @@ from airflow_provider_rmq.utils.amqp import (
     DEFAULT_HEARTBEAT,
     DEFAULT_RPC_TIMEOUT,
     FilterMissState,
+    _read_heartbeat,
     call_with_timeout,
     handle_miss,
     match as _match,
@@ -201,6 +202,36 @@ class TestHeartbeatInUrl:
             url, _ = build_amqp_connection(conn)
         assert url.startswith("amqps://")
         assert f":{AMQPS_PORT}/%2F?heartbeat=15" in url
+
+
+# ---------------------------------------------------------------------------
+# _read_heartbeat with a caller-supplied default
+# ---------------------------------------------------------------------------
+
+class TestReadHeartbeatDefault:
+    def test_missing_key_uses_the_given_default(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            assert _read_heartbeat({}, default=600) == 600
+        assert not caplog.records
+
+    def test_non_number_uses_the_given_default(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            assert _read_heartbeat({"heartbeat": "abc"}, default=600) == 600
+        assert any("600" in r.getMessage() for r in caplog.records)
+
+    def test_interval_shorter_than_a_second_uses_the_given_default(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            assert _read_heartbeat({"heartbeat": 0.5}, default=600) == 600
+        assert any(
+            "shorter than a second" in r.getMessage() and "600" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_valid_value_ignores_the_default(self):
+        assert _read_heartbeat({"heartbeat": "45"}, default=600) == 45
+
+    def test_default_is_the_async_interval_when_not_given(self):
+        assert _read_heartbeat({}) == DEFAULT_HEARTBEAT
 
 
 # ---------------------------------------------------------------------------

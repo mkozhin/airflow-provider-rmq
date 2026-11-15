@@ -92,25 +92,25 @@ def _read_number(
     return value
 
 
-def _read_heartbeat(extras: dict[str, Any]) -> int:
+def _read_heartbeat(extras: dict[str, Any], default: int = DEFAULT_HEARTBEAT) -> int:
     """Read the heartbeat interval in seconds from ``extra``.
 
     ``0`` is accepted as a deliberate opt-out and logged as a WARNING, because it
-    turns off broken-link detection entirely. Unusable values fall back to
-    :data:`DEFAULT_HEARTBEAT` with a WARNING.
+    turns off broken-link detection entirely. A missing key uses ``default``; unusable
+    values fall back to ``default`` with a WARNING.
 
     The interval is read as a number and only then made whole, so that a value between
     zero and one second falls back rather than truncating to zero: an interval too short
     to express is a mistake, and reading it as the opt-out would silently turn off the
     detection the caller was asking to tighten.
     """
-    value = _read_number(extras, HEARTBEAT_KEY, DEFAULT_HEARTBEAT, float, 0)
+    value = _read_number(extras, HEARTBEAT_KEY, default, float, 0)
     if 0 < value < 1:
         log.warning(
             "RMQ connection extra %r=%r is shorter than a second, using %s",
-            HEARTBEAT_KEY, value, DEFAULT_HEARTBEAT,
+            HEARTBEAT_KEY, value, default,
         )
-        return DEFAULT_HEARTBEAT
+        return default
     value = int(value)
     if value == 0:
         log.warning(

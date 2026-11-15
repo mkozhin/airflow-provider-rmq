@@ -22,6 +22,11 @@ log = logging.getLogger("airflow.task")
 # Only warnings and errors from pika will be shown.
 logging.getLogger("pika").setLevel(logging.WARNING)
 
+#: Heartbeat interval in seconds for the blocking connection. ``BlockingConnection``
+#: services heartbeats only inside pika calls, so a short interval drops the link of a
+#: task that works for more than about a minute between calls.
+SYNC_DEFAULT_HEARTBEAT = 600
+
 
 class RMQHook(BaseHook):
     """Hook for interacting with RabbitMQ via pika BlockingConnection.
@@ -129,12 +134,32 @@ class RMQHook(BaseHook):
         credentials = pika.PlainCredentials(conn.login or "guest", conn.password or "guest")
 
         from airflow_provider_rmq.utils.ssl import build_ssl_context
-        from airflow_provider_rmq.utils.amqp import AMQP_PORT, AMQPS_PORT
+        from airflow_provider_rmq.utils.amqp import (
+            AMQP_PORT,
+            AMQPS_PORT,
+            HEARTBEAT_KEY,
+            _read_heartbeat,
+            _read_number,
+        )
 
         ssl_context = build_ssl_context(extras)
         ssl_options = pika.SSLOptions(ssl_context, conn.host) if ssl_context else None
 
         port = conn.port if conn.port else (AMQPS_PORT if ssl_context else AMQP_PORT)
+
+        # An explicit ``null`` goes to pika as ``None``: the heartbeat follows the
+        # broker's proposal, and a blocked connection waits without a deadline.
+        heartbeat = (
+            None
+            if HEARTBEAT_KEY in extras and extras[HEARTBEAT_KEY] is None
+            else _read_heartbeat(extras, default=SYNC_DEFAULT_HEARTBEAT)
+        )
+        blocked_connection_timeout = (
+            None
+            if "blocked_connection_timeout" in extras
+            and extras["blocked_connection_timeout"] is None
+            else _read_number(extras, "blocked_connection_timeout", 300, float, 0)
+        )
 
         return pika.ConnectionParameters(
             host=conn.host or "localhost",
@@ -142,8 +167,8 @@ class RMQHook(BaseHook):
             virtual_host=vhost,
             credentials=credentials,
             ssl_options=ssl_options,
-            heartbeat=extras.get("heartbeat", 600),
-            blocked_connection_timeout=extras.get("blocked_connection_timeout", 300),
+            heartbeat=heartbeat,
+            blocked_connection_timeout=blocked_connection_timeout,
         )
 
     def _establish_connection(self) -> pika.BlockingConnection:

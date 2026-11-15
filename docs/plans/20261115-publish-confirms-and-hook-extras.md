@@ -140,18 +140,18 @@
 - Modify: `tests/test_amqp_utils.py`
 - Modify: `tests/test_hook.py`
 
-- [ ] добавить в `_read_heartbeat` параметр `default: int = DEFAULT_HEARTBEAT`, использовать его во
+- [x] добавить в `_read_heartbeat` параметр `default: int = DEFAULT_HEARTBEAT`, использовать его во
   всех ветках отката; асинхронный вызов (`utils/amqp.py:251`) не менять
-- [ ] константа `SYNC_DEFAULT_HEARTBEAT = 600` в `hooks/rmq.py` с причиной в одну строку
-- [ ] в `_get_connection_params`: явный `null` передаётся в pika как `None`; иначе `heartbeat`
+- [x] константа `SYNC_DEFAULT_HEARTBEAT = 600` в `hooks/rmq.py` с причиной в одну строку
+- [x] в `_get_connection_params`: явный `null` передаётся в pika как `None`; иначе `heartbeat`
   через `_read_heartbeat(extras, default=SYNC_DEFAULT_HEARTBEAT)`, `blocked_connection_timeout`
   через `_read_number(extras, "blocked_connection_timeout", 300, float, 0)`
-- [ ] тесты `_read_heartbeat` с `default`: отсутствующий ключ, нечисло, значение меньше секунды
+- [x] тесты `_read_heartbeat` с `default`: отсутствующий ключ, нечисло, значение меньше секунды
   дают переданное умолчание
-- [ ] тесты хука: `"30"` даёт `30`; `"abc"` и `-5` дают 600 с WARNING; `0` даёт 0 с WARNING;
+- [x] тесты хука: `"30"` даёт `30`; `"abc"` и `-5` дают 600 с WARNING; `0` даёт 0 с WARNING;
   без ключа — 600; `null` даёт `None` для обоих ключей; `"120"` для
   `blocked_connection_timeout` даёт `120.0`, мусор — 300 с WARNING
-- [ ] прогнать тесты — должны пройти
+- [x] прогнать тесты — должны пройти
 
 ### Task 2: Publisher confirms и `mandatory` в `RMQHook`
 
