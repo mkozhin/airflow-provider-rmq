@@ -102,7 +102,7 @@
   - `queue_name` в операторе — шаблонное поле, в тексте ошибки он может быть нерендеренным;
   - пассивный declare проверку не проходит: он не создаёт очередь; `auto_delete` на правило не
     влияет.
-- **QoS.** Одна функция проверки `qos` в `hooks/rmq.py`, её вызывают `RMQHook.__init__` и
+- **QoS.** Одна функция проверки `qos` в `utils/amqp.py` (`parse_qos`, возвращает `QosSettings`), её вызывают `RMQHook.__init__` и
   `RMQConsumeOperator.__init__`; она только отклоняет недопустимое и ничего не пишет в лог:
   - `prefetch_size` не равный `0` — `ValueError`: RabbitMQ его не реализует и закрывает соединение
     с `540 NOT_IMPLEMENTED`; источник — справочник AMQP 0-9-1 на rabbitmq.com
@@ -180,7 +180,7 @@
 - Modify: `tests/test_hook.py`
 - Modify: `tests/test_consume_operator.py`
 
-- [x] функция разбора `qos` в `hooks/rmq.py`; `RMQHook.__init__` и `RMQConsumeOperator.__init__`
+- [x] функция разбора `qos` в `utils/amqp.py` (`parse_qos`); `RMQHook.__init__` и `RMQConsumeOperator.__init__`
   её вызывают
 - [x] `prefetch_size != 0` — `ValueError` со ссылкой на источник (в хуке и в операторе);
   истинный `global_qos` брокеру не передаётся, WARNING — только в `RMQHook.__init__`

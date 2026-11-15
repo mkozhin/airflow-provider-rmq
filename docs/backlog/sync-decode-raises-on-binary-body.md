@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/hooks/rmq.py:676
+where: airflow_provider_rmq/hooks/rmq.py:679
 added: 2026-09-05
 ---
 # Синхронный путь роняет задачу на бинарном теле, асинхронный его читает

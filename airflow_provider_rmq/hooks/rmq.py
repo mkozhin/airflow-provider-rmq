@@ -16,7 +16,18 @@ from tenacity import (
     wait_exponential,
 )
 
-from airflow_provider_rmq.utils.amqp import check_queue_flags, deprecated_feature, parse_qos
+from airflow_provider_rmq.utils.amqp import (
+    AMQP_PORT,
+    AMQPS_PORT,
+    BLOCKED_CONNECTION_TIMEOUT_KEY,
+    HEARTBEAT_KEY,
+    check_queue_flags,
+    deprecated_feature,
+    is_explicit_null,
+    parse_qos,
+    read_blocked_connection_timeout,
+    read_heartbeat,
+)
 
 log = logging.getLogger("airflow.task")
 
@@ -53,6 +64,7 @@ DEFAULT_SYNC_HEARTBEAT = 600
 
 #: Seconds a connection blocked by the broker may stay blocked before pika drops it.
 DEFAULT_BLOCKED_CONNECTION_TIMEOUT = 300
+
 
 class RMQHook(BaseHook):
     """Hook for interacting with RabbitMQ via pika BlockingConnection.
@@ -178,15 +190,6 @@ class RMQHook(BaseHook):
         credentials = pika.PlainCredentials(conn.login or "guest", conn.password or "guest")
 
         from airflow_provider_rmq.utils.ssl import build_ssl_context
-        from airflow_provider_rmq.utils.amqp import (
-            AMQP_PORT,
-            AMQPS_PORT,
-            BLOCKED_CONNECTION_TIMEOUT_KEY,
-            HEARTBEAT_KEY,
-            is_explicit_null,
-            read_blocked_connection_timeout,
-            read_heartbeat,
-        )
 
         ssl_context = build_ssl_context(extras)
         ssl_options = pika.SSLOptions(ssl_context, conn.host) if ssl_context else None
