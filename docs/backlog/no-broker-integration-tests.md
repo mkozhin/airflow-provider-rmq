@@ -60,8 +60,8 @@ dead-lettering на подтверждении, возврат в очередь
 durable у `RMQQueueManagementOperator` (повторный активный declare с
 `durable=True` проходит), повторное объявление exclusive-очереди `RMQHook` на
 том же подключении, exclusive-очередь с `durable=False` и публикация с чтением
-через хук с `global_qos=True`, где `basic.qos` уходит только с `prefetch_count`. Набор проверен на RabbitMQ 4.4.0 /
-Erlang 29.1.2.
+через хук с `global_qos=True`, где `basic.qos` уходит только с
+`prefetch_count`. Набор проверен на RabbitMQ 4.4.0 / Erlang 29.1.2.
 
 **Что открыто — прогон в CI.** Набор ручной: в `.github/workflows/publish.yml`
 нет ни service-контейнера с брокером, ни шага для `integration/`. Из сценариев

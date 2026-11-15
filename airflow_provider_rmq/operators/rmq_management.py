@@ -5,7 +5,8 @@ from typing import Any, Literal, Sequence
 
 from airflow.models import BaseOperator
 
-from airflow_provider_rmq.hooks.rmq import RMQHook, transient_nonexcl_queue_error
+from airflow_provider_rmq.hooks.rmq import RMQHook
+from airflow_provider_rmq.utils.amqp import check_queue_flags
 
 log = logging.getLogger("airflow.task")
 
@@ -84,20 +85,14 @@ class RMQQueueManagementOperator(BaseOperator):
         :param source_exchange: Source exchange for exchange bind/unbind.
         :type source_exchange: str | None
         :raises ValueError: If ``action`` is unknown, or if ``action`` is ``declare_queue``
-            with both ``durable`` and ``exclusive`` set to ``False``: such a queue relies on
-            the RabbitMQ deprecated feature ``transient_nonexcl_queues``, denied by default
-            since RabbitMQ 4.3.
+            with both ``durable`` and ``exclusive`` set to ``False`` (see
+            :func:`~airflow_provider_rmq.utils.amqp.check_queue_flags`).
         """
         super().__init__(**kwargs)
         if action not in VALID_ACTIONS:
             raise ValueError(f"Invalid action '{action}'. Must be one of {VALID_ACTIONS}")
-        if action == "declare_queue" and not durable and not exclusive:
-            raise transient_nonexcl_queue_error(
-                queue_name,
-                "Declare it with durable=True. exclusive=True does not fit this operator: "
-                "it closes its connection when the task finishes, and an exclusive queue is "
-                "deleted together with that connection.",
-            )
+        if action == "declare_queue":
+            check_queue_flags(queue_name, durable, exclusive, suggest_exclusive=False)
         self.action = action
         self.rmq_conn_id = rmq_conn_id
         self.queue_name = queue_name

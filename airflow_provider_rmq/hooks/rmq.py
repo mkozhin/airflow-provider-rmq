@@ -16,6 +16,8 @@ from tenacity import (
     wait_exponential,
 )
 
+from airflow_provider_rmq.utils.amqp import check_queue_flags, deprecated_feature, parse_qos
+
 log = logging.getLogger("airflow.task")
 
 # Suppress verbose pika internal logs (connection, channel, transport details).
@@ -51,56 +53,6 @@ DEFAULT_SYNC_HEARTBEAT = 600
 
 #: Seconds a connection blocked by the broker may stay blocked before pika drops it.
 DEFAULT_BLOCKED_CONNECTION_TIMEOUT = 300
-
-#: RabbitMQ's AMQP 0-9-1 conformance notes; the ``basic.qos`` row states that prefetch
-#: size limits are not implemented.
-RABBITMQ_SPECIFICATION_URL = "https://www.rabbitmq.com/docs/specification"
-
-
-def validate_qos(qos: dict | None) -> None:
-    """Reject QoS settings that RabbitMQ does not accept.
-
-    ``prefetch_size`` other than ``0`` raises ``ValueError``: RabbitMQ does not implement
-    prefetch size limits and closes the connection with ``540 NOT_IMPLEMENTED`` (see
-    :data:`RABBITMQ_SPECIFICATION_URL`). An absent ``prefetch_size`` counts as ``0``, and
-    any value equal to ``0`` (``0``, ``0.0``, ``False``) passes; ``None`` and ``"0"`` are
-    rejected.
-
-    :param qos: QoS settings dict.
-    :type qos: dict | None
-    :raises ValueError: ``prefetch_size`` is not ``0``.
-    """
-    if not qos:
-        return
-    prefetch_size = qos.get("prefetch_size", 0)
-    if prefetch_size != 0:
-        raise ValueError(
-            f"qos prefetch_size={prefetch_size!r} is not supported: RabbitMQ does not "
-            "implement prefetch size limits and closes the connection with "
-            f"540 NOT_IMPLEMENTED ({RABBITMQ_SPECIFICATION_URL}). Use prefetch_count "
-            "to limit unacknowledged messages and leave prefetch_size at 0."
-        )
-
-
-def transient_nonexcl_queue_error(queue_name: str | None, advice: str) -> ValueError:
-    """Build the error for an active declare of a non-durable, non-exclusive queue.
-
-    Such a queue relies on the RabbitMQ deprecated feature ``transient_nonexcl_queues``,
-    denied by default since RabbitMQ 4.3. *advice* tells the caller which flags to use.
-
-    :param queue_name: Name of the queue, as passed by the caller.
-    :type queue_name: str | None
-    :param advice: Sentence appended to the message.
-    :type advice: str
-    :return: The error to raise.
-    :rtype: ValueError
-    """
-    return ValueError(
-        f"Queue '{queue_name}': a non-durable, non-exclusive queue relies on the "
-        "RabbitMQ deprecated feature 'transient_nonexcl_queues', denied by default "
-        f"since RabbitMQ 4.3. {advice}"
-    )
-
 
 class RMQHook(BaseHook):
     """Hook for interacting with RabbitMQ via pika BlockingConnection.
@@ -187,7 +139,8 @@ class RMQHook(BaseHook):
         :param qos: QoS settings dict with the key ``prefetch_count`` — the number of
             unacknowledged messages delivered to a consumer. A true ``global_qos`` is not
             sent to the broker and the hook logs a WARNING; ``prefetch_size`` other than
-            ``0`` raises ``ValueError`` (see :func:`validate_qos`).
+            ``0`` raises ``ValueError`` (see
+            :func:`~airflow_provider_rmq.utils.amqp.parse_qos`).
         :type qos: dict | None
         :param retry_count: Number of connection retry attempts.
         :type retry_count: int
@@ -198,18 +151,16 @@ class RMQHook(BaseHook):
         :type publisher_confirms: bool
         """
         super().__init__()
-        validate_qos(qos)
-        global_qos = (qos or {}).get("global_qos")
-        if global_qos:
+        self._qos = parse_qos(qos)
+        if self._qos.global_qos:
             log.warning(
-                "qos global_qos=%r is not sent to the broker: per-channel prefetch is the "
-                "deprecated RabbitMQ feature 'global_qos', denied by default since RabbitMQ "
-                "4.3. prefetch_count applies to each consumer.",
-                global_qos,
+                "qos global_qos=%r is not sent to the broker: per-channel prefetch is %s. "
+                "prefetch_count applies to each consumer.",
+                self._qos.global_qos,
+                deprecated_feature("global_qos"),
             )
         self.rmq_conn_id = rmq_conn_id
         self._vhost_override = vhost
-        self._qos = qos
         self._retry_count = retry_count
         self._retry_delay = retry_delay
         self._publisher_confirms = publisher_confirms
@@ -297,8 +248,8 @@ class RMQHook(BaseHook):
             # The channel is handed out only once it is fully set up: a channel left
             # open without confirms would publish without waiting for the broker.
             try:
-                if self._qos:
-                    channel.basic_qos(prefetch_count=self._qos.get("prefetch_count", 0))
+                if self._qos.prefetch_count is not None:
+                    channel.basic_qos(prefetch_count=self._qos.prefetch_count)
                 if self._publisher_confirms:
                     channel.confirm_delivery()
             except BaseException:
@@ -391,10 +342,9 @@ class RMQHook(BaseHook):
         """Declare a queue on the broker.
 
         An active declare (``passive=False``) creates either a durable queue or an exclusive
-        one. A queue that is both non-durable and non-exclusive relies on the RabbitMQ
-        deprecated feature ``transient_nonexcl_queues``, denied by default since RabbitMQ 4.3,
-        so that combination is rejected before the broker is contacted. A passive declare
-        creates nothing and is not checked; ``auto_delete`` does not affect the rule.
+        one: a queue that is both non-durable and non-exclusive is rejected before the
+        broker is contacted (see :func:`~airflow_provider_rmq.utils.amqp.check_queue_flags`).
+        A passive declare creates nothing and is not checked.
 
         :param queue_name: Name of the queue to declare.
         :type queue_name: str
@@ -412,10 +362,8 @@ class RMQHook(BaseHook):
         :rtype: pika.frame.Method
         :raises ValueError: If ``passive``, ``durable`` and ``exclusive`` are all ``False``.
         """
-        if not passive and not durable and not exclusive:
-            raise transient_nonexcl_queue_error(
-                queue_name, "Declare it with durable=True or exclusive=True."
-            )
+        if not passive:
+            check_queue_flags(queue_name, durable, exclusive, suggest_exclusive=True)
         channel = self.get_channel()
         return channel.queue_declare(
             queue=queue_name,

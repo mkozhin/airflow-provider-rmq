@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/operators/rmq_consume.py:93
+where: airflow_provider_rmq/operators/rmq_consume.py:94
 added: 2026-09-05
 ---
 # Оператор и сенсор видят только голову очереди: за прогон разбирается один батч
@@ -35,14 +35,14 @@ added: 2026-09-05
   совпадение не подтверждено, сбой летит наружу; после первого `ack` завершает
   цикл возвратом собранного.
 - Перехват — `except Exception`, а не перечень типов: `consume_messages`
-  декодирует строгим `body.decode("utf-8")` (`hooks/rmq.py:712`), и бинарное
+  декодирует строгим `body.decode("utf-8")` (`hooks/rmq.py:676`), и бинарное
   тело даёт `UnicodeDecodeError` мимо любого перечня AMQP-ошибок. Смежное:
   [[sync-decode-raises-on-binary-body]].
 - Перехват охватывает круг целиком: `hook.ack()` и `hook.nack()` тоже
-  обращаются к каналу (`hooks/rmq.py:722-738`).
+  обращаются к каналу (`hooks/rmq.py:686-702`).
 - Окно префетча обязательно. `qos` у оператора по умолчанию `None`, `basic_qos`
-  не вызывается вовсе (`hooks/rmq.py:282-283`), брокер стримит очередь в клиент,
-  а `channel.cancel()` (`hooks/rmq.py:717`) реджектит весь буфер с
+  не вызывается вовсе (`hooks/rmq.py:251-252`), брокер стримит очередь в клиент,
+  а `channel.cancel()` (`hooks/rmq.py:681`) реджектит весь буфер с
   `requeue=True` — `BlockingChannel.cancel` в pika 1.4.4 гонит
   `basic_reject(..., requeue=True)` по `get_waiting_message_count()`. Без окна
   каждое сообщение за пределами батча получает доставку на каждом круге.

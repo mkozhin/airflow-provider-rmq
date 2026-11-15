@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/hooks/rmq.py:712
+where: airflow_provider_rmq/hooks/rmq.py:676
 added: 2026-09-05
 ---
 # Синхронный путь роняет задачу на бинарном теле, асинхронный его читает
@@ -9,7 +9,7 @@ added: 2026-09-05
 `body.decode("utf-8")`, без `errors=`. Невалидный UTF-8 даёт `UnicodeDecodeError`,
 который улетает из `RMQConsumeOperator.execute` и `RMQSensor.poke` мимо их
 единственного `except pika.exceptions.ChannelClosedByBroker`
-(`operators/rmq_consume.py:98`, `sensors/rmq.py:172`): задача красная,
+(`operators/rmq_consume.py:99`, `sensors/rmq.py:172`): задача красная,
 батч остаётся unacked.
 
 Асинхронный путь то же тело читает: `match()` (`utils/amqp.py:306`) и

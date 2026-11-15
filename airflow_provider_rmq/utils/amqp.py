@@ -562,3 +562,114 @@ async def match_and_ack(
         return False
     await handle_miss(message, miss_state)
     return False
+
+
+#: RabbitMQ's AMQP 0-9-1 conformance notes; the ``basic.qos`` row states that prefetch
+#: size limits are not implemented.
+RABBITMQ_SPECIFICATION_URL = "https://www.rabbitmq.com/docs/specification"
+
+#: First RabbitMQ release that denies the deprecated features ``transient_nonexcl_queues``
+#: and ``global_qos`` by default.
+DEPRECATED_FEATURES_DENIED_SINCE = "4.3"
+
+
+def deprecated_feature(name: str) -> str:
+    """Name a deprecated RabbitMQ feature the way the provider's messages state it.
+
+    :param name: Feature flag name, e.g. ``global_qos``.
+    :return: ``the deprecated RabbitMQ feature '<name>', denied by default since
+        RabbitMQ <version>``, with :data:`DEPRECATED_FEATURES_DENIED_SINCE` as version.
+    """
+    return (
+        f"the deprecated RabbitMQ feature '{name}', denied by default since "
+        f"RabbitMQ {DEPRECATED_FEATURES_DENIED_SINCE}"
+    )
+
+
+@dataclass(frozen=True)
+class QosSettings:
+    """QoS settings as the provider applies them to a blocking channel.
+
+    :param prefetch_count: Value for ``basic.qos``; ``None`` means no ``basic.qos`` is
+        sent and the broker's default (no limit) applies.
+    :param global_qos: The caller's ``global_qos`` value. It is never sent to the broker;
+        a true value is kept so the caller can report it.
+    """
+
+    prefetch_count: int | None = None
+    global_qos: Any = None
+
+
+def parse_qos(qos: dict | None) -> QosSettings:
+    """Read a QoS settings dict into the settings the provider applies.
+
+    - ``prefetch_count`` is the only value sent to the broker. Absent or ``None``, no
+      ``basic.qos`` is sent.
+    - ``global_qos`` is never sent: per-channel prefetch is the deprecated RabbitMQ
+      feature ``global_qos`` (see :data:`DEPRECATED_FEATURES_DENIED_SINCE`). The value
+      is returned for the caller to report.
+    - ``prefetch_size`` other than ``0`` raises ``ValueError``: RabbitMQ does not
+      implement prefetch size limits and closes the connection with
+      ``540 NOT_IMPLEMENTED`` (see :data:`RABBITMQ_SPECIFICATION_URL`). An absent
+      ``prefetch_size`` counts as ``0``, and any value equal to ``0`` (``0``, ``0.0``,
+      ``False``) passes; ``None`` and ``"0"`` are rejected.
+
+    Other keys are ignored.
+
+    :param qos: QoS settings dict.
+    :return: The settings to apply.
+    :raises ValueError: ``prefetch_size`` is not ``0``.
+    """
+    if not qos:
+        return QosSettings()
+    prefetch_size = qos.get("prefetch_size", 0)
+    if prefetch_size != 0:
+        raise ValueError(
+            f"qos prefetch_size={prefetch_size!r} is not supported: RabbitMQ does not "
+            "implement prefetch size limits and closes the connection with "
+            f"540 NOT_IMPLEMENTED ({RABBITMQ_SPECIFICATION_URL}). Use prefetch_count "
+            "to limit unacknowledged messages and leave prefetch_size at 0."
+        )
+    return QosSettings(
+        prefetch_count=qos.get("prefetch_count"),
+        global_qos=qos.get("global_qos"),
+    )
+
+
+def check_queue_flags(
+    queue_name: str | None,
+    durable: bool,
+    exclusive: bool,
+    *,
+    suggest_exclusive: bool,
+) -> None:
+    """Reject an active declare of a queue that is neither durable nor exclusive.
+
+    Such a queue relies on the deprecated RabbitMQ feature ``transient_nonexcl_queues``
+    (see :data:`DEPRECATED_FEATURES_DENIED_SINCE`). ``auto_delete`` does not affect the
+    rule. The check needs no broker, so callers run
+    it before they connect.
+
+    :param queue_name: Name of the queue, as passed by the caller; it goes into the
+        message.
+    :param durable: The queue's ``durable`` flag.
+    :param exclusive: The queue's ``exclusive`` flag.
+    :param suggest_exclusive: Offer ``exclusive=True`` as a fix next to ``durable=True``.
+        ``False`` for an operator that closes its connection when the task finishes:
+        an exclusive queue is deleted together with that connection.
+    :raises ValueError: ``durable`` and ``exclusive`` are both ``False``.
+    """
+    if durable or exclusive:
+        return
+    if suggest_exclusive:
+        advice = "Declare it with durable=True or exclusive=True."
+    else:
+        advice = (
+            "Declare it with durable=True. exclusive=True does not fit this operator: "
+            "it closes its connection when the task finishes, and an exclusive queue is "
+            "deleted together with that connection."
+        )
+    raise ValueError(
+        f"Queue '{queue_name}': a non-durable, non-exclusive queue relies on "
+        f"{deprecated_feature('transient_nonexcl_queues')}. {advice}"
+    )

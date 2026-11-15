@@ -16,10 +16,9 @@ from airflow_provider_rmq.hooks.rmq import (
     DEFAULT_BLOCKED_CONNECTION_TIMEOUT,
     DEFAULT_SYNC_HEARTBEAT,
     PIKA_RETURNED_MESSAGE_LOG_PREFIX,
-    RABBITMQ_SPECIFICATION_URL,
     RMQHook,
-    validate_qos,
 )
+from airflow_provider_rmq.utils.amqp import RABBITMQ_SPECIFICATION_URL, QosSettings
 from tests.conftest import FakeAirflowConnection, make_message
 
 
@@ -359,7 +358,7 @@ class TestQos:
         assert "not sent to the broker" in text
         assert "deprecated" in text
         assert "4.3" in text
-        assert hook._qos == qos
+        assert hook._qos == QosSettings(prefetch_count=5, global_qos=value)
 
         self._open_channel(qos, fake_connection, mock_connection)
         mock_channel.basic_qos.assert_called_once_with(prefetch_count=5)
@@ -378,11 +377,20 @@ class TestQos:
         with caplog.at_level(logging.WARNING, logger="airflow.task"):
             self._open_channel({"global_qos": True}, fake_connection, mock_connection)
         assert len(self._global_qos_warnings(caplog)) == 1
-        mock_channel.basic_qos.assert_called_once_with(prefetch_count=0)
-
-    def test_no_basic_qos_without_qos(self, fake_connection, mock_connection, mock_channel):
-        self._open_channel(None, fake_connection, mock_connection)
         mock_channel.basic_qos.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "qos", [None, {}, {"prefetch_count": None}, {"unknown_key": "x"}],
+    )
+    def test_no_basic_qos_without_prefetch_count(
+        self, qos, fake_connection, mock_connection, mock_channel,
+    ):
+        self._open_channel(qos, fake_connection, mock_connection)
+        mock_channel.basic_qos.assert_not_called()
+
+    def test_zero_prefetch_count_sent(self, fake_connection, mock_connection, mock_channel):
+        self._open_channel({"prefetch_count": 0}, fake_connection, mock_connection)
+        mock_channel.basic_qos.assert_called_once_with(prefetch_count=0)
 
     def test_nonzero_prefetch_size_rejected_by_hook(self):
         with pytest.raises(ValueError, match="prefetch_size=1") as exc:
@@ -399,19 +407,6 @@ class TestQos:
             {"prefetch_size": 0, "prefetch_count": 3}, fake_connection, mock_connection,
         )
         mock_channel.basic_qos.assert_called_once_with(prefetch_count=3)
-
-    @pytest.mark.parametrize(
-        "qos",
-        [None, {}, {"prefetch_count": 1}, {"prefetch_size": 0}, {"prefetch_size": 0.0},
-         {"prefetch_size": False}, {"global_qos": True}, {"unknown_key": "x"}],
-    )
-    def test_validate_qos_accepts(self, qos):
-        validate_qos(qos)
-
-    @pytest.mark.parametrize("prefetch_size", [1, 0.5, True, None, "0"])
-    def test_validate_qos_rejects_prefetch_size(self, prefetch_size):
-        with pytest.raises(ValueError, match=f"prefetch_size={prefetch_size!r}"):
-            validate_qos({"prefetch_size": prefetch_size})
 
 
 class TestReturnedMessageLog:

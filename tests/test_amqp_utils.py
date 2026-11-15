@@ -15,7 +15,12 @@ from airflow_provider_rmq.utils.amqp import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_HEARTBEAT,
     DEFAULT_RPC_TIMEOUT,
+    DEPRECATED_FEATURES_DENIED_SINCE,
     FilterMissState,
+    QosSettings,
+    check_queue_flags,
+    deprecated_feature,
+    parse_qos,
     read_heartbeat,
     call_with_timeout,
     handle_miss,
@@ -906,3 +911,69 @@ class TestCallWithTimeout:
             await task
 
         assert survived is False
+
+
+# ---------------------------------------------------------------------------
+# QoS settings and queue flags
+# ---------------------------------------------------------------------------
+
+
+class TestParseQos:
+    @pytest.mark.parametrize(
+        ("qos", "expected"),
+        [
+            (None, QosSettings()),
+            ({}, QosSettings()),
+            ({"prefetch_count": 1}, QosSettings(prefetch_count=1)),
+            ({"prefetch_count": 0}, QosSettings(prefetch_count=0)),
+            ({"prefetch_size": 0}, QosSettings()),
+            ({"prefetch_size": 0.0, "prefetch_count": 3}, QosSettings(prefetch_count=3)),
+            ({"prefetch_size": False}, QosSettings()),
+            ({"global_qos": True}, QosSettings(global_qos=True)),
+            (
+                {"prefetch_count": 5, "global_qos": False},
+                QosSettings(prefetch_count=5, global_qos=False),
+            ),
+            ({"unknown_key": "x"}, QosSettings()),
+        ],
+    )
+    def test_accepts(self, qos, expected):
+        assert parse_qos(qos) == expected
+
+    @pytest.mark.parametrize("prefetch_size", [1, 0.5, True, None, "0"])
+    def test_rejects_prefetch_size(self, prefetch_size):
+        with pytest.raises(ValueError, match=f"prefetch_size={prefetch_size!r}"):
+            parse_qos({"prefetch_size": prefetch_size})
+
+
+def test_deprecated_feature_names_the_release():
+    text = deprecated_feature("global_qos")
+    assert text == (
+        "the deprecated RabbitMQ feature 'global_qos', denied by default since "
+        f"RabbitMQ {DEPRECATED_FEATURES_DENIED_SINCE}"
+    )
+
+
+class TestCheckQueueFlags:
+    @pytest.mark.parametrize(
+        ("durable", "exclusive"), [(True, False), (False, True), (True, True)],
+    )
+    @pytest.mark.parametrize("suggest_exclusive", [True, False])
+    def test_accepts_durable_or_exclusive(self, durable, exclusive, suggest_exclusive):
+        check_queue_flags("q", durable, exclusive, suggest_exclusive=suggest_exclusive)
+
+    def test_rejects_transient_non_exclusive_with_both_fixes(self):
+        with pytest.raises(ValueError) as exc_info:
+            check_queue_flags("q", False, False, suggest_exclusive=True)
+        message = str(exc_info.value)
+        assert message.startswith("Queue 'q': ")
+        assert deprecated_feature("transient_nonexcl_queues") in message
+        assert message.endswith("Declare it with durable=True or exclusive=True.")
+
+    def test_rejects_transient_non_exclusive_with_durable_fix_only(self):
+        with pytest.raises(ValueError) as exc_info:
+            check_queue_flags("q", False, False, suggest_exclusive=False)
+        message = str(exc_info.value)
+        assert deprecated_feature("transient_nonexcl_queues") in message
+        assert "Declare it with durable=True. exclusive=True does not fit" in message
+        assert "or exclusive=True" not in message
