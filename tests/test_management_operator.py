@@ -36,6 +36,58 @@ class TestValidation:
             assert op.action == action
 
 
+class TestTransientNonExclusiveQueue:
+    def test_declare_queue_non_durable_non_exclusive_raises(self):
+        with pytest.raises(ValueError) as exc_info:
+            RMQQueueManagementOperator(
+                task_id="t", action="declare_queue", queue_name="my_queue",
+                durable=False, exclusive=False,
+            )
+        message = str(exc_info.value)
+        assert "my_queue" in message
+        assert "transient_nonexcl_queues" in message
+        assert "durable=True" in message
+        assert "exclusive=True" in message
+
+    def test_check_does_not_touch_hook(self, mock_hook):
+        MockHook, _ = mock_hook
+        with pytest.raises(ValueError):
+            RMQQueueManagementOperator(
+                task_id="t", action="declare_queue", queue_name="my_queue",
+                durable=False,
+            )
+        MockHook.assert_not_called()
+
+    def test_templated_queue_name_does_not_affect_check(self):
+        with pytest.raises(ValueError, match=r"\{\{ params\.q \}\}"):
+            RMQQueueManagementOperator(
+                task_id="t", action="declare_queue", queue_name="{{ params.q }}",
+                durable=False, exclusive=False,
+            )
+
+    def test_templated_queue_name_with_defaults_accepted(self):
+        op = RMQQueueManagementOperator(
+            task_id="t", action="declare_queue", queue_name="{{ params.q }}",
+        )
+        assert op.durable is True
+
+    def test_non_durable_exclusive_queue_accepted(self):
+        op = RMQQueueManagementOperator(
+            task_id="t", action="declare_queue", queue_name="my_queue",
+            durable=False, exclusive=True,
+        )
+        assert op.durable is False
+        assert op.exclusive is True
+
+    @pytest.mark.parametrize("action", ["declare_exchange", "delete_queue"])
+    def test_other_actions_accept_non_durable_non_exclusive(self, action):
+        op = RMQQueueManagementOperator(
+            task_id="t", action=action, queue_name="my_queue", exchange_name="my_ex",
+            durable=False, exclusive=False,
+        )
+        assert op.action == action
+
+
 # ---------------------------------------------------------------------------
 # Queue actions
 # ---------------------------------------------------------------------------
@@ -58,6 +110,17 @@ class TestQueueActions:
             auto_delete=False, arguments={"x-max-length": 1000},
         )
         assert result == {"queue": "my_queue", "message_count": 0}
+
+    def test_declare_queue_defaults_durable(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQQueueManagementOperator(
+            task_id="t", action="declare_queue", queue_name="my_queue",
+        )
+        op.execute(context={})
+        hook.queue_declare.assert_called_once_with(
+            queue_name="my_queue", durable=True, exclusive=False,
+            auto_delete=False, arguments=None,
+        )
 
     def test_delete_queue(self, mock_hook):
         _, hook = mock_hook
@@ -121,6 +184,26 @@ class TestExchangeActions:
             auto_delete=False, internal=True,
             arguments={"alternate-exchange": "alt"},
         )
+
+    def test_declare_exchange_defaults_durable(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQQueueManagementOperator(
+            task_id="t", action="declare_exchange", exchange_name="my_ex",
+        )
+        op.execute(context={})
+        hook.exchange_declare.assert_called_once_with(
+            exchange="my_ex", exchange_type="direct", durable=True,
+            auto_delete=False, internal=False, arguments=None,
+        )
+
+    def test_declare_exchange_non_durable(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQQueueManagementOperator(
+            task_id="t", action="declare_exchange", exchange_name="my_ex",
+            durable=False,
+        )
+        op.execute(context={})
+        assert hook.exchange_declare.call_args.kwargs["durable"] is False
 
     def test_delete_exchange(self, mock_hook):
         _, hook = mock_hook

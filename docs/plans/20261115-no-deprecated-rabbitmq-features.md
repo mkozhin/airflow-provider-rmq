@@ -160,17 +160,17 @@
 - Modify: `airflow_provider_rmq/operators/rmq_management.py`
 - Modify: `tests/test_management_operator.py`
 
-- [ ] умолчание `durable=True`; docstring параметра говорит, что он действует на очередь и exchange
-- [ ] `ValueError` в `__init__` при `action="declare_queue"`, `durable=False`, `exclusive=False`;
+- [x] умолчание `durable=True`; docstring параметра говорит, что он действует на очередь и exchange
+- [x] `ValueError` в `__init__` при `action="declare_queue"`, `durable=False`, `exclusive=False`;
   текст советует `durable=True` и объясняет, почему exclusive-очередь оператору не подходит
-- [ ] тесты: `declare_queue` и `declare_exchange` с умолчаниями передают `durable=True`;
+- [x] тесты: `declare_queue` и `declare_exchange` с умолчаниями передают `durable=True`;
   запрещённое сочетание даёт `ValueError` в `__init__`; то же сочетание с `declare_exchange` и
   `delete_queue` проходит; `exclusive=True, durable=False` проходит; шаблонный `queue_name`
   (`"{{ params.q }}"`) не мешает проверке
-- [ ] существующие `test_declare_queue` / `test_declare_exchange` передают `durable=True` явно и
+- [x] существующие `test_declare_queue` / `test_declare_exchange` передают `durable=True` явно и
   остаются без изменений; умолчание и проверка меняются в одной задаче, иначе
   `TestValidation.test_all_valid_actions_accepted` упадёт
-- [ ] прогнать тесты — должны пройти
+- [x] прогнать тесты — должны пройти
 
 ### Task 3: `qos`: без `global_qos`, отказ от `prefetch_size`
 

@@ -37,7 +37,7 @@ class RMQQueueManagementOperator(BaseOperator):
         action: ActionType,
         rmq_conn_id: str = "rmq_default",
         queue_name: str | None = None,
-        durable: bool = False,
+        durable: bool = True,
         exclusive: bool = False,
         auto_delete: bool = False,
         exchange_name: str | None = None,
@@ -58,9 +58,12 @@ class RMQQueueManagementOperator(BaseOperator):
         :type rmq_conn_id: str
         :param queue_name: Queue name (required for queue actions).
         :type queue_name: str | None
-        :param durable: Resource survives broker restart.
+        :param durable: The declared queue or exchange survives a broker restart. Applies to
+            both ``declare_queue`` and ``declare_exchange``.
         :type durable: bool
-        :param exclusive: Queue is exclusive to the connection.
+        :param exclusive: Queue is exclusive to the connection. The operator closes its
+            connection when the task finishes, so an exclusive queue lives only while the
+            task runs.
         :type exclusive: bool
         :param auto_delete: Resource is deleted when no longer in use.
         :type auto_delete: bool
@@ -80,10 +83,22 @@ class RMQQueueManagementOperator(BaseOperator):
         :type arguments: dict | None
         :param source_exchange: Source exchange for exchange bind/unbind.
         :type source_exchange: str | None
+        :raises ValueError: If ``action`` is unknown, or if ``action`` is ``declare_queue``
+            with both ``durable`` and ``exclusive`` set to ``False``: such a queue relies on
+            the RabbitMQ deprecated feature ``transient_nonexcl_queues``, denied by default
+            since RabbitMQ 4.3.
         """
         super().__init__(**kwargs)
         if action not in VALID_ACTIONS:
             raise ValueError(f"Invalid action '{action}'. Must be one of {VALID_ACTIONS}")
+        if action == "declare_queue" and not durable and not exclusive:
+            raise ValueError(
+                f"Queue '{queue_name}': a non-durable, non-exclusive queue relies on the "
+                "RabbitMQ deprecated feature 'transient_nonexcl_queues', denied by default "
+                "since RabbitMQ 4.3. Declare it with durable=True. exclusive=True does not "
+                "fit this operator: it closes its connection when the task finishes, and an "
+                "exclusive queue is deleted together with that connection."
+            )
         self.action = action
         self.rmq_conn_id = rmq_conn_id
         self.queue_name = queue_name
