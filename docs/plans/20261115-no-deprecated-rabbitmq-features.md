@@ -197,18 +197,18 @@
 **Files:**
 - Create: `integration/test_queue_declare.py`
 
-- [ ] `RMQQueueManagementOperator(action="declare_queue")` с умолчаниями на имени из
+- [x] `RMQQueueManagementOperator(action="declare_queue")` с умолчаниями на имени из
   `scratch.name(...)`, зарегистрированном через `scratch.register_queue(...)`: очередь создана
   (пассивный declare) и durable (активный повторный declare с `durable=True` проходит — см.
   Technical Details)
-- [ ] `RMQHook.queue_declare(name, exclusive=True)` с умолчанием `durable` — дважды на одном хуке:
+- [x] `RMQHook.queue_declare(name, exclusive=True)` с умолчанием `durable` — дважды на одном хуке:
   второй declare проходит (эквивалентность при повторном объявлении); имя из `scratch.name(...)`,
   регистрация для teardown
-- [ ] `RMQHook.queue_declare(name, durable=False, exclusive=True)` проходит
-- [ ] `RMQHook(qos={"prefetch_count": 5, "global_qos": True})` открывает канал и публикует/читает
+- [x] `RMQHook.queue_declare(name, durable=False, exclusive=True)` проходит
+- [x] `RMQHook(qos={"prefetch_count": 5, "global_qos": True})` открывает канал и публикует/читает
   без ошибки
-- [ ] набор работает только по AMQP (`RMQ_TEST_URL`); Management API в тестах не используется
-- [ ] прогнать `.venv/bin/pytest integration/ -q` — должно пройти
+- [x] набор работает только по AMQP (`RMQ_TEST_URL`); Management API в тестах не используется
+- [x] прогнать `.venv/bin/pytest integration/ -q` — должно пройти
 
 ### Task 5: Verify acceptance criteria
 - [ ] все требования из Overview реализованы
