@@ -28,10 +28,11 @@ DEFAULT_CONNECT_TIMEOUT = 15
 #: Seconds allowed for a single AMQP RPC: ``channel()``, declare, bind, publish.
 DEFAULT_RPC_TIMEOUT = 30
 
-#: ``extra`` keys that override the defaults above.
+#: ``extra`` keys of an Airflow connection that tune the AMQP connection.
 HEARTBEAT_KEY = "heartbeat"
 CONNECT_TIMEOUT_KEY = "connect_timeout"
 RPC_TIMEOUT_KEY = "rpc_timeout"
+BLOCKED_CONNECTION_TIMEOUT_KEY = "blocked_connection_timeout"
 
 _MISSING = object()
 
@@ -52,7 +53,7 @@ class AmqpTimeouts:
     rpc: float
 
 
-def _read_number(
+def read_number(
     extras: dict[str, Any],
     key: str,
     default: Any,
@@ -94,7 +95,7 @@ def _read_number(
     return value
 
 
-def _read_heartbeat(extras: dict[str, Any], default: int = DEFAULT_HEARTBEAT) -> int:
+def read_heartbeat(extras: dict[str, Any], default: int = DEFAULT_HEARTBEAT) -> int:
     """Read the heartbeat interval in seconds from ``extra``.
 
     ``0`` is accepted as a deliberate opt-out and logged as a WARNING, because it
@@ -107,27 +108,50 @@ def _read_heartbeat(extras: dict[str, Any], default: int = DEFAULT_HEARTBEAT) ->
     to express is a mistake, and reading it as the opt-out would silently turn off the
     detection the caller was asking to tighten.
     """
-    value = _read_number(extras, HEARTBEAT_KEY, default, float, 0)
+    value = read_number(extras, HEARTBEAT_KEY, default, float, 0)
+    raw = extras.get(HEARTBEAT_KEY, value)
     if 0 < value < 1:
         log.warning(
             "RMQ connection extra %r=%r is shorter than a second, using %s",
-            HEARTBEAT_KEY, value, default,
+            HEARTBEAT_KEY, raw, default,
         )
         return default
     value = int(value)
     if value > MAX_HEARTBEAT:
         log.warning(
             "RMQ connection extra %r=%r is above the AMQP limit of %s seconds, using %s",
-            HEARTBEAT_KEY, value, MAX_HEARTBEAT, default,
+            HEARTBEAT_KEY, raw, MAX_HEARTBEAT, default,
         )
         return default
     if value == 0:
         log.warning(
             "RMQ connection extra %r=0 turns off the AMQP heartbeat: a broken link stays "
-            "undetected and the consumer keeps waiting on a zombie connection",
+            "undetected and the client keeps waiting on a dead connection",
             HEARTBEAT_KEY,
         )
     return value
+
+
+def read_blocked_connection_timeout(extras: dict[str, Any], default: float) -> float:
+    """Read the seconds a connection blocked by the broker may stay blocked.
+
+    A missing key uses ``default``; a non-numeric, non-finite or negative value falls
+    back to ``default`` with a WARNING. ``0`` is accepted and logged as a WARNING,
+    because pika drops the connection as soon as the broker blocks it.
+    """
+    value = read_number(extras, BLOCKED_CONNECTION_TIMEOUT_KEY, default, float, 0)
+    if value == 0:
+        log.warning(
+            "RMQ connection extra %r=0 drops the connection as soon as the broker "
+            "blocks it; null waits without a deadline",
+            BLOCKED_CONNECTION_TIMEOUT_KEY,
+        )
+    return value
+
+
+def is_explicit_null(extras: dict[str, Any], key: str) -> bool:
+    """Return whether ``extra`` sets ``key`` to ``null``, as opposed to leaving it out."""
+    return extras.get(key, _MISSING) is None
 
 
 def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
@@ -141,10 +165,10 @@ def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
     """
     extras = conn_info.extra_dejson
     return AmqpTimeouts(
-        connect=_read_number(
+        connect=read_number(
             extras, CONNECT_TIMEOUT_KEY, DEFAULT_CONNECT_TIMEOUT, float, _MIN_TIMEOUT
         ),
-        rpc=_read_number(extras, RPC_TIMEOUT_KEY, DEFAULT_RPC_TIMEOUT, float, _MIN_TIMEOUT),
+        rpc=read_number(extras, RPC_TIMEOUT_KEY, DEFAULT_RPC_TIMEOUT, float, _MIN_TIMEOUT),
     )
 
 
@@ -257,7 +281,7 @@ def build_amqp_connection(
     ssl_context = build_ssl_context(extras)
     vhost = vhost_override or conn_info.schema or "/"
     port = conn_info.port if conn_info.port else (AMQPS_PORT if ssl_context else AMQP_PORT)
-    query = urlencode({HEARTBEAT_KEY: _read_heartbeat(extras)})
+    query = urlencode({HEARTBEAT_KEY: read_heartbeat(extras)})
     url = (
         f"{'amqps' if ssl_context else 'amqp'}://"
         f"{quote(conn_info.login or 'guest', safe='')}:{quote(conn_info.password or 'guest', safe='')}"

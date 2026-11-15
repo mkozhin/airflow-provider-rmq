@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import ssl
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pika
 import pika.exceptions
 import pytest
+from pika.adapters.blocking_connection import BlockingChannel
 
-from airflow_provider_rmq.hooks.rmq import SYNC_DEFAULT_HEARTBEAT, RMQHook
+from airflow_provider_rmq.hooks.rmq import (
+    DEFAULT_BLOCKED_CONNECTION_TIMEOUT,
+    DEFAULT_SYNC_HEARTBEAT,
+    PIKA_RETURNED_MESSAGE_LOG_PREFIX,
+    RMQHook,
+)
 from tests.conftest import FakeAirflowConnection, make_message
 
 
@@ -90,16 +98,17 @@ class TestConnectionParams:
     def test_unusable_heartbeat_falls_back_to_sync_default(self, raw, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
             params = self._params_for({"heartbeat": raw})
-        assert params.heartbeat == 600
+        assert params.heartbeat == DEFAULT_SYNC_HEARTBEAT
         assert any(
-            "heartbeat" in r.getMessage() and "using 600" in r.getMessage()
+            "heartbeat" in r.getMessage()
+            and f"using {DEFAULT_SYNC_HEARTBEAT}" in r.getMessage()
             for r in caplog.records
         )
 
     def test_heartbeat_above_amqp_limit_falls_back_to_sync_default(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
             params = self._params_for({"heartbeat": 100000})
-        assert params.heartbeat == 600
+        assert params.heartbeat == DEFAULT_SYNC_HEARTBEAT
         assert any("AMQP limit" in r.getMessage() for r in caplog.records)
 
     def test_zero_heartbeat_is_kept_with_warning(self, caplog):
@@ -111,8 +120,8 @@ class TestConnectionParams:
     def test_missing_keys_use_sync_defaults(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
             params = self._params_for({})
-        assert params.heartbeat == SYNC_DEFAULT_HEARTBEAT == 600
-        assert params.blocked_connection_timeout == 300
+        assert params.heartbeat == DEFAULT_SYNC_HEARTBEAT == 600
+        assert params.blocked_connection_timeout == DEFAULT_BLOCKED_CONNECTION_TIMEOUT
         assert not caplog.records
 
     def test_null_passes_none_to_pika_for_both_keys(self, caplog):
@@ -127,15 +136,15 @@ class TestConnectionParams:
     def test_null_heartbeat_keeps_default_blocked_connection_timeout(self):
         params = self._params_for({"heartbeat": None})
         assert params.heartbeat is None
-        assert params.blocked_connection_timeout == 300
+        assert params.blocked_connection_timeout == DEFAULT_BLOCKED_CONNECTION_TIMEOUT
 
     def test_null_blocked_connection_timeout_keeps_default_heartbeat(self):
         params = self._params_for({"blocked_connection_timeout": None})
         assert params.blocked_connection_timeout is None
-        assert params.heartbeat == 600
+        assert params.heartbeat == DEFAULT_SYNC_HEARTBEAT
 
     def test_zero_blocked_connection_timeout_is_kept_with_warning(self, caplog):
-        with caplog.at_level(logging.WARNING, logger="airflow.task"):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
             params = self._params_for({"blocked_connection_timeout": 0})
         assert params.blocked_connection_timeout == 0
         assert any(
@@ -146,9 +155,10 @@ class TestConnectionParams:
     def test_negative_blocked_connection_timeout_falls_back_to_default(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
             params = self._params_for({"blocked_connection_timeout": -1})
-        assert params.blocked_connection_timeout == 300
+        assert params.blocked_connection_timeout == DEFAULT_BLOCKED_CONNECTION_TIMEOUT
         assert any(
-            "blocked_connection_timeout" in r.getMessage() and "using 300" in r.getMessage()
+            "blocked_connection_timeout" in r.getMessage()
+            and f"using {DEFAULT_BLOCKED_CONNECTION_TIMEOUT}" in r.getMessage()
             for r in caplog.records
         )
 
@@ -160,7 +170,7 @@ class TestConnectionParams:
     def test_garbage_blocked_connection_timeout_falls_back_to_default(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
             params = self._params_for({"blocked_connection_timeout": "soon"})
-        assert params.blocked_connection_timeout == 300
+        assert params.blocked_connection_timeout == DEFAULT_BLOCKED_CONNECTION_TIMEOUT
         assert any("blocked_connection_timeout" in r.getMessage() for r in caplog.records)
 
 
@@ -312,13 +322,22 @@ class TestPublisherConfirms:
 class TestReturnedMessageLog:
     LOGGER = "pika.adapters.blocking_connection"
 
+    def test_prefix_matches_pika_source(self):
+        source = inspect.getsource(BlockingChannel._on_puback_message_returned)
+        assert f'"{PIKA_RETURNED_MESSAGE_LOG_PREFIX}' in source
+
     def test_returned_message_record_is_dropped(self, caplog):
+        impl = MagicMock(channel_number=1)
+        channel = SimpleNamespace(_impl=impl, _delivery_confirmation=True)
+        method = pika.spec.Basic.Return(
+            reply_code=312, reply_text="NO_ROUTE", exchange="", routing_key="q",
+        )
+        properties = pika.BasicProperties(headers={"token": "secret"})
         with caplog.at_level(logging.WARNING, logger=self.LOGGER):
-            logging.getLogger(self.LOGGER).warning(
-                "Published message was returned: _delivery_confirmation=%s; "
-                "properties=%r; body_prefix=%.255r",
-                True, {"headers": {"token": "secret"}}, b"secret body",
+            BlockingChannel._on_puback_message_returned(
+                channel, impl, method, properties, b"secret body",
             )
+        assert channel._puback_return.method is method
         assert not caplog.records
 
     def test_other_pika_warnings_pass(self, caplog):

@@ -78,9 +78,9 @@ curl -u <admin>:<admin-password> -X PUT https://broker.example/api/permissions/<
 `rabbitmqctl` не зовёт никогда: это разовая подготовка руками.
 
 `test_filter_miss.py` проверен на RabbitMQ 4.2.0 / Erlang 27.3.4.5: classic- и
-quorum-очереди, topic-обменник, DLX. `test_publish_confirms.py` (`amq.direct`,
-очередь с `x-max-length` и `x-overflow=reject-publish`) против живого брокера
-ещё не запускался.
+quorum-очереди, topic-обменник, DLX. `test_publish_confirms.py` покрывает
+публикацию с подтверждениями: `amq.direct`, очередь с `x-max-length` и
+`x-overflow=reject-publish`, несуществующие очередь и обменник.
 
 ## Фикстуры
 

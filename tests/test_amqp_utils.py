@@ -16,7 +16,7 @@ from airflow_provider_rmq.utils.amqp import (
     DEFAULT_HEARTBEAT,
     DEFAULT_RPC_TIMEOUT,
     FilterMissState,
-    _read_heartbeat,
+    read_heartbeat,
     call_with_timeout,
     handle_miss,
     match as _match,
@@ -205,48 +205,54 @@ class TestHeartbeatInUrl:
 
 
 # ---------------------------------------------------------------------------
-# _read_heartbeat with a caller-supplied default
+# read_heartbeat with a caller-supplied default
 # ---------------------------------------------------------------------------
 
 class TestReadHeartbeatDefault:
     def test_missing_key_uses_the_given_default(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
-            assert _read_heartbeat({}, default=600) == 600
+            assert read_heartbeat({}, default=600) == 600
         assert not caplog.records
 
     def test_non_number_uses_the_given_default(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
-            assert _read_heartbeat({"heartbeat": "abc"}, default=600) == 600
+            assert read_heartbeat({"heartbeat": "abc"}, default=600) == 600
         assert any("600" in r.getMessage() for r in caplog.records)
 
     def test_interval_shorter_than_a_second_uses_the_given_default(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
-            assert _read_heartbeat({"heartbeat": 0.5}, default=600) == 600
+            assert read_heartbeat({"heartbeat": 0.5}, default=600) == 600
         assert any(
             "shorter than a second" in r.getMessage() and "600" in r.getMessage()
             for r in caplog.records
         )
 
     def test_valid_value_ignores_the_default(self):
-        assert _read_heartbeat({"heartbeat": "45"}, default=600) == 45
+        assert read_heartbeat({"heartbeat": "45"}, default=600) == 45
 
     def test_amqp_limit_is_accepted(self):
-        assert _read_heartbeat({"heartbeat": 65535}, default=600) == 65535
+        assert read_heartbeat({"heartbeat": 65535}, default=600) == 65535
 
     @pytest.mark.parametrize("raw", [65536, "100000"])
     def test_interval_above_amqp_limit_uses_the_given_default(self, raw, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
-            assert _read_heartbeat({"heartbeat": raw}, default=600) == 600
+            assert read_heartbeat({"heartbeat": raw}, default=600) == 600
         assert any(
             "above the AMQP limit of 65535" in r.getMessage() and "600" in r.getMessage()
             for r in caplog.records
         )
 
+    @pytest.mark.parametrize("raw", ["65536.9", 0.25])
+    def test_warning_names_the_value_as_written(self, raw, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            read_heartbeat({"heartbeat": raw}, default=600)
+        assert any(f"'heartbeat'={raw!r}" in r.getMessage() for r in caplog.records)
+
     def test_interval_above_amqp_limit_uses_async_default(self):
-        assert _read_heartbeat({"heartbeat": 70000}) == DEFAULT_HEARTBEAT
+        assert read_heartbeat({"heartbeat": 70000}) == DEFAULT_HEARTBEAT
 
     def test_default_is_the_async_interval_when_not_given(self):
-        assert _read_heartbeat({}) == DEFAULT_HEARTBEAT
+        assert read_heartbeat({}) == DEFAULT_HEARTBEAT
 
 
 # ---------------------------------------------------------------------------

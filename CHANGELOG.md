@@ -19,7 +19,8 @@
 - Unreadable `@rmq_trigger` arguments are no longer silently replaced by defaults.
 - An unreadable subdirectory of `DAGS_FOLDER` no longer drops its subscriptions silently: it is logged and its files are held like unreadable files.
 - `RMQHook` reads `heartbeat` and `blocked_connection_timeout` in Extra as numbers or numeric strings; invalid values fall back to the defaults with a WARNING.
-- `RMQHook` logs a WARNING on `"heartbeat": 0` and `"blocked_connection_timeout": 0` and uses the default for a `heartbeat` under one second; a `heartbeat` above 65535 falls back to the default with a WARNING on both paths.
+- `RMQHook` logs a WARNING on `"heartbeat": 0` and `"blocked_connection_timeout": 0`.
+- A `heartbeat` under one second (in `RMQHook`) or above 65535 (in `RMQHook` and on the async path) falls back to the default with a WARNING.
 - `RMQHook.queue_info` returns `consumer_count` for a missing queue as well.
 - `RMQHook.__del__` does not raise at interpreter shutdown.
 

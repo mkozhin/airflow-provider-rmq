@@ -1,9 +1,9 @@
 """What the broker says to ``RMQPublishOperator`` with publisher confirms on.
 
-The unit suite proves how the operator turns pika exceptions into task failures;
-these tests prove the broker raises them where a message would otherwise be lost:
-a queue that does not exist, a binding that does not exist, an exchange that does
-not exist, and a queue that refuses the message. One test drives ``RMQHook`` directly
+These tests prove the broker answers a publish with confirms where a message would
+otherwise be lost, and that the operator fails the task on that answer: a queue that
+does not exist, a binding that does not exist, an exchange that does not exist, and a
+queue that refuses the message; a message to an existing queue is delivered. One test drives ``RMQHook`` directly
 to prove that the channel it reopens after the broker closed one is in confirms mode.
 
 Every queue here is declared through the ``scratch`` fixture, so it carries the run's

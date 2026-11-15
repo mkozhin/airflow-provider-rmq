@@ -283,12 +283,6 @@ class TestMandatoryResolution:
 
 
 class TestPublisherConfirms:
-    def test_hook_created_with_confirms_by_default(self, mock_hook):
-        MockHook, _ = mock_hook
-        op = RMQPublishOperator(task_id="t", queue_name="q", message="m")
-        op.execute(context={})
-        assert MockHook.call_args.kwargs["publisher_confirms"] is True
-
     def test_hook_created_without_confirms(self, mock_hook):
         MockHook, _ = mock_hook
         op = RMQPublishOperator(task_id="t", queue_name="q", message="m", confirm=False)

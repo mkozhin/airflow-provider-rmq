@@ -149,9 +149,10 @@ class RMQPublishOperator(BaseOperator):
                         mandatory=mandatory,
                     )
                 except (UnroutableError, NackError, ChannelClosedByBroker) as exc:
-                    # Without confirms a channel the broker closes can surface on a later
+                    # UnroutableError and NackError need confirms; without them only
+                    # ChannelClosedByBroker gets here, and it can surface on a later
                     # publish than the one that caused it, so the message number would
-                    # mislead: the pika exception is raised as is.
+                    # mislead: it is raised as is.
                     if not self.confirm:
                         raise
                     raise AirflowException(self._failure_text(number, total, exc)) from exc

@@ -23,6 +23,12 @@ log = logging.getLogger("airflow.task")
 logging.getLogger("pika").setLevel(logging.WARNING)
 
 
+#: Start of the WARNING pika logs for a message the broker returned, written by
+#: ``BlockingChannel._on_puback_message_returned`` in
+#: ``pika/adapters/blocking_connection.py`` (pika 1.3 and 1.4).
+PIKA_RETURNED_MESSAGE_LOG_PREFIX = "Published message was returned"
+
+
 class _DropReturnedMessageRecords(logging.Filter):
     """Drop pika's WARNING about a message the broker returned.
 
@@ -33,7 +39,7 @@ class _DropReturnedMessageRecords(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return not str(record.msg).startswith("Published message was returned")
+        return not str(record.msg).startswith(PIKA_RETURNED_MESSAGE_LOG_PREFIX)
 
 
 logging.getLogger("pika.adapters.blocking_connection").addFilter(_DropReturnedMessageRecords())
@@ -41,10 +47,9 @@ logging.getLogger("pika.adapters.blocking_connection").addFilter(_DropReturnedMe
 #: Heartbeat interval in seconds for the blocking connection. ``BlockingConnection``
 #: services heartbeats only inside pika calls, so a short interval drops the link of a
 #: task that works for more than about a minute between calls.
-SYNC_DEFAULT_HEARTBEAT = 600
+DEFAULT_SYNC_HEARTBEAT = 600
 
-#: ``extra`` key for the seconds a connection blocked by the broker may stay blocked.
-BLOCKED_CONNECTION_TIMEOUT_KEY = "blocked_connection_timeout"
+#: Seconds a connection blocked by the broker may stay blocked before pika drops it.
 DEFAULT_BLOCKED_CONNECTION_TIMEOUT = 300
 
 
@@ -164,9 +169,11 @@ class RMQHook(BaseHook):
         from airflow_provider_rmq.utils.amqp import (
             AMQP_PORT,
             AMQPS_PORT,
+            BLOCKED_CONNECTION_TIMEOUT_KEY,
             HEARTBEAT_KEY,
-            _read_heartbeat,
-            _read_number,
+            is_explicit_null,
+            read_blocked_connection_timeout,
+            read_heartbeat,
         )
 
         ssl_context = build_ssl_context(extras)
@@ -178,26 +185,16 @@ class RMQHook(BaseHook):
         # broker's proposal, and a blocked connection waits without a deadline.
         heartbeat = (
             None
-            if extras.get(HEARTBEAT_KEY, 0) is None
-            else _read_heartbeat(extras, default=SYNC_DEFAULT_HEARTBEAT)
+            if is_explicit_null(extras, HEARTBEAT_KEY)
+            else read_heartbeat(extras, default=DEFAULT_SYNC_HEARTBEAT)
         )
         blocked_connection_timeout = (
             None
-            if extras.get(BLOCKED_CONNECTION_TIMEOUT_KEY, 0) is None
-            else _read_number(
-                extras,
-                BLOCKED_CONNECTION_TIMEOUT_KEY,
-                DEFAULT_BLOCKED_CONNECTION_TIMEOUT,
-                float,
-                0,
+            if is_explicit_null(extras, BLOCKED_CONNECTION_TIMEOUT_KEY)
+            else read_blocked_connection_timeout(
+                extras, default=DEFAULT_BLOCKED_CONNECTION_TIMEOUT
             )
         )
-        if blocked_connection_timeout == 0:
-            log.warning(
-                "RMQ connection extra %r=0 drops the connection as soon as the broker "
-                "blocks it; null waits without a deadline",
-                BLOCKED_CONNECTION_TIMEOUT_KEY,
-            )
 
         return pika.ConnectionParameters(
             host=conn.host or "localhost",

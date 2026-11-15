@@ -1,12 +1,12 @@
 ---
 worth: later
-where: airflow_provider_rmq/utils/amqp.py:535
+where: airflow_provider_rmq/utils/amqp.py:559
 added: 2026-09-05
 ---
 # Вердикт `ERROR` крутится до TTL, и `ack_unmatched` этого не убирает
 
 **Симптом.** `ERROR` возвращается в очередь всегда. Ветка вердикта:
-`utils/amqp.py:535` (`match_and_ack`), `watcher/consumer.py:3257`,
+`utils/amqp.py:559` (`match_and_ack`), `watcher/consumer.py:3257`,
 `operators/rmq_consume.py:112`, `sensors/rmq.py:196` — в каждой из них
 `nack(requeue=True)` стоит следующей строкой или через одну.
 Для сбоя, который пройдёт сам (упавший `filter_callable`,

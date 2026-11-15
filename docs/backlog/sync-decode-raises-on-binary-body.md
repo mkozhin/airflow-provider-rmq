@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/hooks/rmq.py:663
+where: airflow_provider_rmq/hooks/rmq.py:660
 added: 2026-09-05
 ---
 # Синхронный путь роняет задачу на бинарном теле, асинхронный его читает
@@ -12,7 +12,7 @@ added: 2026-09-05
 (`operators/rmq_consume.py:93`, `sensors/rmq.py:172`): задача красная,
 батч остаётся unacked.
 
-Асинхронный путь то же тело читает: `match()` (`utils/amqp.py:282`) и
+Асинхронный путь то же тело читает: `match()` (`utils/amqp.py:306`) и
 `_handle_message` (`triggers/rmq.py:119`) декодируют с `errors="replace"` — именно
 потому, что бинарные тела в этом проекте считаются реальным случаем.
 
