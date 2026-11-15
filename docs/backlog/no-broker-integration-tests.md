@@ -43,7 +43,7 @@ added: 2026-09-02
 фикстуру уникального префикса `rmqtest.{pid}.{uuid8}.` с teardown'ом всего
 созданного и хелпер глубины очереди через пассивный `queue_declare`. Каталог
 лежит вне `testpaths` (`pyproject.toml`), поэтому обычный прогон его не
-собирает. В нём два файла. `integration/test_filter_miss.py`, шесть тестов, —
+собирает. В нём три файла. `integration/test_filter_miss.py`, шесть тестов, —
 путь промаха фильтра целиком: подтверждение при `ack_unmatched`, отсутствие
 dead-lettering на подтверждении, возврат в очередь при умолчании, нечитаемое
 тело, которое остаётся в очереди и при `ack_unmatched=True`, батч сенсора и два
@@ -55,11 +55,18 @@ dead-lettering на подтверждении, возврат в очередь
 очередь, 312 NO_ROUTE на несуществующей очереди, `mandatory` на `amq.direct`,
 404 на несуществующем обменнике, nack от очереди с `x-overflow=reject-publish`
 и режим подтверждений на канале, который `RMQHook` открывает после 404.
+`integration/test_queue_declare.py`, четыре теста, — объявления и QoS на
+брокере, запрещающем `transient_nonexcl_queues` и `global_qos`: умолчание
+durable у `RMQQueueManagementOperator` (повторный declare с `durable=False`
+получает 406), exclusive-очередь `RMQHook` с умолчанием `durable`, объявленная
+дважды на одном подключении, exclusive-очередь с `durable=False` и публикация с
+чтением через хук с `global_qos=True`. Набор проверен на RabbitMQ 4.4.0 /
+Erlang 29.1.2.
 
 **Что открыто — прогон в CI.** Набор ручной: в `.github/workflows/publish.yml`
 нет ни service-контейнера с брокером, ни шага для `integration/`. Из сценариев
 списка ниже написан только промах фильтра (п. 2); публикация с подтверждениями
-написана сверх списка.
+и объявления с QoS написаны сверх списка.
 
 **Направление решения.** Отдельная job в CI с service-контейнером
 `rabbitmq:4-management` и sqlite-метабазой Airflow (`airflow db migrate`),

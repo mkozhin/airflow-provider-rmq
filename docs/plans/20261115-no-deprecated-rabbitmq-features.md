@@ -218,26 +218,26 @@
   передаётся, non-durable non-exclusive declare нет
 
 ### Task 6: [Final] Документация, CHANGELOG и бэклог
-- [ ] `readme.md` и `readme_ru.md`:
+- [x] `readme.md` и `readme_ru.md`:
   - `RMQHook`: `qos` — только `prefetch_count`, что делают `global_qos` и `prefetch_size`;
     `queue_declare` и `exchange_declare` — умолчание `durable=True`, правило для очередей;
   - `RMQConsumeOperator`: `qos`;
   - `RMQQueueManagementOperator`: умолчание `durable=True` для очереди и exchange'а, правило,
     ошибка при создании оператора;
   - фразу `:237` про transient queue не трогать: exclusive-временные очереди остаются допустимыми
-- [ ] `CHANGELOG.md`, `v2.7.0`, по одной строке на пункт, ссылки только относительные — по
+- [x] `CHANGELOG.md`, `v2.7.0`, по одной строке на пункт, ссылки только относительные — по
   Solution Overview
-- [ ] `integration/README.md` (абзац про состав набора, `:80-84`) и
+- [x] `integration/README.md` (абзац про состав набора, `:80-84`) и
   `docs/backlog/no-broker-integration-tests.md` (раздел «Что есть»): описать третий файл
   `test_queue_declare.py` — что он покрывает (умолчания durable у оператора и хука,
   exclusive-очередь с повторным declare, QoS с `global_qos`); строка о проверенной версии брокера —
   та, на которой прогнан набор
-- [ ] пересчитать ссылки на строки, которые сдвинули задачи 1 и 3, во всех пунктах `docs/backlog/`:
+- [x] пересчитать ссылки на строки, которые сдвинули задачи 1 и 3, во всех пунктах `docs/backlog/`:
   `grep -rn 'hooks/rmq.py:\|rmq_consume.py:' docs/backlog/` — каждая ссылка должна указывать на
   ту же конструкцию, что до правок (в том числе `sync-decode-raises-on-binary-body`,
   `operator-sees-only-the-head-of-the-queue`, `error-verdict-redelivers-until-ttl`,
   `reliability-hardening-plan-stale`)
-- [ ] пункт бэклога `docs/backlog/watcher-liveness-relies-on-management-metrics.md` с front matter
+- [x] пункт бэклога `docs/backlog/watcher-liveness-relies-on-management-metrics.md` с front matter
   `worth: later`, `where: airflow_provider_rmq/watcher/consumer.py:<строка _probe_consumers>`,
   `added: 2026-11-15`:
   - проверка живости watcher'а (`_probe_consumers`, `GET /api/consumers/{vhost}`) опирается на
@@ -247,7 +247,7 @@
   - что переводит пункт в работу: перевод функции в `denied_by_default` или отключение метрик на
     проде;
   - направления: опора на AMQP-проверку, обнаружение отключённой статистики
-- [ ] перенести план в `docs/plans/completed/`
+- [x] перенести план в `docs/plans/completed/` (moved by the harness after all phases)
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*

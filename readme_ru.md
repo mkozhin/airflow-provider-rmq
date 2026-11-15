@@ -146,7 +146,7 @@ pip install dist/airflow_provider_rmq-*.whl
 |---|---|---|---|---|
 | `rmq_conn_id` | `str` | `"rmq_default"` | Нет | ID подключения Airflow |
 | `vhost` | `str \| None` | `None` | Нет | Переопределить виртуальный хост из подключения |
-| `qos` | `dict \| None` | `None` | Нет | Настройки QoS: `prefetch_size`, `prefetch_count`, `global_qos` |
+| `qos` | `dict \| None` | `None` | Нет | Настройки QoS: `{"prefetch_count": 10}` — число неподтверждённых сообщений, которые брокер доставляет консьюмеру; это единственный ключ, который уходит брокеру. Истинный `global_qos` не передаётся, хук пишет WARNING: prefetch на канал — устаревшая функция RabbitMQ `global_qos`, запрещённая по умолчанию с RabbitMQ 4.3. `prefetch_size`, отличный от `0`, даёт `ValueError`: RabbitMQ не реализует ограничение по размеру ([соответствие AMQP 0-9-1](https://www.rabbitmq.com/docs/specification)) |
 | `retry_count` | `int` | `3` | Нет | Количество попыток переподключения |
 | `retry_delay` | `float` | `1.0` | Нет | Базовая задержка (секунды) между попытками (экспоненциальный рост) |
 | `publisher_confirms` | `bool` | `False` | Нет | Переводить каждый канал, который открывает хук, включая переоткрытый, в режим подтверждений издателя: `basic_publish` ждёт, пока брокер подтвердит каждое сообщение |
@@ -156,13 +156,13 @@ pip install dist/airflow_provider_rmq-*.whl
 | Метод | Описание |
 |---|---|
 | `get_channel()` | Возвращает pika `BlockingChannel` (создаёт подключение лениво; открывает новый канал, если текущий закрыт) |
-| `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Объявить очередь |
+| `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Объявить очередь. `durable` по умолчанию `True`. Активное объявление (`passive=False`) с `durable=False` требует `exclusive=True`: очередь одновременно non-durable и non-exclusive опирается на устаревшую функцию RabbitMQ `transient_nonexcl_queues`, запрещённую по умолчанию с RabbitMQ 4.3, и даёт `ValueError` до обращения к брокеру. `auto_delete` на правило не влияет |
 | `queue_delete(queue_name, if_unused, if_empty)` | Удалить очередь |
 | `queue_bind(queue, exchange, routing_key, arguments)` | Привязать очередь к обменнику |
 | `queue_unbind(queue, exchange, routing_key, arguments)` | Отвязать очередь от обменника |
 | `queue_purge(queue_name)` | Удалить все сообщения из очереди |
 | `queue_info(queue_name)` | Получить информацию об очереди через пассивное объявление: словарь с ключами `queue`, `message_count`, `consumer_count` и `exists`. Для отсутствующей очереди — те же ключи, оба счётчика `0` и `exists=False` |
-| `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Объявить обменник |
+| `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Объявить обменник. `durable` по умолчанию `True` |
 | `exchange_delete(exchange, if_unused)` | Удалить обменник |
 | `exchange_bind(destination, source, routing_key, arguments)` | Привязать обменник к обменнику |
 | `exchange_unbind(destination, source, routing_key, arguments)` | Отвязать обменник от обменника |
@@ -282,7 +282,7 @@ RMQPublishOperator(
 | `max_messages` | `int` | `100` | Нет | Максимальное количество сообщений за выполнение |
 | `filter_headers` | `dict[str, Any] \| None` | `None` | Нет | Словарь AMQP заголовков для фильтрации. Поддерживает ключи `body.*` для фильтрации по JSON-телу (например, `{"body.data.status": "active"}`) |
 | `filter_callable` | `Callable[[Any, str], bool] \| None` | `None` | Нет | Пользовательская функция фильтрации `(properties, body_str) -> bool` |
-| `qos` | `dict \| None` | `None` | Нет | Настройки QoS: `{"prefetch_count": 10}` |
+| `qos` | `dict \| None` | `None` | Нет | Настройки QoS: `{"prefetch_count": 10}` — единственный ключ, который уходит брокеру. `prefetch_size`, отличный от `0`, даёт `ValueError` при создании оператора; истинный `global_qos` брокеру не передаётся, а хук пишет WARNING в задаче. См. [`RMQHook`](#rmqhook) |
 | `ack_unmatched` | `bool` | `False` | Нет | Подтверждать сообщение, отвергнутое фильтром, вместо возврата в очередь. Сообщение уходит из брокера навсегда — на подтверждение DLX не срабатывает. Обязан быть `bool` |
 
 **Шаблонные поля:** `queue_name`
@@ -374,8 +374,8 @@ def my_pipeline():
 | `action` | `str` | — | **Да** | Действие (см. таблицу ниже) |
 | `rmq_conn_id` | `str` | `"rmq_default"` | Нет | ID подключения Airflow |
 | `queue_name` | `str \| None` | `None` | Условно | Имя очереди (обязательно для операций с очередями) |
-| `durable` | `bool` | `False` | Нет | Ресурс переживает перезапуск брокера |
-| `exclusive` | `bool` | `False` | Нет | Очередь эксклюзивна для этого подключения |
+| `durable` | `bool` | `True` | Нет | Объявленная очередь или обменник переживает перезапуск брокера. Действует на `declare_queue` и `declare_exchange` |
+| `exclusive` | `bool` | `False` | Нет | Очередь эксклюзивна для этого подключения. Оператор закрывает подключение по завершении задачи, поэтому эксклюзивная очередь живёт, только пока задача выполняется |
 | `auto_delete` | `bool` | `False` | Нет | Ресурс удаляется, когда больше не используется |
 | `exchange_name` | `str \| None` | `None` | Условно | Имя обменника (обязательно для операций с обменниками) |
 | `exchange_type` | `str` | `"direct"` | Нет | Тип обменника: `direct`, `fanout`, `topic`, `headers` |
@@ -387,6 +387,8 @@ def my_pipeline():
 | `source_exchange` | `str \| None` | `None` | Условно | Обменник-источник для exchange bind/unbind |
 
 **Шаблонные поля:** `queue_name`, `exchange_name`, `routing_key`, `arguments`
+
+**Очереди durable.** `action="declare_queue"` с `durable=False` и `exclusive=False` даёт `ValueError` при создании оператора: такая очередь опирается на устаревшую функцию RabbitMQ `transient_nonexcl_queues`, запрещённую по умолчанию с RabbitMQ 4.3. У обычной задачи ошибка возникает при импорте DAG'а, у mapped-задачи (`.partial(...).expand(...)`) — при её выполнении. `queue_name` в тексте ошибки может быть нерендеренным шаблоном. Объявляйте очередь с `durable=True` — это умолчание.
 
 #### Поддерживаемые действия
 

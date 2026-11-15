@@ -7,7 +7,7 @@ added: 2026-09-05
 
 **Симптом.** `ERROR` возвращается в очередь всегда. Ветка вердикта:
 `utils/amqp.py:559` (`match_and_ack`), `watcher/consumer.py:3257`,
-`operators/rmq_consume.py:112`, `sensors/rmq.py:196` — в каждой из них
+`operators/rmq_consume.py:117`, `sensors/rmq.py:196` — в каждой из них
 `nack(requeue=True)` стоит следующей строкой или через одну.
 Для сбоя, который пройдёт сам (упавший `filter_callable`,
 недоступный внешний сервис), это правильно: следующий оборот отдаёт `MATCH` или

@@ -146,7 +146,7 @@ Core hook for all RabbitMQ interactions. Uses pika `BlockingConnection` with aut
 |---|---|---|---|---|
 | `rmq_conn_id` | `str` | `"rmq_default"` | No | Airflow connection ID |
 | `vhost` | `str \| None` | `None` | No | Override virtual host from connection |
-| `qos` | `dict \| None` | `None` | No | QoS settings: `prefetch_size`, `prefetch_count`, `global_qos` |
+| `qos` | `dict \| None` | `None` | No | QoS settings: `{"prefetch_count": 10}` — the number of unacknowledged messages delivered to a consumer, the only key sent to the broker. A true `global_qos` is not sent and the hook logs a WARNING: per-channel prefetch is the deprecated RabbitMQ feature `global_qos`, denied by default since RabbitMQ 4.3. `prefetch_size` other than `0` raises `ValueError`: RabbitMQ does not implement prefetch size limits ([AMQP 0-9-1 conformance](https://www.rabbitmq.com/docs/specification)) |
 | `retry_count` | `int` | `3` | No | Number of connection retry attempts |
 | `retry_delay` | `float` | `1.0` | No | Base delay (seconds) between retries (exponential backoff) |
 | `publisher_confirms` | `bool` | `False` | No | Put every channel the hook opens, a reopened one included, into publisher confirms mode: `basic_publish` waits for the broker to acknowledge each message |
@@ -156,13 +156,13 @@ Core hook for all RabbitMQ interactions. Uses pika `BlockingConnection` with aut
 | Method | Description |
 |---|---|
 | `get_channel()` | Returns a pika `BlockingChannel` (creates connection lazily; opens a new channel when the current one is closed) |
-| `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Declare a queue |
+| `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Declare a queue. `durable` defaults to `True`. An active declare (`passive=False`) with `durable=False` requires `exclusive=True`: a non-durable, non-exclusive queue relies on the deprecated RabbitMQ feature `transient_nonexcl_queues`, denied by default since RabbitMQ 4.3, and raises `ValueError` before the broker is contacted. `auto_delete` does not affect the rule |
 | `queue_delete(queue_name, if_unused, if_empty)` | Delete a queue |
 | `queue_bind(queue, exchange, routing_key, arguments)` | Bind a queue to an exchange |
 | `queue_unbind(queue, exchange, routing_key, arguments)` | Unbind a queue from an exchange |
 | `queue_purge(queue_name)` | Remove all messages from a queue |
 | `queue_info(queue_name)` | Get queue info via passive declare: a dict with `queue`, `message_count`, `consumer_count` and `exists`. A missing queue gives the same keys with both counts `0` and `exists=False` |
-| `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Declare an exchange |
+| `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Declare an exchange. `durable` defaults to `True` |
 | `exchange_delete(exchange, if_unused)` | Delete an exchange |
 | `exchange_bind(destination, source, routing_key, arguments)` | Bind exchange to exchange |
 | `exchange_unbind(destination, source, routing_key, arguments)` | Unbind exchange from exchange |
@@ -282,7 +282,7 @@ Consumes messages from a RabbitMQ queue. Matching messages are ACKed and returne
 | `max_messages` | `int` | `100` | No | Maximum number of messages to consume per execution |
 | `filter_headers` | `dict[str, Any] \| None` | `None` | No | Dict of AMQP headers that a message must match. Supports `body.*` keys for JSON body filtering (e.g., `{"body.data.status": "active"}`) |
 | `filter_callable` | `Callable[[Any, str], bool] \| None` | `None` | No | Custom filter function `(properties, body_str) -> bool` |
-| `qos` | `dict \| None` | `None` | No | QoS settings: `{"prefetch_count": 10}` |
+| `qos` | `dict \| None` | `None` | No | QoS settings: `{"prefetch_count": 10}` — the only key sent to the broker. `prefetch_size` other than `0` raises `ValueError` when the operator is created; a true `global_qos` is not sent to the broker, and the hook logs a WARNING in the task. See [`RMQHook`](#rmqhook) |
 | `ack_unmatched` | `bool` | `False` | No | ACK a message the filter rejected instead of returning it to the queue. The message leaves the broker for good — DLX does not fire on an acknowledgement. Must be a `bool` |
 
 **Template fields:** `queue_name`
@@ -374,8 +374,8 @@ Performs queue and exchange management operations on RabbitMQ.
 | `action` | `str` | — | **Yes** | Action to perform (see table below) |
 | `rmq_conn_id` | `str` | `"rmq_default"` | No | Airflow connection ID |
 | `queue_name` | `str \| None` | `None` | Conditional | Queue name (required for queue actions) |
-| `durable` | `bool` | `False` | No | Resource survives broker restart |
-| `exclusive` | `bool` | `False` | No | Queue is exclusive to this connection |
+| `durable` | `bool` | `True` | No | The declared queue or exchange survives a broker restart. Applies to `declare_queue` and `declare_exchange` |
+| `exclusive` | `bool` | `False` | No | Queue is exclusive to this connection. The operator closes its connection when the task finishes, so an exclusive queue lives only while the task runs |
 | `auto_delete` | `bool` | `False` | No | Resource is deleted when no longer in use |
 | `exchange_name` | `str \| None` | `None` | Conditional | Exchange name (required for exchange actions) |
 | `exchange_type` | `str` | `"direct"` | No | Exchange type: `direct`, `fanout`, `topic`, `headers` |
@@ -387,6 +387,8 @@ Performs queue and exchange management operations on RabbitMQ.
 | `source_exchange` | `str \| None` | `None` | Conditional | Source exchange for exchange bind/unbind |
 
 **Template fields:** `queue_name`, `exchange_name`, `routing_key`, `arguments`
+
+**Queues are durable.** `action="declare_queue"` with `durable=False` and `exclusive=False` raises `ValueError` when the operator is created: such a queue relies on the deprecated RabbitMQ feature `transient_nonexcl_queues`, denied by default since RabbitMQ 4.3. For a regular task the error surfaces at DAG import, for a mapped task (`.partial(...).expand(...)`) when the task runs. `queue_name` in the message may be the unrendered template. Declare the queue with `durable=True`, the default.
 
 #### Supported Actions
 

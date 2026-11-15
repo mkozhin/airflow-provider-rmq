@@ -33,9 +33,9 @@ watcher-child-process и publish-confirms-and-hook-extras иначе, чем о�
 
 | задача | состояние |
 |---|---|
-| 1. decode `errors="replace"` | сделано в триггере (`triggers/rmq.py:119`) и в watcher'е (`watcher/consumer.py:3762`, `utils/amqp.py:306`); **не** сделано в `RMQHook.consume_messages` (`hooks/rmq.py:660`) — это изменение решений ACK/NACK, разбирается в [[sync-decode-raises-on-binary-body]] |
-| 2. `queue_info` с `consumer_count`, guard в `__del__`, warning на пустой publish | сделано планом `docs/plans/completed/20261115-publish-confirms-and-hook-extras.md` (`hooks/rmq.py:461-469`, `hooks/rmq.py:270-280`, `operators/rmq_publish.py:130-136`) |
-| 3–4. publisher confirms в хуке и операторе | сделано планом `docs/plans/completed/20261115-publish-confirms-and-hook-extras.md`: `confirm_delivery()` в `get_channel()` (`hooks/rmq.py:245-246`), `basic_publish(..., mandatory)` (`hooks/rmq.py:578`), `confirm`/`mandatory` и `AirflowException` с номером сообщения в операторе (`operators/rmq_publish.py:117-210`) |
+| 1. decode `errors="replace"` | сделано в триггере (`triggers/rmq.py:119`) и в watcher'е (`watcher/consumer.py:3762`, `utils/amqp.py:306`); **не** сделано в `RMQHook.consume_messages` (`hooks/rmq.py:712`) — это изменение решений ACK/NACK, разбирается в [[sync-decode-raises-on-binary-body]] |
+| 2. `queue_info` с `consumer_count`, guard в `__del__`, warning на пустой publish | сделано планом `docs/plans/completed/20261115-publish-confirms-and-hook-extras.md` (`hooks/rmq.py:513-521`, `hooks/rmq.py:309-319`, `operators/rmq_publish.py:130-136`) |
+| 3–4. publisher confirms в хуке и операторе | сделано планом `docs/plans/completed/20261115-publish-confirms-and-hook-extras.md`: `confirm_delivery()` в `get_channel()` (`hooks/rmq.py:284-285`), `basic_publish(..., mandatory)` (`hooks/rmq.py:630`), `confirm`/`mandatory` и `AirflowException` с номером сообщения в операторе (`operators/rmq_publish.py:117-210`) |
 | 5. ленивый `WatcherSession` | не сделано, фабрика создаётся при импорте (`watcher/models.py:96`) |
 | 6–7. защита `source` и takeover-warning | не сделано → [[ui-subscription-taken-over-by-scan]] |
 | 8. at-least-once, `DagRunAlreadyExists`, детерминированный `run_id` | сделано (`_build_run_id` и `_sync_trigger`, `watcher/consumer.py:249-305`) |

@@ -10,6 +10,8 @@
 - `RMQPublishOperator` waits for the broker to confirm each message (`confirm=True`), so large batches publish slower; `confirm=False` publishes without waiting.
 - `RMQPublishOperator` publishes to the default exchange (`queue_name=…` or `exchange=""`) with `mandatory=True` by default: a message no queue takes fails the task.
 - `RMQPublishOperator` fails the task when the broker rejects a message (nack) or closes the channel (404 on a missing exchange, 403).
+- `RMQHook.queue_declare`, `RMQHook.exchange_declare` and `RMQQueueManagementOperator` declare durable queues and exchanges by default (`durable=True`).
+- `RMQHook` does not send `global_qos` to the broker and logs a WARNING when it is set (deprecated RabbitMQ feature `global_qos`).
 
 ### Added
 - `RMQHook(publisher_confirms=…)` and `RMQHook.basic_publish(mandatory=…)`.
@@ -29,6 +31,9 @@
 - Before rollout, check the production DAG folder for: files that will now fail to import, `.py` files in hidden directories, heavy directories (`.git`, `.venv`, `node_modules`) that belong in `.airflowignore`, and `@rmq_trigger` factories under `.airflowignore`.
 - Publishing to the default exchange (`queue_name=…` or `exchange=""`) fails when the queue does not exist: create target queues before publishing, or set `mandatory=False`.
 - Set `execution_timeout` on publish tasks: the wait for a broker confirmation has no deadline of its own.
+- A queue declared with `durable=False` needs `exclusive=True`; otherwise `RMQHook.queue_declare` and `RMQQueueManagementOperator` raise `ValueError` (deprecated RabbitMQ feature `transient_nonexcl_queues`).
+- `qos` with `prefetch_size` other than `0` raises `ValueError` in `RMQHook` and `RMQConsumeOperator`: RabbitMQ does not implement it.
+- Declaring with the default `durable` an exchange or queue that already exists as non-durable fails with 406 `PRECONDITION_FAILED`.
 
 ## v2.6.0
 
