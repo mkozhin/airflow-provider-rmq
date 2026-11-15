@@ -206,13 +206,13 @@
 - Modify: `airflow_provider_rmq/hooks/rmq.py`
 - Modify: `tests/test_hook.py`
 
-- [ ] `queue_info` для отсутствующей очереди возвращает `consumer_count: 0`; docstring описывает
+- [x] `queue_info` для отсутствующей очереди возвращает `consumer_count: 0`; docstring описывает
   одну форму ответа для обеих веток
-- [ ] `__del__` оборачивает проверку и `close()` в `try/except Exception: pass`
-- [ ] обновить ожидаемый словарь в `test_queue_info_nonexistent` (`tests/test_hook.py:402-415`)
-- [ ] тесты: форма ответа `queue_info` одинакова для обеих веток; `__del__` не бросает, когда
+- [x] `__del__` оборачивает проверку и `close()` в `try/except Exception: pass`
+- [x] обновить ожидаемый словарь в `test_queue_info_nonexistent` (`tests/test_hook.py:402-415`)
+- [x] тесты: форма ответа `queue_info` одинакова для обеих веток; `__del__` не бросает, когда
   `is_open` или `close()` бросают
-- [ ] прогнать тесты — должны пройти
+- [x] прогнать тесты — должны пройти
 
 ### Task 5: Integration-тест публикации против живого брокера
 

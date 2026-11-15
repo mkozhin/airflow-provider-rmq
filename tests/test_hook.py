@@ -510,10 +510,62 @@ class TestQueueInfoChannelClosed:
         assert info == {
             "queue": "nonexistent_queue",
             "message_count": 0,
+            "consumer_count": 0,
             "exists": False,
         }
         # Channel should be reset
         assert hook._channel is None
+
+    def test_queue_info_same_keys_for_both_branches(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        method = MagicMock()
+        method.method.queue = "q"
+        method.method.message_count = 1
+        method.method.consumer_count = 1
+        mock_ch.queue_declare.return_value = method
+        existing = hook.queue_info("q")
+
+        mock_ch.queue_declare.side_effect = pika.exceptions.ChannelClosedByBroker(404, "NOT_FOUND")
+        missing = hook.queue_info("missing")
+
+        assert existing.keys() == missing.keys()
+
+
+# ---------------------------------------------------------------------------
+# __del__ never raises
+# ---------------------------------------------------------------------------
+class TestDel:
+    def test_del_closes_open_connection(self):
+        hook = RMQHook()
+        conn = MagicMock()
+        conn.is_open = True
+        hook._connection = conn
+        with patch.object(RMQHook, "close") as close:
+            hook.__del__()
+        close.assert_called_once_with()
+        hook._connection = None
+
+    def test_del_swallows_is_open_error(self):
+        hook = RMQHook()
+        conn = MagicMock()
+        type(conn).is_open = PropertyMock(side_effect=AttributeError("pika unloaded"))
+        hook._connection = conn
+        hook.__del__()
+        hook._connection = None
+
+    def test_del_swallows_close_error(self):
+        hook = RMQHook()
+        conn = MagicMock()
+        conn.is_open = True
+        hook._connection = conn
+        with patch.object(RMQHook, "close", side_effect=RuntimeError("boom")) as close:
+            hook.__del__()
+        close.assert_called_once_with()
+        hook._connection = None
+
+    def test_del_without_connection_attribute(self):
+        hook = RMQHook.__new__(RMQHook)
+        hook.__del__()
 
 
 # ---------------------------------------------------------------------------

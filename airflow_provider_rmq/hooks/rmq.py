@@ -222,9 +222,16 @@ class RMQHook(BaseHook):
         self.close()
 
     def __del__(self) -> None:
-        """Auto-close connection when hook is garbage-collected."""
-        if getattr(self, "_connection", None) and self._connection.is_open:
-            self.close()
+        """Auto-close connection when hook is garbage-collected.
+
+        Any exception is swallowed: at interpreter shutdown ``pika`` may be only partly
+        loaded, and an exception raised from ``__del__`` is only printed to stderr.
+        """
+        try:
+            if getattr(self, "_connection", None) and self._connection.is_open:
+                self.close()
+        except Exception:  # noqa: BLE001, S110 - a finalizer must never raise
+            pass
 
     def close(self) -> None:
         """Gracefully close channel and connection."""
@@ -391,7 +398,9 @@ class RMQHook(BaseHook):
 
         :param queue_name: Name of the queue.
         :type queue_name: str
-        :return: Dict with ``queue``, ``message_count``, ``consumer_count``, ``exists`` keys.
+        :return: Dict with ``queue``, ``message_count``, ``consumer_count`` and ``exists``
+            keys. The same keys are returned whether the queue exists or not; for a missing
+            queue ``message_count`` and ``consumer_count`` are ``0`` and ``exists`` is ``False``.
         :rtype: dict[str, Any]
         """
         channel = self.get_channel()
@@ -406,7 +415,12 @@ class RMQHook(BaseHook):
         except pika.exceptions.ChannelClosedByBroker as e:
             log.warning("Channel closed by broker for queue '%s': %s", queue_name, e)
             self._channel = None
-            return {"queue": queue_name, "message_count": 0, "exists": False}
+            return {
+                "queue": queue_name,
+                "message_count": 0,
+                "consumer_count": 0,
+                "exists": False,
+            }
 
     # --- Exchange operations ---
 
