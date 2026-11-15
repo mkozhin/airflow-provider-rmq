@@ -3230,7 +3230,7 @@ class RMQConsumerManager:
                     # with them and consumption stops for good once the misses reach the
                     # window size. The same holds for a message the filter could not be
                     # evaluated on, which goes back whatever the subscription asked for.
-                    # The unacked window stays unbounded.
+                    # The unacked window is the broker's default consumer prefetch.
                     consumer_tag = _consumer_tag(sub_id, _attach_nonce())
                     async with _attached(queue, consumer_tag, rpc_timeout) as q_iter:
                         state.consumer_tag = consumer_tag

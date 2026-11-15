@@ -591,7 +591,10 @@ class QosSettings:
     """QoS settings as the provider applies them to a blocking channel.
 
     :param prefetch_count: Value for ``basic.qos``; ``None`` means no ``basic.qos`` is
-        sent and the broker's default (no limit) applies.
+        sent and the broker's configured default prefetch applies, which is unlimited
+        unless RabbitMQ sets ``default_consumer_prefetch`` (see
+        https://www.rabbitmq.com/docs/consumer-prefetch#configurable-default-prefetch).
+        ``0`` requests unlimited prefetch.
     :param global_qos: The caller's ``global_qos`` value. It is never sent to the broker;
         a true value is kept so the caller can report it.
     """
@@ -604,7 +607,7 @@ def parse_qos(qos: dict | None) -> QosSettings:
     """Read a QoS settings dict into the settings the provider applies.
 
     - ``prefetch_count`` is the only value sent to the broker. Absent or ``None``, no
-      ``basic.qos`` is sent.
+      ``basic.qos`` is sent and the broker's configured default prefetch applies.
     - ``global_qos`` is never sent: per-channel prefetch is the deprecated RabbitMQ
       feature ``global_qos`` (see :data:`DEPRECATED_FEATURES_DENIED_SINCE`). The value
       is returned for the caller to report.
