@@ -219,16 +219,16 @@
 **Files:**
 - Create: `integration/test_publish_confirms.py`
 
-- [ ] публикация оператором в существующую очередь (`scratch`) проходит, сообщение в очереди
-- [ ] `queue_name=` на несуществующую очередь (имя с `rmq_prefix`) падает с `AirflowException`
+- [x] публикация оператором в существующую очередь (`scratch`) проходит, сообщение в очереди
+- [x] `queue_name=` на несуществующую очередь (имя с `rmq_prefix`) падает с `AirflowException`
   и `312 NO_ROUTE`
-- [ ] встроенный `amq.direct` с ключом `rmq_prefix…` без биндинга: при умолчаниях проходит, с
+- [x] встроенный `amq.direct` с ключом `rmq_prefix…` без биндинга: при умолчаниях проходит, с
   `mandatory=True` падает
-- [ ] публикация в несуществующий exchange (имя с `rmq_prefix`) падает с `AirflowException` и
+- [x] публикация в несуществующий exchange (имя с `rmq_prefix`) падает с `AirflowException` и
   кодом 404
-- [ ] очередь `scratch` с `{"x-max-length": 0, "x-overflow": "reject-publish"}`: публикация в неё
+- [x] очередь `scratch` с `{"x-max-length": 0, "x-overflow": "reject-publish"}`: публикация в неё
   падает с текстом про nack
-- [ ] файл собирается только при заданном `RMQ_TEST_URL` (без него — skip), как остальные тесты
+- [x] файл собирается только при заданном `RMQ_TEST_URL` (без него — skip), как остальные тесты
   каталога
 
 ### Task 6: Verify acceptance criteria
