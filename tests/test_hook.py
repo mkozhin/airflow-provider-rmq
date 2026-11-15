@@ -195,6 +195,50 @@ class TestLazyConnection:
         mock_conn.channel.assert_called_once()
 
 
+class TestPublisherConfirms:
+    def test_confirm_delivery_called_with_flag(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook._publisher_confirms = True
+        hook.get_channel()
+        mock_ch.confirm_delivery.assert_called_once_with()
+
+    def test_flag_set_through_constructor(self, fake_connection, mock_connection, mock_channel):
+        with patch.object(RMQHook, "get_connection", return_value=fake_connection):
+            with patch(f"{HOOK_MODULE}.pika.BlockingConnection", return_value=mock_connection):
+                hook = RMQHook(publisher_confirms=True)
+                hook.get_channel()
+                mock_channel.confirm_delivery.assert_called_once_with()
+                hook._connection = None
+                hook._channel = None
+
+    def test_confirm_delivery_not_called_without_flag(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook.get_channel()
+        mock_ch.confirm_delivery.assert_not_called()
+
+    def test_open_channel_is_not_confirmed_again(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook._publisher_confirms = True
+        hook.get_channel()
+        hook.get_channel()
+        hook.basic_publish(exchange="", routing_key="q", body="x")
+        mock_ch.confirm_delivery.assert_called_once_with()
+
+    def test_reopened_channel_is_confirmed_again(self, hook_with_mocks):
+        hook, mock_conn, first_ch = hook_with_mocks
+        hook._publisher_confirms = True
+        hook.get_channel()
+        type(first_ch).is_closed = PropertyMock(return_value=True)
+
+        second_ch = MagicMock()
+        type(second_ch).is_closed = PropertyMock(return_value=False)
+        mock_conn.channel.return_value = second_ch
+
+        assert hook.get_channel() is second_ch
+        first_ch.confirm_delivery.assert_called_once_with()
+        second_ch.confirm_delivery.assert_called_once_with()
+
+
 # ---------------------------------------------------------------------------
 # 3.3.4 — Context manager
 # ---------------------------------------------------------------------------
@@ -360,6 +404,16 @@ class TestPublishAndConsume:
         hook.basic_publish(exchange="", routing_key="q", body="data", properties=props)
         call_kwargs = mock_ch.basic_publish.call_args
         assert call_kwargs.kwargs["properties"] is props
+
+    def test_basic_publish_mandatory_reaches_pika(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook.basic_publish(exchange="", routing_key="q", body="data", mandatory=True)
+        assert mock_ch.basic_publish.call_args.kwargs["mandatory"] is True
+
+    def test_basic_publish_mandatory_defaults_to_false(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook.basic_publish(exchange="", routing_key="q", body="data")
+        assert mock_ch.basic_publish.call_args.kwargs["mandatory"] is False
 
     def test_consume_messages(self, hook_with_mocks):
         hook, _, mock_ch = hook_with_mocks

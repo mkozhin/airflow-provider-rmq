@@ -100,6 +100,7 @@ class RMQHook(BaseHook):
         qos: dict | None = None,
         retry_count: int = 3,
         retry_delay: float = 1.0,
+        publisher_confirms: bool = False,
     ) -> None:
         """Create a new RMQHook instance.
 
@@ -113,6 +114,9 @@ class RMQHook(BaseHook):
         :type retry_count: int
         :param retry_delay: Base delay in seconds between retries (exponential backoff).
         :type retry_delay: float
+        :param publisher_confirms: Put every channel the hook opens into publisher confirms
+            mode, so :meth:`basic_publish` waits for the broker to acknowledge each message.
+        :type publisher_confirms: bool
         """
         super().__init__()
         self.rmq_conn_id = rmq_conn_id
@@ -120,6 +124,7 @@ class RMQHook(BaseHook):
         self._qos = qos
         self._retry_count = retry_count
         self._retry_delay = retry_delay
+        self._publisher_confirms = publisher_confirms
         self._connection: pika.BlockingConnection | None = None
         self._channel: BlockingChannel | None = None
 
@@ -203,6 +208,8 @@ class RMQHook(BaseHook):
                     prefetch_count=self._qos.get("prefetch_count", 0),
                     global_qos=self._qos.get("global_qos", False),
                 )
+            if self._publisher_confirms:
+                self._channel.confirm_delivery()
         return self._channel
 
     # --- Context manager ---
@@ -514,8 +521,22 @@ class RMQHook(BaseHook):
         routing_key: str,
         body: str | bytes,
         properties: pika.BasicProperties | None = None,
+        mandatory: bool = False,
     ) -> None:
         """Publish a message to an exchange.
+
+        With ``publisher_confirms=True`` the call returns after the broker acknowledges
+        the message and raises the pika exception when it does not:
+
+        - :class:`pika.exceptions.UnroutableError` -- the broker returned the message
+          (``mandatory=True`` and no queue matched the routing key);
+        - :class:`pika.exceptions.NackError` -- the broker rejected the message;
+        - :class:`pika.exceptions.ChannelClosedByBroker` -- the broker closed the channel,
+          for example 404 on a missing exchange or 403 without permission; the next
+          :meth:`get_channel` opens a new channel.
+
+        Without publisher confirms the call returns once the message is written to the
+        socket, and a channel the broker closes surfaces on a later call.
 
         :param exchange: Exchange name (empty string for default exchange).
         :type exchange: str
@@ -525,12 +546,19 @@ class RMQHook(BaseHook):
         :type body: str | bytes
         :param properties: Optional AMQP message properties.
         :type properties: pika.BasicProperties | None
+        :param mandatory: Ask the broker to return the message when no queue matches
+            the routing key.
+        :type mandatory: bool
         """
         channel = self.get_channel()
         if isinstance(body, str):
             body = body.encode("utf-8")
         channel.basic_publish(
-            exchange=exchange, routing_key=routing_key, body=body, properties=properties,
+            exchange=exchange,
+            routing_key=routing_key,
+            body=body,
+            properties=properties,
+            mandatory=mandatory,
         )
 
     # --- Consume ---

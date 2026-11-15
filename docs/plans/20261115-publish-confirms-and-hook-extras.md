@@ -159,15 +159,15 @@
 - Modify: `airflow_provider_rmq/hooks/rmq.py`
 - Modify: `tests/test_hook.py`
 
-- [ ] параметр `publisher_confirms: bool = False` последним в `RMQHook.__init__`, с docstring
-- [ ] в `get_channel()` при `publisher_confirms` вызывать `confirm_delivery()` один раз на каждый
+- [x] параметр `publisher_confirms: bool = False` последним в `RMQHook.__init__`, с docstring
+- [x] в `get_channel()` при `publisher_confirms` вызывать `confirm_delivery()` один раз на каждый
   новый канал
-- [ ] `basic_publish(..., mandatory: bool = False)` передаёт флаг в `channel.basic_publish`;
+- [x] `basic_publish(..., mandatory: bool = False)` передаёт флаг в `channel.basic_publish`;
   docstring называет исключения pika, которые всплывают в режиме confirms
-- [ ] тесты: `confirm_delivery` вызывается при флаге и не вызывается без него; повторный
+- [x] тесты: `confirm_delivery` вызывается при флаге и не вызывается без него; повторный
   `get_channel()` на открытом канале не вызывает его снова; вызывается снова после переоткрытия
   закрытого канала; `mandatory` доходит до pika; без аргумента в pika уходит `mandatory=False`
-- [ ] прогнать тесты — должны пройти
+- [x] прогнать тесты — должны пройти
 
 ### Task 3: `confirm` и `mandatory` в `RMQPublishOperator`
 
