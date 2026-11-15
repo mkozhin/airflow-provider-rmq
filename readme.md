@@ -24,7 +24,7 @@
 `airflow-provider-rmq` is a community provider package for Apache Airflow × RabbitMQ. It supports:
 
 - **Reactive DAG triggering** — [RMQ Watcher Plugin](#rmq-watcher-plugin) starts DAGs automatically when messages arrive in a queue, with no polling and no worker slots consumed
-- Publishing messages to exchanges and queues
+- Publishing messages to exchanges and queues with publisher confirms
 - Consuming messages with header-based and callable-based filtering
 - Waiting for specific messages with sensors (classic poke and deferrable mode)
 - Deferrable sensor in **pull mode** (periodic polling) and **push mode** (broker-delivered via `basic_consume`) — choose based on latency requirements
@@ -103,13 +103,14 @@ Set `"cert_reqs": "CERT_NONE"` to disable certificate verification (not recommen
 
 ### Connection Timing
 
-Three optional **Extra** keys control AMQP timing. All of them are plain JSON values next to the SSL settings:
+Four optional **Extra** keys control AMQP timing. All of them are plain JSON values next to the SSL settings:
 
 ```json
 {
   "heartbeat": 30,
   "connect_timeout": 15,
-  "rpc_timeout": 30
+  "rpc_timeout": 30,
+  "blocked_connection_timeout": 300
 }
 ```
 
@@ -118,10 +119,16 @@ Three optional **Extra** keys control AMQP timing. All of them are plain JSON va
 | `heartbeat` | `30` on the async path, `600` in `RMQHook` | every AMQP connection | Seconds between AMQP heartbeat frames. `aiormq` allows three missed intervals and checks every half-interval, so a broken connection becomes an exception in roughly `3 × heartbeat` seconds — about 90 s at the default — and `connect_robust` reconnects |
 | `connect_timeout` | `15` | RMQ Watcher | Seconds allowed for establishing an async connection |
 | `rpc_timeout` | `30` | RMQ Watcher | Seconds allowed for a single async AMQP call — `channel()`, declare, bind, publish |
+| `blocked_connection_timeout` | `300` | `RMQHook` | Seconds a connection blocked by the broker (resource alarm) may stay blocked before the hook drops it with an exception |
 
-`heartbeat` is the same key the synchronous hook reads; the two paths differ only in default, because `RMQHook` lives in short sessions inside a task while the watcher holds a connection for days. Setting `"heartbeat": 0` is accepted as a deliberate opt-out and logged as a WARNING: with heartbeats off, a link that dies silently (a broker restart behind a proxy that keeps the client half open) stays undetected.
+`heartbeat` is the same key on both paths. The paths differ in two things:
 
-`connect_timeout` and `rpc_timeout` have no counterpart in `RMQHook` — pika is driven by its own retry logic there. A value that is not a positive number falls back to the default with a WARNING.
+- **Default.** `RMQHook` uses `600`: pika's `BlockingConnection` services heartbeats only inside pika calls, so a short interval drops the link of a task that works for more than about a minute between calls. The async path uses `30`, because the watcher holds a connection for days and has to notice a dead link quickly.
+- **`null`.** `RMQHook` passes `null` in `heartbeat` or `blocked_connection_timeout` to pika as is: the heartbeat follows the broker's proposal, and a blocked connection waits without a deadline. The async path reads `null` in `heartbeat` as an unusable value and uses the default with a WARNING.
+
+Setting `"heartbeat": 0` is accepted as a deliberate opt-out and logged as a WARNING: with heartbeats off, a link that dies silently (a broker restart behind a proxy that keeps the client half open) stays undetected.
+
+`connect_timeout` and `rpc_timeout` have no counterpart in `RMQHook` — pika is driven by its own retry logic there. Every key takes a number or a numeric string (`"30"`). A value that is not a finite number, or is below the key's minimum, falls back to the default with a WARNING. The minimum is `0` for `heartbeat` and `blocked_connection_timeout` and anything above zero for `connect_timeout` and `rpc_timeout`; a `heartbeat` between zero and one second also falls back to the default.
 
 ---
 
@@ -142,23 +149,24 @@ Core hook for all RabbitMQ interactions. Uses pika `BlockingConnection` with aut
 | `qos` | `dict \| None` | `None` | No | QoS settings: `prefetch_size`, `prefetch_count`, `global_qos` |
 | `retry_count` | `int` | `3` | No | Number of connection retry attempts |
 | `retry_delay` | `float` | `1.0` | No | Base delay (seconds) between retries (exponential backoff) |
+| `publisher_confirms` | `bool` | `False` | No | Put every channel the hook opens, a reopened one included, into publisher confirms mode: `basic_publish` waits for the broker to acknowledge each message |
 
 #### Key Methods
 
 | Method | Description |
 |---|---|
-| `get_channel()` | Returns a pika `BlockingChannel` (creates connection lazily) |
+| `get_channel()` | Returns a pika `BlockingChannel` (creates connection lazily; opens a new channel when the current one is closed) |
 | `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Declare a queue |
 | `queue_delete(queue_name, if_unused, if_empty)` | Delete a queue |
 | `queue_bind(queue, exchange, routing_key, arguments)` | Bind a queue to an exchange |
 | `queue_unbind(queue, exchange, routing_key, arguments)` | Unbind a queue from an exchange |
 | `queue_purge(queue_name)` | Remove all messages from a queue |
-| `queue_info(queue_name)` | Get queue info (message_count, consumer_count, exists) via passive declare |
+| `queue_info(queue_name)` | Get queue info via passive declare: a dict with `queue`, `message_count`, `consumer_count` and `exists`. A missing queue gives the same keys with both counts `0` and `exists=False` |
 | `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Declare an exchange |
 | `exchange_delete(exchange, if_unused)` | Delete an exchange |
 | `exchange_bind(destination, source, routing_key, arguments)` | Bind exchange to exchange |
 | `exchange_unbind(destination, source, routing_key, arguments)` | Unbind exchange from exchange |
-| `basic_publish(exchange, routing_key, body, properties)` | Publish a message |
+| `basic_publish(exchange, routing_key, body, properties, mandatory)` | Publish a message. `mandatory=True` (default `False`) asks the broker to return a message that no queue matches. With `publisher_confirms=True` the call waits for the broker's acknowledgement and raises `pika.exceptions.UnroutableError` (message returned), `NackError` (message rejected) or `ChannelClosedByBroker` (e.g. 404 on a missing exchange, 403 without permission; the next `get_channel()` opens a new channel). Without publisher confirms the call returns once the message is written to the socket, a returned message is not reported, and a channel the broker closes surfaces on a later call |
 | `consume_messages(queue_name, max_messages, auto_ack, inactivity_timeout)` | Consume messages from a queue |
 | `ack(delivery_tag)` | Acknowledge a message |
 | `nack(delivery_tag, requeue)` | Negatively acknowledge a message |
@@ -189,7 +197,7 @@ hook.basic_publish(
 
 **Import:** `from airflow_provider_rmq.operators.rmq_publish import RMQPublishOperator`
 
-Publishes one or more messages to RabbitMQ. Supports strings, dicts (auto-serialized to JSON), and lists.
+Publishes one or more messages to RabbitMQ and, by default, waits for the broker to confirm each one (see [Publisher Confirms](#publisher-confirms)). Supports strings, dicts (auto-serialized to JSON), and lists.
 
 #### Parameters
 
@@ -208,8 +216,30 @@ Publishes one or more messages to RabbitMQ. Supports strings, dicts (auto-serial
 | `correlation_id` | `str \| None` | `None` | No | Application correlation identifier |
 | `reply_to` | `str \| None` | `None` | No | Reply-to queue name |
 | `message_id` | `str \| None` | `None` | No | Application message identifier |
+| `confirm` | `bool` | `True` | No | Publisher confirms: wait for the broker to acknowledge each message and fail the task when the broker returns, rejects or does not accept one |
+| `mandatory` | `bool \| None` | `None` | No | Ask the broker to return a message that no queue matches. `None` resolves after templates are rendered: `True` for the default exchange (`exchange=""` or `queue_name=`) with `confirm=True`, `False` otherwise. `True` with `confirm=False` raises `ValueError` and the DAG fails to import |
 
 **Template fields:** `exchange`, `routing_key`, `message`
+
+`message=None` or an empty list logs a WARNING `Message is empty, nothing to publish to exchange='…' routing_key='…'`; the task succeeds without connecting to the broker.
+
+#### Publisher Confirms
+
+With `confirm=True` each message waits for the broker's acknowledgement before the next one is sent. When the broker does not accept a message, the task fails with an `AirflowException` that names the message by its position in the batch, the exchange and the routing key; the pika exception is kept as `__cause__`.
+
+| Broker response | Failure text |
+|---|---|
+| Returned: no queue matches the routing key and `mandatory` is on (e.g. `queue_name=` names a missing queue) | `message 3 of 5 to exchange='' routing_key='orders' was returned by the broker: 312 NO_ROUTE` |
+| Rejected (nack), e.g. a full queue with `x-max-length` and `x-overflow=reject-publish` | `message 3 of 5 to exchange='' routing_key='orders' was rejected by the broker (nack)` |
+| Channel closed: 404 on a missing exchange, 403 without permission | `message 1 of 1 to exchange='events' routing_key='orders.new' was not published, broker closed the channel: 404 NOT_FOUND - no exchange 'events' in vhost '/'` |
+
+- **Default `mandatory`.** On the default exchange a message to a missing queue is always lost, so `mandatory` is on there. On a named exchange no queue bound for the key can be a normal state, so `mandatory` is off; set `mandatory=True` to fail on unrouted messages there too.
+- **What an acknowledgement means.** The broker has taken the message. An unrouted message with `mandatory=False` is acknowledged too, and dropped. A persistent message (`delivery_mode=2`) is on disk at acknowledgement only in durable queues; a transient queue does not write it to disk.
+- **Returned messages in the log.** When the broker returns a message, pika logs a WARNING into the task log with the message's full properties — headers, `correlation_id`, `reply_to`, `message_id` — and the first 255 characters of the `repr` of the body.
+- **Retries publish again.** Messages before the failing one are already in the broker, and a task retry publishes the whole batch again: publishing is at-least-once, so consumers should tolerate duplicates (for example by `message_id`). The publish call itself is not retried; only the connection is.
+- **Cost and waiting.** Each message costs one round trip to the broker — about a millisecond on a local network, more for persistent messages and quorum queues — so a large batch publishes noticeably slower. The wait for an acknowledgement has no deadline of its own: a quorum queue that has lost its majority holds the acknowledgement on a live, unblocked connection, and the task waits until its `execution_timeout`. Set `execution_timeout` on publish tasks.
+
+With `confirm=False` the task does not wait for the broker: a returned or rejected message goes unnoticed, a publish to a missing exchange can leave the task green, and a channel the broker closes surfaces on a later message as the pika exception itself.
 
 #### Usage Example
 

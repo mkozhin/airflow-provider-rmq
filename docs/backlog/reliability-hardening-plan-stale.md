@@ -8,8 +8,8 @@ added: 2026-09-02
 **Контекст.** `docs/plans/20260703-reliability-hardening.md` — 16 задач по
 итогам ревью 2026-07-03. В его чек-листе (`## Implementation Steps`, с :211)
 116 пунктов, и ни один не отмечен выполненным. Часть задач закрыта планами
-connection-resilience, watcher-audit-fixes, status-truthfulness и
-watcher-child-process иначе, чем он описывает. Исполнять его как есть нельзя:
+connection-resilience, watcher-audit-fixes, status-truthfulness,
+watcher-child-process и publish-confirms-and-hook-extras иначе, чем он описывает. Исполнять его как есть нельзя:
 половина шагов переделает уже сделанное, другая половина ссылается на строки,
 имена и устройство watcher'а, которых нет.
 
@@ -32,9 +32,9 @@ watcher-child-process иначе, чем он описывает. Исполня
 
 | задача | состояние |
 |---|---|
-| 1. decode `errors="replace"` | сделано в триггере (`triggers/rmq.py:119`) и в watcher'е (`watcher/consumer.py:3762`, `utils/amqp.py:273`); **не** сделано в `RMQHook.consume_messages` (`hooks/rmq.py:547`) — это изменение решений ACK/NACK, разбирается в [[sync-decode-raises-on-binary-body]] |
-| 2. `queue_info` с `consumer_count`, guard в `__del__`, warning на пустой publish | не сделано (`hooks/rmq.py:377`, `hooks/rmq.py:192-195`, `operators/rmq_publish.py:239-251`) → [[hook-extras-not-validated]] |
-| 3–4. publisher confirms в хуке и операторе | не сделано → [[publish-operator-no-confirms]] |
+| 1. decode `errors="replace"` | сделано в триггере (`triggers/rmq.py:119`) и в watcher'е (`watcher/consumer.py:3762`, `utils/amqp.py:273`); **не** сделано в `RMQHook.consume_messages` (`hooks/rmq.py:614`) — это изменение решений ACK/NACK, разбирается в [[sync-decode-raises-on-binary-body]] |
+| 2. `queue_info` с `consumer_count`, guard в `__del__`, warning на пустой publish | сделано планом `docs/plans/completed/20261115-publish-confirms-and-hook-extras.md` (`hooks/rmq.py:417-424`, `hooks/rmq.py:224-234`, `operators/rmq_publish.py:130-136`) |
+| 3–4. publisher confirms в хуке и операторе | сделано планом `docs/plans/completed/20261115-publish-confirms-and-hook-extras.md`: `confirm_delivery()` в `get_channel()` (`hooks/rmq.py:211-212`), `basic_publish(..., mandatory)` (`hooks/rmq.py:532`), `confirm`/`mandatory` и `AirflowException` с номером сообщения в операторе (`operators/rmq_publish.py:117-208`) |
 | 5. ленивый `WatcherSession` | не сделано, фабрика создаётся при импорте (`watcher/models.py:96`) |
 | 6–7. защита `source` и takeover-warning | не сделано → [[ui-subscription-taken-over-by-scan]] |
 | 8. at-least-once, `DagRunAlreadyExists`, детерминированный `run_id` | сделано (`_build_run_id` и `_sync_trigger`, `watcher/consumer.py:249-305`) |
@@ -45,20 +45,22 @@ watcher-child-process иначе, чем он описывает. Исполня
 | 14. statsd-метрики | сделано в другом составе: `dag_triggered`, `consumer_attached`, `consumer_restarted`, `cycle_completed`, `cycle_timed_out`, `cycle_step_timed_out`, `cycle_step_skipped`, `tasks_abandoned`, `filter_missed`, `filter_errored`, `sync_superseded`; нет `consumer_reconnect`, `orphan_detected` |
 | 15–16. приёмка, документация | привязаны к остальному |
 
-**Почему это важно.** План — единственное место, где лидер-лок и confirms
-описаны с проработанным дизайном (арбитр, не-robust соединение, поведение при
+**Почему это важно.** План — единственное место, где лидер-лок описан с
+проработанным дизайном (арбитр, не-robust соединение, поведение при
 недоступности арбитра). Пока он лежит в `docs/plans/` как невыполненный, он
-выглядит очередью работы, которой на две трети нет, и одновременно прячет три
-действительно нужных дизайна внутри устаревшего списка, часть которого
+выглядит очередью работы, которой на две трети нет, и одновременно прячет
+действительно нужный дизайн внутри устаревшего списка, часть которого
 описывает watcher-поток, а не watcher-процесс.
 
 **Направление решения.** Не исполнять, а разобрать:
 
-- задача 1 — в [[sync-decode-raises-on-binary-body]]; задача 2 — в
-  [[hook-extras-not-validated]]; задача 5 — туда же или в маленький план
+- задача 1 — в [[sync-decode-raises-on-binary-body]];
+- задачи 2–4 сделаны планом
+  `docs/plans/completed/20261115-publish-confirms-and-hook-extras.md`;
+- задача 5 (ленивый `WatcherSession`) открыта — кандидат на маленький план
   «мелочи хука и моделей»;
-- задачи 3–4 и 6–7 — уже вынесены в отдельные пункты бэклога, план на них
-  пишется по этим пунктам;
+- задачи 6–7 — уже вынесены в [[ui-subscription-taken-over-by-scan]], план на
+  них пишется по этому пункту;
 - задачи 12–13 — отдельный план по лидер-локу, написанный под дочерний процесс
   watcher'а, со свободным номером ADR и с решением, стоит ли он дороже второго
   направления из [[status-cache-stale-across-replicas]] (версионированная

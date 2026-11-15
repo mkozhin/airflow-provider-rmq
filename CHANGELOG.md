@@ -7,14 +7,26 @@
 - `rmq_trigger` must be imported from the provider and `dag` from Airflow (`airflow.decorators` or `airflow.models.dag`). Wrappers, aliases, `import *` and decorators placed below `@rmq_trigger` are rejected.
 - The watcher lists DAG files the way Airflow does: `.airflowignore` is respected, hidden files and directories are scanned, zip archives are not read.
 - `@rmq_trigger` in a file outside `DAGS_FOLDER` or excluded by `.airflowignore` fails the import. Tests and CI that build a `DagBag` must set `DAGS_FOLDER` to the same folder.
+- `RMQPublishOperator` waits for the broker to confirm each message (`confirm=True`), so large batches publish slower; `confirm=False` publishes without waiting.
+- `RMQPublishOperator` publishes to the default exchange (`queue_name=…` or `exchange=""`) with `mandatory=True` by default: a message no queue takes fails the task.
+- `RMQPublishOperator` fails the task when the broker rejects a message (nack) or closes the channel (404 on a missing exchange, 403).
+
+### Added
+- `RMQHook(publisher_confirms=…)` and `RMQHook.basic_publish(mandatory=…)`.
+- `RMQPublishOperator` logs a WARNING when there is nothing to publish (`message=None` or an empty list).
 
 ### Fixed
 - Unreadable `@rmq_trigger` arguments are no longer silently replaced by defaults.
 - An unreadable subdirectory of `DAGS_FOLDER` no longer drops its subscriptions silently: it is logged and its files are held like unreadable files.
+- `RMQHook` reads `heartbeat` and `blocked_connection_timeout` in Extra as numbers or numeric strings; invalid values fall back to the defaults with a WARNING.
+- `RMQHook.queue_info` returns `consumer_count` for a missing queue as well.
+- `RMQHook.__del__` does not raise at interpreter shutdown.
 
 ### Upgrade notes
 - RabbitMQ 4.3 or newer is required: on earlier versions a requeueing nack spends a quorum queue's `delivery-limit`, so redelivered messages can be dead-lettered or dropped.
 - Before rollout, check the production DAG folder for: files that will now fail to import, `.py` files in hidden directories, heavy directories (`.git`, `.venv`, `node_modules`) that belong in `.airflowignore`, and `@rmq_trigger` factories under `.airflowignore`.
+- Publishing to the default exchange (`queue_name=…` or `exchange=""`) fails when the queue does not exist: create target queues before publishing, or set `mandatory=False`.
+- Set `execution_timeout` on publish tasks: the wait for a broker confirmation has no deadline of its own.
 
 ## v2.6.0
 

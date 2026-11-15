@@ -239,10 +239,10 @@
 - [x] `ruff check` и `mypy` по изменённым файлам не дают новых замечаний относительно `main`
 
 ### Task 7: [Final] Документация и бэклог
-- [ ] `readme.md` и `readme_ru.md`, раздел `RMQHook`: `publisher_confirms` в таблице параметров,
+- [x] `readme.md` и `readme_ru.md`, раздел `RMQHook`: `publisher_confirms` в таблице параметров,
   `basic_publish(..., mandatory)` и исключения режима confirms в таблице методов, форма ответа
   `queue_info`
-- [ ] `readme.md` и `readme_ru.md`, раздел `RMQPublishOperator`:
+- [x] `readme.md` и `readme_ru.md`, раздел `RMQPublishOperator`:
   - параметры `confirm` и `mandatory`, правило умолчания `mandatory` (default exchange — через
     `queue_name=` или `exchange=""` — даёт `True`);
   - когда задача теперь падает: несмаршрутизированное сообщение при `mandatory`, nack (например
@@ -256,7 +256,7 @@
   - при возврате pika пишет в лог задачи WARNING с полными свойствами сообщения, включая
     заголовки, и первыми 255 символами `repr` тела;
   - пустой `message` даёт WARNING «nothing to publish», задача успешна
-- [ ] `readme.md` и `readme_ru.md`, раздел Connection Timing:
+- [x] `readme.md` и `readme_ru.md`, раздел Connection Timing:
   - вводная фраза («Three optional Extra keys») и таблица: добавить `blocked_connection_timeout`
     (умолчание 300, только `RMQHook`, секунды до обрыва соединения, заблокированного брокером);
   - переписать абзац `:122`: пути отличаются умолчанием heartbeat и обработкой `null`
@@ -266,7 +266,7 @@
   - правило отката `:124` привести к коду: строковые числа принимаются, нечисло и значение ниже
     минимума заменяются умолчанием с WARNING, `0` допустим для `heartbeat` и
     `blocked_connection_timeout`
-- [ ] `CHANGELOG.md`, раздел `v2.7.0`, по одной строке на пункт, ссылки только относительные:
+- [x] `CHANGELOG.md`, раздел `v2.7.0`, по одной строке на пункт, ссылки только относительные:
   - Changed: `RMQPublishOperator` ждёт подтверждения брокера (`confirm=True`), большой батч
     публикуется медленнее; `mandatory` по умолчанию для публикации в default exchange; задача
     падает при nack и закрытии канала брокером;
@@ -276,9 +276,9 @@
     `queue_info`, `__del__` при завершении интерпретатора;
   - Upgrade notes: публикация в default exchange (`queue_name=…` или `exchange=""`) падает, если
     очереди нет; задачам публикации стоит задать `execution_timeout`
-- [ ] `git rm docs/backlog/publish-operator-no-confirms.md docs/backlog/hook-extras-not-validated.md`
-- [ ] перенести план в `docs/plans/completed/`
-- [ ] `docs/backlog/reliability-hardening-plan-stale.md`: задачи 2–4 в таблице отмечены сделанными
+- [x] `git rm docs/backlog/publish-operator-no-confirms.md docs/backlog/hook-extras-not-validated.md`
+- [x] перенести план в `docs/plans/completed/` (moved by the harness after all phases)
+- [x] `docs/backlog/reliability-hardening-plan-stale.md`: задачи 2–4 в таблице отмечены сделанными
   со ссылкой на `docs/plans/completed/20261115-publish-confirms-and-hook-extras.md` и
   актуальными строками; убрать ссылки на удалённые пункты; в «Направлении решения» задачу 5
   (ленивый `WatcherSession`) переформулировать без «туда же» — она остаётся открытой, кандидат на
