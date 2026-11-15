@@ -410,6 +410,48 @@ class TestQueueOperations:
             exclusive=False, auto_delete=False, arguments=None,
         )
 
+    def test_queue_declare_defaults_to_durable(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook.queue_declare("test_queue")
+        mock_ch.queue_declare.assert_called_once_with(
+            queue="test_queue", passive=False, durable=True,
+            exclusive=False, auto_delete=False, arguments=None,
+        )
+
+    def test_queue_declare_non_durable_exclusive_allowed(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook.queue_declare("test_queue", durable=False, exclusive=True)
+        mock_ch.queue_declare.assert_called_once_with(
+            queue="test_queue", passive=False, durable=False,
+            exclusive=True, auto_delete=False, arguments=None,
+        )
+
+    @pytest.mark.parametrize("auto_delete", [False, True])
+    def test_queue_declare_non_durable_non_exclusive_rejected(self, hook_with_mocks, auto_delete):
+        hook, _, mock_ch = hook_with_mocks
+        with (
+            patch.object(hook, "get_channel", wraps=hook.get_channel) as get_channel,
+            pytest.raises(ValueError) as exc_info,
+        ):
+            hook.queue_declare(
+                "temp_queue", durable=False, exclusive=False, auto_delete=auto_delete,
+            )
+        get_channel.assert_not_called()
+        mock_ch.queue_declare.assert_not_called()
+        message = str(exc_info.value)
+        assert "temp_queue" in message
+        assert "transient_nonexcl_queues" in message
+        assert "durable=True" in message
+        assert "exclusive=True" in message
+
+    def test_queue_declare_passive_non_durable_allowed(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook.queue_declare("test_queue", passive=True, durable=False)
+        mock_ch.queue_declare.assert_called_once_with(
+            queue="test_queue", passive=True, durable=False,
+            exclusive=False, auto_delete=False, arguments=None,
+        )
+
     def test_queue_delete(self, hook_with_mocks):
         hook, _, mock_ch = hook_with_mocks
         hook.queue_delete("test_queue", if_unused=True)
@@ -461,6 +503,14 @@ class TestExchangeOperations:
         hook.exchange_declare("test_ex", exchange_type="topic", durable=True)
         mock_ch.exchange_declare.assert_called_once_with(
             exchange="test_ex", exchange_type="topic", passive=False,
+            durable=True, auto_delete=False, internal=False, arguments=None,
+        )
+
+    def test_exchange_declare_defaults_to_durable(self, hook_with_mocks):
+        hook, _, mock_ch = hook_with_mocks
+        hook.exchange_declare("test_ex")
+        mock_ch.exchange_declare.assert_called_once_with(
+            exchange="test_ex", exchange_type="direct", passive=False,
             durable=True, auto_delete=False, internal=False, arguments=None,
         )
 

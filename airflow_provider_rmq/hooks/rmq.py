@@ -326,12 +326,18 @@ class RMQHook(BaseHook):
         self,
         queue_name: str,
         passive: bool = False,
-        durable: bool = False,
+        durable: bool = True,
         exclusive: bool = False,
         auto_delete: bool = False,
         arguments: dict | None = None,
     ) -> pika.frame.Method:
         """Declare a queue on the broker.
+
+        An active declare (``passive=False``) creates either a durable queue or an exclusive
+        one. A queue that is both non-durable and non-exclusive relies on the RabbitMQ
+        deprecated feature ``transient_nonexcl_queues``, denied by default since RabbitMQ 4.3,
+        so that combination is rejected before the broker is contacted. A passive declare
+        creates nothing and is not checked; ``auto_delete`` does not affect the rule.
 
         :param queue_name: Name of the queue to declare.
         :type queue_name: str
@@ -347,7 +353,14 @@ class RMQHook(BaseHook):
         :type arguments: dict | None
         :return: Broker response frame.
         :rtype: pika.frame.Method
+        :raises ValueError: If ``passive``, ``durable`` and ``exclusive`` are all ``False``.
         """
+        if not passive and not durable and not exclusive:
+            raise ValueError(
+                f"Queue '{queue_name}': a non-durable, non-exclusive queue relies on the "
+                "RabbitMQ deprecated feature 'transient_nonexcl_queues', denied by default "
+                "since RabbitMQ 4.3. Declare it with durable=True or exclusive=True."
+            )
         channel = self.get_channel()
         return channel.queue_declare(
             queue=queue_name,
@@ -475,7 +488,7 @@ class RMQHook(BaseHook):
         exchange: str,
         exchange_type: str = "direct",
         passive: bool = False,
-        durable: bool = False,
+        durable: bool = True,
         auto_delete: bool = False,
         internal: bool = False,
         arguments: dict | None = None,

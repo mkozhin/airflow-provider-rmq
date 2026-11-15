@@ -144,15 +144,15 @@
 - Modify: `airflow_provider_rmq/hooks/rmq.py`
 - Modify: `tests/test_hook.py`
 
-- [ ] умолчание `durable=True` в `queue_declare` и `exchange_declare`; docstring'и описывают правило
-- [ ] `ValueError` в `queue_declare` до обращения к каналу при `passive=False`, `durable=False`,
+- [x] умолчание `durable=True` в `queue_declare` и `exchange_declare`; docstring'и описывают правило
+- [x] `ValueError` в `queue_declare` до обращения к каналу при `passive=False`, `durable=False`,
   `exclusive=False`; текст по Solution Overview
-- [ ] тесты: `queue_declare` и `exchange_declare` с умолчаниями уходят в pika с `durable=True`;
+- [x] тесты: `queue_declare` и `exchange_declare` с умолчаниями уходят в pika с `durable=True`;
   `durable=False, exclusive=True` проходит; `durable=False, exclusive=False` даёт `ValueError` и
   не трогает канал; `passive=True, durable=False` проходит; текст ошибки называет очередь и оба
   исправления
-- [ ] существующий тест `:407` передаёт `durable=True` явно и остаётся без изменений
-- [ ] прогнать тесты — должны пройти
+- [x] существующий тест `:407` передаёт `durable=True` явно и остаётся без изменений
+- [x] прогнать тесты — должны пройти
 
 ### Task 2: `RMQQueueManagementOperator`: умолчание `durable=True` и отказ при создании оператора
 
