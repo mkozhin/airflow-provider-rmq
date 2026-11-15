@@ -77,10 +77,11 @@ curl -u <admin>:<admin-password> -X PUT https://broker.example/api/permissions/<
 `rabbitmqctl set_permissions -p <vhost> <user> ".*" ".*" ".*"`. Сам набор
 `rabbitmqctl` не зовёт никогда: это разовая подготовка руками.
 
-`test_filter_miss.py` проверен на RabbitMQ 4.2.0 / Erlang 27.3.4.5: classic- и
-quorum-очереди, topic-обменник, DLX. `test_publish_confirms.py` покрывает
-публикацию с подтверждениями: `amq.direct`, очередь с `x-max-length` и
-`x-overflow=reject-publish`, несуществующие очередь и обменник.
+Набор проверен на RabbitMQ 4.4.0 / Erlang 29.1.2. `test_filter_miss.py`
+покрывает classic- и quorum-очереди, topic-обменник, DLX.
+`test_publish_confirms.py` покрывает публикацию с подтверждениями:
+`amq.direct`, очередь с `x-max-length` и `x-overflow=reject-publish`,
+несуществующие очередь и обменник.
 
 ## Фикстуры
 

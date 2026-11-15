@@ -288,10 +288,9 @@
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
 
 **Manual verification:**
-- обновить учётные данные в `.env` (брокер отвечает на текущие 403 ACCESS_REFUSED), прогнать
-  `integration/` на брокере RabbitMQ 4.3+ (лучше 4.4) — все семь тестов
-  `test_publish_confirms.py` против живого брокера ещё не запускались — и обновить строку о
-  проверенных версиях в `integration/README.md`
+- прогон `integration/` на живом брокере: выполнен на RabbitMQ 4.4.0 / Erlang 29.1.2,
+  13 passed (включая семь тестов `test_publish_confirms.py`); строка о проверенных
+  версиях в `integration/README.md` обновлена
 - проверить на Airflow 2.9.1 (прод): импорт примеров DAG'ов из `docs/example_dags/` и публикация
   одного сообщения
 
