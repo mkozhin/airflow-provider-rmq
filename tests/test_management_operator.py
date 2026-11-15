@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from airflow import DAG
 
 from airflow_provider_rmq.operators.rmq_management import (
     RMQQueueManagementOperator,
@@ -46,8 +48,8 @@ class TestTransientNonExclusiveQueue:
         message = str(exc_info.value)
         assert "my_queue" in message
         assert "transient_nonexcl_queues" in message
-        assert "durable=True" in message
-        assert "exclusive=True" in message
+        assert "Declare it with durable=True. exclusive=True does not fit this operator" in message
+        assert "or exclusive=True" not in message
 
     def test_check_does_not_touch_hook(self, mock_hook):
         MockHook, _ = mock_hook
@@ -71,13 +73,28 @@ class TestTransientNonExclusiveQueue:
         )
         assert op.durable is True
 
-    def test_non_durable_exclusive_queue_accepted(self):
+    def test_non_durable_exclusive_queue_declared(self, mock_hook):
+        _, hook = mock_hook
         op = RMQQueueManagementOperator(
             task_id="t", action="declare_queue", queue_name="my_queue",
             durable=False, exclusive=True,
         )
-        assert op.durable is False
-        assert op.exclusive is True
+        op.execute({})
+        hook.queue_declare.assert_called_once_with(
+            queue_name="my_queue", durable=False, exclusive=True,
+            auto_delete=False, arguments=None,
+        )
+
+    def test_mapped_non_durable_queue_builds_at_dag_level(self):
+        with DAG(dag_id="mapped_declare", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc), schedule=None):
+            mapped = RMQQueueManagementOperator.partial(
+                task_id="declare", action="declare_queue", durable=False,
+            ).expand(queue_name=["q1", "q2"])
+        assert mapped.partial_kwargs["durable"] is False
+
+    def test_durable_and_exclusive_are_not_templated(self):
+        assert "durable" not in RMQQueueManagementOperator.template_fields
+        assert "exclusive" not in RMQQueueManagementOperator.template_fields
 
     @pytest.mark.parametrize("action", ["declare_exchange", "delete_queue"])
     def test_other_actions_accept_non_durable_non_exclusive(self, action):

@@ -156,13 +156,13 @@ pip install dist/airflow_provider_rmq-*.whl
 | Метод | Описание |
 |---|---|
 | `get_channel()` | Возвращает pika `BlockingChannel` (создаёт подключение лениво; открывает новый канал, если текущий закрыт) |
-| `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Объявить очередь. `durable` по умолчанию `True`. Активное объявление (`passive=False`) с `durable=False` требует `exclusive=True`: очередь одновременно non-durable и non-exclusive опирается на устаревшую функцию RabbitMQ `transient_nonexcl_queues`, запрещённую по умолчанию с RabbitMQ 4.3, и даёт `ValueError` до обращения к брокеру. `auto_delete` на правило не влияет |
+| `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Объявить очередь. `durable` по умолчанию `True`. Активное объявление (`passive=False`) с `durable=False` требует `exclusive=True`: очередь одновременно non-durable и non-exclusive опирается на устаревшую функцию RabbitMQ `transient_nonexcl_queues`, запрещённую по умолчанию с RabbitMQ 4.3, и даёт `ValueError` до обращения к брокеру. `auto_delete` на правило не влияет. Объявление существующей очереди с другим `durable` падает с 406 `PRECONDITION_FAILED`; передавайте флаг, с которым очередь создана |
 | `queue_delete(queue_name, if_unused, if_empty)` | Удалить очередь |
 | `queue_bind(queue, exchange, routing_key, arguments)` | Привязать очередь к обменнику |
 | `queue_unbind(queue, exchange, routing_key, arguments)` | Отвязать очередь от обменника |
 | `queue_purge(queue_name)` | Удалить все сообщения из очереди |
 | `queue_info(queue_name)` | Получить информацию об очереди через пассивное объявление: словарь с ключами `queue`, `message_count`, `consumer_count` и `exists`. Для отсутствующей очереди — те же ключи, оба счётчика `0` и `exists=False` |
-| `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Объявить обменник. `durable` по умолчанию `True` |
+| `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Объявить обменник. `durable` по умолчанию `True`. Объявление существующего обменника с другим `durable` падает с 406 `PRECONDITION_FAILED`; передавайте флаг, с которым обменник создан |
 | `exchange_delete(exchange, if_unused)` | Удалить обменник |
 | `exchange_bind(destination, source, routing_key, arguments)` | Привязать обменник к обменнику |
 | `exchange_unbind(destination, source, routing_key, arguments)` | Отвязать обменник от обменника |
@@ -374,7 +374,7 @@ def my_pipeline():
 | `action` | `str` | — | **Да** | Действие (см. таблицу ниже) |
 | `rmq_conn_id` | `str` | `"rmq_default"` | Нет | ID подключения Airflow |
 | `queue_name` | `str \| None` | `None` | Условно | Имя очереди (обязательно для операций с очередями) |
-| `durable` | `bool` | `True` | Нет | Объявленная очередь или обменник переживает перезапуск брокера. Действует на `declare_queue` и `declare_exchange` |
+| `durable` | `bool` | `True` | Нет | Объявленная очередь или обменник переживает перезапуск брокера. Действует на `declare_queue` и `declare_exchange`. Объявление существующей очереди или обменника с другим `durable` падает с 406 `PRECONDITION_FAILED`; передавайте флаг, с которым ресурс создан |
 | `exclusive` | `bool` | `False` | Нет | Очередь эксклюзивна для этого подключения. Оператор закрывает подключение по завершении задачи, поэтому эксклюзивная очередь живёт, только пока задача выполняется |
 | `auto_delete` | `bool` | `False` | Нет | Ресурс удаляется, когда больше не используется |
 | `exchange_name` | `str \| None` | `None` | Условно | Имя обменника (обязательно для операций с обменниками) |

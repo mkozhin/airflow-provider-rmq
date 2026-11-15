@@ -5,7 +5,7 @@ from typing import Any, Literal, Sequence
 
 from airflow.models import BaseOperator
 
-from airflow_provider_rmq.hooks.rmq import RMQHook
+from airflow_provider_rmq.hooks.rmq import RMQHook, transient_nonexcl_queue_error
 
 log = logging.getLogger("airflow.task")
 
@@ -92,12 +92,11 @@ class RMQQueueManagementOperator(BaseOperator):
         if action not in VALID_ACTIONS:
             raise ValueError(f"Invalid action '{action}'. Must be one of {VALID_ACTIONS}")
         if action == "declare_queue" and not durable and not exclusive:
-            raise ValueError(
-                f"Queue '{queue_name}': a non-durable, non-exclusive queue relies on the "
-                "RabbitMQ deprecated feature 'transient_nonexcl_queues', denied by default "
-                "since RabbitMQ 4.3. Declare it with durable=True. exclusive=True does not "
-                "fit this operator: it closes its connection when the task finishes, and an "
-                "exclusive queue is deleted together with that connection."
+            raise transient_nonexcl_queue_error(
+                queue_name,
+                "Declare it with durable=True. exclusive=True does not fit this operator: "
+                "it closes its connection when the task finishes, and an exclusive queue is "
+                "deleted together with that connection.",
             )
         self.action = action
         self.rmq_conn_id = rmq_conn_id

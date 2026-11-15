@@ -83,9 +83,11 @@ curl -u <admin>:<admin-password> -X PUT https://broker.example/api/permissions/<
 `amq.direct`, очередь с `x-max-length` и `x-overflow=reject-publish`,
 несуществующие очередь и обменник. `test_queue_declare.py` покрывает
 объявления и QoS: durable-очередь по умолчанию у `RMQQueueManagementOperator`,
-exclusive-очередь `RMQHook` с умолчанием `durable` и повторным объявлением на
-том же подключении, exclusive-очередь с `durable=False`, публикацию и чтение
-через хук с `global_qos=True`.
+повторное объявление exclusive-очереди `RMQHook` на том же подключении,
+exclusive-очередь с `durable=False`, `basic.qos` только с `prefetch_count`,
+публикацию и чтение через хук с `global_qos=True`. Этот файл что-то доказывает
+только на RabbitMQ 4.3+, где устаревшие функции `transient_nonexcl_queues` и
+`global_qos` оставлены в `denied_by_default`.
 
 ## Фикстуры
 

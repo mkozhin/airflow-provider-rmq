@@ -156,13 +156,13 @@ Core hook for all RabbitMQ interactions. Uses pika `BlockingConnection` with aut
 | Method | Description |
 |---|---|
 | `get_channel()` | Returns a pika `BlockingChannel` (creates connection lazily; opens a new channel when the current one is closed) |
-| `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Declare a queue. `durable` defaults to `True`. An active declare (`passive=False`) with `durable=False` requires `exclusive=True`: a non-durable, non-exclusive queue relies on the deprecated RabbitMQ feature `transient_nonexcl_queues`, denied by default since RabbitMQ 4.3, and raises `ValueError` before the broker is contacted. `auto_delete` does not affect the rule |
+| `queue_declare(queue_name, passive, durable, exclusive, auto_delete, arguments)` | Declare a queue. `durable` defaults to `True`. An active declare (`passive=False`) with `durable=False` requires `exclusive=True`: a non-durable, non-exclusive queue relies on the deprecated RabbitMQ feature `transient_nonexcl_queues`, denied by default since RabbitMQ 4.3, and raises `ValueError` before the broker is contacted. `auto_delete` does not affect the rule. Declaring an existing queue with a different `durable` fails with 406 `PRECONDITION_FAILED`; pass the flag the queue was created with |
 | `queue_delete(queue_name, if_unused, if_empty)` | Delete a queue |
 | `queue_bind(queue, exchange, routing_key, arguments)` | Bind a queue to an exchange |
 | `queue_unbind(queue, exchange, routing_key, arguments)` | Unbind a queue from an exchange |
 | `queue_purge(queue_name)` | Remove all messages from a queue |
 | `queue_info(queue_name)` | Get queue info via passive declare: a dict with `queue`, `message_count`, `consumer_count` and `exists`. A missing queue gives the same keys with both counts `0` and `exists=False` |
-| `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Declare an exchange. `durable` defaults to `True` |
+| `exchange_declare(exchange, exchange_type, passive, durable, auto_delete, internal, arguments)` | Declare an exchange. `durable` defaults to `True`. Declaring an existing exchange with a different `durable` fails with 406 `PRECONDITION_FAILED`; pass the flag the exchange was created with |
 | `exchange_delete(exchange, if_unused)` | Delete an exchange |
 | `exchange_bind(destination, source, routing_key, arguments)` | Bind exchange to exchange |
 | `exchange_unbind(destination, source, routing_key, arguments)` | Unbind exchange from exchange |
@@ -374,7 +374,7 @@ Performs queue and exchange management operations on RabbitMQ.
 | `action` | `str` | — | **Yes** | Action to perform (see table below) |
 | `rmq_conn_id` | `str` | `"rmq_default"` | No | Airflow connection ID |
 | `queue_name` | `str \| None` | `None` | Conditional | Queue name (required for queue actions) |
-| `durable` | `bool` | `True` | No | The declared queue or exchange survives a broker restart. Applies to `declare_queue` and `declare_exchange` |
+| `durable` | `bool` | `True` | No | The declared queue or exchange survives a broker restart. Applies to `declare_queue` and `declare_exchange`. Declaring an existing queue or exchange with a different `durable` fails with 406 `PRECONDITION_FAILED`; pass the flag the resource was created with |
 | `exclusive` | `bool` | `False` | No | Queue is exclusive to this connection. The operator closes its connection when the task finishes, so an exclusive queue lives only while the task runs |
 | `auto_delete` | `bool` | `False` | No | Resource is deleted when no longer in use |
 | `exchange_name` | `str \| None` | `None` | Conditional | Exchange name (required for exchange actions) |

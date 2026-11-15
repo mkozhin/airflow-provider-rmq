@@ -373,11 +373,12 @@ class TestQos:
         assert self._global_qos_warnings(caplog) == []
 
     def test_warning_not_repeated_on_channel_open(
-        self, caplog, fake_connection, mock_connection,
+        self, caplog, fake_connection, mock_connection, mock_channel,
     ):
         with caplog.at_level(logging.WARNING, logger="airflow.task"):
             self._open_channel({"global_qos": True}, fake_connection, mock_connection)
         assert len(self._global_qos_warnings(caplog)) == 1
+        mock_channel.basic_qos.assert_called_once_with(prefetch_count=0)
 
     def test_no_basic_qos_without_qos(self, fake_connection, mock_connection, mock_channel):
         self._open_channel(None, fake_connection, mock_connection)
@@ -401,17 +402,16 @@ class TestQos:
 
     @pytest.mark.parametrize(
         "qos",
-        [None, {}, {"prefetch_count": 1}, {"prefetch_size": 0}, {"global_qos": True},
-         {"unknown_key": "x"}],
+        [None, {}, {"prefetch_count": 1}, {"prefetch_size": 0}, {"prefetch_size": 0.0},
+         {"prefetch_size": False}, {"global_qos": True}, {"unknown_key": "x"}],
     )
-    def test_validate_qos_accepts(self, qos, caplog):
-        with caplog.at_level(logging.DEBUG):
-            validate_qos(qos)
-        assert caplog.records == []
+    def test_validate_qos_accepts(self, qos):
+        validate_qos(qos)
 
-    def test_validate_qos_rejects_prefetch_size(self):
-        with pytest.raises(ValueError, match="prefetch_size"):
-            validate_qos({"prefetch_size": 1})
+    @pytest.mark.parametrize("prefetch_size", [1, 0.5, True, None, "0"])
+    def test_validate_qos_rejects_prefetch_size(self, prefetch_size):
+        with pytest.raises(ValueError, match=f"prefetch_size={prefetch_size!r}"):
+            validate_qos({"prefetch_size": prefetch_size})
 
 
 class TestReturnedMessageLog:
@@ -536,8 +536,7 @@ class TestQueueOperations:
         message = str(exc_info.value)
         assert "temp_queue" in message
         assert "transient_nonexcl_queues" in message
-        assert "durable=True" in message
-        assert "exclusive=True" in message
+        assert message.endswith("Declare it with durable=True or exclusive=True.")
 
     def test_queue_declare_passive_non_durable_allowed(self, hook_with_mocks):
         hook, _, mock_ch = hook_with_mocks

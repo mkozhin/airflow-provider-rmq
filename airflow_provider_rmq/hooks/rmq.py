@@ -60,14 +60,11 @@ RABBITMQ_SPECIFICATION_URL = "https://www.rabbitmq.com/docs/specification"
 def validate_qos(qos: dict | None) -> None:
     """Reject QoS settings that RabbitMQ does not accept.
 
-    The setting the broker honours is ``prefetch_count``: the number of unacknowledged
-    messages delivered to a consumer. ``prefetch_size`` other than ``0`` raises
-    ``ValueError``: RabbitMQ does not implement prefetch size limits and closes the
-    connection with ``540 NOT_IMPLEMENTED`` (see :data:`RABBITMQ_SPECIFICATION_URL`).
-    ``global_qos`` is accepted and never sent to the broker: per-channel prefetch is the
-    deprecated RabbitMQ feature ``global_qos``, denied by default since RabbitMQ 4.3.
-    ``None``, an empty dict and other keys pass unchecked. The function writes nothing
-    to the log.
+    ``prefetch_size`` other than ``0`` raises ``ValueError``: RabbitMQ does not implement
+    prefetch size limits and closes the connection with ``540 NOT_IMPLEMENTED`` (see
+    :data:`RABBITMQ_SPECIFICATION_URL`). An absent ``prefetch_size`` counts as ``0``, and
+    any value equal to ``0`` (``0``, ``0.0``, ``False``) passes; ``None`` and ``"0"`` are
+    rejected.
 
     :param qos: QoS settings dict.
     :type qos: dict | None
@@ -83,6 +80,26 @@ def validate_qos(qos: dict | None) -> None:
             f"540 NOT_IMPLEMENTED ({RABBITMQ_SPECIFICATION_URL}). Use prefetch_count "
             "to limit unacknowledged messages and leave prefetch_size at 0."
         )
+
+
+def transient_nonexcl_queue_error(queue_name: str | None, advice: str) -> ValueError:
+    """Build the error for an active declare of a non-durable, non-exclusive queue.
+
+    Such a queue relies on the RabbitMQ deprecated feature ``transient_nonexcl_queues``,
+    denied by default since RabbitMQ 4.3. *advice* tells the caller which flags to use.
+
+    :param queue_name: Name of the queue, as passed by the caller.
+    :type queue_name: str | None
+    :param advice: Sentence appended to the message.
+    :type advice: str
+    :return: The error to raise.
+    :rtype: ValueError
+    """
+    return ValueError(
+        f"Queue '{queue_name}': a non-durable, non-exclusive queue relies on the "
+        "RabbitMQ deprecated feature 'transient_nonexcl_queues', denied by default "
+        f"since RabbitMQ 4.3. {advice}"
+    )
 
 
 class RMQHook(BaseHook):
@@ -182,12 +199,13 @@ class RMQHook(BaseHook):
         """
         super().__init__()
         validate_qos(qos)
-        if qos and bool(qos.get("global_qos")):
+        global_qos = (qos or {}).get("global_qos")
+        if global_qos:
             log.warning(
                 "qos global_qos=%r is not sent to the broker: per-channel prefetch is the "
                 "deprecated RabbitMQ feature 'global_qos', denied by default since RabbitMQ "
                 "4.3. prefetch_count applies to each consumer.",
-                qos.get("global_qos"),
+                global_qos,
             )
         self.rmq_conn_id = rmq_conn_id
         self._vhost_override = vhost
@@ -395,10 +413,8 @@ class RMQHook(BaseHook):
         :raises ValueError: If ``passive``, ``durable`` and ``exclusive`` are all ``False``.
         """
         if not passive and not durable and not exclusive:
-            raise ValueError(
-                f"Queue '{queue_name}': a non-durable, non-exclusive queue relies on the "
-                "RabbitMQ deprecated feature 'transient_nonexcl_queues', denied by default "
-                "since RabbitMQ 4.3. Declare it with durable=True or exclusive=True."
+            raise transient_nonexcl_queue_error(
+                queue_name, "Declare it with durable=True or exclusive=True."
             )
         channel = self.get_channel()
         return channel.queue_declare(
