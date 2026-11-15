@@ -175,30 +175,30 @@
 - Modify: `airflow_provider_rmq/operators/rmq_publish.py`
 - Modify: `tests/test_publish_operator.py`
 
-- [ ] параметры `confirm: bool = True` и `mandatory: bool | None = None` с docstring;
+- [x] параметры `confirm: bool = True` и `mandatory: bool | None = None` с docstring;
   `ValueError` в `__init__` на `mandatory=True` при `confirm=False`
-- [ ] `execute` разрешает `mandatory` по отрендеренному `self.exchange` (правило из Solution
+- [x] `execute` разрешает `mandatory` по отрендеренному `self.exchange` (правило из Solution
   Overview), создаёт хук с `publisher_confirms=self.confirm`, передаёт `mandatory` в каждый
   `basic_publish`
-- [ ] при `confirm=True` перехват `UnroutableError`, `NackError`, `ChannelClosedByBroker` с
+- [x] при `confirm=True` перехват `UnroutableError`, `NackError`, `ChannelClosedByBroker` с
   `AirflowException`, текст по типу исключения (с `reply_code`/`reply_text`), исходное
   исключение в `__cause__`; при `confirm=False` исключения не оборачиваются
-- [ ] WARNING при пустом списке сообщений
-- [ ] тесты разрешения `mandatory` по kwarg, ушедшему в `hook.basic_publish`: `queue_name=` → True;
+- [x] WARNING при пустом списке сообщений
+- [x] тесты разрешения `mandatory` по kwarg, ушедшему в `hook.basic_publish`: `queue_name=` → True;
   `exchange=""` → True; именованный exchange → False; `exchange="{{ params.ex }}"`, отрендеренный
   в `""` (через `render_template_fields` или присвоение `op.exchange = ""` перед `execute`) → True;
   явные True/False имеют приоритет; `confirm=False` без `mandatory` → False;
   `mandatory=True, confirm=False` → `ValueError`
-- [ ] тесты `execute`: хук создаётся с `publisher_confirms=True` по умолчанию и с `False` при
+- [x] тесты `execute`: хук создаётся с `publisher_confirms=True` по умолчанию и с `False` при
   `confirm=False`; `UnroutableError` на 3-м из 5 сообщений даёт `AirflowException` с «message 3
   of 5», `312 NO_ROUTE` и два успешных вызова до него; `NackError` даёт текст про nack;
   `ChannelClosedByBroker(404, "NOT_FOUND …")` даёт текст с кодом и причиной; при
   `confirm=False` то же исключение пробрасывается как есть; `message=None` и `[]` пишут WARNING
   и ничего не публикуют
-- [ ] обновить проверки аргументов конструктора хука в `TestConnectionId`
+- [x] обновить проверки аргументов конструктора хука в `TestConnectionId`
   (`tests/test_publish_operator.py:178-192`, вызовы `assert_called_once_with` на `:183` и `:192`)
   под `publisher_confirms=`
-- [ ] прогнать тесты — должны пройти
+- [x] прогнать тесты — должны пройти
 
 ### Task 4: `queue_info` и `__del__`
 

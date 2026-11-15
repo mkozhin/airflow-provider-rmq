@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pika
 import pytest
+from airflow.exceptions import AirflowException
+from pika.adapters.blocking_connection import ReturnedMessage
+from pika.exceptions import ChannelClosedByBroker, NackError, UnroutableError
 
 from airflow_provider_rmq.operators.rmq_publish import RMQPublishOperator
 
@@ -180,7 +184,7 @@ class TestConnectionId:
         MockHook, _ = mock_hook
         op = RMQPublishOperator(task_id="t", exchange="", routing_key="q", message="m")
         op.execute(context={})
-        MockHook.assert_called_once_with(rmq_conn_id="rmq_default")
+        MockHook.assert_called_once_with(rmq_conn_id="rmq_default", publisher_confirms=True)
 
     def test_custom_conn_id(self, mock_hook):
         MockHook, _ = mock_hook
@@ -189,4 +193,175 @@ class TestConnectionId:
             rmq_conn_id="my_rmq",
         )
         op.execute(context={})
-        MockHook.assert_called_once_with(rmq_conn_id="my_rmq")
+        MockHook.assert_called_once_with(rmq_conn_id="my_rmq", publisher_confirms=True)
+
+
+def _returned(reply_code: int = 312, reply_text: str = "NO_ROUTE") -> ReturnedMessage:
+    method = pika.spec.Basic.Return(
+        reply_code=reply_code, reply_text=reply_text, exchange="", routing_key="q",
+    )
+    return ReturnedMessage(method, pika.BasicProperties(), b"body")
+
+
+def _published_mandatory(hook: MagicMock) -> list[bool]:
+    return [c.kwargs["mandatory"] for c in hook.basic_publish.call_args_list]
+
+
+class TestMandatoryResolution:
+    def test_queue_name_is_mandatory(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQPublishOperator(task_id="t", queue_name="q", message="m")
+        op.execute(context={})
+        assert _published_mandatory(hook) == [True]
+
+    def test_default_exchange_is_mandatory(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQPublishOperator(task_id="t", exchange="", routing_key="q", message="m")
+        op.execute(context={})
+        assert _published_mandatory(hook) == [True]
+
+    def test_named_exchange_is_not_mandatory(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQPublishOperator(task_id="t", exchange="ex", routing_key="rk", message="m")
+        op.execute(context={})
+        assert _published_mandatory(hook) == [False]
+
+    def test_templated_exchange_rendered_to_default_is_mandatory(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQPublishOperator(
+            task_id="t", exchange="{{ params.ex }}", routing_key="q", message="m",
+        )
+        op.render_template_fields(context={"params": {"ex": ""}})
+        assert op.exchange == ""
+        op.execute(context={})
+        assert _published_mandatory(hook) == [True]
+
+    def test_templated_exchange_rendered_to_named_is_not_mandatory(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQPublishOperator(
+            task_id="t", exchange="{{ params.ex }}", routing_key="q", message="m",
+        )
+        op.render_template_fields(context={"params": {"ex": "orders"}})
+        op.execute(context={})
+        assert _published_mandatory(hook) == [False]
+
+    def test_explicit_false_wins_on_default_exchange(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQPublishOperator(task_id="t", queue_name="q", message="m", mandatory=False)
+        op.execute(context={})
+        assert _published_mandatory(hook) == [False]
+
+    def test_explicit_true_wins_on_named_exchange(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQPublishOperator(
+            task_id="t", exchange="ex", routing_key="rk", message="m", mandatory=True,
+        )
+        op.execute(context={})
+        assert _published_mandatory(hook) == [True]
+
+    def test_no_confirm_resolves_to_false(self, mock_hook):
+        _, hook = mock_hook
+        op = RMQPublishOperator(task_id="t", queue_name="q", message="m", confirm=False)
+        op.execute(context={})
+        assert _published_mandatory(hook) == [False]
+
+    def test_mandatory_without_confirm_raises(self):
+        with pytest.raises(ValueError, match="mandatory=True requires confirm=True"):
+            RMQPublishOperator(
+                task_id="t", queue_name="q", message="m", confirm=False, mandatory=True,
+            )
+
+    def test_mandatory_false_without_confirm_is_allowed(self):
+        op = RMQPublishOperator(
+            task_id="t", queue_name="q", message="m", confirm=False, mandatory=False,
+        )
+        assert op.mandatory is False
+
+
+class TestPublisherConfirms:
+    def test_hook_created_with_confirms_by_default(self, mock_hook):
+        MockHook, _ = mock_hook
+        op = RMQPublishOperator(task_id="t", queue_name="q", message="m")
+        op.execute(context={})
+        assert MockHook.call_args.kwargs["publisher_confirms"] is True
+
+    def test_hook_created_without_confirms(self, mock_hook):
+        MockHook, _ = mock_hook
+        op = RMQPublishOperator(task_id="t", queue_name="q", message="m", confirm=False)
+        op.execute(context={})
+        assert MockHook.call_args.kwargs["publisher_confirms"] is False
+
+    def test_unroutable_message_fails_task_with_its_number(self, mock_hook):
+        _, hook = mock_hook
+        error = UnroutableError([_returned()])
+        hook.basic_publish.side_effect = [None, None, error, None, None]
+        op = RMQPublishOperator(
+            task_id="t", queue_name="missing", message=["a", "b", "c", "d", "e"],
+        )
+        with pytest.raises(AirflowException) as excinfo:
+            op.execute(context={})
+        text = str(excinfo.value)
+        assert "message 3 of 5" in text
+        assert "exchange=''" in text
+        assert "routing_key='missing'" in text
+        assert "returned by the broker: 312 NO_ROUTE" in text
+        assert excinfo.value.__cause__ is error
+        assert hook.basic_publish.call_count == 3
+
+    def test_nack_fails_task(self, mock_hook):
+        _, hook = mock_hook
+        error = NackError([_returned()])
+        hook.basic_publish.side_effect = error
+        op = RMQPublishOperator(task_id="t", exchange="ex", routing_key="rk", message="m")
+        with pytest.raises(AirflowException, match=r"message 1 of 1 .*rejected by the broker \(nack\)") as excinfo:
+            op.execute(context={})
+        assert excinfo.value.__cause__ is error
+
+    def test_channel_closed_by_broker_fails_task(self, mock_hook):
+        _, hook = mock_hook
+        error = ChannelClosedByBroker(404, "NOT_FOUND - no exchange 'nope' in vhost '/'")
+        hook.basic_publish.side_effect = error
+        op = RMQPublishOperator(task_id="t", exchange="nope", routing_key="rk", message="m")
+        with pytest.raises(AirflowException) as excinfo:
+            op.execute(context={})
+        text = str(excinfo.value)
+        assert "exchange='nope'" in text
+        assert "broker closed the channel: 404 NOT_FOUND - no exchange 'nope'" in text
+        assert excinfo.value.__cause__ is error
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UnroutableError([_returned()]),
+            NackError([]),
+            ChannelClosedByBroker(404, "NOT_FOUND"),
+        ],
+    )
+    def test_without_confirm_exception_is_not_wrapped(self, mock_hook, error):
+        _, hook = mock_hook
+        hook.basic_publish.side_effect = error
+        op = RMQPublishOperator(
+            task_id="t", exchange="ex", routing_key="rk", message="m", confirm=False,
+        )
+        with pytest.raises(type(error)) as excinfo:
+            op.execute(context={})
+        assert excinfo.value is error
+
+    def test_other_exceptions_are_not_wrapped(self, mock_hook):
+        _, hook = mock_hook
+        hook.basic_publish.side_effect = RuntimeError("boom")
+        op = RMQPublishOperator(task_id="t", queue_name="q", message="m")
+        with pytest.raises(RuntimeError, match="boom"):
+            op.execute(context={})
+
+
+class TestEmptyPublish:
+    @pytest.mark.parametrize("message", [None, []])
+    def test_empty_message_warns_and_publishes_nothing(self, mock_hook, caplog, message):
+        MockHook, hook = mock_hook
+        op = RMQPublishOperator(task_id="t", queue_name="q", message=message)
+        with caplog.at_level(logging.WARNING, logger="airflow.task"):
+            op.execute(context={})
+        hook.basic_publish.assert_not_called()
+        MockHook.assert_not_called()
+        assert any("nothing to publish" in r.getMessage() for r in caplog.records)

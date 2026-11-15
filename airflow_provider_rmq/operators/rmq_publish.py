@@ -5,7 +5,9 @@ import logging
 from typing import Any, Sequence
 
 import pika
+from airflow.exceptions import AirflowException
 from airflow.models import BaseOperator
+from pika.exceptions import ChannelClosedByBroker, NackError, UnroutableError
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
 
@@ -19,6 +21,11 @@ class RMQPublishOperator(BaseOperator):
     (via default exchange with routing_key=queue_name).
 
     Messages can be strings, dicts (auto-serialized to JSON), or lists thereof.
+
+    With ``confirm=True`` every message waits for the broker acknowledgement, and the
+    task fails when the broker returns, rejects or cannot accept a message. Messages
+    published before the failing one stay in the broker, so a retry publishes them again
+    (at-least-once).
     """
 
     template_fields: Sequence[str] = ("exchange", "routing_key", "message")
@@ -40,6 +47,8 @@ class RMQPublishOperator(BaseOperator):
         correlation_id: str | None = None,
         reply_to: str | None = None,
         message_id: str | None = None,
+        confirm: bool = True,
+        mandatory: bool | None = None,
         **kwargs,
     ):
         """Create a new RMQPublishOperator.
@@ -70,8 +79,22 @@ class RMQPublishOperator(BaseOperator):
         :type reply_to: str | None
         :param message_id: Application message identifier.
         :type message_id: str | None
+        :param confirm: Publish with publisher confirms: wait for the broker to acknowledge
+            each message and fail the task on a returned, rejected or refused message.
+        :type confirm: bool
+        :param mandatory: Ask the broker to return a message that no queue matches.
+            ``None`` resolves at execution, after templates are rendered: ``True`` for the
+            default exchange (``exchange=""`` or ``queue_name=``) with ``confirm=True``,
+            ``False`` otherwise. ``True`` requires ``confirm=True``.
+        :type mandatory: bool | None
+        :raises ValueError: If ``mandatory=True`` is combined with ``confirm=False``.
         """
         super().__init__(**kwargs)
+        if mandatory and not confirm:
+            raise ValueError(
+                "mandatory=True requires confirm=True: without publisher confirms "
+                "a returned message is not reported to the task"
+            )
         self.rmq_conn_id = rmq_conn_id
         if queue_name:
             self.exchange = ""
@@ -88,6 +111,8 @@ class RMQPublishOperator(BaseOperator):
         self.correlation_id = correlation_id
         self.reply_to = reply_to
         self.message_id = message_id
+        self.confirm = confirm
+        self.mandatory = mandatory
 
     def execute(self, context: Any) -> None:
         properties = pika.BasicProperties(
@@ -102,20 +127,85 @@ class RMQPublishOperator(BaseOperator):
         )
 
         messages = self._normalize_messages()
+        if not messages:
+            log.warning(
+                "Message is empty, nothing to publish to exchange='%s' routing_key='%s'",
+                self.exchange,
+                self.routing_key,
+            )
+            return
 
-        with RMQHook(rmq_conn_id=self.rmq_conn_id) as hook:
-            for msg in messages:
-                hook.basic_publish(
-                    exchange=self.exchange,
-                    routing_key=self.routing_key,
-                    body=msg,
-                    properties=properties,
-                )
+        mandatory = self._resolve_mandatory()
+        total = len(messages)
+
+        with RMQHook(rmq_conn_id=self.rmq_conn_id, publisher_confirms=self.confirm) as hook:
+            for number, msg in enumerate(messages, start=1):
+                try:
+                    hook.basic_publish(
+                        exchange=self.exchange,
+                        routing_key=self.routing_key,
+                        body=msg,
+                        properties=properties,
+                        mandatory=mandatory,
+                    )
+                except (UnroutableError, NackError, ChannelClosedByBroker) as exc:
+                    if not self.confirm:
+                        raise
+                    raise AirflowException(self._failure_text(number, total, exc)) from exc
                 log.info(
                     "Published message to exchange='%s' routing_key='%s'",
                     self.exchange,
                     self.routing_key,
                 )
+
+    def _resolve_mandatory(self) -> bool:
+        """Return the ``mandatory`` flag for the rendered exchange.
+
+        An explicit value wins. Otherwise publishing to the default exchange with
+        confirms is mandatory: a message to a missing queue there is always lost.
+
+        :return: Value passed as ``mandatory`` to every publish.
+        :rtype: bool
+        """
+        if self.mandatory is not None:
+            return bool(self.mandatory)
+        return self.confirm and self.exchange == ""
+
+    def _failure_text(
+        self,
+        number: int,
+        total: int,
+        exc: UnroutableError | NackError | ChannelClosedByBroker,
+    ) -> str:
+        """Describe a publish the broker did not accept.
+
+        :param number: One-based number of the failed message.
+        :type number: int
+        :param total: Number of messages in the batch.
+        :type total: int
+        :param exc: Exception raised by pika for this message.
+        :type exc: UnroutableError | NackError | ChannelClosedByBroker
+        :return: Text for the task failure.
+        :rtype: str
+        """
+        target = (
+            f"message {number} of {total} to exchange='{self.exchange}' "
+            f"routing_key='{self.routing_key}'"
+        )
+        if isinstance(exc, UnroutableError):
+            if exc.messages:
+                method = exc.messages[0].method
+                return (
+                    f"{target} was returned by the broker: "
+                    f"{method.reply_code} {method.reply_text}"
+                )
+            return f"{target} was returned by the broker"
+        if isinstance(exc, NackError):
+            return f"{target} was rejected by the broker (nack)"
+        return (
+            f"{target} was not published, broker closed the channel: "
+            f"{exc.reply_code} {exc.reply_text}"
+        )
 
     def _normalize_messages(self) -> list[str]:
         """Convert message input to a list of string payloads.
