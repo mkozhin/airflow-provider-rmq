@@ -52,6 +52,38 @@ DEFAULT_SYNC_HEARTBEAT = 600
 #: Seconds a connection blocked by the broker may stay blocked before pika drops it.
 DEFAULT_BLOCKED_CONNECTION_TIMEOUT = 300
 
+#: RabbitMQ's AMQP 0-9-1 conformance notes; the ``basic.qos`` row states that prefetch
+#: size limits are not implemented.
+RABBITMQ_SPECIFICATION_URL = "https://www.rabbitmq.com/docs/specification"
+
+
+def validate_qos(qos: dict | None) -> None:
+    """Reject QoS settings that RabbitMQ does not accept.
+
+    The setting the broker honours is ``prefetch_count``: the number of unacknowledged
+    messages delivered to a consumer. ``prefetch_size`` other than ``0`` raises
+    ``ValueError``: RabbitMQ does not implement prefetch size limits and closes the
+    connection with ``540 NOT_IMPLEMENTED`` (see :data:`RABBITMQ_SPECIFICATION_URL`).
+    ``global_qos`` is accepted and never sent to the broker: per-channel prefetch is the
+    deprecated RabbitMQ feature ``global_qos``, denied by default since RabbitMQ 4.3.
+    ``None``, an empty dict and other keys pass unchecked. The function writes nothing
+    to the log.
+
+    :param qos: QoS settings dict.
+    :type qos: dict | None
+    :raises ValueError: ``prefetch_size`` is not ``0``.
+    """
+    if not qos:
+        return
+    prefetch_size = qos.get("prefetch_size", 0)
+    if prefetch_size != 0:
+        raise ValueError(
+            f"qos prefetch_size={prefetch_size!r} is not supported: RabbitMQ does not "
+            "implement prefetch size limits and closes the connection with "
+            f"540 NOT_IMPLEMENTED ({RABBITMQ_SPECIFICATION_URL}). Use prefetch_count "
+            "to limit unacknowledged messages and leave prefetch_size at 0."
+        )
+
 
 class RMQHook(BaseHook):
     """Hook for interacting with RabbitMQ via pika BlockingConnection.
@@ -135,7 +167,10 @@ class RMQHook(BaseHook):
         :type rmq_conn_id: str
         :param vhost: Override the virtual host from the connection.
         :type vhost: str | None
-        :param qos: QoS settings dict with keys ``prefetch_size``, ``prefetch_count``, ``global_qos``.
+        :param qos: QoS settings dict with the key ``prefetch_count`` — the number of
+            unacknowledged messages delivered to a consumer. A true ``global_qos`` is not
+            sent to the broker and the hook logs a WARNING; ``prefetch_size`` other than
+            ``0`` raises ``ValueError`` (see :func:`validate_qos`).
         :type qos: dict | None
         :param retry_count: Number of connection retry attempts.
         :type retry_count: int
@@ -146,6 +181,14 @@ class RMQHook(BaseHook):
         :type publisher_confirms: bool
         """
         super().__init__()
+        validate_qos(qos)
+        if qos and bool(qos.get("global_qos")):
+            log.warning(
+                "qos global_qos=%r is not sent to the broker: per-channel prefetch is the "
+                "deprecated RabbitMQ feature 'global_qos', denied by default since RabbitMQ "
+                "4.3. prefetch_count applies to each consumer.",
+                qos.get("global_qos"),
+            )
         self.rmq_conn_id = rmq_conn_id
         self._vhost_override = vhost
         self._qos = qos
@@ -237,11 +280,7 @@ class RMQHook(BaseHook):
             # open without confirms would publish without waiting for the broker.
             try:
                 if self._qos:
-                    channel.basic_qos(
-                        prefetch_size=self._qos.get("prefetch_size", 0),
-                        prefetch_count=self._qos.get("prefetch_count", 0),
-                        global_qos=self._qos.get("global_qos", False),
-                    )
+                    channel.basic_qos(prefetch_count=self._qos.get("prefetch_count", 0))
                 if self._publisher_confirms:
                     channel.confirm_delivery()
             except BaseException:

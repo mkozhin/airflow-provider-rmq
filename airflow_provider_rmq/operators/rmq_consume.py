@@ -6,7 +6,7 @@ from typing import Any, Callable, Sequence
 import pika.exceptions
 from airflow.models import BaseOperator
 
-from airflow_provider_rmq.hooks.rmq import RMQHook
+from airflow_provider_rmq.hooks.rmq import RMQHook, validate_qos
 from airflow_provider_rmq.utils.amqp import FilterMissState, handle_miss_sync
 from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
@@ -52,7 +52,11 @@ class RMQConsumeOperator(BaseOperator):
         :type filter_headers: dict[str, Any] | None
         :param filter_callable: Callable ``(properties, body) -> bool`` for custom filtering.
         :type filter_callable: Callable[[Any, str], bool] | None
-        :param qos: QoS settings dict (``prefetch_size``, ``prefetch_count``, ``global_qos``).
+        :param qos: QoS settings dict with the key ``prefetch_count`` — the number of
+            unacknowledged messages delivered to the consumer. ``prefetch_size`` other
+            than ``0`` raises ``ValueError`` when the operator is created; a true
+            ``global_qos`` is not sent to the broker (see
+            :func:`~airflow_provider_rmq.hooks.rmq.validate_qos`).
         :type qos: dict | None
         :param ack_unmatched: What to do with a message the filter rejected. ``False``
             (default) returns it to the queue. ``True`` acknowledges it instead: the
@@ -72,6 +76,7 @@ class RMQConsumeOperator(BaseOperator):
 
         if not isinstance(ack_unmatched, bool):
             raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
+        validate_qos(qos)
 
     def execute(self, context: Any) -> list[dict[str, Any]]:
         msg_filter = MessageFilter(

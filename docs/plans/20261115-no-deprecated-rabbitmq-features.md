@@ -180,17 +180,17 @@
 - Modify: `tests/test_hook.py`
 - Modify: `tests/test_consume_operator.py`
 
-- [ ] функция разбора `qos` в `hooks/rmq.py`; `RMQHook.__init__` и `RMQConsumeOperator.__init__`
+- [x] функция разбора `qos` в `hooks/rmq.py`; `RMQHook.__init__` и `RMQConsumeOperator.__init__`
   её вызывают
-- [ ] `prefetch_size != 0` — `ValueError` со ссылкой на источник (в хуке и в операторе);
+- [x] `prefetch_size != 0` — `ValueError` со ссылкой на источник (в хуке и в операторе);
   истинный `global_qos` брокеру не передаётся, WARNING — только в `RMQHook.__init__`
-- [ ] `get_channel` вызывает `basic_qos` только с `prefetch_count`
-- [ ] docstring'и `qos` у хука и оператора перечисляют только `prefetch_count`
-- [ ] тесты: WARNING на `global_qos` `True`, `1`, `"true"` при создании хука, и `basic_qos` без
+- [x] `get_channel` вызывает `basic_qos` только с `prefetch_count`
+- [x] docstring'и `qos` у хука и оператора перечисляют только `prefetch_count`
+- [x] тесты: WARNING на `global_qos` `True`, `1`, `"true"` при создании хука, и `basic_qos` без
   `global_qos`; создание оператора с `global_qos=True` WARNING не пишет; `global_qos=False` и
   отсутствие ключа — без WARNING; `prefetch_size` `1` — `ValueError` в хуке и операторе;
   `prefetch_size=0` проходит; `qos=None` и `{}` проходят
-- [ ] прогнать тесты — должны пройти
+- [x] прогнать тесты — должны пройти
 
 ### Task 4: Integration-тест объявлений и QoS на живом брокере
 

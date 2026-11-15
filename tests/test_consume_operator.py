@@ -211,6 +211,33 @@ class TestConnectionId:
         op.execute(context={})
         MockHook.assert_called_once_with(rmq_conn_id="custom", qos=qos)
 
+
+class TestQos:
+    def test_nonzero_prefetch_size_rejected_at_creation(self, mock_hook):
+        MockHook, _ = mock_hook
+        with pytest.raises(ValueError, match="prefetch_size=1"):
+            RMQConsumeOperator(
+                task_id="t", queue_name="q", qos={"prefetch_size": 1, "prefetch_count": 5},
+            )
+        MockHook.assert_not_called()
+
+    def test_zero_prefetch_size_accepted(self, mock_hook):
+        op = RMQConsumeOperator(
+            task_id="t", queue_name="q", qos={"prefetch_size": 0, "prefetch_count": 5},
+        )
+        assert op.qos == {"prefetch_size": 0, "prefetch_count": 5}
+
+    @pytest.mark.parametrize("qos", [None, {}])
+    def test_empty_qos_accepted(self, qos, mock_hook):
+        assert RMQConsumeOperator(task_id="t", queue_name="q", qos=qos).qos == qos
+
+    def test_global_qos_kept_as_passed_without_warning(self, caplog, mock_hook):
+        qos = {"prefetch_count": 5, "global_qos": True}
+        with caplog.at_level(logging.DEBUG):
+            op = RMQConsumeOperator(task_id="t", queue_name="q", qos=qos)
+        assert op.qos == qos
+        assert not [r for r in caplog.records if "global_qos" in r.getMessage()]
+
 # ---------------------------------------------------------------------------
 # ack_unmatched
 # ---------------------------------------------------------------------------

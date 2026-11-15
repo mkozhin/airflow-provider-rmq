@@ -16,7 +16,9 @@ from airflow_provider_rmq.hooks.rmq import (
     DEFAULT_BLOCKED_CONNECTION_TIMEOUT,
     DEFAULT_SYNC_HEARTBEAT,
     PIKA_RETURNED_MESSAGE_LOG_PREFIX,
+    RABBITMQ_SPECIFICATION_URL,
     RMQHook,
+    validate_qos,
 )
 from tests.conftest import FakeAirflowConnection, make_message
 
@@ -317,6 +319,99 @@ class TestPublisherConfirms:
         mock_connection.close.assert_called_once_with()
         assert hook._connection is None
         assert hook._channel is None
+
+
+class TestQos:
+    @staticmethod
+    def _global_qos_warnings(caplog):
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "global_qos" in r.getMessage()
+        ]
+
+    @staticmethod
+    def _open_channel(qos, fake_connection, mock_connection):
+        with (
+            patch.object(RMQHook, "get_connection", return_value=fake_connection),
+            patch(f"{HOOK_MODULE}.pika.BlockingConnection", return_value=mock_connection),
+        ):
+            hook = RMQHook(qos=qos)
+            hook.get_channel()
+            hook._connection = None
+            hook._channel = None
+
+    def test_basic_qos_gets_prefetch_count_only(
+        self, fake_connection, mock_connection, mock_channel,
+    ):
+        self._open_channel({"prefetch_count": 10}, fake_connection, mock_connection)
+        mock_channel.basic_qos.assert_called_once_with(prefetch_count=10)
+
+    @pytest.mark.parametrize("value", [True, 1, "true"])
+    def test_true_global_qos_warns_and_is_not_sent(
+        self, value, caplog, fake_connection, mock_connection, mock_channel,
+    ):
+        qos = {"prefetch_count": 5, "global_qos": value}
+        with caplog.at_level(logging.WARNING, logger="airflow.task"):
+            hook = RMQHook(qos=qos)
+        warnings = self._global_qos_warnings(caplog)
+        assert len(warnings) == 1
+        text = warnings[0].getMessage()
+        assert "not sent to the broker" in text
+        assert "deprecated" in text
+        assert "4.3" in text
+        assert hook._qos == qos
+
+        self._open_channel(qos, fake_connection, mock_connection)
+        mock_channel.basic_qos.assert_called_once_with(prefetch_count=5)
+
+    @pytest.mark.parametrize(
+        "qos", [{"prefetch_count": 5, "global_qos": False}, {"prefetch_count": 5}, None, {}],
+    )
+    def test_no_warning_without_true_global_qos(self, qos, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow.task"):
+            RMQHook(qos=qos)
+        assert self._global_qos_warnings(caplog) == []
+
+    def test_warning_not_repeated_on_channel_open(
+        self, caplog, fake_connection, mock_connection,
+    ):
+        with caplog.at_level(logging.WARNING, logger="airflow.task"):
+            self._open_channel({"global_qos": True}, fake_connection, mock_connection)
+        assert len(self._global_qos_warnings(caplog)) == 1
+
+    def test_no_basic_qos_without_qos(self, fake_connection, mock_connection, mock_channel):
+        self._open_channel(None, fake_connection, mock_connection)
+        mock_channel.basic_qos.assert_not_called()
+
+    def test_nonzero_prefetch_size_rejected_by_hook(self):
+        with pytest.raises(ValueError, match="prefetch_size=1") as exc:
+            RMQHook(qos={"prefetch_size": 1, "prefetch_count": 5})
+        text = str(exc.value)
+        assert "540 NOT_IMPLEMENTED" in text
+        assert RABBITMQ_SPECIFICATION_URL in text
+        assert "prefetch_count" in text
+
+    def test_zero_prefetch_size_accepted(
+        self, fake_connection, mock_connection, mock_channel,
+    ):
+        self._open_channel(
+            {"prefetch_size": 0, "prefetch_count": 3}, fake_connection, mock_connection,
+        )
+        mock_channel.basic_qos.assert_called_once_with(prefetch_count=3)
+
+    @pytest.mark.parametrize(
+        "qos",
+        [None, {}, {"prefetch_count": 1}, {"prefetch_size": 0}, {"global_qos": True},
+         {"unknown_key": "x"}],
+    )
+    def test_validate_qos_accepts(self, qos, caplog):
+        with caplog.at_level(logging.DEBUG):
+            validate_qos(qos)
+        assert caplog.records == []
+
+    def test_validate_qos_rejects_prefetch_size(self):
+        with pytest.raises(ValueError, match="prefetch_size"):
+            validate_qos({"prefetch_size": 1})
 
 
 class TestReturnedMessageLog:
