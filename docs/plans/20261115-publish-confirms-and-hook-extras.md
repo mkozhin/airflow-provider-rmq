@@ -232,11 +232,11 @@
   каталога
 
 ### Task 6: Verify acceptance criteria
-- [ ] все требования из Overview реализованы
-- [ ] изменены ожидания только у `test_queue_info_nonexistent` и у проверок аргументов хука в
+- [x] все требования из Overview реализованы
+- [x] изменены ожидания только у `test_queue_info_nonexistent` и у проверок аргументов хука в
   тестах оператора; остальные существующие тесты проходят без правок
-- [ ] полный прогон: `.venv/bin/pytest tests/ -q`
-- [ ] `ruff check` и `mypy` по изменённым файлам не дают новых замечаний относительно `main`
+- [x] полный прогон: `.venv/bin/pytest tests/ -q`
+- [x] `ruff check` и `mypy` по изменённым файлам не дают новых замечаний относительно `main`
 
 ### Task 7: [Final] Документация и бэклог
 - [ ] `readme.md` и `readme_ru.md`, раздел `RMQHook`: `publisher_confirms` в таблице параметров,

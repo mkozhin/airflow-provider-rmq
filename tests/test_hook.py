@@ -203,13 +203,15 @@ class TestPublisherConfirms:
         mock_ch.confirm_delivery.assert_called_once_with()
 
     def test_flag_set_through_constructor(self, fake_connection, mock_connection, mock_channel):
-        with patch.object(RMQHook, "get_connection", return_value=fake_connection):
-            with patch(f"{HOOK_MODULE}.pika.BlockingConnection", return_value=mock_connection):
-                hook = RMQHook(publisher_confirms=True)
-                hook.get_channel()
-                mock_channel.confirm_delivery.assert_called_once_with()
-                hook._connection = None
-                hook._channel = None
+        with (
+            patch.object(RMQHook, "get_connection", return_value=fake_connection),
+            patch(f"{HOOK_MODULE}.pika.BlockingConnection", return_value=mock_connection),
+        ):
+            hook = RMQHook(publisher_confirms=True)
+            hook.get_channel()
+            mock_channel.confirm_delivery.assert_called_once_with()
+            hook._connection = None
+            hook._channel = None
 
     def test_confirm_delivery_not_called_without_flag(self, hook_with_mocks):
         hook, _, mock_ch = hook_with_mocks
