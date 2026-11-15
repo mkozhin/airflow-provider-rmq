@@ -21,6 +21,8 @@ AMQPS_PORT = 5671
 #: surfaces as an exception in about ``3 * DEFAULT_HEARTBEAT`` seconds — some 90 s at
 #: the default — and ``connect_robust`` reconnects.
 DEFAULT_HEARTBEAT = 30
+#: Longest heartbeat AMQP can carry: ``Connection.Tune`` holds it in an unsigned short.
+MAX_HEARTBEAT = 65535
 #: Seconds allowed for establishing an AMQP connection.
 DEFAULT_CONNECT_TIMEOUT = 15
 #: Seconds allowed for a single AMQP RPC: ``channel()``, declare, bind, publish.
@@ -97,7 +99,8 @@ def _read_heartbeat(extras: dict[str, Any], default: int = DEFAULT_HEARTBEAT) ->
 
     ``0`` is accepted as a deliberate opt-out and logged as a WARNING, because it
     turns off broken-link detection entirely. A missing key uses ``default``; unusable
-    values fall back to ``default`` with a WARNING.
+    values, including one above :data:`MAX_HEARTBEAT`, fall back to ``default`` with a
+    WARNING.
 
     The interval is read as a number and only then made whole, so that a value between
     zero and one second falls back rather than truncating to zero: an interval too short
@@ -112,6 +115,12 @@ def _read_heartbeat(extras: dict[str, Any], default: int = DEFAULT_HEARTBEAT) ->
         )
         return default
     value = int(value)
+    if value > MAX_HEARTBEAT:
+        log.warning(
+            "RMQ connection extra %r=%r is above the AMQP limit of %s seconds, using %s",
+            HEARTBEAT_KEY, value, MAX_HEARTBEAT, default,
+        )
+        return default
     if value == 0:
         log.warning(
             "RMQ connection extra %r=0 turns off the AMQP heartbeat: a broken link stays "

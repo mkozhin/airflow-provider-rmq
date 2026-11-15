@@ -18,11 +18,15 @@ HOOK_PATH = "airflow_provider_rmq.operators.rmq_publish.RMQHook"
 
 @pytest.fixture
 def mock_hook():
-    """Return a mocked RMQHook used as context manager."""
-    with patch(HOOK_PATH) as MockHook:
-        hook_instance = MagicMock()
-        MockHook.return_value.__enter__ = MagicMock(return_value=hook_instance)
-        MockHook.return_value.__exit__ = MagicMock(return_value=False)
+    """Return a mocked RMQHook used as context manager.
+
+    The mock follows ``RMQHook``'s signatures, so a keyword the hook does not accept
+    fails the test.
+    """
+    with patch(HOOK_PATH, autospec=True) as MockHook:
+        hook_instance = MockHook.return_value
+        hook_instance.__enter__.return_value = hook_instance
+        hook_instance.__exit__.return_value = False
         yield MockHook, hook_instance
 
 
@@ -307,10 +311,11 @@ class TestPublisherConfirms:
         assert "returned by the broker: 312 NO_ROUTE" in text
         assert excinfo.value.__cause__ is error
         assert hook.basic_publish.call_count == 3
+        assert _published_mandatory(hook) == [True, True, True]
 
     def test_nack_fails_task(self, mock_hook):
         _, hook = mock_hook
-        error = NackError([_returned()])
+        error = NackError([])
         hook.basic_publish.side_effect = error
         op = RMQPublishOperator(task_id="t", exchange="ex", routing_key="rk", message="m")
         with pytest.raises(AirflowException, match=r"message 1 of 1 .*rejected by the broker \(nack\)") as excinfo:
@@ -329,21 +334,14 @@ class TestPublisherConfirms:
         assert "broker closed the channel: 404 NOT_FOUND - no exchange 'nope'" in text
         assert excinfo.value.__cause__ is error
 
-    @pytest.mark.parametrize(
-        "error",
-        [
-            UnroutableError([_returned()]),
-            NackError([]),
-            ChannelClosedByBroker(404, "NOT_FOUND"),
-        ],
-    )
-    def test_without_confirm_exception_is_not_wrapped(self, mock_hook, error):
+    def test_without_confirm_channel_close_is_not_wrapped(self, mock_hook):
         _, hook = mock_hook
+        error = ChannelClosedByBroker(404, "NOT_FOUND")
         hook.basic_publish.side_effect = error
         op = RMQPublishOperator(
             task_id="t", exchange="ex", routing_key="rk", message="m", confirm=False,
         )
-        with pytest.raises(type(error)) as excinfo:
+        with pytest.raises(ChannelClosedByBroker) as excinfo:
             op.execute(context={})
         assert excinfo.value is error
 

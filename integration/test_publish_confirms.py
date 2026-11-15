@@ -3,7 +3,8 @@
 The unit suite proves how the operator turns pika exceptions into task failures;
 these tests prove the broker raises them where a message would otherwise be lost:
 a queue that does not exist, a binding that does not exist, an exchange that does
-not exist, and a queue that refuses the message.
+not exist, and a queue that refuses the message. One test drives ``RMQHook`` directly
+to prove that the channel it reopens after the broker closed one is in confirms mode.
 
 Every queue here is declared through the ``scratch`` fixture, so it carries the run's
 prefix and is deleted in teardown. The tests that need a missing queue or a missing
@@ -19,6 +20,7 @@ import pytest
 from airflow.exceptions import AirflowException
 from pika.exceptions import ChannelClosedByBroker, NackError, UnroutableError
 
+from airflow_provider_rmq.hooks.rmq import RMQHook
 from airflow_provider_rmq.operators.rmq_publish import RMQPublishOperator
 
 from .conftest import BrokerScratch
@@ -108,7 +110,9 @@ def test_publish_to_a_missing_exchange_fails_with_not_found(
         routing_key="any",
         message="lost",
     )
-    with pytest.raises(AirflowException, match="404") as excinfo:
+    with pytest.raises(
+        AirflowException, match=r"broker closed the channel: 404 NOT_FOUND"
+    ) as excinfo:
         operator.execute({})
 
     assert "message 1 of 1" in str(excinfo.value)
@@ -135,3 +139,27 @@ def test_publish_to_a_queue_that_rejects_fails_with_nack(
 
     assert isinstance(excinfo.value.__cause__, NackError)
     assert scratch.depth(name) == 0
+
+
+def test_channel_reopened_after_not_found_is_in_confirms_mode(
+    scratch: BrokerScratch, rmq_conn_id: str
+) -> None:
+    """After a 404 closes the channel, the hook's next channel still waits for confirms.
+
+    The unrouted publish on the reopened channel raises ``UnroutableError`` only when
+    that channel is in confirms mode; without confirms it would return silently.
+    """
+    with RMQHook(rmq_conn_id=rmq_conn_id, publisher_confirms=True) as hook:
+        with pytest.raises(ChannelClosedByBroker) as excinfo:
+            hook.basic_publish(
+                exchange=scratch.name("no-such-exchange"), routing_key="any", body="lost"
+            )
+        assert excinfo.value.reply_code == 404
+
+        with pytest.raises(UnroutableError):
+            hook.basic_publish(
+                exchange="",
+                routing_key=scratch.name("no-such-queue"),
+                body="lost",
+                mandatory=True,
+            )

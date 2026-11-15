@@ -91,7 +91,16 @@ class TestConnectionParams:
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
             params = self._params_for({"heartbeat": raw})
         assert params.heartbeat == 600
-        assert any("heartbeat" in r.getMessage() for r in caplog.records)
+        assert any(
+            "heartbeat" in r.getMessage() and "using 600" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_heartbeat_above_amqp_limit_falls_back_to_sync_default(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            params = self._params_for({"heartbeat": 100000})
+        assert params.heartbeat == 600
+        assert any("AMQP limit" in r.getMessage() for r in caplog.records)
 
     def test_zero_heartbeat_is_kept_with_warning(self, caplog):
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
@@ -114,6 +123,34 @@ class TestConnectionParams:
         assert params.heartbeat is None
         assert params.blocked_connection_timeout is None
         assert not caplog.records
+
+    def test_null_heartbeat_keeps_default_blocked_connection_timeout(self):
+        params = self._params_for({"heartbeat": None})
+        assert params.heartbeat is None
+        assert params.blocked_connection_timeout == 300
+
+    def test_null_blocked_connection_timeout_keeps_default_heartbeat(self):
+        params = self._params_for({"blocked_connection_timeout": None})
+        assert params.blocked_connection_timeout is None
+        assert params.heartbeat == 600
+
+    def test_zero_blocked_connection_timeout_is_kept_with_warning(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow.task"):
+            params = self._params_for({"blocked_connection_timeout": 0})
+        assert params.blocked_connection_timeout == 0
+        assert any(
+            "drops the connection as soon as the broker blocks it" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_negative_blocked_connection_timeout_falls_back_to_default(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            params = self._params_for({"blocked_connection_timeout": -1})
+        assert params.blocked_connection_timeout == 300
+        assert any(
+            "blocked_connection_timeout" in r.getMessage() and "using 300" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_blocked_connection_timeout_as_string_is_read_as_float(self):
         params = self._params_for({"blocked_connection_timeout": "120"})
@@ -239,6 +276,55 @@ class TestPublisherConfirms:
         assert hook.get_channel() is second_ch
         first_ch.confirm_delivery.assert_called_once_with()
         second_ch.confirm_delivery.assert_called_once_with()
+
+    def test_channel_failing_confirm_is_closed_and_not_cached(self, hook_with_mocks):
+        hook, mock_conn, first_ch = hook_with_mocks
+        hook._publisher_confirms = True
+        first_ch.confirm_delivery.side_effect = TimeoutError("no Confirm.SelectOk")
+
+        with pytest.raises(TimeoutError):
+            hook.get_channel()
+        assert hook._channel is None
+        first_ch.close.assert_called_once_with()
+
+        second_ch = MagicMock()
+        type(second_ch).is_closed = PropertyMock(return_value=False)
+        mock_conn.channel.return_value = second_ch
+        assert hook.get_channel() is second_ch
+        second_ch.confirm_delivery.assert_called_once_with()
+
+    def test_failure_in_enter_closes_connection(
+        self, fake_connection, mock_connection, mock_channel
+    ):
+        mock_channel.confirm_delivery.side_effect = TimeoutError("no Confirm.SelectOk")
+        with (
+            patch.object(RMQHook, "get_connection", return_value=fake_connection),
+            patch(f"{HOOK_MODULE}.pika.BlockingConnection", return_value=mock_connection),
+        ):
+            hook = RMQHook(publisher_confirms=True)
+            with pytest.raises(TimeoutError), hook:
+                pass
+        mock_connection.close.assert_called_once_with()
+        assert hook._connection is None
+        assert hook._channel is None
+
+
+class TestReturnedMessageLog:
+    LOGGER = "pika.adapters.blocking_connection"
+
+    def test_returned_message_record_is_dropped(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            logging.getLogger(self.LOGGER).warning(
+                "Published message was returned: _delivery_confirmation=%s; "
+                "properties=%r; body_prefix=%.255r",
+                True, {"headers": {"token": "secret"}}, b"secret body",
+            )
+        assert not caplog.records
+
+    def test_other_pika_warnings_pass(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            logging.getLogger(self.LOGGER).warning("Message was Nack'ed by broker")
+        assert [r.getMessage() for r in caplog.records] == ["Message was Nack'ed by broker"]
 
 
 # ---------------------------------------------------------------------------

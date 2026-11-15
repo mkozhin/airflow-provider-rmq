@@ -22,10 +22,30 @@ log = logging.getLogger("airflow.task")
 # Only warnings and errors from pika will be shown.
 logging.getLogger("pika").setLevel(logging.WARNING)
 
+
+class _DropReturnedMessageRecords(logging.Filter):
+    """Drop pika's WARNING about a message the broker returned.
+
+    That record carries the returned message's full properties (headers,
+    ``correlation_id``, ``reply_to``, ``message_id``) and the start of its body, and
+    either may hold credentials or personal data. A return still reaches the caller as
+    ``UnroutableError`` with the reply code.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not str(record.msg).startswith("Published message was returned")
+
+
+logging.getLogger("pika.adapters.blocking_connection").addFilter(_DropReturnedMessageRecords())
+
 #: Heartbeat interval in seconds for the blocking connection. ``BlockingConnection``
 #: services heartbeats only inside pika calls, so a short interval drops the link of a
 #: task that works for more than about a minute between calls.
 SYNC_DEFAULT_HEARTBEAT = 600
+
+#: ``extra`` key for the seconds a connection blocked by the broker may stay blocked.
+BLOCKED_CONNECTION_TIMEOUT_KEY = "blocked_connection_timeout"
+DEFAULT_BLOCKED_CONNECTION_TIMEOUT = 300
 
 
 class RMQHook(BaseHook):
@@ -36,6 +56,8 @@ class RMQHook(BaseHook):
     - SSL/TLS support (configured via Airflow connection extras)
     - Retry/reconnect logic (tenacity with configurable retry_count/retry_delay)
     - Dead Letter Queue helper (build_dlq_arguments)
+    - Publisher confirms (publisher_confirms) and mandatory publishing
+      (basic_publish(mandatory=...))
     - Context manager support
     - QoS configuration
     """
@@ -156,15 +178,26 @@ class RMQHook(BaseHook):
         # broker's proposal, and a blocked connection waits without a deadline.
         heartbeat = (
             None
-            if HEARTBEAT_KEY in extras and extras[HEARTBEAT_KEY] is None
+            if extras.get(HEARTBEAT_KEY, 0) is None
             else _read_heartbeat(extras, default=SYNC_DEFAULT_HEARTBEAT)
         )
         blocked_connection_timeout = (
             None
-            if "blocked_connection_timeout" in extras
-            and extras["blocked_connection_timeout"] is None
-            else _read_number(extras, "blocked_connection_timeout", 300, float, 0)
+            if extras.get(BLOCKED_CONNECTION_TIMEOUT_KEY, 0) is None
+            else _read_number(
+                extras,
+                BLOCKED_CONNECTION_TIMEOUT_KEY,
+                DEFAULT_BLOCKED_CONNECTION_TIMEOUT,
+                float,
+                0,
+            )
         )
+        if blocked_connection_timeout == 0:
+            log.warning(
+                "RMQ connection extra %r=0 drops the connection as soon as the broker "
+                "blocks it; null waits without a deadline",
+                BLOCKED_CONNECTION_TIMEOUT_KEY,
+            )
 
         return pika.ConnectionParameters(
             host=conn.host or "localhost",
@@ -201,21 +234,37 @@ class RMQHook(BaseHook):
             self._connection = self._establish_connection()
             self._channel = None
         if self._channel is None or self._channel.is_closed:
-            self._channel = self._connection.channel()
-            if self._qos:
-                self._channel.basic_qos(
-                    prefetch_size=self._qos.get("prefetch_size", 0),
-                    prefetch_count=self._qos.get("prefetch_count", 0),
-                    global_qos=self._qos.get("global_qos", False),
-                )
-            if self._publisher_confirms:
-                self._channel.confirm_delivery()
+            self._channel = None
+            channel = self._connection.channel()
+            # The channel is handed out only once it is fully set up: a channel left
+            # open without confirms would publish without waiting for the broker.
+            try:
+                if self._qos:
+                    channel.basic_qos(
+                        prefetch_size=self._qos.get("prefetch_size", 0),
+                        prefetch_count=self._qos.get("prefetch_count", 0),
+                        global_qos=self._qos.get("global_qos", False),
+                    )
+                if self._publisher_confirms:
+                    channel.confirm_delivery()
+            except BaseException:
+                if channel.is_open:
+                    try:
+                        channel.close()
+                    except Exception:
+                        log.warning("Error closing RabbitMQ channel", exc_info=True)
+                raise
+            self._channel = channel
         return self._channel
 
     # --- Context manager ---
 
     def __enter__(self) -> RMQHook:
-        self.get_channel()
+        try:
+            self.get_channel()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

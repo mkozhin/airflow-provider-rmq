@@ -116,10 +116,10 @@ Four optional **Extra** keys control AMQP timing. All of them are plain JSON val
 
 | Key | Default | Used by | Meaning |
 |---|---|---|---|
-| `heartbeat` | `30` on the async path, `600` in `RMQHook` | every AMQP connection | Seconds between AMQP heartbeat frames. `aiormq` allows three missed intervals and checks every half-interval, so a broken connection becomes an exception in roughly `3 × heartbeat` seconds — about 90 s at the default — and `connect_robust` reconnects |
+| `heartbeat` | `30` on the async path, `600` in `RMQHook` | every AMQP connection | Seconds between AMQP heartbeat frames. On the async path `aiormq` allows three missed intervals and checks every half-interval, so a broken connection becomes an exception in roughly `3 × heartbeat` seconds — about 90 s at the default — and `connect_robust` reconnects |
 | `connect_timeout` | `15` | RMQ Watcher | Seconds allowed for establishing an async connection |
 | `rpc_timeout` | `30` | RMQ Watcher | Seconds allowed for a single async AMQP call — `channel()`, declare, bind, publish |
-| `blocked_connection_timeout` | `300` | `RMQHook` | Seconds a connection blocked by the broker (resource alarm) may stay blocked before the hook drops it with an exception |
+| `blocked_connection_timeout` | `300` | `RMQHook` | Seconds a connection blocked by the broker (resource alarm) may stay blocked before the hook drops it with an exception. `0` drops it as soon as the broker blocks it and is logged as a WARNING; `null` waits without a deadline |
 
 `heartbeat` is the same key on both paths. The paths differ in two things:
 
@@ -128,7 +128,7 @@ Four optional **Extra** keys control AMQP timing. All of them are plain JSON val
 
 Setting `"heartbeat": 0` is accepted as a deliberate opt-out and logged as a WARNING: with heartbeats off, a link that dies silently (a broker restart behind a proxy that keeps the client half open) stays undetected.
 
-`connect_timeout` and `rpc_timeout` have no counterpart in `RMQHook` — pika is driven by its own retry logic there. Every key takes a number or a numeric string (`"30"`). A value that is not a finite number, or is below the key's minimum, falls back to the default with a WARNING. The minimum is `0` for `heartbeat` and `blocked_connection_timeout` and anything above zero for `connect_timeout` and `rpc_timeout`; a `heartbeat` between zero and one second also falls back to the default.
+`connect_timeout` and `rpc_timeout` have no counterpart in `RMQHook` — pika is driven by its own retry logic there. Every key takes a number or a numeric string (`"30"`). A value that is not a finite number, or is below the key's minimum, falls back to the default with a WARNING. The minimum is `0` for `heartbeat` and `blocked_connection_timeout` and anything above zero for `connect_timeout` and `rpc_timeout`; a `heartbeat` between zero and one second or above `65535` (the largest value AMQP can carry) also falls back to the default.
 
 ---
 
@@ -217,7 +217,7 @@ Publishes one or more messages to RabbitMQ and, by default, waits for the broker
 | `reply_to` | `str \| None` | `None` | No | Reply-to queue name |
 | `message_id` | `str \| None` | `None` | No | Application message identifier |
 | `confirm` | `bool` | `True` | No | Publisher confirms: wait for the broker to acknowledge each message and fail the task when the broker returns, rejects or does not accept one |
-| `mandatory` | `bool \| None` | `None` | No | Ask the broker to return a message that no queue matches. `None` resolves after templates are rendered: `True` for the default exchange (`exchange=""` or `queue_name=`) with `confirm=True`, `False` otherwise. `True` with `confirm=False` raises `ValueError` and the DAG fails to import |
+| `mandatory` | `bool \| None` | `None` | No | Ask the broker to return a message that no queue matches. `None` resolves after templates are rendered: `True` for the default exchange (`exchange=""` or `queue_name=`) with `confirm=True`, `False` otherwise. `True` with `confirm=False` raises `ValueError` when the operator is constructed (for a regular task, at DAG import) |
 
 **Template fields:** `exchange`, `routing_key`, `message`
 
@@ -235,8 +235,8 @@ With `confirm=True` each message waits for the broker's acknowledgement before t
 
 - **Default `mandatory`.** On the default exchange a message to a missing queue is always lost, so `mandatory` is on there. On a named exchange no queue bound for the key can be a normal state, so `mandatory` is off; set `mandatory=True` to fail on unrouted messages there too.
 - **What an acknowledgement means.** The broker has taken the message. An unrouted message with `mandatory=False` is acknowledged too, and dropped. A persistent message (`delivery_mode=2`) is on disk at acknowledgement only in durable queues; a transient queue does not write it to disk.
-- **Returned messages in the log.** When the broker returns a message, pika logs a WARNING into the task log with the message's full properties — headers, `correlation_id`, `reply_to`, `message_id` — and the first 255 characters of the `repr` of the body.
-- **Retries publish again.** Messages before the failing one are already in the broker, and a task retry publishes the whole batch again: publishing is at-least-once, so consumers should tolerate duplicates (for example by `message_id`). The publish call itself is not retried; only the connection is.
+- **Returned messages in the log.** pika's WARNING about a returned message, which carries the message's headers, `correlation_id`, `reply_to`, `message_id` and the start of its body, is kept out of the log, since headers and bodies may hold credentials or personal data. The task failure names the message, the exchange, the routing key and the reply code.
+- **Retries publish again.** Messages before the failing one are already in the broker, and a task retry publishes the whole batch again: publishing is at-least-once, so consumers should tolerate duplicates, for example by a business key carried in each message body. `message_id` does not tell messages apart: it is set once on the operator and is not a template field, so every message of the task, in every run, carries the same value. The publish call itself is not retried; only the connection is.
 - **Cost and waiting.** Each message costs one round trip to the broker — about a millisecond on a local network, more for persistent messages and quorum queues — so a large batch publishes noticeably slower. The wait for an acknowledgement has no deadline of its own: a quorum queue that has lost its majority holds the acknowledgement on a live, unblocked connection, and the task waits until its `execution_timeout`. Set `execution_timeout` on publish tasks.
 
 With `confirm=False` the task does not wait for the broker: a returned or rejected message goes unnoticed, a publish to a missing exchange can leave the task green, and a channel the broker closes surfaces on a later message as the pika exception itself.

@@ -35,14 +35,14 @@ added: 2026-09-05
   совпадение не подтверждено, сбой летит наружу; после первого `ack` завершает
   цикл возвратом собранного.
 - Перехват — `except Exception`, а не перечень типов: `consume_messages`
-  декодирует строгим `body.decode("utf-8")` (`hooks/rmq.py:547`), и бинарное
+  декодирует строгим `body.decode("utf-8")` (`hooks/rmq.py:663`), и бинарное
   тело даёт `UnicodeDecodeError` мимо любого перечня AMQP-ошибок. Смежное:
   [[sync-decode-raises-on-binary-body]].
 - Перехват охватывает круг целиком: `hook.ack()` и `hook.nack()` тоже
-  обращаются к каналу (`hooks/rmq.py:557-573`).
+  обращаются к каналу (`hooks/rmq.py:673-689`).
 - Окно префетча обязательно. `qos` у оператора по умолчанию `None`, `basic_qos`
-  не вызывается вовсе (`hooks/rmq.py:175-180`), брокер стримит очередь в клиент,
-  а `channel.cancel()` (`hooks/rmq.py:552`) реджектит весь буфер с
+  не вызывается вовсе (`hooks/rmq.py:242-247`), брокер стримит очередь в клиент,
+  а `channel.cancel()` (`hooks/rmq.py:668`) реджектит весь буфер с
   `requeue=True` — `BlockingChannel.cancel` в pika 1.4.4 гонит
   `basic_reject(..., requeue=True)` по `get_waiting_message_count()`. Без окна
   каждое сообщение за пределами батча получает доставку на каждом круге.

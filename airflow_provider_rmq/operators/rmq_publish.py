@@ -149,6 +149,9 @@ class RMQPublishOperator(BaseOperator):
                         mandatory=mandatory,
                     )
                 except (UnroutableError, NackError, ChannelClosedByBroker) as exc:
+                    # Without confirms a channel the broker closes can surface on a later
+                    # publish than the one that caused it, so the message number would
+                    # mislead: the pika exception is raised as is.
                     if not self.confirm:
                         raise
                     raise AirflowException(self._failure_text(number, total, exc)) from exc
@@ -168,7 +171,7 @@ class RMQPublishOperator(BaseOperator):
         :rtype: bool
         """
         if self.mandatory is not None:
-            return bool(self.mandatory)
+            return self.mandatory
         return self.confirm and self.exchange == ""
 
     def _failure_text(
@@ -193,13 +196,11 @@ class RMQPublishOperator(BaseOperator):
             f"routing_key='{self.routing_key}'"
         )
         if isinstance(exc, UnroutableError):
-            if exc.messages:
-                method = exc.messages[0].method
-                return (
-                    f"{target} was returned by the broker: "
-                    f"{method.reply_code} {method.reply_text}"
-                )
-            return f"{target} was returned by the broker"
+            method = exc.messages[0].method
+            return (
+                f"{target} was returned by the broker: "
+                f"{method.reply_code} {method.reply_text}"
+            )
         if isinstance(exc, NackError):
             return f"{target} was rejected by the broker (nack)"
         return (

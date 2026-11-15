@@ -230,6 +230,21 @@ class TestReadHeartbeatDefault:
     def test_valid_value_ignores_the_default(self):
         assert _read_heartbeat({"heartbeat": "45"}, default=600) == 45
 
+    def test_amqp_limit_is_accepted(self):
+        assert _read_heartbeat({"heartbeat": 65535}, default=600) == 65535
+
+    @pytest.mark.parametrize("raw", [65536, "100000"])
+    def test_interval_above_amqp_limit_uses_the_given_default(self, raw, caplog):
+        with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.utils.amqp"):
+            assert _read_heartbeat({"heartbeat": raw}, default=600) == 600
+        assert any(
+            "above the AMQP limit of 65535" in r.getMessage() and "600" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_interval_above_amqp_limit_uses_async_default(self):
+        assert _read_heartbeat({"heartbeat": 70000}) == DEFAULT_HEARTBEAT
+
     def test_default_is_the_async_interval_when_not_given(self):
         assert _read_heartbeat({}) == DEFAULT_HEARTBEAT
 
