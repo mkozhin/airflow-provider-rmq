@@ -172,7 +172,7 @@ def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
     )
 
 
-def _abandon_call(future: Any) -> None:
+def abandon_call(future: Any) -> None:
     """Stop watching ``future``, whenever it may end.
 
     A cancelled call takes as long as it takes to notice — an ``aiormq`` RPC answers a
@@ -234,7 +234,7 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
     except asyncio.CancelledError:
         future.remove_done_callback(_on_done)
         future.cancel()
-        _abandon_call(future)
+        abandon_call(future)
         raise
     finally:
         timer.cancel()
@@ -242,7 +242,7 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
     future.remove_done_callback(_on_done)
     if not future.done():
         # Already cancelled by the timer; it is left to run its cancellation out.
-        _abandon_call(future)
+        abandon_call(future)
         raise asyncio.TimeoutError()
 
     try:
@@ -251,6 +251,32 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
         if expired:
             raise asyncio.TimeoutError() from None
         raise
+
+
+#: Seconds a best-effort ``close()`` of a connection, channel or client is given.
+CLOSE_TIMEOUT = 5.0
+
+
+async def close_quietly(
+    closeable: Any, what: str, logger: logging.Logger, method: str = "close"
+) -> None:
+    """Close ``closeable``, giving up after :data:`CLOSE_TIMEOUT`.
+
+    Closing is best effort wherever it happens: the caller has already stopped using the
+    object and what happens next does not depend on the answer. The failure is logged
+    rather than swallowed — a close that fails or never returns is a broker or a socket
+    behaving oddly, and that is worth a line.
+
+    :param closeable: Object to close.
+    :param what: What is being closed, for the log line.
+    :param logger: Logger the failure is reported to — the caller's own, so the line
+        lands where the caller's other lines do.
+    :param method: Name of the closing coroutine — ``httpx`` spells it ``aclose``.
+    """
+    try:
+        await call_with_timeout(getattr(closeable, method)(), timeout=CLOSE_TIMEOUT)
+    except Exception as exc:
+        logger.warning("Closing %s failed: %s — continuing without it", what, exc)
 
 
 class _PropsShim:

@@ -15,6 +15,7 @@ from airflow_provider_rmq.utils.amqp import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_HEARTBEAT,
     DEFAULT_RPC_TIMEOUT,
+    CLOSE_TIMEOUT,
     DEPRECATED_FEATURES_DENIED_SINCE,
     FilterMissState,
     QosSettings,
@@ -22,7 +23,9 @@ from airflow_provider_rmq.utils.amqp import (
     deprecated_feature,
     parse_qos,
     read_heartbeat,
+    abandon_call,
     call_with_timeout,
+    close_quietly,
     handle_miss,
     match as _match,
     nack_and_sleep as _nack_and_sleep,
@@ -911,6 +914,94 @@ class TestCallWithTimeout:
             await task
 
         assert survived is False
+
+
+class TestAbandonCall:
+    @pytest.mark.asyncio
+    async def test_the_failure_of_an_abandoned_call_is_retrieved(self):
+        """A call nobody awaits any more still has its exception read once it lands, so
+        asyncio has no "exception was never retrieved" to report for it."""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        abandon_call(future)
+        future.set_exception(ValueError("late failure"))
+        await asyncio.sleep(0)
+
+        assert future._log_traceback is False
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_call_is_left_alone(self):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        abandon_call(future)
+        future.cancel()
+        await asyncio.sleep(0)
+
+        assert future.cancelled()
+
+
+class TestCloseQuietly:
+    @pytest.mark.asyncio
+    async def test_a_successful_close_logs_nothing(self):
+        closeable = MagicMock()
+        closeable.close = AsyncMock()
+        logger = MagicMock(spec=logging.Logger)
+
+        await close_quietly(closeable, "the connection", logger)
+
+        closeable.close.assert_awaited_once_with()
+        logger.warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_close_is_logged_to_the_given_logger(self):
+        closeable = MagicMock()
+        closeable.close = AsyncMock(side_effect=ConnectionError("socket gone"))
+        logger = MagicMock(spec=logging.Logger)
+
+        await close_quietly(closeable, "the connection", logger)
+
+        logger.warning.assert_called_once()
+        message, *args = logger.warning.call_args.args
+        line = message % tuple(args)
+        assert "the connection" in line
+        assert "socket gone" in line
+
+    @pytest.mark.asyncio
+    async def test_a_close_that_never_returns_gives_up_after_close_timeout(self):
+        async def hangs():
+            await asyncio.Future()
+
+        closeable = MagicMock()
+        closeable.close = hangs
+        logger = MagicMock(spec=logging.Logger)
+
+        with patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.05):
+            started = time.monotonic()
+            await close_quietly(closeable, "the channel", logger)
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0
+        logger.warning.assert_called_once()
+        assert "the channel" in logger.warning.call_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_the_closing_method_can_be_named(self):
+        """``httpx`` clients close with ``aclose``."""
+        client = MagicMock()
+        client.aclose = AsyncMock()
+        client.close = AsyncMock()
+        logger = MagicMock(spec=logging.Logger)
+
+        await close_quietly(client, "the HTTP client", logger, method="aclose")
+
+        client.aclose.assert_awaited_once_with()
+        client.close.assert_not_called()
+        logger.warning.assert_not_called()
+
+    def test_the_default_bound_is_five_seconds(self):
+        assert CLOSE_TIMEOUT == 5.0
 
 
 # ---------------------------------------------------------------------------

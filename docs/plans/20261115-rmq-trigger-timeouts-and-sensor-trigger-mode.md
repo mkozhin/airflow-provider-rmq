@@ -341,25 +341,25 @@
 - Modify: `tests/test_amqp_utils.py`
 - Modify: `docs/adr/0007-connection-liveness-two-tier-check.md`
 
-- [ ] перенести `_CLOSE_TIMEOUT` и `_close_quietly` в `utils/amqp.py` как `CLOSE_TIMEOUT` и
+- [x] перенести `_CLOSE_TIMEOUT` и `_close_quietly` в `utils/amqp.py` как `CLOSE_TIMEOUT` и
       `close_quietly(closeable, what, logger, method="close")`; WARNING — в переданный логгер;
       docstring нейтральный
-- [ ] `watcher/consumer.py` импортирует их и передаёт свой модульный `log` — строки и логгер прежние;
+- [x] `watcher/consumer.py` импортирует их и передаёт свой модульный `log` — строки и логгер прежние;
       ссылки `:data:`_CLOSE_TIMEOUT`` и упоминания `_close_quietly` в комментариях и docstring'ах
       (`:80`, `:641`, `:667`, `:1353` и прочие) указывают на новые имена
-- [ ] ADR-0007 (`:228`, `:479` и прочие упоминания) — новые имена; итоговый
+- [x] ADR-0007 (`:228`, `:479` и прочие упоминания) — новые имена; итоговый
       `grep -rnw --include='*.py' --include='*.md' "_close_quietly\|_CLOSE_TIMEOUT" docs airflow_provider_rmq tests`
       пуст, кроме `docs/plans/completed/` и этого файла плана
-- [ ] `_abandon_call` в `utils/amqp.py` становится публичным `abandon_call` (им пользуются
+- [x] `_abandon_call` в `utils/amqp.py` становится публичным `abandon_call` (им пользуются
       `call_with_timeout` и `_step` триггера); обновить его вызовы и упоминания
-- [ ] `tests/watcher/test_consumer.py`: прямой импорт `_CLOSE_TIMEOUT` из `watcher.consumer`
+- [x] `tests/watcher/test_consumer.py`: прямой импорт `_CLOSE_TIMEOUT` из `watcher.consumer`
       (`:408-416`) → `CLOSE_TIMEOUT` из `utils.amqp`; все 8 `patch(...consumer._CLOSE_TIMEOUT...)` →
       `airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT` (константу читает `close_quietly` из своего модуля);
       прочие упоминания `_close_quietly` в тестах — на новое имя; тест `:4341-4346`, проверяющий
       WARNING через `consumer.log`, проходит без изменения цели патча
-- [ ] тесты `close_quietly` в `tests/test_amqp_utils.py`: закрытие удалось; исключение → WARNING в
+- [x] тесты `close_quietly` в `tests/test_amqp_utils.py`: закрытие удалось; исключение → WARNING в
       переданный логгер и возврат; зависшее закрытие → возврат через `CLOSE_TIMEOUT`; `method="aclose"`
-- [ ] прогнать `pytest tests/ -q` — всё зелёное до задачи 2
+- [x] прогнать `pytest tests/ -q` — всё зелёное до задачи 2
 
 ### Task 2: `RMQTrigger`: попытка на своём `aiormq`-соединении
 

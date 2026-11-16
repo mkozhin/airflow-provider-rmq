@@ -404,15 +404,15 @@ class TestStopBudgets:
         ``stop()`` closes every connection at once. Summing it per connection instead
         would put the arithmetic over the caller's bound at three pooled conn_ids.
         """
+        from airflow_provider_rmq.utils.amqp import CLOSE_TIMEOUT
         from airflow_provider_rmq.watcher import listener
         from airflow_provider_rmq.watcher.consumer import (
-            _CLOSE_TIMEOUT,
             _STOP_CANCEL_TIMEOUT,
             _STOP_STATUS_TIMEOUT,
         )
 
         assert (
-            _STOP_CANCEL_TIMEOUT + _STOP_STATUS_TIMEOUT + 2 * _CLOSE_TIMEOUT
+            _STOP_CANCEL_TIMEOUT + _STOP_STATUS_TIMEOUT + 2 * CLOSE_TIMEOUT
             < listener._STOP_TIMEOUT
         )
 
@@ -433,7 +433,7 @@ class TestStopBudgets:
         client.aclose = AsyncMock(side_effect=_never_returns)
         manager._http_client = client
 
-        with patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.1):
+        with patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.1):
             started = time.monotonic()
             await manager.stop()
             elapsed = time.monotonic() - started
@@ -4338,7 +4338,7 @@ class TestConnectionPool:
         manager._conn("rmq_default").connections[_ROLE_PUBLISH] = publish_conn
         manager._conn("rmq_default").publish_channel = _make_live_channel()
 
-        with patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05), \
+        with patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.05), \
              patch("airflow_provider_rmq.watcher.consumer.log") as mock_log:
             await manager._drop_connection("rmq_default")
 
@@ -5761,7 +5761,7 @@ class TestLivenessAmqpProbe:
         _fast_timeouts(manager)
         manager._conn("rmq_default").connections[_ROLE_CONSUME] = self._hanging_declare_connection()
 
-        with patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05):
+        with patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.05):
             first = await manager._check_liveness([sub])
             second = await manager._check_liveness([sub])
 
@@ -6881,7 +6881,7 @@ class TestConsumersOnAReplacedConnection:
                    return_value=_make_conn_info()), \
              _patch_watcher_session(), \
              patch.object(manager, "_update_all_conn_counts"), \
-             patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05), \
+             patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.05), \
              patch("airflow_provider_rmq.watcher.consumer._new_connection",
                    side_effect=[blocked, fresh]) as connect:
             await manager.reconcile([sub])
@@ -6960,7 +6960,7 @@ class TestConsumersOnAReplacedConnection:
                    return_value=_make_conn_info()), \
              _patch_watcher_session(), \
              patch.object(manager, "_update_all_conn_counts"), \
-             patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05), \
+             patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.05), \
              patch("airflow_provider_rmq.watcher.consumer._new_connection",
                    side_effect=[blocked, fresh]) as connect:
             await manager.reconcile([sub])
@@ -8773,7 +8773,7 @@ class TestIncidentRecovery:
 
         with _patch_mgmt_connection(), _patch_watcher_session(), \
              patch.object(manager, "_update_all_conn_counts"), \
-             patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05), \
+             patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.05), \
              patch("airflow_provider_rmq.watcher.consumer._new_connection",
                    side_effect=[zombie, fresh]) as connect:
             await manager.reconcile([sub])
@@ -9850,7 +9850,7 @@ class TestTheRowsAStopLeavesBehind:
         with _patch_watcher_session(), \
              patch("airflow_provider_rmq.watcher.consumer.set_consumer_status",
                    side_effect=write), \
-             patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 5.0), \
+             patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 5.0), \
              pytest.raises(asyncio.TimeoutError):
             await call_with_timeout(mgr.stop(), timeout=0.3)
 
@@ -10081,7 +10081,7 @@ class TestConsumerChannelIsClosed:
         queue = MagicMock()
         queue.iterator.return_value = _HangingClose()
 
-        with patch("airflow_provider_rmq.watcher.consumer._CLOSE_TIMEOUT", 0.05):
+        with patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.05):
             async with _attached(queue, "tag", 1.0):
                 pass    # leaving the block must return, not wait on basic.cancel
 
