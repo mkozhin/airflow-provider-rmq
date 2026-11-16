@@ -332,13 +332,13 @@ class ManagementApi:
 
     def __init__(self, url: str, vhost: str, prefix: str) -> None:
         self._url = url
-        self.vhost = vhost
-        self.prefix = prefix
+        self._vhost = vhost
+        self._prefix = prefix
 
     def connections_named(self, name: str) -> list[dict[str, Any]]:
         """Connections of the vhost whose client named them *name*."""
         listed = _management_request(
-            self._url, "GET", f"/api/vhosts/{quote(self.vhost, safe='')}/connections"
+            self._url, "GET", f"/api/vhosts/{quote(self._vhost, safe='')}/connections"
         )
         return [
             connection
@@ -352,8 +352,8 @@ class ManagementApi:
         :raises ValueError: *name* lacks the test's prefix.
         :raises AssertionError: The vhost has no connection by that name, or several.
         """
-        if self.prefix not in name:
-            raise ValueError(f"{name!r} is outside this test's namespace {self.prefix!r}")
+        if self._prefix not in name:
+            raise ValueError(f"{name!r} is outside this test's namespace {self._prefix!r}")
         found = self.connections_named(name)
         assert len(found) == 1, f"expected one connection named {name!r}, found {len(found)}"
         _management_request(

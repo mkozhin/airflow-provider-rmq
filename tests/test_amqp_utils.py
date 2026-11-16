@@ -454,7 +454,7 @@ class TestMatchAndAck:
         f = MessageFilter(filter_headers={"type": "order"})
         with patch.object(MessageFilter, "evaluate") as evaluate:
             result = await match_and_ack(
-                msg, f, _make_miss_state(), verdict=(FilterVerdict.MATCH, None)
+                msg, f, _make_miss_state(), evaluation=(FilterVerdict.MATCH, None)
             )
         assert result is True
         evaluate.assert_not_called()
@@ -467,7 +467,7 @@ class TestMatchAndAck:
         f = MessageFilter(filter_headers={"type": "order"})
         state = _make_miss_state()
         with patch.object(MessageFilter, "evaluate") as evaluate:
-            result = await match_and_ack(msg, f, state, verdict=(FilterVerdict.MISS, None))
+            result = await match_and_ack(msg, f, state, evaluation=(FilterVerdict.MISS, None))
         assert result is False
         evaluate.assert_not_called()
         msg.nack.assert_awaited_once_with(requeue=True)
@@ -481,7 +481,7 @@ class TestMatchAndAck:
             "WARNING", logger="test.miss.state"
         ):
             result = await match_and_ack(
-                msg, MessageFilter(), state, verdict=(FilterVerdict.ERROR, "KeyError: 'x'")
+                msg, MessageFilter(), state, evaluation=(FilterVerdict.ERROR, "KeyError: 'x'")
             )
         assert result is False
         evaluate.assert_not_called()

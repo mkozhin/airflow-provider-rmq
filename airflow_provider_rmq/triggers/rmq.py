@@ -125,12 +125,21 @@ class _Attempt:
     waiting: bool = False
     give_back: Callable[[], Awaitable[None]] | None = None
 
+    def enter(self, step: str) -> None:
+        """Enter ``step`` unless the deadline has passed.
+
+        :raises _DeadlineReached: The deadline has passed.
+        """
+        self.step = step
+        if self.deadline is not None and self.deadline <= asyncio.get_running_loop().time():
+            raise _DeadlineReached
+
     def bound(self, seconds: float, step: str) -> float:
         """Enter ``step`` and return its bound: ``seconds``, cut to what the deadline leaves.
 
         :raises _DeadlineReached: The deadline has passed.
         """
-        self.step = step
+        self.enter(step)
         return _within(seconds, self.deadline)
 
     def exit_by(self, seconds: float) -> float:
@@ -157,15 +166,26 @@ def _within(seconds: float, deadline: float | None) -> float:
     return min(seconds, remaining)
 
 
+def _close_frame(exc: BaseException | None) -> spec.Connection.Close | None:
+    """The ``Connection.Close`` the broker answered the handshake with, if ``exc`` carries one.
+
+    ``aiormq`` raises :exc:`AMQPInternalError` with the frame it got instead of
+    ``Connection.OpenOk`` as its second argument.
+    """
+    if not isinstance(exc, AMQPInternalError) or len(exc.args) < 2:
+        return None
+    frame = exc.args[1]
+    return frame if isinstance(frame, spec.Connection.Close) else None
+
+
 def _text(exc: BaseException) -> str:
     """The text of an exception, with the broker's reply where ``str()`` hides it.
 
-    ``aiormq`` raises :exc:`AMQPInternalError` with the ``Connection.Close`` it got
-    instead of ``Connection.OpenOk``, and the frame's own ``str()`` shows neither its
-    code nor its text.
+    The ``Connection.Close`` of a refused handshake (:func:`_close_frame`) shows neither
+    its code nor its text in its own ``str()``.
     """
-    frame = exc.args[1] if isinstance(exc, AMQPInternalError) and len(exc.args) > 1 else None
-    if isinstance(frame, spec.Connection.Close):
+    frame = _close_frame(exc)
+    if frame is not None:
         return f"Connection.Close {frame.reply_code}: {frame.reply_text}"
     return str(exc)
 
@@ -243,13 +263,11 @@ def _refused(exc: BaseException | None) -> bool:
         return True
     if isinstance(exc, ChannelNotFoundEntity):
         return not _HOME_NODE_DOWN.search(str(exc))
-    if isinstance(exc, AMQPInternalError):
-        # aiormq raises it with the frame it got instead of Connection.OpenOk.
-        frame = exc.args[1] if len(exc.args) > 1 else None
-        if isinstance(frame, spec.Connection.Close):
-            if frame.reply_code == 403:
-                return True
-            return frame.reply_code == 530 and bool(_VHOST_REFUSED.search(frame.reply_text or ""))
+    frame = _close_frame(exc)
+    if frame is not None:
+        if frame.reply_code == 403:
+            return True
+        return frame.reply_code == 530 and bool(_VHOST_REFUSED.search(frame.reply_text or ""))
     return False
 
 
@@ -285,6 +303,20 @@ def _failure(exc: BaseException, attempt: _Attempt) -> str:
     if isinstance(exc, (_StepTimeout, _ConnectionLost, _ConsumerCancelled)):
         return str(exc)
     return f"{attempt.step} failed: {_describe(exc)}"
+
+
+def _retry_pause(previous: float, attempt: _Attempt) -> tuple[float, float]:
+    """The pause before the attempt that follows ``attempt``.
+
+    :param previous: The pause before ``attempt``; ``0`` before the first one.
+    :param attempt: The attempt that failed.
+    :returns: ``(pause, wait)``: the step of the backoff the next pause doubles from —
+        it starts over once ``attempt`` reached the wait for a message — and the seconds
+        to wait, cut to what the deadline leaves.
+    :raises _DeadlineReached: Nothing is left until the deadline.
+    """
+    pause = next_backoff(0.0 if attempt.waiting else previous, RETRY_PAUSE_MAX, RETRY_PAUSE_MIN)
+    return pause, _within(pause, attempt.deadline)
 
 
 async def _pause(seconds: float) -> None:
@@ -476,7 +508,6 @@ class RMQTrigger(BaseTrigger):
             },
         )
 
-
     async def run(self) -> AsyncIterator[TriggerEvent]:
         """Wait for a matching message and fire one event.
 
@@ -509,42 +540,39 @@ class RMQTrigger(BaseTrigger):
 
         pause = 0.0
         number = 0
-        while True:
-            number += 1
-            attempt = _Attempt(number, deadline)
-            # Created before the first await, so the finally closes it whatever ends the
-            # attempt — a result, a failure, or a cancellation of run() by the triggerer.
-            connection = aiormq.Connection(url, context=ssl_context)
-            try:
+        try:
+            while True:
+                number += 1
+                attempt = _Attempt(number, deadline)
+                # Created before the first await, so the finally closes it whatever ends the
+                # attempt — a result, a failure, or a cancellation of run() by the triggerer.
+                connection = aiormq.Connection(url, context=ssl_context)
                 try:
-                    result = await self._attempt(connection, timeouts, attempt, msg_filter, miss_state)
-                    # The event is handed over before the attempt is left: a matching
-                    # message is acknowledged by now, and a cancellation that lands
-                    # while the consumer is left or the connection closes must not take
-                    # the event with it.
-                    yield TriggerEvent(result)
-                    return
-                finally:
-                    await self._leave(connection, attempt)
-            except _DeadlineReached:
-                yield TriggerEvent({"status": "timeout"})
-                return
-            except Exception as exc:
-                if not _retryable(exc, attempt):
-                    log.exception("RMQTrigger encountered an error")
-                    yield TriggerEvent({"status": "error", "error": _text(exc)})
-                    return
-                pause = next_backoff(0.0 if attempt.waiting else pause, RETRY_PAUSE_MAX, RETRY_PAUSE_MIN)
-                try:
-                    wait = _within(pause, deadline)
+                    try:
+                        result = await self._attempt(connection, timeouts, attempt, msg_filter, miss_state)
+                        # The event is handed over before the attempt is left: a matching
+                        # message is acknowledged by now, and a cancellation that lands
+                        # while the consumer is left or the connection closes must not take
+                        # the event with it.
+                        yield TriggerEvent(result)
+                        return
+                    finally:
+                        await self._leave(connection, attempt)
                 except _DeadlineReached:
-                    yield TriggerEvent({"status": "timeout"})
-                    return
-                log.warning(
-                    "RMQTrigger: %s on conn_id=%r (attempt %d); retrying queue %r in %gs",
-                    _failure(exc, attempt), self.rmq_conn_id, number, self.queue_name, wait,
-                )
-                await _pause(wait)
+                    raise
+                except Exception as exc:
+                    if not _retryable(exc, attempt):
+                        log.exception("RMQTrigger encountered an error")
+                        yield TriggerEvent({"status": "error", "error": _text(exc)})
+                        return
+                    pause, wait = _retry_pause(pause, attempt)
+                    log.warning(
+                        "RMQTrigger: %s on conn_id=%r (attempt %d); retrying queue %r in %gs",
+                        _failure(exc, attempt), self.rmq_conn_id, number, self.queue_name, wait,
+                    )
+                    await _pause(wait)
+        except _DeadlineReached:
+            yield TriggerEvent({"status": "timeout"})
 
     async def _attempt(
         self,
@@ -649,12 +677,17 @@ class RMQTrigger(BaseTrigger):
         """
         buffer: deque[DeliveredMessage] = deque()
         arrived = asyncio.Event()
+        tag = f"rmq-trigger.{uuid.uuid4().hex}"
 
         async def _on_delivery(delivered: DeliveredMessage) -> None:
             buffer.append(delivered)
             arrived.set()
 
-        tag = f"rmq-trigger.{uuid.uuid4().hex}"
+        def _hand_over_give_back() -> None:
+            attempt.give_back = functools.partial(
+                self._give_back, channel, closing, tag, buffer, attempt.exit_by(timeouts.rpc)
+            )
+
         bound = attempt.bound(timeouts.rpc, "consume")
         await _step(
             channel.basic_consume(self.queue_name, _on_delivery, consumer_tag=tag), bound, "consume", closing
@@ -664,14 +697,12 @@ class RMQTrigger(BaseTrigger):
             while True:
                 _ensure_open("wait", closing, channel.closing)
                 if buffer:
-                    attempt.bound(timeouts.rpc, "ack")
+                    attempt.enter("ack")
                     result = await self._handle(
                         buffer.popleft(), closing, timeouts.rpc, msg_filter, miss_state
                     )
                     if result is not None:
-                        attempt.give_back = functools.partial(
-                            self._give_back, channel, closing, tag, buffer, attempt.exit_by(timeouts.rpc)
-                        )
+                        _hand_over_give_back()
                         return result
                     continue
                 bound = attempt.bound(timeouts.rpc, "wait")
@@ -691,9 +722,7 @@ class RMQTrigger(BaseTrigger):
                         f"consumer on queue {self.queue_name!r} was cancelled by the broker"
                     )
         except _DeadlineReached:
-            attempt.give_back = functools.partial(
-                self._give_back, channel, closing, tag, buffer, attempt.exit_by(timeouts.rpc)
-            )
+            _hand_over_give_back()
             raise
 
     async def _give_back(
@@ -745,7 +774,7 @@ class RMQTrigger(BaseTrigger):
                     closing,
                 )
                 buffer.clear()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - best effort: closing the connection returns the deliveries
             log.warning(
                 "RMQTrigger: returning %d unread deliveries to queue %r failed: %s; "
                 "closing the connection returns them",
@@ -786,16 +815,16 @@ class RMQTrigger(BaseTrigger):
         """
         _ensure_open("ack", closing, delivered.channel.closing)
         message = IncomingMessage(delivered)
-        verdict = match(message, msg_filter)
+        verdict, reason = match(message, msg_filter)
         try:
             matched = await _step(
-                match_and_ack(message, msg_filter, miss_state, verdict=verdict),
+                match_and_ack(message, msg_filter, miss_state, evaluation=(verdict, reason)),
                 timeout,
                 "ack",
                 closing,
             )
         except (_StepTimeout, _ConnectionLost, ConnectionError, AMQPError) as exc:
-            if verdict[0] is not FilterVerdict.MATCH or isinstance(exc.__cause__, ChannelInvalidStateError):
+            if verdict is not FilterVerdict.MATCH or isinstance(exc.__cause__, ChannelInvalidStateError):
                 raise
             log.warning(
                 "RMQTrigger: ACK not confirmed for the matching message on queue %r "

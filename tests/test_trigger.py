@@ -41,12 +41,18 @@ from airflow_provider_rmq.triggers.rmq import (
     _step,
     _StepTimeout,
 )
+from airflow_provider_rmq.utils import amqp as amqp_utils
 from airflow_provider_rmq.utils.amqp import DEFAULT_HEARTBEAT, match_and_ack
-from airflow_provider_rmq.utils.amqp import match as match_in_trigger
 from airflow_provider_rmq.utils.filters import FilterVerdict
 from tests.conftest import STREAK_TEXT, FakeAirflowConnection, log_lines
 
 ACK_TEXT = "ACK not confirmed"
+#: Reply texts of RabbitMQ: the 530 refusing a user access to a vhost, and the 404 on a
+#: durable classic queue whose node is restarting.
+VHOST_REFUSED = "NOT_ALLOWED - access to vhost 'test' refused for user 'airflow'"
+HOME_NODE_DOWN = (
+    "NOT_FOUND - home node 'rabbit@node-1' of durable queue 'q' in vhost 'test' is down or inaccessible"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1339,7 +1345,8 @@ async def _read_frame(reader: asyncio.StreamReader) -> Any:
     return frame
 
 
-async def _handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def _until_open(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Serve the handshake up to and including reading ``Connection.Open``."""
     await reader.readexactly(8)
     writer.write(_frame(0, spec.Connection.Start(
         server_properties={"capabilities": {"basic.nack": True, "publisher_confirms": True}},
@@ -1348,6 +1355,10 @@ async def _handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter)
     writer.write(_frame(0, spec.Connection.Tune(channel_max=2047, frame_max=131072, heartbeat=0)))
     await _read_frame(reader)
     await _read_frame(reader)
+
+
+async def _handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    await _until_open(reader, writer)
     writer.write(_frame(0, spec.Connection.OpenOk()))
     await writer.drain()
 
@@ -1378,12 +1389,96 @@ async def _local_server(handler):
         await server.wait_closed()
 
 
+def _close_after_start_ok(code: int, text: str):
+    async def _handler(reader, writer):
+        await reader.readexactly(8)
+        writer.write(_frame(0, spec.Connection.Start(server_properties={})))
+        await _read_frame(reader)
+        writer.write(_frame(0, spec.Connection.Close(
+            reply_code=code, reply_text=text, class_id=10, method_id=11,
+        )))
+        await writer.drain()
+        await _forever()
+    return _handler
+
+
+def _close_on_open(code: int, text: str):
+    async def _handler(reader, writer):
+        await _until_open(reader, writer)
+        writer.write(_frame(0, spec.Connection.Close(
+            reply_code=code, reply_text=text, class_id=10, method_id=40,
+        )))
+        await writer.drain()
+        await _forever()
+    return _handler
+
+
+async def _eof(reader, writer):
+    writer.close()
+
+
+async def _silent(reader, writer):
+    await _forever()
+
+
+def _channel_close_on_declare(text: str):
+    async def _handler(reader, writer):
+        await _handshake(reader, writer)
+        await _read_frame(reader)
+        writer.write(_frame(1, spec.Channel.OpenOk()))
+        await _read_frame(reader)
+        writer.write(_frame(1, spec.Channel.Close(
+            reply_code=404, reply_text=text, class_id=50, method_id=10,
+        )))
+        await writer.drain()
+        await _forever()
+    return _handler
+
+
+class _Script:
+    """Per-connection server handlers, in order; connections past the list stay silent."""
+
+    def __init__(self, *handlers):
+        self.handlers = handlers
+        self.accepted = 0
+
+    async def __call__(self, reader, writer):
+        self.accepted += 1
+        index = self.accepted - 1
+        await (self.handlers[index] if index < len(self.handlers) else _silent)(reader, writer)
+
+
+async def _run_real(trigger, script: _Script, until_accepted: int | None = None) -> list[dict]:
+    """Run ``trigger`` against a local server playing ``script``.
+
+    :param until_accepted: Cancel ``run()`` once the server has taken this many
+        connections; ``None`` waits for ``run()`` to end by itself.
+    """
+    events: list[dict] = []
+
+    async def _run():
+        async for event in trigger.run():
+            events.append(event.payload)
+
+    async with _local_server(script) as port:
+        conn_info = FakeAirflowConnection(
+            host="127.0.0.1", port=port, extra='{"connect_timeout": 0.2, "rpc_timeout": 2}'
+        )
+        with patch("airflow_provider_rmq.triggers.rmq.BaseHook") as mock_base:
+            mock_base.get_connection = MagicMock(return_value=conn_info)
+            task = asyncio.ensure_future(_run())
+            if until_accepted is not None:
+                while script.accepted < until_accepted and not task.done():
+                    await asyncio.sleep(0.01)
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+    return events
+
+
 class TestRealAiormqConnection:
     @pytest.mark.asyncio
     async def test_silent_handshake_times_out_and_the_connection_is_closed(self, caplog):
-        async def _silent(reader, writer):
-            await _forever()
-
         created: list = []
         real = aiormq.Connection
 
@@ -1566,7 +1661,7 @@ class TestFilterMissState:
         trigger = RMQTrigger(rmq_conn_id="conn", queue_name="my_queue", ack_unmatched=True)
         captured = []
 
-        async def _fake_match_and_ack(message, msg_filter, miss_state, verdict=None):
+        async def _fake_match_and_ack(message, msg_filter, miss_state, evaluation=None):
             captured.append(miss_state)
             return True
 
@@ -1584,9 +1679,9 @@ class TestFilterMissState:
         )
         verdicts = []
 
-        async def _recording(message, msg_filter, miss_state, verdict=None):
-            verdicts.append(verdict)
-            return await match_and_ack(message, msg_filter, miss_state, verdict=verdict)
+        async def _recording(message, msg_filter, miss_state, evaluation=None):
+            verdicts.append(evaluation)
+            return await match_and_ack(message, msg_filter, miss_state, evaluation=evaluation)
 
         with patch("airflow_provider_rmq.triggers.rmq.match_and_ack", new=_recording), patch(
             "airflow_provider_rmq.utils.filters.MessageFilter.evaluate",
@@ -1605,9 +1700,9 @@ class TestFilterMissState:
         seen = []
         streaks = []
 
-        async def _recording(message, msg_filter, miss_state, verdict=None):
+        async def _recording(message, msg_filter, miss_state, evaluation=None):
             seen.append(miss_state)
-            result = await match_and_ack(message, msg_filter, miss_state, verdict=verdict)
+            result = await match_and_ack(message, msg_filter, miss_state, evaluation=evaluation)
             streaks.append(miss_state.streak)
             return result
 
@@ -1670,9 +1765,9 @@ class TestFilterMissState:
         )
         seen = []
 
-        async def _recording(message, msg_filter, miss_state, verdict=None):
+        async def _recording(message, msg_filter, miss_state, evaluation=None):
             seen.append(miss_state)
-            return await match_and_ack(message, msg_filter, miss_state, verdict=verdict)
+            return await match_and_ack(message, msg_filter, miss_state, evaluation=evaluation)
 
         broker = _broker(
             Msg(body=b"invoice", headers={"x-type": "invoice"}),
@@ -1706,11 +1801,6 @@ def _fails_on(attempt: int, failure):
             await failure(connection=connection, channel=channel)
     return _hook
 
-
-VHOST_REFUSED = "NOT_ALLOWED - access to vhost 'test' refused for user 'airflow'"
-HOME_NODE_DOWN = (
-    "NOT_FOUND - home node 'rabbit@node-1' of durable queue 'q' in vhost 'test' is down or inaccessible"
-)
 
 STREAM_GET = "NOT_IMPLEMENTED - basic.get not supported by stream queues"
 
@@ -2074,12 +2164,11 @@ class TestPushGiveBack:
         stray = Msg(headers={"x-type": "invoice"})
         unread = [Msg(headers={"x-type": "invoice"}), Msg(headers={"x-type": "invoice"})]
         broker = _broker(stray, *unread)
-        real_match = match_in_trigger
 
         def _slow_first(message, msg_filter):
             if not broker.acked:
                 time.sleep(0.08)
-            return real_match(message, msg_filter)
+            return amqp_utils.match(message, msg_filter)
 
         with patch("airflow_provider_rmq.triggers.rmq.match", _slow_first):
             events = await _run_against(trigger, broker)
@@ -2381,105 +2470,6 @@ class TestPauseAndDeadline:
 # ---------------------------------------------------------------------------
 # Handshake outcomes on a real aiormq.Connection
 # ---------------------------------------------------------------------------
-async def _until_open(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Serve the handshake up to and including reading ``Connection.Open``."""
-    await reader.readexactly(8)
-    writer.write(_frame(0, spec.Connection.Start(
-        server_properties={"capabilities": {"basic.nack": True, "publisher_confirms": True}},
-    )))
-    await _read_frame(reader)
-    writer.write(_frame(0, spec.Connection.Tune(channel_max=2047, frame_max=131072, heartbeat=0)))
-    await _read_frame(reader)
-    await _read_frame(reader)
-
-
-def _close_after_start_ok(code: int, text: str):
-    async def _handler(reader, writer):
-        await reader.readexactly(8)
-        writer.write(_frame(0, spec.Connection.Start(server_properties={})))
-        await _read_frame(reader)
-        writer.write(_frame(0, spec.Connection.Close(
-            reply_code=code, reply_text=text, class_id=10, method_id=11,
-        )))
-        await writer.drain()
-        await _forever()
-    return _handler
-
-
-def _close_on_open(code: int, text: str):
-    async def _handler(reader, writer):
-        await _until_open(reader, writer)
-        writer.write(_frame(0, spec.Connection.Close(
-            reply_code=code, reply_text=text, class_id=10, method_id=40,
-        )))
-        await writer.drain()
-        await _forever()
-    return _handler
-
-
-async def _eof(reader, writer):
-    writer.close()
-
-
-async def _silent(reader, writer):
-    await _forever()
-
-
-def _channel_close_on_declare(text: str):
-    async def _handler(reader, writer):
-        await _handshake(reader, writer)
-        await _read_frame(reader)
-        writer.write(_frame(1, spec.Channel.OpenOk()))
-        await _read_frame(reader)
-        writer.write(_frame(1, spec.Channel.Close(
-            reply_code=404, reply_text=text, class_id=50, method_id=10,
-        )))
-        await writer.drain()
-        await _forever()
-    return _handler
-
-
-class _Script:
-    """Per-connection server handlers, in order; connections past the list stay silent."""
-
-    def __init__(self, *handlers):
-        self.handlers = handlers
-        self.accepted = 0
-
-    async def __call__(self, reader, writer):
-        self.accepted += 1
-        index = self.accepted - 1
-        await (self.handlers[index] if index < len(self.handlers) else _silent)(reader, writer)
-
-
-async def _run_real(trigger, script: _Script, until_accepted: int | None = None) -> list[dict]:
-    """Run ``trigger`` against a local server playing ``script``.
-
-    :param until_accepted: Cancel ``run()`` once the server has taken this many
-        connections; ``None`` waits for ``run()`` to end by itself.
-    """
-    events: list[dict] = []
-
-    async def _run():
-        async for event in trigger.run():
-            events.append(event.payload)
-
-    async with _local_server(script) as port:
-        conn_info = FakeAirflowConnection(
-            host="127.0.0.1", port=port, extra='{"connect_timeout": 0.2, "rpc_timeout": 2}'
-        )
-        with patch("airflow_provider_rmq.triggers.rmq.BaseHook") as mock_base:
-            mock_base.get_connection = MagicMock(return_value=conn_info)
-            task = asyncio.ensure_future(_run())
-            if until_accepted is not None:
-                while script.accepted < until_accepted and not task.done():
-                    await asyncio.sleep(0.01)
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait_for(task, 5)
-    return events
-
-
 REAL_HANDSHAKE_FAILURES = [
     pytest.param(
         _close_after_start_ok(320, "CONNECTION_FORCED - broker forced connection closure"),

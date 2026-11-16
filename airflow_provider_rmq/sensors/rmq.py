@@ -15,6 +15,9 @@ from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
 
+#: Values of ``trigger_mode``, and the deprecated spellings ``mode`` still takes for it.
+_TRIGGER_MODES = ("pull", "push")
+
 
 class RMQSensor(BaseSensorOperator):
     """Wait for a message in a RabbitMQ queue matching optional conditions.
@@ -108,7 +111,7 @@ class RMQSensor(BaseSensorOperator):
         """
         if "mode" in kwargs and kwargs["mode"] is None:
             del kwargs["mode"]
-        if kwargs.get("mode") in ("pull", "push"):
+        if kwargs.get("mode") in _TRIGGER_MODES:
             if trigger_mode is not None:
                 raise ValueError(
                     f"Both trigger_mode={trigger_mode!r} and mode={kwargs['mode']!r} are "
@@ -142,7 +145,7 @@ class RMQSensor(BaseSensorOperator):
         # new instance and starts from zero; poke reports each of them as a batch.
         self._miss_state: FilterMissState | None = None
 
-        if self.trigger_mode not in ("pull", "push"):
+        if self.trigger_mode not in _TRIGGER_MODES:
             raise ValueError(
                 f"trigger_mode must be 'pull' or 'push'; received {self.trigger_mode!r}."
             )
@@ -198,7 +201,9 @@ class RMQSensor(BaseSensorOperator):
         """
         try:
             timeout = timedelta(seconds=self.timeout)
-            datetime.now(timezone.utc) + timeout
+            # Only probes for OverflowError: defer() counts its deadline the same way,
+            # and one past the year 9999 cannot be counted.
+            _deadline = datetime.now(timezone.utc) + timeout
         except OverflowError:
             return None
         return timeout
@@ -259,14 +264,16 @@ class RMQSensor(BaseSensorOperator):
                     # messages that may well match.
                     for remaining in messages[i + 1:]:
                         hook.nack(remaining["method"].delivery_tag, requeue=True)
-                    self._report_poke(miss_state, 1, evaluated, dropped_before)
+                    self._report_poke(
+                        miss_state, matched=1, evaluated=evaluated, dropped_before=dropped_before
+                    )
                     return True
                 if verdict is FilterVerdict.ERROR:
                     miss_state.on_error(reason)
                     hook.nack(msg["method"].delivery_tag, requeue=True)
                 else:
                     handle_miss_sync(hook, msg["method"].delivery_tag, miss_state)
-            self._report_poke(miss_state, 0, evaluated, dropped_before)
+            self._report_poke(miss_state, matched=0, evaluated=evaluated, dropped_before=dropped_before)
             return False
         finally:
             hook.close()
