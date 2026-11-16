@@ -8,7 +8,7 @@ added: 2026-09-05
 **Симптом.** `RMQConsumeOperator.execute` делает ровно один
 `hook.consume_messages(max_messages=...)` и разбирает, что пришло. Если своё
 сообщение лежит за пределами батча, прогон возвращает пустой список зелёной
-задачей. У `RMQSensor.poke` (`sensors/rmq.py:216`) то же самое, батчами по
+задачей. У `RMQSensor.poke` (`sensors/rmq.py:232`) то же самое, батчами по
 `poke_batch_size`.
 
 С `ack_unmatched=True` это не тупик: чужие сообщения уходят из

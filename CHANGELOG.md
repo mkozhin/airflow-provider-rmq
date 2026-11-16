@@ -20,6 +20,7 @@
 - `RMQHook(publisher_confirms=…)` and `RMQHook.basic_publish(mandatory=…)`.
 - `RMQPublishOperator` logs a WARNING when there is nothing to publish (`message=None` or an empty list).
 - `RMQSensor(trigger_mode=…)` selects the trigger's `pull` or `push` mode.
+- Dependency `aiormq` (`>=6.8.0,<7.0.0`).
 
 ### Deprecated
 - `RMQSensor(mode="pull"|"push")`; use `trigger_mode`.
@@ -43,6 +44,8 @@
 - A queue declared with `durable=False` needs `exclusive=True`; otherwise `RMQHook.queue_declare` and `RMQQueueManagementOperator` raise `ValueError` (deprecated RabbitMQ feature `transient_nonexcl_queues`).
 - `qos` with `prefetch_size` other than `0` raises `ValueError` in `RMQHook` and `RMQConsumeOperator`: RabbitMQ does not implement it.
 - Declaring with the default `durable` an exchange or queue that already exists as non-durable fails with 406 `PRECONDITION_FAILED`.
+- Deferrable `RMQSensor` fails the task when its `timeout` (default 604800 s) runs out, or skips it with `soft_fail=True`: set `timeout` to the longest wait you accept.
+- `RMQSensor(mode=…)` other than `poke`, `reschedule`, `pull` or `push` fails the DAG file at parse time; replace `mode="pull"`/`"push"` with `trigger_mode`.
 
 ## v2.6.0
 

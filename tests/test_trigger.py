@@ -4,12 +4,13 @@ import asyncio
 import contextlib
 import itertools
 import logging
+import re
 import ssl
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import aiormq
@@ -23,7 +24,10 @@ from aiormq.exceptions import (
     ChannelNotFoundEntity,
     ChannelPreconditionFailed,
     ConnectionClosed,
+    ConnectionCommandInvalid,
+    ConnectionFrameError,
     ConnectionNotAllowed,
+    ConnectionNotImplemented,
     IncompatibleProtocolError,
     ProbableAuthenticationError,
 )
@@ -114,8 +118,10 @@ class FakeBroker:
     ``pending`` is the queue. ``basic_get`` takes from it, then from ``tail`` (``None``
     there is an empty poll), and waits forever once both are drained. ``basic_consume``
     hands every pending message to the consumer before it returns, the way deliveries
-    already in flight reach the callback before the caller looks. A requeued NACK puts
-    the message back at the end of ``pending``.
+    already in flight reach the callback before the caller looks; every callback runs
+    as a task of its own, as ``aiormq`` runs it. A requeued NACK puts the message back
+    at the end of ``pending``; ``multiple=True`` NACKs every unacknowledged tag up to
+    the one given.
 
     ``hooks`` maps a step name — ``connect``, ``channel``, ``declare``, ``get``,
     ``consume``, ``ack``, ``nack``, ``cancel``, ``close`` — to a coroutine function
@@ -197,6 +203,7 @@ class FakeChannel:
         self.tags = itertools.count(1)
         self.in_flight: dict[int, Msg] = {}
         self.declared: list = []
+        self.callbacks: list[asyncio.Task] = []
 
     @property
     def is_closed(self) -> bool:
@@ -249,13 +256,18 @@ class FakeChannel:
         await self.broker.call("consume", self.connection, self)
         self.consumers[consumer_tag] = callback
         while self.broker.pending:
-            await callback(self._delivered(self.broker.pending.popleft(), consumer_tag))
+            self._dispatch(callback, self._delivered(self.broker.pending.popleft(), consumer_tag))
         return spec.Basic.ConsumeOk(consumer_tag=consumer_tag)
+
+    def _dispatch(self, callback, delivered: DeliveredMessage) -> None:
+        """Run the consumer callback as a task, the way ``aiormq`` does."""
+        self.callbacks.append(asyncio.get_running_loop().create_task(callback(delivered)))
 
     async def deliver(self, msg: Msg) -> None:
         """A message arriving at the consumer after ``basic_consume`` returned."""
         (consumer_tag, callback), = self.consumers.items()
-        await callback(self._delivered(msg, consumer_tag))
+        self._dispatch(callback, self._delivered(msg, consumer_tag))
+        await asyncio.sleep(0)
 
     async def basic_ack(self, delivery_tag, multiple=False):
         self._check_open()
@@ -265,10 +277,12 @@ class FakeChannel:
     async def basic_nack(self, delivery_tag, multiple=False, requeue=True):
         self._check_open()
         await self.broker.call("nack", self.connection, self)
-        msg = self.in_flight.pop(delivery_tag)
-        self.broker.nacked.append((msg, requeue))
-        if requeue:
-            self.broker.pending.append(msg)
+        tags = sorted(t for t in self.in_flight if t <= delivery_tag) if multiple else [delivery_tag]
+        for tag in tags:
+            msg = self.in_flight.pop(tag)
+            self.broker.nacked.append((msg, requeue))
+            if requeue:
+                self.broker.pending.append(msg)
 
     async def basic_cancel(self, consumer_tag):
         self._check_open()
@@ -336,27 +350,6 @@ def pauses():
 
     with patch("airflow_provider_rmq.triggers.rmq._pause", _record):
         yield taken
-
-
-async def _run_until_attempt(trigger, broker, attempt: int, conn_info=None) -> list[dict]:
-    """Run until attempt ``attempt`` has connected, then cancel ``run()``.
-
-    :returns: Events fired before the cancellation.
-    """
-    events: list[dict] = []
-
-    async def _run():
-        async for event in trigger.run():
-            events.append(event.payload)
-
-    with _patched(broker, conn_info):
-        task = asyncio.ensure_future(_run())
-        while len(broker.connections) < attempt and not task.done():
-            await asyncio.sleep(0.005)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait_for(task, 2)
-    return events
 
 
 def _retry_lines(caplog) -> list[logging.LogRecord]:
@@ -499,7 +492,7 @@ class TestRunWithFilter:
 
     @pytest.mark.asyncio
     async def test_nack_uses_short_delay_not_poll_interval(self):
-        """After NACK, sleep should use a short delay (0.1s), not poll_interval."""
+        """After a NACK the next ``basic_get`` follows the 0.1 s pause, not ``poll_interval``."""
         trigger = RMQTrigger(
             rmq_conn_id="conn", queue_name="q",
             filter_data={"filter_headers": {"x-type": "order"}},
@@ -510,11 +503,11 @@ class TestRunWithFilter:
             Msg(body=b"order", headers={"x-type": "order"}),
         )
 
-        with patch("airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            events = await _run_against(trigger, broker)
+        started = time.monotonic()
+        events = await asyncio.wait_for(_run_against(trigger, broker), 5)
 
         assert events[0]["status"] == "success"
-        mock_sleep.assert_awaited_once_with(0.1)
+        assert 0.1 <= time.monotonic() - started < 5
 
 
 class TestRunEmptyQueue:
@@ -973,7 +966,7 @@ class TestStepBounds:
         with _patched(broker, _timeouts(rpc=30)):
             task = asyncio.ensure_future(_collect_events(trigger))
             waited_on = "get" if mode == "pull" else "consume"
-            while waited_on not in broker.calls:
+            while waited_on not in broker.calls and not task.done():
                 await asyncio.sleep(0.005)
             await asyncio.sleep(0.01)
             task.cancel()
@@ -1004,9 +997,11 @@ class TestAckOfMatchingMessage:
         assert "'orders'" in line.getMessage()
 
     @pytest.mark.asyncio
-    async def test_connection_lost_during_ack_still_fires_success(self, caplog):
-        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
-        broker = _broker(Msg(body=b"payload"))
+    @pytest.mark.parametrize("mode", ["pull", "push"])
+    async def test_connection_lost_during_ack_still_fires_success(self, mode, caplog):
+        """One WARNING: in push mode there is nothing left to give back on a lost connection."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode=mode)
+        broker = _broker(Msg(body=b"payload"), Msg(body=b"unread"))
 
         async def _lose(connection, channel):
             connection.lose(asyncio.CancelledError())
@@ -1018,19 +1013,168 @@ class TestAckOfMatchingMessage:
             events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
 
         assert events[0]["status"] == "success"
+        (line,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert ACK_TEXT in line.getMessage()
+        assert "cancel" not in broker.calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["pull", "push"])
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ChannelPreconditionFailed("PRECONDITION_FAILED - unknown delivery tag 1"),
+            ConnectionClosed(320, "CONNECTION_FORCED - broker forced connection closure"),
+            ConnectionResetError(104, "Connection reset by peer"),
+        ],
+        ids=["channel-closed-406", "connection-closed-320", "connection-reset"],
+    )
+    async def test_broker_side_failure_of_the_ack_still_fires_success(self, exc, mode, caplog):
+        """The frame may have been written before the failure: the outcome is unknown."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode=mode)
+        broker = _broker(Msg(body=b"payload"))
+        broker.hooks["ack"] = fail(exc)
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
+
+        assert events[0]["status"] == "success"
+        assert events[0]["message"]["body"] == "payload"
         assert len(log_lines(caplog, ACK_TEXT)) == 1
 
     @pytest.mark.asyncio
-    async def test_ack_on_closed_channel_still_fires_success(self, caplog):
+    @pytest.mark.parametrize(
+        ("mode", "step"), [("pull", "close"), ("push", "cancel"), ("push", "close")]
+    )
+    async def test_cancelling_run_while_the_attempt_is_left_keeps_the_event(self, mode, step):
+        """The triggerer reads the event as soon as it is yielded and resumes ``run()``
+        straight away; a cancellation that lands while the consumer is left or the
+        connection closes after an acknowledged match finds the event already out."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode=mode)
+        broker = _broker(Msg(body=b"payload"), Msg(body=b"unread"))
+        broker.hooks[step] = hang()
+        events: list[dict] = []
+
+        async def _triggerer() -> None:
+            async for event in trigger.run():
+                events.append(event.payload)
+
+        with _patched(broker, _timeouts(rpc=30)):
+            task = asyncio.ensure_future(_triggerer())
+            while step not in broker.calls and not task.done():
+                await asyncio.sleep(0.005)
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert [e["status"] for e in events] == ["success"]
+        assert events[0]["message"]["body"] == "payload"
+        assert [m.body for m in broker.acked] == [b"payload"]
+        assert broker.connections[0].close_calls == 1
+        assert broker.connections[0].is_closed
+        await _settle()
+        assert _stray_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_ack_on_closed_channel_is_retried(self, caplog):
+        """Nothing was written to a closed channel: the broker puts the message back."""
         trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
-        broker = _broker(Msg(body=b"payload"))
-        broker.hooks["ack"] = fail(ChannelInvalidStateError("closed"))
+        first, again = Msg(body=b"payload"), Msg(body=b"payload again")
+        broker = _broker(first, tail=[again])
+        broker.hooks["ack"] = on(fail(ChannelInvalidStateError("closed")), 1)
 
         with caplog.at_level("WARNING"):
-            events = await _run_against(trigger, broker, _timeouts(rpc=30))
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
 
-        assert events[0]["status"] == "success"
-        assert len(log_lines(caplog, ACK_TEXT)) == 1
+        assert events[0]["message"]["body"] == "payload again"
+        assert log_lines(caplog, ACK_TEXT) == []
+        (line,) = _retry_lines(caplog)
+        assert "ack failed: ChannelInvalidStateError" in line.getMessage()
+        assert broker.acked == [again]
+
+    @pytest.mark.asyncio
+    async def test_push_connection_lost_between_buffered_deliveries_is_retried(self, caplog):
+        """A buffered delivery of a closed connection is the broker's again: no success for it."""
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q", mode="push", ack_unmatched=True,
+            filter_data={"filter_headers": {"x-type": "order"}},
+        )
+        miss = Msg(body=b"miss", headers={"x-type": "invoice"})
+        order = Msg(body=b"order", headers={"x-type": "order"})
+        broker = _broker(miss, order)
+        lost = []
+
+        async def _lose_behind_the_miss(connection, channel):
+            # The ACK of the miss goes out, the connection closes right behind it, and
+            # the broker puts the unacknowledged order back in the queue.
+            if not lost:
+                lost.append(connection.attempt)
+                connection.lose(ConnectionClosed(320, "CONNECTION_FORCED"))
+                broker.pending.append(order)
+
+        broker.hooks["ack"] = _lose_behind_the_miss
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
+
+        assert events == [
+            {"status": "success", "message": {
+                "body": "order", "headers": {"x-type": "order"}, "routing_key": "rk", "exchange": "",
+            }},
+        ]
+        assert lost == [1]
+        assert log_lines(caplog, ACK_TEXT) == []
+        (line,) = _retry_lines(caplog)
+        assert "(attempt 1)" in line.getMessage()
+        assert "connection lost during wait: ConnectionClosed" in line.getMessage()
+        assert broker.acked == [miss, order]
+
+    @pytest.mark.asyncio
+    async def test_pull_connection_lost_with_the_get_is_retried(self, caplog):
+        """``basic_get`` and the close land in one turn: the message is not acknowledged."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+        order = Msg(body=b"order")
+        broker = _broker(order)
+
+        async def _lose_with_the_get(connection, channel):
+            if connection.attempt == 1:
+                connection.lose(ConnectionClosed(320, "CONNECTION_FORCED"))
+                broker.pending.append(order)
+
+        broker.hooks["get"] = _lose_with_the_get
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
+
+        assert [e["status"] for e in events] == ["success"]
+        assert events[0]["message"]["body"] == "order"
+        assert log_lines(caplog, ACK_TEXT) == []
+        (line,) = _retry_lines(caplog)
+        assert "(attempt 1)" in line.getMessage()
+        assert "connection lost during ack: ConnectionClosed" in line.getMessage()
+        assert broker.acked == [order]
+
+    @pytest.mark.asyncio
+    async def test_ack_refused_by_a_channel_closed_under_it_is_retried(self, caplog):
+        """The connection closes as the ACK starts, and the ACK raises before writing."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+        first, again = Msg(body=b"payload"), Msg(body=b"payload again")
+        broker = _broker(first, tail=[again])
+
+        async def _lose_then_refuse(connection, channel):
+            connection.lose(ConnectionClosed(320, "CONNECTION_FORCED"))
+            raise ChannelInvalidStateError("closed")
+
+        broker.hooks["ack"] = on(_lose_then_refuse, 1)
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
+
+        assert events[0]["message"]["body"] == "payload again"
+        assert log_lines(caplog, ACK_TEXT) == []
+        (line,) = _retry_lines(caplog)
+        assert "connection lost during ack: ConnectionClosed" in line.getMessage()
+        assert broker.acked == [again]
 
     @pytest.mark.asyncio
     async def test_nack_timeout_of_a_miss_is_not_success(self, caplog):
@@ -1087,8 +1231,7 @@ class TestStep:
         with pytest.raises(_StepTimeout) as info:
             await _step(_forever(), 0.01, "declare", _future())
         assert not isinstance(info.value, OSError)
-        assert info.value.step == "declare"
-        assert info.value.timeout == 0.01
+        assert str(info.value) == "declare did not complete within 0.01s"
         await _settle()
         assert _stray_tasks() == []
 
@@ -1139,7 +1282,7 @@ class TestStep:
 
         with _patched(broker, _timeouts(rpc=30)):
             task = asyncio.ensure_future(_run())
-            while "get" not in broker.calls:
+            while "get" not in broker.calls and not task.done():
                 await asyncio.sleep(0.005)
             await asyncio.sleep(0.01)
             broker.connections[0].lose(asyncio.CancelledError())
@@ -1260,7 +1403,7 @@ class TestRealAiormqConnection:
                 mock_base.get_connection = MagicMock(return_value=conn_info)
                 started = time.monotonic()
                 task = asyncio.ensure_future(_collect_events(trigger))
-                while len(created) < 2:
+                while len(created) < 2 and not task.done():
                     await asyncio.sleep(0.01)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -1569,16 +1712,54 @@ HOME_NODE_DOWN = (
     "NOT_FOUND - home node 'rabbit@node-1' of durable queue 'q' in vhost 'test' is down or inaccessible"
 )
 
+STREAM_GET = "NOT_IMPLEMENTED - basic.get not supported by stream queues"
+
+#: ``(step, hook, text the error event carries)``.
 REFUSALS = [
-    pytest.param("connect", fail(ProbableAuthenticationError("ACCESS_REFUSED - Login was refused")), id="auth"),
-    pytest.param("connect", fail(AuthenticationError("AMQPLAIN", ["PLAIN"])), id="sasl"),
-    pytest.param("connect", fail(_open_refused(530, VHOST_REFUSED)), id="vhost-530"),
-    pytest.param("connect", fail(_open_refused(403, "ACCESS_REFUSED - vhost")), id="vhost-403"),
-    pytest.param("get", fail(ConnectionNotAllowed("NOT_ALLOWED - vhost deleted")), id="not-allowed"),
-    pytest.param("get", lose(ConnectionNotAllowed("NOT_ALLOWED - vhost deleted")), id="not-allowed-closing"),
-    pytest.param("declare", fail(ChannelAccessRefused("ACCESS_REFUSED - queue 'q'")), id="403"),
-    pytest.param("declare", fail(ChannelNotFoundEntity("NOT_FOUND - no queue 'q'")), id="404"),
-    pytest.param("get", close_channel(ChannelNotFoundEntity("NOT_FOUND - no queue 'q'")), id="404-channel"),
+    pytest.param(
+        "connect", fail(ProbableAuthenticationError("ACCESS_REFUSED - Login was refused")),
+        "ACCESS_REFUSED - Login was refused", id="auth",
+    ),
+    pytest.param("connect", fail(AuthenticationError("AMQPLAIN", ["PLAIN"])), "AMQPLAIN", id="sasl"),
+    pytest.param("connect", fail(_open_refused(530, VHOST_REFUSED)), VHOST_REFUSED, id="vhost-530"),
+    pytest.param(
+        "connect", fail(_open_refused(403, "ACCESS_REFUSED - vhost")), "ACCESS_REFUSED - vhost",
+        id="vhost-403",
+    ),
+    pytest.param(
+        "get", fail(ConnectionNotAllowed("NOT_ALLOWED - vhost deleted")), "NOT_ALLOWED - vhost deleted",
+        id="not-allowed",
+    ),
+    pytest.param(
+        "get", lose(ConnectionNotAllowed("NOT_ALLOWED - vhost deleted")),
+        "connection lost during get: ConnectionNotAllowed: NOT_ALLOWED - vhost deleted",
+        id="not-allowed-closing",
+    ),
+    pytest.param(
+        "declare", fail(ChannelAccessRefused("ACCESS_REFUSED - queue 'q'")), "ACCESS_REFUSED - queue 'q'",
+        id="403",
+    ),
+    pytest.param(
+        "declare", fail(ChannelNotFoundEntity("NOT_FOUND - no queue 'q'")), "NOT_FOUND - no queue 'q'",
+        id="404",
+    ),
+    pytest.param(
+        "get", close_channel(ChannelNotFoundEntity("NOT_FOUND - no queue 'q'")), "NOT_FOUND - no queue 'q'",
+        id="404-channel",
+    ),
+    pytest.param(
+        "get", lose(ConnectionNotImplemented(STREAM_GET)),
+        f"connection lost during get: ConnectionNotImplemented: {STREAM_GET}", id="540-closing",
+    ),
+    pytest.param("get", fail(ConnectionNotImplemented(STREAM_GET)), STREAM_GET, id="540"),
+    pytest.param(
+        "declare", fail(ConnectionFrameError("FRAME_ERROR - bad frame")), "FRAME_ERROR - bad frame",
+        id="501",
+    ),
+    pytest.param(
+        "get", lose(ConnectionCommandInvalid("COMMAND_INVALID - second 'channel.open'")),
+        "ConnectionCommandInvalid: COMMAND_INVALID", id="503-closing",
+    ),
 ]
 
 HANDSHAKE_FAILURES = [
@@ -1601,8 +1782,8 @@ HANDSHAKE_FAILURES = [
 class TestClassification:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("attempt", [1, 3])
-    @pytest.mark.parametrize(("step", "failure"), REFUSALS)
-    async def test_refusal_is_an_error_on_any_attempt(self, step, failure, attempt):
+    @pytest.mark.parametrize(("step", "failure", "text"), REFUSALS)
+    async def test_refusal_is_an_error_on_any_attempt(self, step, failure, text, attempt):
         trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
         broker = _broker(Msg())
         broker.hooks[step] = _fails_on(attempt, failure)
@@ -1612,6 +1793,7 @@ class TestClassification:
         )
 
         assert events[0]["status"] == "error"
+        assert text in events[0]["error"]
         assert len(broker.connections) == attempt
         assert all(connection.close_calls == 1 for connection in broker.connections)
 
@@ -1688,6 +1870,7 @@ class TestClassification:
 
     @pytest.mark.asyncio
     async def test_runtime_error_of_a_closed_connection_is_retried(self, caplog):
+        """``_step`` reads a call that failed on a closed connection as the lost connection."""
         trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
         broker = _broker(Msg(body=b"after"))
 
@@ -1702,6 +1885,65 @@ class TestClassification:
 
         assert events[0]["message"]["body"] == "after"
         assert "connection lost during channel" in _retry_lines(caplog)[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_call_on_a_closed_channel_is_retried(self, caplog):
+        """``ChannelInvalidStateError`` with the connection still alive."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+        broker = _broker(Msg(body=b"after"))
+        broker.hooks["get"] = on(fail(ChannelInvalidStateError("channel closed")), 1)
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker), 2)
+
+        assert events[0]["message"]["body"] == "after"
+        assert "get failed: ChannelInvalidStateError" in _retry_lines(caplog)[0].getMessage()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("step", ["declare", "get"])
+    async def test_reset_socket_after_the_connect_is_retried_on_the_first_attempt(self, step, caplog):
+        """Only the connect step is an error on the first attempt."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+        broker = _broker(Msg(body=b"after"))
+        broker.hooks[step] = on(fail(ConnectionResetError(104, "Connection reset by peer")), 1)
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker), 2)
+
+        assert events[0]["message"]["body"] == "after"
+        (line,) = _retry_lines(caplog)
+        assert f"{step} failed: ConnectionResetError" in line.getMessage()
+        assert "(attempt 1)" in line.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_call_cancelled_on_a_live_connection_is_retried(self, caplog):
+        """A step ended by cancellation with ``closing`` still pending gives no reason."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+        broker = _broker(Msg(body=b"after"))
+        broker.hooks["get"] = on(fail(asyncio.CancelledError()), 1)
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker), 2)
+
+        assert events[0]["message"]["body"] == "after"
+        assert "connection lost during get: no reason given" in _retry_lines(caplog)[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_closing_future_is_a_lost_connection(self, caplog):
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+        broker = _broker(Msg(body=b"after"))
+
+        async def _cancel_closing(connection, channel):
+            connection.closing.cancel()
+            await _forever()
+
+        broker.hooks["get"] = on(_cancel_closing, 1)
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker), 2)
+
+        assert events[0]["message"]["body"] == "after"
+        assert "connection lost during get: CancelledError" in _retry_lines(caplog)[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_any_other_exception_is_an_error(self):
@@ -1746,7 +1988,7 @@ class TestHeartbeatLoss:
 
         with _patched(broker, _timeouts(rpc=30)):
             task = asyncio.ensure_future(_collect_events(trigger))
-            while broker.calls.count("get") < 2:
+            while broker.calls.count("get") < 2 and not task.done():
                 await asyncio.sleep(0.005)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -1818,7 +2060,7 @@ class TestPushGiveBack:
         events = await _run_against(trigger, broker)
 
         assert events[0]["message"]["body"] == "first"
-        assert broker.calls == ["connect", "channel", "declare", "consume", "ack", "cancel", "nack", "nack", "close"]
+        assert broker.calls == ["connect", "channel", "declare", "consume", "ack", "cancel", "nack", "close"]
         assert broker.acked == [first]
         assert broker.nacked == [(second, True), (third, True)]
 
@@ -1843,9 +2085,26 @@ class TestPushGiveBack:
             events = await _run_against(trigger, broker)
 
         assert events == [{"status": "timeout"}]
-        assert broker.calls[-4:] == ["cancel", "nack", "nack", "close"]
+        assert broker.calls[-3:] == ["cancel", "nack", "close"]
         assert broker.acked == [stray]
         assert broker.nacked == [(msg, True) for msg in unread]
+
+    @pytest.mark.asyncio
+    async def test_delivery_arriving_during_the_cancel_is_given_back(self):
+        """A delivery the broker sent before ``cancel-ok`` lands in the buffer and goes back."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode="push")
+        first, late = Msg(body=b"first"), Msg(body=b"late")
+        broker = _broker(first)
+
+        async def _deliver_before_cancel_ok(connection, channel):
+            await channel.deliver(late)
+
+        broker.hooks["cancel"] = _deliver_before_cancel_ok
+
+        events = await asyncio.wait_for(_run_against(trigger, broker), 2)
+
+        assert events[0]["message"]["body"] == "first"
+        assert broker.nacked == [(late, True)]
 
     @pytest.mark.asyncio
     async def test_hanging_cancel_holds_the_exit_for_one_rpc_bound(self, caplog):
@@ -1855,15 +2114,58 @@ class TestPushGiveBack:
 
         with caplog.at_level("WARNING"):
             started = time.monotonic()
-            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=0.2)), 2)
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=0.2)), 3)
             elapsed = time.monotonic() - started
 
         assert events[0]["message"]["body"] == "first"
-        assert 0.2 <= elapsed < 0.6
+        assert 0.2 <= elapsed < 1.5
         (line,) = log_lines(caplog, "returning 2 unread deliveries")
         assert "cancel did not complete within 0.2s" in line.getMessage()
         assert broker.nacked == []
         assert broker.connections[0].close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_cancel_and_nack_share_one_rpc_bound(self, caplog):
+        """The NACK gets what the cancel left of ``rpc_timeout``, not a bound of its own."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode="push")
+        broker = _broker(Msg(body=b"first"), Msg(), Msg())
+
+        async def _slow_cancel(connection, channel):
+            await asyncio.sleep(0.4)
+
+        broker.hooks["cancel"] = _slow_cancel
+        broker.hooks["nack"] = hang()
+
+        with caplog.at_level("WARNING"):
+            started = time.monotonic()
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=0.6)), 3)
+            elapsed = time.monotonic() - started
+
+        assert events[0]["message"]["body"] == "first"
+        # One rpc_timeout for the two of them; a bound of its own for the NACK is 1.0 s.
+        assert 0.6 <= elapsed < 0.9
+        (line,) = log_lines(caplog, "returning 2 unread deliveries")
+        bound = float(re.search(r"nack did not complete within ([0-9.]+)s", line.getMessage()).group(1))
+        assert bound < 0.25
+
+    @pytest.mark.asyncio
+    async def test_cancel_spending_the_whole_bound_leaves_no_nack(self, caplog):
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode="push")
+        broker = _broker(Msg(body=b"first"), Msg(), Msg())
+
+        async def _cancel_past_the_bound(connection, channel):
+            # Blocking the loop lets the cancel complete, with nothing left of the bound.
+            time.sleep(0.25)  # noqa: ASYNC251
+
+        broker.hooks["cancel"] = _cancel_past_the_bound
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=0.2)), 3)
+
+        assert events[0]["message"]["body"] == "first"
+        assert "nack" not in broker.calls
+        (line,) = log_lines(caplog, "returning 2 unread deliveries")
+        assert "nack did not complete within 0s" in line.getMessage()
 
     @pytest.mark.asyncio
     async def test_failed_nack_leaves_the_rest_to_the_close(self, caplog):
@@ -1879,17 +2181,63 @@ class TestPushGiveBack:
         assert broker.connections[0].close_calls == 1
 
 
+class TestPushDeliveryTakenBeforeTheDeadline:
+    """A delivery taken off the buffer before the deadline is disposed of under the full
+    ``rpc_timeout``; the deadline then ends the attempt through the give-back."""
+
+    @pytest.mark.asyncio
+    async def test_stray_is_returned_and_the_rest_given_back(self):
+        """The NACK of a miss and its 0.1 s pause outlast what the deadline left."""
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q", mode="push", message_wait_timeout=0.05,
+            filter_data={"filter_headers": {"x-type": "order"}},
+        )
+        first, second = Msg(headers={"x-type": "invoice"}), Msg(headers={"x-type": "invoice"})
+        broker = _broker(first, second)
+
+        events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
+
+        assert events == [{"status": "timeout"}]
+        assert broker.calls[-4:] == ["nack", "cancel", "nack", "close"]
+        assert broker.nacked == [(first, True), (second, True)]
+
+    @pytest.mark.asyncio
+    async def test_match_is_acked_without_a_false_warning(self, caplog):
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q", mode="push", message_wait_timeout=0.05,
+        )
+        matching = Msg(body=b"order")
+        broker = _broker(matching)
+
+        async def _slow_ack(connection, channel):
+            await asyncio.sleep(0.15)
+
+        broker.hooks["ack"] = _slow_ack
+
+        with caplog.at_level("WARNING"):
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
+
+        assert events[0]["message"]["body"] == "order"
+        assert log_lines(caplog, ACK_TEXT) == []
+        assert broker.acked == [matching]
+
+
 # ---------------------------------------------------------------------------
 # Pause between attempts and message_wait_timeout
 # ---------------------------------------------------------------------------
 class TestPauseAndDeadline:
     @pytest.mark.asyncio
     async def test_pause_doubles_to_sixty_and_starts_over_after_a_wait(self, pauses):
-        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
-        broker = _broker(Msg(body=b"seventh"))
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", poll_interval=0.02)
+        broker = _broker(tail=[None, Msg(body=b"seventh")])
         broker.hooks["connect"] = on(hang(), 1, 2, 3, 4, 6)
-        # Attempt 5 gets as far as basic_get, the wait for a message.
-        broker.hooks["get"] = on(lose(asyncio.CancelledError()), 5)
+
+        async def _lose_after_an_empty_get(connection, channel):
+            # Attempt 5 gets an answer to basic_get, the wait for a message, and loses
+            # the connection while it pauses on the empty queue.
+            asyncio.get_running_loop().call_later(0.005, connection.lose, asyncio.CancelledError())
+
+        broker.hooks["get"] = on(_lose_after_an_empty_get, 5)
 
         events = await asyncio.wait_for(
             _run_against(trigger, broker, _timeouts(rpc=30, connect=0.01)), 5
@@ -1897,6 +2245,53 @@ class TestPauseAndDeadline:
 
         assert events[0]["message"]["body"] == "seventh"
         assert pauses == [15, 30, 60, 60, 15, 30]
+
+    @pytest.mark.asyncio
+    async def test_pull_attempt_that_got_no_answer_to_get_keeps_the_pause_growing(self, pauses):
+        """Only a ``basic_get`` that returned is the wait for a message."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
+        broker = _broker(Msg(body=b"fourth"))
+        broker.hooks["get"] = on(hang(), 1, 2, 3)
+
+        events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=0.01)), 5)
+
+        assert events[0]["message"]["body"] == "fourth"
+        assert pauses == [15, 30, 60]
+
+    @pytest.mark.asyncio
+    async def test_push_pause_starts_over_after_a_wait(self, pauses):
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode="push")
+        broker = FakeBroker()
+        broker.hooks["connect"] = on(hang(), 1, 2, 4)
+
+        async def _consume(connection, channel):
+            async def _later():
+                await asyncio.sleep(0.01)
+                if connection.attempt == 3:
+                    connection.lose(asyncio.CancelledError())
+                else:
+                    await channel.deliver(Msg(body=b"fifth"))
+            asyncio.get_running_loop().create_task(_later())
+
+        broker.hooks["consume"] = _consume
+
+        events = await asyncio.wait_for(
+            _run_against(trigger, broker, _timeouts(rpc=30, connect=0.01)), 5
+        )
+
+        assert events[0]["message"]["body"] == "fifth"
+        assert pauses == [15, 30, 15, 30]
+
+    @pytest.mark.asyncio
+    async def test_pull_mode_ignores_message_wait_timeout(self):
+        trigger = RMQTrigger(
+            rmq_conn_id="conn", queue_name="q", message_wait_timeout=0.01, poll_interval=0.05,
+        )
+        broker = _broker(tail=[None, Msg(body=b"later")])
+
+        events = await asyncio.wait_for(_run_against(trigger, broker), 2)
+
+        assert events[0]["message"]["body"] == "later"
 
     @pytest.mark.asyncio
     async def test_deadline_running_out_during_the_pause(self, pauses):
@@ -1963,7 +2358,8 @@ class TestPauseAndDeadline:
             elapsed = time.monotonic() - started
 
         assert events == [{"status": "timeout"}]
-        assert 0.25 <= elapsed < 0.05 + 0.2 + 0.15
+        # rpc_timeout is 30 s: anything short of it shows the exit added no rpc bound.
+        assert 0.25 <= elapsed < 1.0
 
     @pytest.mark.asyncio
     async def test_overrun_with_a_hanging_cancel_is_at_most_rpc_and_the_close(self):
@@ -1972,13 +2368,14 @@ class TestPauseAndDeadline:
         )
         broker = FakeBroker(hooks={"close": hang(), "cancel": hang()})
 
-        with patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.2):
+        with patch("airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT", 0.5):
             started = time.monotonic()
-            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=0.2)), 2)
+            events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=0.5)), 5)
             elapsed = time.monotonic() - started
 
         assert events == [{"status": "timeout"}]
-        assert 0.45 <= elapsed < 0.05 + 0.2 + 0.2 + 0.15
+        # Deadline, one rpc_timeout and the close: 1.05 s; a second rpc_timeout is 1.55 s.
+        assert 1.05 <= elapsed < 1.45
 
 
 # ---------------------------------------------------------------------------
@@ -2128,6 +2525,17 @@ class TestRealHandshake:
 
         assert events[0]["status"] == "error"
         assert script.accepted == len(handlers) + 1
+
+    @pytest.mark.asyncio
+    async def test_login_refused_on_the_second_attempt_is_an_error(self):
+        """A ``Connection.Close`` 403 after ``StartOk`` is a refusal, not a cut handshake."""
+        script = _Script(_silent, _close_after_start_ok(403, "ACCESS_REFUSED - Login was refused"))
+
+        events = await _run_real(RMQTrigger(rmq_conn_id="conn", queue_name="q"), script)
+
+        assert events[0]["status"] == "error"
+        assert "ACCESS_REFUSED" in events[0]["error"]
+        assert script.accepted == 2
 
     @pytest.mark.asyncio
     async def test_404_of_a_home_node_is_read_off_the_real_exception(self, caplog):

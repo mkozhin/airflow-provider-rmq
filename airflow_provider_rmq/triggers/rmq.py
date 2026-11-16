@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Literal, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, cast
 from urllib.parse import urlencode
 
 import aiormq
@@ -19,7 +20,10 @@ from aiormq.exceptions import (
     ChannelClosed,
     ChannelInvalidStateError,
     ChannelNotFoundEntity,
+    ConnectionCommandInvalid,
+    ConnectionFrameError,
     ConnectionNotAllowed,
+    ConnectionNotImplemented,
     ProbableAuthenticationError,
 )
 from airflow.hooks.base import BaseHook
@@ -70,9 +74,7 @@ class _StepTimeout(Exception):
     """
 
     def __init__(self, step: str, timeout: float):
-        super().__init__(f"{step} did not complete within {timeout:g}s")
-        self.step = step
-        self.timeout = timeout
+        super().__init__(f"{step} did not complete within {round(timeout, 3):g}s")
 
 
 class _ConnectionLost(Exception):
@@ -89,7 +91,6 @@ class _ConnectionLost(Exception):
 
     def __init__(self, step: str, reason: BaseException | None):
         super().__init__(f"connection lost during {step}: {_describe(reason)}")
-        self.step = step
         self.reason = reason
 
 
@@ -113,12 +114,16 @@ class _Attempt:
     :param deadline: Loop time ``message_wait_timeout`` runs out at, or ``None``.
     :param step: Name of the step the attempt is in or last ran.
     :param waiting: Whether the attempt got as far as waiting for a message.
+    :param give_back: What leaving the push consumer takes once the attempt has a
+        result: cancelling it and returning its unread deliveries. ``None`` when there
+        is nothing to give back.
     """
 
     number: int
     deadline: float | None
     step: str = "connect"
     waiting: bool = False
+    give_back: Callable[[], Awaitable[None]] | None = None
 
     def bound(self, seconds: float, step: str) -> float:
         """Enter ``step`` and return its bound: ``seconds``, cut to what the deadline leaves.
@@ -127,6 +132,16 @@ class _Attempt:
         """
         self.step = step
         return _within(seconds, self.deadline)
+
+    def exit_by(self, seconds: float) -> float:
+        """Loop time leaving the push consumer must be done by.
+
+        ``seconds`` from now, and never more than ``seconds`` past the deadline: a
+        delivery taken off the buffer before the deadline is disposed of within
+        ``seconds``, so the exit that follows ends at most ``seconds`` past it.
+        """
+        until = asyncio.get_running_loop().time() + seconds
+        return until if self.deadline is None else min(until, self.deadline + seconds)
 
 
 def _within(seconds: float, deadline: float | None) -> float:
@@ -142,11 +157,24 @@ def _within(seconds: float, deadline: float | None) -> float:
     return min(seconds, remaining)
 
 
+def _text(exc: BaseException) -> str:
+    """The text of an exception, with the broker's reply where ``str()`` hides it.
+
+    ``aiormq`` raises :exc:`AMQPInternalError` with the ``Connection.Close`` it got
+    instead of ``Connection.OpenOk``, and the frame's own ``str()`` shows neither its
+    code nor its text.
+    """
+    frame = exc.args[1] if isinstance(exc, AMQPInternalError) and len(exc.args) > 1 else None
+    if isinstance(frame, spec.Connection.Close):
+        return f"Connection.Close {frame.reply_code}: {frame.reply_text}"
+    return str(exc)
+
+
 def _describe(reason: BaseException | None) -> str:
     """Name a closing reason for a log line: type and text, or just the type."""
     if reason is None:
         return "no reason given"
-    text = str(reason)
+    text = _text(reason)
     return f"{type(reason).__name__}: {text}" if text else type(reason).__name__
 
 
@@ -160,6 +188,18 @@ def _closing_reason(closing: asyncio.Future) -> BaseException | None:
     if closing.cancelled():
         return asyncio.CancelledError()
     return closing.exception()
+
+
+def _ensure_open(step: str, *closings: asyncio.Future) -> None:
+    """Raise :exc:`_ConnectionLost` for ``step`` if any of ``closings`` has finished.
+
+    ``aiormq`` stops the connection's writer before it finishes ``closing``, so from
+    then on no frame reaches the broker, and the broker puts every unacknowledged
+    delivery back.
+    """
+    for closing in closings:
+        if closing.done():
+            raise _ConnectionLost(step, _closing_reason(closing))
 
 
 def _drop(task: asyncio.Future) -> None:
@@ -176,18 +216,29 @@ def _named(url: str, name: str) -> str:
     return f"{url}{separator}{urlencode({'name': name})}"
 
 
-def _refused(exc: BaseException) -> bool:
+def _refused(exc: BaseException | None) -> bool:
     """Whether the broker refused the trigger for good: no attempt can get further.
 
-    A wrong or changed password, no access to the vhost, no access to the queue, and a
-    queue that is not there. The 404 of a durable classic queue whose node is restarting
-    is not one of them: the queue comes back with its node.
+    A wrong or changed password, no access to the vhost, no access to the queue, a
+    queue that is not there, and a connection the broker closed with 540 NOT_IMPLEMENTED
+    (``basic_get`` on a stream queue), 501 FRAME_ERROR or 503 COMMAND_INVALID — the
+    same call meets the same answer on every attempt. The 404 of a durable classic queue
+    whose node is restarting is not one of them: the queue comes back with its node.
 
     The reply text of an ``aiormq`` exception is its ``str()``; there is no attribute
     of its own for it.
     """
     if isinstance(
-        exc, (ProbableAuthenticationError, AuthenticationError, ConnectionNotAllowed, ChannelAccessRefused)
+        exc,
+        (
+            ProbableAuthenticationError,
+            AuthenticationError,
+            ConnectionNotAllowed,
+            ChannelAccessRefused,
+            ConnectionNotImplemented,
+            ConnectionFrameError,
+            ConnectionCommandInvalid,
+        ),
     ):
         return True
     if isinstance(exc, ChannelNotFoundEntity):
@@ -221,7 +272,7 @@ def _retryable(exc: BaseException, attempt: _Attempt) -> bool:
     if isinstance(exc, _StepTimeout):
         return True
     if isinstance(exc, _ConnectionLost):
-        return exc.reason is None or not _refused(exc.reason)
+        return not _refused(exc.reason)
     if _refused(exc):
         return False
     if attempt.step == "connect" and isinstance(exc, (OSError, EOFError, StopAsyncIteration, AMQPInternalError)):
@@ -287,12 +338,12 @@ async def _step(
         cause = task.exception() if task.done() and not task.cancelled() else None
         _drop(task)
         raise _ConnectionLost(name, _closing_reason(closing)) from cause
-    if task.done():
-        if task.cancelled():
-            raise _ConnectionLost(name, None)
-        return task.result()
-    _drop(task)
-    raise _StepTimeout(name, timeout)
+    if not task.done():
+        _drop(task)
+        raise _StepTimeout(name, timeout)
+    if task.cancelled():
+        raise _ConnectionLost(name, None)
+    raise cast(BaseException, task.exception())
 
 
 class RMQTrigger(BaseTrigger):
@@ -312,9 +363,9 @@ class RMQTrigger(BaseTrigger):
     ends it. Every broker call is bounded in time: the handshake by ``connect_timeout``,
     opening the channel, the passive declare of the queue, ``basic_get``,
     ``basic_consume`` and every acknowledgement by ``rpc_timeout``, both from the
-    connection's ``extra``. In push mode the wait for a delivery is watched in turns of
-    at most ``rpc_timeout`` seconds, each of which also checks the channel and the
-    consumer.
+    connection's ``extra``. In push mode a closed channel ends the wait for a delivery
+    at once, and every ``rpc_timeout`` seconds without a delivery the trigger checks
+    that the broker has not cancelled its consumer.
 
     **Retries.** A step out of time, a lost connection or channel (heartbeat, a broker
     restart, a reset socket) and a consumer cancelled by the broker (the queue deleted
@@ -326,13 +377,22 @@ class RMQTrigger(BaseTrigger):
     first attempt — a wrong host or port, a broker that is not there — and retried on
     later ones. An error event ends ``run()`` on any attempt for a wrong password, no
     access to the vhost, a 403 or a 404 on the queue (except the 404 of a durable
-    queue whose node is restarting, which is retried), and for any other exception.
+    queue whose node is restarting, which is retried), a connection the broker closed
+    with 540, 501 or 503, and for any other exception.
 
     **Acknowledgement.** A matching message is acknowledged before the success event is
     fired. When that acknowledgement cannot be confirmed — it timed out, or the
     connection went away under it — the event is fired all the same with a WARNING:
     the frame may have reached the broker, so the message may come back as a
-    duplicate, but it is never lost.
+    duplicate, but it is never lost. A connection or a channel that has closed before
+    the acknowledgement is written gets no frame at all: the attempt is retried, and
+    the broker delivers the message again.
+
+    **Event before cleanup.** The success event is fired while the attempt still holds its
+    connection; the push consumer is left and the connection is closed after it. A
+    cancellation of ``run()`` that lands while they run — the triggerer stopping, the
+    task cleared — finds the event already handed over, so an acknowledged message is
+    never left without it.
 
     **Leaving the push consumer.** On a match and on ``message_wait_timeout`` the
     consumer is cancelled and every delivery the broker had already sent and the
@@ -340,7 +400,9 @@ class RMQTrigger(BaseTrigger):
     connection closes: a quorum queue counts a delivery dropped with its connection
     against ``delivery-limit``, a NACK it does not. Both get one ``rpc_timeout`` between
     them; if they fail, the connection is closed all the same and the broker puts the
-    deliveries back itself.
+    deliveries back itself. The consumer takes no prefetch limit: the broker sends it
+    every ready message of the queue, and they wait in the triggerer's memory until
+    the trigger reads them or gives them back.
 
     Note: callable filters are NOT supported here (cannot be serialized).
 
@@ -377,9 +439,11 @@ class RMQTrigger(BaseTrigger):
             pause between them; ``{"status": "timeout"}`` is fired when it runs out.
             ``None`` means wait indefinitely (until the sensor-level timeout fires). The
             deadline is checked before every step, and every step and pause is cut to
-            what it leaves. It may be overrun by at most ``rpc_timeout`` plus
-            :data:`~airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT` seconds: returning
-            the unread deliveries to the queue and closing the connection.
+            what it leaves — except the ACK or NACK of a delivery already taken, which
+            gets the full ``rpc_timeout``. It may be overrun by at most ``rpc_timeout``
+            plus :data:`~airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT` seconds:
+            disposing of that delivery, returning the unread deliveries to the queue and
+            closing the connection. Pull mode ignores it.
         :param ack_unmatched: What to do with a message the filter rejected. ``False``
             (default) returns it to the queue. ``True`` acknowledges it instead: the
             message leaves the broker for good — DLX does not fire on an
@@ -448,14 +512,27 @@ class RMQTrigger(BaseTrigger):
         while True:
             number += 1
             attempt = _Attempt(number, deadline)
+            # Created before the first await, so the finally closes it whatever ends the
+            # attempt — a result, a failure, or a cancellation of run() by the triggerer.
+            connection = aiormq.Connection(url, context=ssl_context)
             try:
-                result = await self._attempt(url, ssl_context, timeouts, attempt, msg_filter, miss_state)
+                try:
+                    result = await self._attempt(connection, timeouts, attempt, msg_filter, miss_state)
+                    # The event is handed over before the attempt is left: a matching
+                    # message is acknowledged by now, and a cancellation that lands
+                    # while the consumer is left or the connection closes must not take
+                    # the event with it.
+                    yield TriggerEvent(result)
+                    return
+                finally:
+                    await self._leave(connection, attempt)
             except _DeadlineReached:
-                result = {"status": "timeout"}
+                yield TriggerEvent({"status": "timeout"})
+                return
             except Exception as exc:
                 if not _retryable(exc, attempt):
                     log.exception("RMQTrigger encountered an error")
-                    yield TriggerEvent({"status": "error", "error": str(exc)})
+                    yield TriggerEvent({"status": "error", "error": _text(exc)})
                     return
                 pause = next_backoff(0.0 if attempt.waiting else pause, RETRY_PAUSE_MAX, RETRY_PAUSE_MIN)
                 try:
@@ -468,48 +545,45 @@ class RMQTrigger(BaseTrigger):
                     _failure(exc, attempt), self.rmq_conn_id, number, self.queue_name, wait,
                 )
                 await _pause(wait)
-                continue
-            yield TriggerEvent(result)
-            return
 
     async def _attempt(
         self,
-        url: str,
-        ssl_context: Any,
+        connection: aiormq.Connection,
         timeouts: AmqpTimeouts,
         attempt: _Attempt,
         msg_filter: MessageFilter,
         miss_state: FilterMissState,
     ) -> dict[str, Any]:
-        """Run one attempt on a connection and a channel of its own.
+        """Run one attempt on ``connection`` and a channel of its own.
 
-        The connection object is created before the first ``await``, so the ``finally``
-        closes it whatever ends the attempt — a result, a failure, or a cancellation of
-        ``run()`` by the triggerer. Closing the connection closes its channel, and the
-        broker puts back every delivery the attempt had not acknowledged.
+        The attempt leaves the connection open: :meth:`_leave` closes it.
 
         :raises _DeadlineReached: ``message_wait_timeout`` ran out before a step.
         """
-        connection = aiormq.Connection(url, context=ssl_context)
+        # Every bound is taken before its call is made: an expired deadline must stop
+        # the call from starting at all.
+        bound = attempt.bound(timeouts.connect, "connect")
+        await _step(connection.connect(), bound, "connect")
+        closing = connection.closing
+        bound = attempt.bound(timeouts.rpc, "channel")
+        channel = await _step(connection.channel(publisher_confirms=False), bound, "channel", closing)
+        bound = attempt.bound(timeouts.rpc, "declare")
+        await _step(channel.queue_declare(self.queue_name, passive=True), bound, "declare", closing)
+        if self.mode == "push":
+            return await self._consume(channel, closing, timeouts, attempt, msg_filter, miss_state)
+        return await self._poll(channel, closing, timeouts, attempt, msg_filter, miss_state)
+
+    async def _leave(self, connection: aiormq.Connection, attempt: _Attempt) -> None:
+        """End an attempt: give back the push consumer's deliveries, then close the connection.
+
+        Neither step raises an :exc:`Exception`: a failure of either is logged, and
+        closing the connection closes its channel, so the broker puts back every
+        delivery the attempt had not acknowledged. A cancellation of ``run()`` that
+        lands in the give-back still leaves the connection closed.
+        """
         try:
-            # Every bound is taken before its call is made: an expired deadline must
-            # stop the call from starting at all.
-            bound = attempt.bound(timeouts.connect, "connect")
-            await _step(connection.connect(), bound, "connect")
-            closing = connection.closing
-            bound = attempt.bound(timeouts.rpc, "channel")
-            channel = await _step(connection.channel(publisher_confirms=False), bound, "channel", closing)
-            bound = attempt.bound(timeouts.rpc, "declare")
-            await _step(channel.queue_declare(self.queue_name, passive=True), bound, "declare", closing)
-            if self.mode == "push":
-                return await self._consume(channel, closing, timeouts, attempt, msg_filter, miss_state)
-            return await self._poll(channel, closing, timeouts, attempt, msg_filter, miss_state)
-        except RuntimeError as exc:
-            # A call on a connection that has closed under it; ChannelInvalidStateError,
-            # one of these, is retried as it is.
-            if connection.is_closed and not isinstance(exc, ChannelInvalidStateError):
-                raise _ConnectionLost(attempt.step, _closing_reason(connection.closing)) from exc
-            raise
+            if attempt.give_back is not None:
+                await attempt.give_back()
         finally:
             await close_quietly(connection, f"RMQTrigger connection for queue {self.queue_name!r}", log)
 
@@ -523,10 +597,10 @@ class RMQTrigger(BaseTrigger):
         miss_state: FilterMissState,
     ) -> dict[str, Any]:
         """Pull mode: ``basic_get`` until a message matches, pausing on an empty queue."""
-        attempt.waiting = True
         while True:
             bound = attempt.bound(timeouts.rpc, "get")
             delivered = await _step(channel.basic_get(self.queue_name, no_ack=False), bound, "get", closing)
+            attempt.waiting = True
             if isinstance(delivered.delivery, spec.Basic.GetEmpty):
                 await asyncio.sleep(self.poll_interval)
                 continue
@@ -555,15 +629,23 @@ class RMQTrigger(BaseTrigger):
         """Push mode: ``basic_consume`` into a local buffer and take deliveries from it.
 
         The consumer callback only appends a delivery to the buffer; the filter, the
-        acknowledgement and every bound run here. A delivery is taken off the buffer
-        only once the deadline has been checked, so one that is not handled is still
-        there to be given back. The wait is watched in turns of at most ``rpc_timeout``
-        seconds: a delivery is handled, a closed channel ends the attempt, and a turn
-        that brought neither looks for the consumer tag in ``channel.consumers`` —
+        acknowledgement and every bound run here. The consumer takes no prefetch limit,
+        so the broker sends it every ready message of the queue and they wait here in
+        memory. A delivery is taken off the buffer only once the deadline has been
+        checked, so one that is not handled is still there to be given back; one that
+        is taken is acknowledged or returned within the full ``rpc_timeout``, whatever
+        the deadline leaves, and :meth:`_give_back` shares the same ``rpc_timeout`` past
+        the deadline. A closed connection or channel ends the attempt before the next
+        delivery is taken off the buffer: the broker has put every buffered delivery
+        back, and no acknowledgement of one could reach it. A delivery or a closed
+        channel ends a turn of the wait at once; a turn that brought neither in
+        ``rpc_timeout`` seconds looks for the consumer tag in ``channel.consumers`` —
         ``aiormq`` drops the tag when the broker cancels the consumer, and nothing else
         puts a consumer back on this channel.
 
-        A match and an expired deadline end the attempt through :meth:`_give_back`.
+        A match and an expired deadline hand :meth:`_give_back` to the attempt
+        (:attr:`_Attempt.give_back`), with the time it may take counted from that moment;
+        :meth:`_leave` runs it once the event has been fired.
         """
         buffer: deque[DeliveredMessage] = deque()
         arrived = asyncio.Event()
@@ -580,11 +662,16 @@ class RMQTrigger(BaseTrigger):
         attempt.waiting = True
         try:
             while True:
+                _ensure_open("wait", closing, channel.closing)
                 if buffer:
-                    bound = attempt.bound(timeouts.rpc, "ack")
-                    result = await self._handle(buffer.popleft(), closing, bound, msg_filter, miss_state)
+                    attempt.bound(timeouts.rpc, "ack")
+                    result = await self._handle(
+                        buffer.popleft(), closing, timeouts.rpc, msg_filter, miss_state
+                    )
                     if result is not None:
-                        await self._give_back(channel, closing, tag, buffer, timeouts.rpc)
+                        attempt.give_back = functools.partial(
+                            self._give_back, channel, closing, tag, buffer, attempt.exit_by(timeouts.rpc)
+                        )
                         return result
                     continue
                 bound = attempt.bound(timeouts.rpc, "wait")
@@ -597,16 +684,16 @@ class RMQTrigger(BaseTrigger):
                 finally:
                     if not waiter.done():
                         waiter.cancel()
-                if buffer:
+                if buffer or channel.closing.done():
                     continue
-                if channel.closing.done():
-                    raise _ConnectionLost("wait", _closing_reason(channel.closing))
                 if tag not in channel.consumers:
                     raise _ConsumerCancelled(
                         f"consumer on queue {self.queue_name!r} was cancelled by the broker"
                     )
         except _DeadlineReached:
-            await self._give_back(channel, closing, tag, buffer, timeouts.rpc)
+            attempt.give_back = functools.partial(
+                self._give_back, channel, closing, tag, buffer, attempt.exit_by(timeouts.rpc)
+            )
             raise
 
     async def _give_back(
@@ -615,31 +702,49 @@ class RMQTrigger(BaseTrigger):
         closing: asyncio.Future,
         tag: str,
         buffer: deque[DeliveredMessage],
-        rpc: float,
+        until: float,
     ) -> None:
         """Cancel the consumer and NACK the unread deliveries back to the queue.
 
         Cancelling first stops new deliveries; the ones the broker sent before its
-        ``basic.cancel-ok`` land in the buffer and are NACKed with the rest. The
-        cancellation and the NACKs share one ``rpc`` bound: the deadline has been met or
-        the result is in hand, and this is what may overrun the deadline. A failure
-        changes nothing about the outcome — the connection is closed next, and the
-        broker puts back whatever is still unacknowledged.
+        ``basic.cancel-ok`` land in the buffer and go back with the rest. Every delivery
+        taken off the buffer had its ACK or NACK queued for writing ahead of this one,
+        so one ``basic.nack`` with ``multiple=True`` up to the last buffered tag returns
+        exactly the buffer. The cancellation and the NACK share the time up to ``until``
+        (:meth:`_Attempt.exit_by`): the deadline has been met or the result is in hand,
+        and this is what may overrun the deadline. A failure changes nothing about the
+        outcome — the connection is closed next, and the broker puts back whatever is
+        still unacknowledged. On a connection or a channel that has closed already
+        there is nothing to send, and the broker has put the deliveries back itself.
         """
+        if closing.done() or channel.closing.done():
+            return
         loop = asyncio.get_running_loop()
-        until = loop.time() + rpc
+
+        def _left(step: str) -> float:
+            left = until - loop.time()
+            if left <= 0:
+                raise _StepTimeout(step, 0)
+            return left
+
         try:
-            await _step(channel.basic_cancel(tag), rpc, "cancel", closing)
-            # Deliveries that arrived before cancel-ok run their callbacks as tasks.
-            await asyncio.sleep(0)
-            while buffer:
-                left = until - loop.time()
-                if left <= 0:
-                    raise _StepTimeout("nack", rpc)
+            # Every bound is taken before its call is made.
+            bound = _left("cancel")
+            await _step(channel.basic_cancel(tag), bound, "cancel", closing)
+            # A delivery the broker sent before cancel-ok is read off the socket before
+            # it, and its callback task runs before this coroutine is woken by cancel-ok:
+            # it is in the buffer by now.
+            if buffer:
                 # Every delivery of a consumer is a Basic.Deliver.
-                delivery = cast(spec.Basic.Deliver, buffer[0].delivery)
-                await _step(channel.basic_nack(delivery.delivery_tag, requeue=True), left, "nack", closing)
-                buffer.popleft()
+                last = cast(spec.Basic.Deliver, buffer[-1].delivery)
+                bound = _left("nack")
+                await _step(
+                    channel.basic_nack(last.delivery_tag, multiple=True, requeue=True),
+                    bound,
+                    "nack",
+                    closing,
+                )
+                buffer.clear()
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "RMQTrigger: returning %d unread deliveries to queue %r failed: %s; "
@@ -672,9 +777,14 @@ class RMQTrigger(BaseTrigger):
         the message, and one still queued for writing is dropped with the connection,
         which puts the message back. A failed acknowledgement of a matching message
         therefore still fires the success event, with a WARNING — a duplicate is
-        possible, a lost message is not. A failed broker call on any other verdict is
-        raised to the caller.
+        possible, a lost message is not. Where nothing can have been written the
+        broker certainly puts the message back, and the attempt is retried like any
+        other on a closed connection or channel: the connection or the channel had
+        closed before the call, or the call raised :exc:`ChannelInvalidStateError`,
+        which ``aio_pika`` raises on a closed channel before writing anything. A failed
+        broker call on any other verdict is raised to the caller.
         """
+        _ensure_open("ack", closing, delivered.channel.closing)
         message = IncomingMessage(delivered)
         verdict = match(message, msg_filter)
         try:
@@ -684,8 +794,8 @@ class RMQTrigger(BaseTrigger):
                 "ack",
                 closing,
             )
-        except (_StepTimeout, _ConnectionLost, ChannelInvalidStateError, ConnectionError, AMQPError) as exc:
-            if verdict[0] is not FilterVerdict.MATCH:
+        except (_StepTimeout, _ConnectionLost, ConnectionError, AMQPError) as exc:
+            if verdict[0] is not FilterVerdict.MATCH or isinstance(exc.__cause__, ChannelInvalidStateError):
                 raise
             log.warning(
                 "RMQTrigger: ACK not confirmed for the matching message on queue %r "

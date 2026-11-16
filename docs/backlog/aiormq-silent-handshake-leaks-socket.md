@@ -1,12 +1,12 @@
 ---
 worth: later
-where: airflow_provider_rmq/triggers/rmq.py:498
+where: airflow_provider_rmq/triggers/rmq.py:566
 added: 2026-11-16
 ---
 # Брошенный `connect()` триггера оставляет сокет, если брокер молчит на первом кадре handshake
 
 **Симптом.** `RMQTrigger` ограничивает подключение `connect_timeout`: шаг
-`connect` (`airflow_provider_rmq/triggers/rmq.py:498`) отменяет
+`connect` (`airflow_provider_rmq/triggers/rmq.py:566`) отменяет
 `aiormq.Connection.connect()` и закрывает объект соединения в `finally` попытки.
 Если брокер принял TCP и не прислал ни одного кадра handshake, этого мало: в
 `aiormq` 6.x `Connection.connect()` открывает транспорт, пишет заголовок протокола и

@@ -9,11 +9,11 @@ added: 2026-09-05
 `body.decode("utf-8")`, без `errors=`. Невалидный UTF-8 даёт `UnicodeDecodeError`,
 который улетает из `RMQConsumeOperator.execute` и `RMQSensor.poke` мимо их
 единственного `except pika.exceptions.ChannelClosedByBroker`
-(`operators/rmq_consume.py:99`, `sensors/rmq.py:221`): задача красная,
+(`operators/rmq_consume.py:99`, `sensors/rmq.py:237`): задача красная,
 батч остаётся unacked.
 
 Асинхронный путь то же тело читает: `match()` (`utils/amqp.py:338`) и
-`RMQTrigger._handle` (`triggers/rmq.py:703`) декодируют с `errors="replace"` — именно
+`RMQTrigger._handle` (`triggers/rmq.py:813`) декодируют с `errors="replace"` — именно
 потому, что бинарные тела в этом проекте считаются реальным случаем.
 
 **Почему это не просто «привести к одному виду».** Замена строгого декодирования

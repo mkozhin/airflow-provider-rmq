@@ -5,7 +5,8 @@ behaves the way those fakes say it does: a message is delivered and acknowledged
 both modes, a quorum queue keeps the deliveries the push consumer gave back without
 counting them, a deleted queue cancels the consumer and then answers 404, a connection
 the broker closes is followed by a new attempt, ``message_wait_timeout`` ends the wait,
-and a wrong password is an error on the first attempt.
+and a wrong password is an error on the first attempt. One test needs no broker: it holds
+the Management API helper to the test's own connections.
 
 Every queue is declared through the ``scratch`` fixture and deleted in teardown. The
 connections opened here are the trigger's own, named ``rmq-trigger:<queue>``; the one
@@ -149,6 +150,7 @@ async def test_matching_message_fires_success(
 
 async def test_push_on_quorum_queue_gives_back_the_rest_uncounted(
     scratch: BrokerScratch,
+    rmq_url: str,
     rmq_conn_id: str,
     pika_channel: pika.adapters.blocking_connection.BlockingChannel,
     trigger_log: pytest.LogCaptureFixture,
@@ -156,7 +158,9 @@ async def test_push_on_quorum_queue_gives_back_the_rest_uncounted(
     """The deliveries behind the match go back by NACK and carry no delivery count.
 
     A quorum queue counts a delivery dropped with its connection — the next read of
-    such a message has an ``x-delivery-count`` header — but not one NACKed back.
+    such a message has an ``x-delivery-count`` header — but not one NACKed back. The
+    control message at the end is dropped with its connection on purpose and must come
+    back counted, which shows the header is there to be missed.
     """
     queue = scratch.declare_queue("quorum.push", arguments={"x-queue-type": "quorum"})
     scratch.publish(queue, b"wanted", headers=WANTED)
@@ -178,6 +182,18 @@ async def test_push_on_quorum_queue_gives_back_the_rest_uncounted(
     for body, headers in left:
         assert "x-delivery-count" not in headers, (body, headers)
     assert not [r for r in trigger_log.records if "unread deliveries" in r.getMessage()]
+
+    scratch.publish(queue, b"control", headers=STRAY)
+    dropping = pika.BlockingConnection(pika.URLParameters(rmq_url))
+    try:
+        method, _, body = dropping.channel().basic_get(queue, auto_ack=False)
+        assert body == b"control"
+    finally:
+        dropping.close()
+    await wait_for(lambda: scratch.depth(queue) == 1)
+    method, properties, body = pika_channel.basic_get(queue, auto_ack=True)
+    assert body == b"control"
+    assert (properties.headers or {}).get("x-delivery-count") == 1
 
 
 async def test_deleted_queue_cancels_the_consumer_then_answers_404(
@@ -275,4 +291,13 @@ async def test_wrong_password_is_an_error_on_the_first_attempt(
     event = await first_event(trigger)
 
     assert event["status"] == "error"
+    assert "ACCESS_REFUSED" in event["error"]
     assert retry_lines(trigger_log) == []
+
+
+def test_management_api_closes_only_the_tests_own_connections() -> None:
+    """A name outside the test's prefix is refused before any request is sent."""
+    api = ManagementApi("http://user:password@127.0.0.1:9/", "test", "rmqtest.1.abcdef01.")
+
+    with pytest.raises(ValueError, match="outside this test's namespace"):
+        api.close_connection_named("rmq-trigger:production-queue", "must not be sent")

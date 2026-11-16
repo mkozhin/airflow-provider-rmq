@@ -5,6 +5,7 @@ import logging
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+import pika.exceptions
 import pytest
 from airflow.exceptions import AirflowException, AirflowProviderDeprecationWarning
 
@@ -22,6 +23,8 @@ from tests.conftest import (
 
 
 HOOK_PATH = "airflow_provider_rmq.sensors.rmq.RMQHook"
+#: Start of the batch line when nothing matched, with or without the dropped clause.
+_NOTHING_MATCHED_TEXT = "read from queue 'q' passed the filter"
 
 
 def _make_raw_msg(body="msg", delivery_tag=1, routing_key="rk", exchange="", headers=None):
@@ -606,7 +609,7 @@ class TestAckUnmatched:
             for _ in range(100):
                 sensor.poke(context={})
 
-        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+        assert log_lines(caplog, _NOTHING_MATCHED_TEXT) == []
         assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
         streak_lines = log_lines(caplog, STREAK_TEXT)
         assert len(streak_lines) == 1
@@ -749,14 +752,22 @@ class TestDeferTimeout:
         assert exc_info.value.timeout == timedelta(seconds=90)
         assert exc_info.value.trigger.mode == "push"
 
+    @pytest.mark.parametrize("timeout", [float("inf"), 1e12, 1e15], ids=["inf", "past-9999", "huge"])
+    def test_timeout_no_date_can_reach_defers_without_a_limit(self, timeout):
+        """Airflow 2.9 keeps ``timeout`` as given; later versions refuse some of these
+        values in the constructor, so the value is set on the built sensor."""
+        from airflow.exceptions import TaskDeferred
+
+        sensor = RMQSensor(task_id="t", queue_name="q", deferrable=True)
+        sensor.timeout = timeout
+        with pytest.raises(TaskDeferred) as exc_info:
+            sensor.execute(context={})
+        assert exc_info.value.timeout is None
+
 
 # ---------------------------------------------------------------------------
 # reschedule — one batch line per poke
 # ---------------------------------------------------------------------------
-#: Start of the batch line when nothing matched, with or without the dropped clause.
-_NOTHING_MATCHED_TEXT = "read from queue 'q' passed the filter"
-
-
 class TestReschedulePokeReport:
     def _sensor(self, mode, **kwargs):
         return RMQSensor(
@@ -901,5 +912,28 @@ class TestReschedulePokeReport:
         with caplog.at_level(logging.WARNING):
             assert sensor.poke(context={}) is False
 
-        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+        assert log_lines(caplog, _NOTHING_MATCHED_TEXT) == []
         assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
+
+    def test_poke_mode_reports_no_batch_without_ack_unmatched(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+        ]
+        sensor = self._sensor("poke")
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is False
+
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+
+    def test_queue_closed_by_the_broker_reports_no_batch(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.side_effect = pika.exceptions.ChannelClosedByBroker(404, "NOT_FOUND")
+        sensor = self._sensor("reschedule")
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is False
+
+        assert log_lines(caplog, _NOTHING_MATCHED_TEXT) == []
+        assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
+        (line,) = log_lines(caplog, "is not available")
+        assert "NOT_FOUND" in line.getMessage()

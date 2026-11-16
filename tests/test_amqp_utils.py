@@ -466,9 +466,7 @@ class TestMatchAndAck:
         msg = _make_aio_message(headers={"type": "order"})
         f = MessageFilter(filter_headers={"type": "order"})
         state = _make_miss_state()
-        with patch.object(MessageFilter, "evaluate") as evaluate, patch(
-            "airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock
-        ):
+        with patch.object(MessageFilter, "evaluate") as evaluate:
             result = await match_and_ack(msg, f, state, verdict=(FilterVerdict.MISS, None))
         assert result is False
         evaluate.assert_not_called()
@@ -479,9 +477,9 @@ class TestMatchAndAck:
     async def test_given_error_verdict_carries_its_reason(self, caplog):
         msg = _make_aio_message()
         state = _make_miss_state()
-        with patch.object(MessageFilter, "evaluate") as evaluate, patch(
-            "airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock
-        ), caplog.at_level("WARNING", logger="test.miss.state"):
+        with patch.object(MessageFilter, "evaluate") as evaluate, caplog.at_level(
+            "WARNING", logger="test.miss.state"
+        ):
             result = await match_and_ack(
                 msg, MessageFilter(), state, verdict=(FilterVerdict.ERROR, "KeyError: 'x'")
             )
@@ -1062,6 +1060,7 @@ class TestCloseQuietly:
         logger.warning.assert_not_called()
 
     def test_the_default_bound_is_five_seconds(self):
+        """The README and the trigger's overrun bound state five seconds."""
         assert CLOSE_TIMEOUT == 5.0
 
 

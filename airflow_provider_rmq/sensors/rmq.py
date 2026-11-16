@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Literal, Sequence
 
 import pika.exceptions
@@ -30,7 +30,9 @@ class RMQSensor(BaseSensorOperator):
     says, every retry waiting the full ``timeout`` again — or SKIPPED with
     ``soft_fail=True``; ``execute_complete`` is not called. A ``message_wait_timeout``
     longer than ``timeout`` therefore never comes into play: the task fails by
-    ``timeout`` instead of being skipped.
+    ``timeout`` instead of being skipped. A ``timeout`` no date can be counted to —
+    ``float("inf")``, or one past the year 9999 — leaves the deferred wait without a
+    limit.
 
     A message the filter read and rejected is disposed of according to
     ``ack_unmatched``: NACKed with requeue=True by default, so it stays in the queue for
@@ -184,8 +186,22 @@ class RMQSensor(BaseSensorOperator):
                 ack_unmatched=self.ack_unmatched,
             ),
             method_name="execute_complete",
-            timeout=timedelta(seconds=self.timeout),
+            timeout=self._defer_timeout(),
         )
+
+    def _defer_timeout(self) -> timedelta | None:
+        """The sensor's ``timeout`` as ``defer()`` takes it.
+
+        ``None`` — no limit on the deferred wait — for a ``timeout`` no date can be
+        counted to: ``float("inf")``, which the base class accepts, or a number of
+        seconds that takes the deadline past the year 9999.
+        """
+        try:
+            timeout = timedelta(seconds=self.timeout)
+            datetime.now(timezone.utc) + timeout
+        except OverflowError:
+            return None
+        return timeout
 
     def execute_complete(self, context: Any, event: dict[str, Any]) -> dict | None:
         if event.get("status") == "success":

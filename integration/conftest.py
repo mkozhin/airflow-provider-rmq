@@ -288,13 +288,26 @@ class BrokerScratch:
 MANAGEMENT_TIMEOUT = 10.0
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Answer a redirect with its own ``HTTPError`` instead of following it: the
+    ``Authorization`` header would go along to wherever the redirect points."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_MANAGEMENT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _management_request(
     url: str, method: str, path: str, headers: dict[str, str] | None = None
 ) -> Any:
     """Send one request to the Management API at *url* and return the decoded JSON body.
 
     The credentials travel in the ``Authorization`` header only: the URL the request is
-    sent to has them stripped, so neither an error nor a log line can carry them.
+    sent to has them stripped, so neither an error nor a log line can carry them. A
+    redirect is not followed and comes back as :exc:`urllib.error.HTTPError`, so the
+    header never reaches another host.
     """
     parts = urlsplit(url)
     host = parts.netloc.rpartition("@")[2]
@@ -304,7 +317,7 @@ def _management_request(
     request.add_header("Authorization", "Basic " + base64.b64encode(token.encode()).decode())
     for name, value in (headers or {}).items():
         request.add_header(name, value)
-    with urllib.request.urlopen(request, timeout=MANAGEMENT_TIMEOUT) as response:
+    with _MANAGEMENT_OPENER.open(request, timeout=MANAGEMENT_TIMEOUT) as response:
         body = response.read()
     return json.loads(body) if body else None
 
@@ -330,8 +343,7 @@ class ManagementApi:
         return [
             connection
             for connection in listed
-            if connection.get("vhost") == self.vhost
-            and (connection.get("client_properties") or {}).get("connection_name") == name
+            if (connection.get("client_properties") or {}).get("connection_name") == name
         ]
 
     def close_connection_named(self, name: str, reason: str) -> None:

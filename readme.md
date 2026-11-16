@@ -26,7 +26,7 @@
 - **Reactive DAG triggering** — [RMQ Watcher Plugin](#rmq-watcher-plugin) starts DAGs automatically when messages arrive in a queue, with no polling and no worker slots consumed
 - Publishing messages to exchanges and queues with publisher confirms
 - Consuming messages with header-based and callable-based filtering
-- Waiting for specific messages with sensors (classic poke and deferrable mode)
+- Waiting for specific messages with sensors (`poke` and `reschedule` modes, and deferrable mode)
 - Deferrable sensor in **pull mode** (periodic polling) and **push mode** (broker-delivered via `basic_consume`) — choose based on latency requirements
 - Full queue and exchange management (declare, delete, purge, bind, unbind)
 - SSL/TLS connections
@@ -440,7 +440,7 @@ RMQQueueManagementOperator(
 
 **Import:** `from airflow_provider_rmq.sensors.rmq import RMQSensor`
 
-Waits for a message in a RabbitMQ queue that matches optional filter conditions. Supports classic poke mode and deferrable mode.
+Waits for a message in a RabbitMQ queue that matches optional filter conditions. Supports the `poke` and `reschedule` modes of `BaseSensorOperator` and deferrable mode.
 
 #### Parameters
 
@@ -456,7 +456,7 @@ Waits for a message in a RabbitMQ queue that matches optional filter conditions.
 | `timeout` | `float` | `604800` | No | Max seconds to wait before failing (inherited from BaseSensorOperator). With `deferrable=True` it bounds the whole wait in the triggerer (see [Deferrable Mode](#deferrable-mode)) |
 | `mode` | `str` | `"poke"` | No | `"poke"` or `"reschedule"` (inherited from BaseSensorOperator, which checks the value). `"pull"` and `"push"` are accepted as deprecated spellings of `trigger_mode` with an `AirflowProviderDeprecationWarning` |
 | `trigger_mode` | `Literal["pull", "push"] \| None` | `None` (= `"pull"`) | No | How the trigger reads the queue when `deferrable=True`: `"pull"` = `basic_get` in a loop, `"push"` = broker-pushed via `basic_consume`. Ignored without `deferrable=True`. Passing it together with `mode="pull"`/`"push"` raises `ValueError` |
-| `message_wait_timeout` | `float \| None` | `None` | No | Max seconds to wait for a matching message in push mode. `None` = no limit. Only valid with `trigger_mode="push"`. Supports Jinja templates and XCom |
+| `message_wait_timeout` | `float \| None` | `None` | No | Max seconds to wait for a matching message in push mode. `None` = wait until the sensor's `timeout` (see [Deferrable Mode](#deferrable-mode)). Only valid with `trigger_mode="push"`. Supports Jinja templates and XCom |
 | `ack_unmatched` | `bool` | `False` | No | ACK a message the filter rejected instead of returning it to the queue. The message leaves the broker for good — DLX does not fire on an acknowledgement. Must be a `bool` |
 
 **Template fields:** `queue_name`, `message_wait_timeout`
@@ -467,7 +467,7 @@ Waits for a message in a RabbitMQ queue that matches optional filter conditions.
 
 When `deferrable=True`, the sensor defers execution to the Airflow triggerer process using `RMQTrigger`. This frees the worker slot while waiting for a message, which is more resource-efficient for long waits.
 
-**`timeout` bounds the whole wait.** The sensor hands its own `timeout` to the deferral, so the wait in the triggerer — every reconnect of the trigger included — ends after `timeout` seconds. The scheduler then ends the task with `TaskDeferralError("Trigger/execution timeout")`: the task is **FAILED** and retried as the DAG says, every retry waiting the full `timeout` again, or **SKIPPED** with `soft_fail=True`. `execute_complete` is not called. A `message_wait_timeout` longer than `timeout` never comes into play: the task fails by `timeout` instead of being skipped.
+**`timeout` bounds the whole wait.** The sensor hands its own `timeout` to the deferral, so the wait in the triggerer — every reconnect of the trigger included — ends after `timeout` seconds. The scheduler then ends the task with `TaskDeferralError("Trigger/execution timeout")`: the task is **FAILED** and retried as the DAG says, every retry waiting the full `timeout` again, or **SKIPPED** with `soft_fail=True`. `execute_complete` is not called. A `message_wait_timeout` longer than `timeout` never comes into play: the task fails by `timeout` instead of being skipped. A `timeout` no date can be counted to — `float("inf")`, or one that reaches past the year 9999 — leaves the deferred wait without a limit.
 
 **Limitation:** `filter_callable` cannot be used with `deferrable=True` because Python callables cannot be serialized to the triggerer process. Use `filter_headers` instead.
 
@@ -577,12 +577,12 @@ Async trigger for deferrable sensor mode. Talks to the broker over `aiormq` dire
 | `filter_data` | `dict \| None` | `None` | No | Serialized filter from `MessageFilter.serialize()` |
 | `poll_interval` | `float` | `5.0` | No | Seconds between polls when queue is empty (pull mode only) |
 | `mode` | `Literal["pull", "push"]` | `"pull"` | No | Delivery mode: `"pull"` = `basic_get` in a loop, `"push"` = `basic_consume`. `RMQSensor` passes its `trigger_mode` here |
-| `message_wait_timeout` | `float \| None` | `None` | No | Max seconds to wait in push mode, counted from the start of `run()` across every attempt and every pause between them. The timeout event comes at most `rpc_timeout` + `CLOSE_TIMEOUT` (5 s) after it: the trigger cancels its consumer, NACKs the unread deliveries back to the queue and closes the connection |
+| `message_wait_timeout` | `float \| None` | `None` | No | Max seconds to wait in push mode, counted from the start of `run()` across every attempt and every pause between them. The timeout event comes at most `rpc_timeout` + `CLOSE_TIMEOUT` (5 s) after it: the trigger finishes the ACK or NACK of the delivery in hand, cancels its consumer, NACKs the unread deliveries back to the queue and closes the connection. Pull mode ignores it |
 | `ack_unmatched` | `bool` | `False` | No | ACK a message the filter rejected instead of returning it to the queue. The message leaves the broker for good — DLX does not fire on an acknowledgement. Must be a `bool` |
 
 #### Bounds, retries and errors
 
-**Every broker call is bounded.** Each attempt opens a connection of its own — listed as `rmq-trigger:<queue>` in the Management UI — and a channel on it, and closes the connection whatever ends the attempt, a cancellation of the task included. The handshake runs under `connect_timeout`; opening the channel, the passive declare of the queue, `basic_get`, `basic_consume`, every ACK/NACK and `basic_cancel` run under `rpc_timeout` (see [Connection Timing](#connection-timing)). In push mode the wait for a delivery is checked every `rpc_timeout` seconds for a closed channel and for a consumer the broker cancelled. A resource alarm does not hold up the connect: the trigger only reads, and the broker blocks publishing connections.
+**Every broker call is bounded.** Each attempt opens a connection of its own — listed as `rmq-trigger:<queue>` in the Management UI — and a channel on it, and closes the connection whatever ends the attempt, a cancellation of the task included. The handshake runs under `connect_timeout`; opening the channel, the passive declare of the queue, `basic_get`, `basic_consume`, every ACK/NACK and `basic_cancel` run under `rpc_timeout` (see [Connection Timing](#connection-timing)). In push mode a closed channel ends the wait for a delivery at once, and every `rpc_timeout` seconds without a delivery the trigger checks that the broker has not cancelled its consumer. A resource alarm does not hold up the connect: the trigger only reads, and the broker blocks publishing connections.
 
 **What is retried.** A step that ran out of time, a lost connection or channel (heartbeat, a broker restart, a reset socket) and a consumer the broker cancelled (the queue deleted, a quorum leader moving, a node restarting) end the attempt with a WARNING in the task log, for example:
 
@@ -592,9 +592,9 @@ RMQTrigger: connect did not complete within 15s on conn_id='rabbitmq' (attempt 3
 
 The pause before the next attempt is 15 s, then 30 s, then 60 s for every one after that, and starts over at 15 s once an attempt has reached the wait for a message. The task stays deferred meanwhile and carries on by itself once the broker is back; the sensor's `timeout` bounds the whole wait (see [Deferrable Mode](#deferrable-mode)).
 
-**What is an error.** The trigger fires an error event — the sensor then fails with `RuntimeError` — on any attempt for a wrong or changed password (403 during the handshake), no access to the vhost (530 on `Connection.Open`), a 403 or a 404 on the queue, and any exception other than the ones listed here. A 404 whose reply says the home node of a durable classic queue is down or inaccessible is a node restart, not a missing queue, and is retried. A refused connection and a handshake cut short (EOF, a `Connection.Close` in the middle of it, a vhost that is down) are an error on the first attempt — a wrong host or port, a broker that is not there — and retried on every later one.
+**What is an error.** The trigger fires an error event — the sensor then fails with `RuntimeError` — on any attempt for a wrong or changed password (403 during the handshake), no access to the vhost (530 on `Connection.Open`), a 403 or a 404 on the queue, a connection the broker closed with 540 NOT_IMPLEMENTED (for instance `basic_get` on a stream queue), 501 FRAME_ERROR or 503 COMMAND_INVALID, and any exception other than the ones listed here. A 404 whose reply says the home node of a durable classic queue is down or inaccessible is a node restart, not a missing queue, and is retried. A refused connection and a handshake cut short (EOF, a `Connection.Close` in the middle of it, a vhost that is down) are an error on the first attempt — a wrong host or port, a broker that is not there — and retried on every later one.
 
-**The matching message is acknowledged before the success event.** When that ACK cannot be confirmed — it timed out, or the connection went away under it — the event fires all the same, with the WARNING `ACK not confirmed … the message may be delivered again`: the frame may or may not have reached the broker, so a duplicate is possible and a lost message is not. In push mode a match and an expired `message_wait_timeout` cancel the consumer and NACK the deliveries the broker had already sent back to the queue before the connection closes: a quorum queue counts a delivery dropped with its connection against `delivery-limit`, and a NACK it does not.
+**The matching message is acknowledged before the success event.** When that ACK cannot be confirmed — it timed out, or the connection went away under it — the event fires all the same, with the WARNING `ACK not confirmed … the message may be delivered again`: the frame may or may not have reached the broker, so a duplicate is possible and a lost message is not. When nothing can have been written — the connection or the channel had closed before the ACK, or the ACK failed on a closed channel before writing — the attempt is retried instead: the broker puts the message back. In push mode a closed connection or channel ends the attempt before the next buffered delivery is read: the broker has put the buffered deliveries back. A delivery taken before `message_wait_timeout` runs out gets its ACK or NACK under the full `rpc_timeout`. In push mode a match and an expired `message_wait_timeout` cancel the consumer and NACK the deliveries the broker had already sent back to the queue, in one `basic.nack` with `multiple=True`, before the connection closes: a quorum queue counts a delivery dropped with its connection against `delivery-limit`, and a NACK it does not. The push consumer takes no prefetch limit, so the broker sends it every ready message of the queue, and they wait in the triggerer's memory until the trigger reads them or gives them back. The success event is fired before the consumer is left and the connection closes: a trigger cancelled during that cleanup — the triggerer stopping, the task cleared, the deferral timing out — has already handed the event over.
 
 **A broker that never starts the handshake.** When the broker accepts the TCP connection and never sends the first handshake frame, `aiormq` leaves that socket open after the connect step is given up on, until the other side closes it. Once the pause between attempts has reached 60 s, that is at most one socket a minute for as long as the broker stays that way.
 

@@ -43,7 +43,7 @@ added: 2026-09-02
 фикстуру уникального префикса `rmqtest.{pid}.{uuid8}.` с teardown'ом всего
 созданного и хелпер глубины очереди через пассивный `queue_declare`. Каталог
 лежит вне `testpaths` (`pyproject.toml`), поэтому обычный прогон его не
-собирает. В нём три файла. `integration/test_filter_miss.py`, шесть тестов, —
+собирает. В нём четыре файла. `integration/test_filter_miss.py`, шесть тестов, —
 путь промаха фильтра целиком: подтверждение при `ack_unmatched`, отсутствие
 dead-lettering на подтверждении, возврат в очередь при умолчании, нечитаемое
 тело, которое остаётся в очереди и при `ack_unmatched=True`, батч сенсора и два
@@ -61,7 +61,14 @@ durable у `RMQQueueManagementOperator` (повторный активный dec
 `durable=True` проходит), повторное объявление exclusive-очереди `RMQHook` на
 том же подключении, exclusive-очередь с `durable=False` и публикация с чтением
 через хук с `global_qos=True`, где `basic.qos` уходит только с
-`prefetch_count`. Набор проверен на RabbitMQ 4.4.0 / Erlang 29.1.2.
+`prefetch_count`. `integration/test_trigger.py`, восемь тестов, — `RMQTrigger.run()`
+на брокере: success-событие в pull и push, возврат непрочитанных доставок
+quorum-очереди через NACK без `x-delivery-count` (с контрольной доставкой,
+брошенной вместе с соединением, у которой счётчик есть), удалённая очередь
+(отмена консьюмера, повтор, затем 404), соединение, закрытое брокером через
+Management API (повтор; без учётных данных Management API тест пропускается),
+граница префикса теста у закрытия соединения, `message_wait_timeout` и неверный
+пароль (`ACCESS_REFUSED` на первой попытке). Набор проверен на RabbitMQ 4.4.0 / Erlang 29.1.2.
 
 **Что открыто — прогон в CI.** Набор ручной: в `.github/workflows/publish.yml`
 нет ни service-контейнера с брокером, ни шага для `integration/`. Из сценариев
