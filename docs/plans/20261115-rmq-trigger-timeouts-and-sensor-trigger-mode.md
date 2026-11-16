@@ -516,31 +516,33 @@
 - Modify: `integration/conftest.py`
 - Modify: `integration/README.md`
 
-- [ ] `integration/conftest.py`: `_load_env` переносит из `.env` и `RMQ_TEST_MANAGEMENT_URL`; фикстура
+- [x] `integration/conftest.py`: `_load_env` переносит из `.env` и `RMQ_TEST_MANAGEMENT_URL`; фикстура
       `rmq_management_url` — тест, которому она нужна, пропускается, если переменной нет, и
       пропускается с понятной причиной при 401/403 (пользователю нужен тег `management` или
       `monitoring`); vhost — тот же `test`; запросы к Management API затрагивают только соединения,
       которые тест нашёл по имени
-- [ ] pull и push: `RMQTrigger.run()` получает опубликованное сообщение в scratch-очереди и отдаёт
+  ⚠️ в этом окружении `RMQ_TEST_MANAGEMENT_URL` без учётных данных — тест закрытия соединения
+  брокером скипается с причиной; клиент Management API проверен на локальном HTTP-фейке
+- [x] pull и push: `RMQTrigger.run()` получает опубликованное сообщение в scratch-очереди и отдаёт
       success-событие с прежними полями
-- [ ] push на quorum-очереди (`scratch.declare_queue(..., arguments={"x-queue-type": "quorum"})`): за
+- [x] push на quorum-очереди (`scratch.declare_queue(..., arguments={"x-queue-type": "quorum"})`): за
       совпадающим сообщением лежат ещё два; после success-события оба на месте, и при следующем чтении
       у них нет заголовка `x-delivery-count` (возврат через `basic.nack` его не увеличивает, обрыв
       соединения увеличил бы)
-- [ ] push: очередь удаляется, пока триггер ждёт (подключение с `rpc_timeout` 2 с через свой
+- [x] push: очередь удаляется, пока триггер ждёт (подключение с `rpc_timeout` 2 с через свой
       `AIRFLOW_CONN_*`, константа паузы подменена на 0,1 с) → WARNING об отмене консьюмера, затем
       error-событие с 404 не позже чем через 10 с
-- [ ] push: соединение триггера закрывается со стороны брокера — `GET /api/vhosts/test/connections`,
+- [x] push: соединение триггера закрывается со стороны брокера — `GET /api/vhosts/test/connections`,
       соединение с `client_properties.connection_name == "rmq-trigger:<scratch-очередь>"`, `DELETE
       /api/connections/{name}` только для него → WARNING и новая попытка, затем опубликованное
       сообщение доставляется; соединение фикстуры `scratch` не затронуто
-- [ ] push: `message_wait_timeout` 3 с без сообщений и с пустым буфером → timeout-событие не позже
+- [x] push: `message_wait_timeout` 3 с без сообщений и с пустым буфером → timeout-событие не позже
       чем через 3 с + `CLOSE_TIMEOUT`
-- [ ] неверный пароль в `AIRFLOW_CONN_*` → error-событие на первой попытке
-- [ ] `integration/README.md`: что проверяет `test_trigger.py`; переменная `RMQ_TEST_MANAGEMENT_URL` в
+- [x] неверный пароль в `AIRFLOW_CONN_*` → error-событие на первой попытке
+- [x] `integration/README.md`: что проверяет `test_trigger.py`; переменная `RMQ_TEST_MANAGEMENT_URL` в
       таблице переменных (формат, тег пользователя, тест пропускается без неё), фикстура
       `rmq_management_url` в таблице фикстур
-- [ ] прогнать `pytest integration/ -q` на vhost `test` — всё зелёное
+- [x] прогнать `pytest integration/ -q` на vhost `test` — всё зелёное
 
 ### Task 6: Verify acceptance criteria
 - [ ] все сценарии зависания из Overview ограничены по времени и видны в логе задачи

@@ -7,17 +7,25 @@ default ``/``, aborts the run instead of touching a shared namespace.
 
 Everything a test creates carries the ``rmqtest.{pid}.{uuid8}.`` prefix of its
 :class:`BrokerScratch` and is deleted in teardown.
+
+A test that closes a connection from the broker's side reaches the Management API
+through :class:`ManagementApi`, which only ever touches connections of the suite's
+vhost that it found by their client-given name.
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import aio_pika
 import pika
@@ -29,7 +37,11 @@ log = logging.getLogger(__name__)
 #: Environment variable holding the AMQP URL of the test broker.
 URL_ENV = "RMQ_TEST_URL"
 
-#: Dotenv-style file read for the variable above, at the repository root.
+#: Environment variable holding the Management API base URL with its credentials:
+#: ``https://<user>:<password>@host[:port][/path-prefix]``. Optional.
+MANAGEMENT_URL_ENV = "RMQ_TEST_MANAGEMENT_URL"
+
+#: Dotenv-style file read for the variables above, at the repository root.
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 #: This directory. Only the items collected from it are gated and configured here.
@@ -64,14 +76,16 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 
 def _load_env() -> None:
-    """Copy the suite's variable from the dotenv file into the environment.
+    """Copy the suite's variables from the dotenv file into the environment.
 
     A value already present in the environment wins, so a one-off run can point
     the suite at another broker without editing the file.
     """
-    value = _read_env_file(ENV_FILE).get(URL_ENV)
-    if value and not os.environ.get(URL_ENV):
-        os.environ[URL_ENV] = value
+    values = _read_env_file(ENV_FILE)
+    for variable in (URL_ENV, MANAGEMENT_URL_ENV):
+        value = values.get(variable)
+        if value and not os.environ.get(variable):
+            os.environ[variable] = value
 
 
 def vhost_of(url: str) -> str:
@@ -215,6 +229,28 @@ class BrokerScratch:
             if channel.is_open:
                 channel.close()
 
+    def consumers(self, queue: str) -> int:
+        """Return the number of consumers on *queue*, by the same passive declare."""
+        self._guard(queue)
+        channel = self._connection.channel()
+        try:
+            return channel.queue_declare(queue=queue, passive=True).method.consumer_count
+        finally:
+            if channel.is_open:
+                channel.close()
+
+    def delete_queue(self, queue: str) -> None:
+        """Delete *queue* now and drop it from the register."""
+        self._guard(queue)
+        channel = self._connection.channel()
+        try:
+            channel.queue_delete(queue=queue)
+        finally:
+            if channel.is_open:
+                channel.close()
+        if queue in self._queues:
+            self._queues.remove(queue)
+
     # --- teardown ---
 
     def teardown(self) -> None:
@@ -248,6 +284,74 @@ class BrokerScratch:
             )
 
 
+#: Seconds one Management API request is given.
+MANAGEMENT_TIMEOUT = 10.0
+
+
+def _management_request(
+    url: str, method: str, path: str, headers: dict[str, str] | None = None
+) -> Any:
+    """Send one request to the Management API at *url* and return the decoded JSON body.
+
+    The credentials travel in the ``Authorization`` header only: the URL the request is
+    sent to has them stripped, so neither an error nor a log line can carry them.
+    """
+    parts = urlsplit(url)
+    host = parts.netloc.rpartition("@")[2]
+    base = urlunsplit((parts.scheme, host, parts.path.rstrip("/"), "", ""))
+    token = f"{unquote(parts.username or '')}:{unquote(parts.password or '')}"
+    request = urllib.request.Request(base + path, method=method)
+    request.add_header("Authorization", "Basic " + base64.b64encode(token.encode()).decode())
+    for name, value in (headers or {}).items():
+        request.add_header(name, value)
+    with urllib.request.urlopen(request, timeout=MANAGEMENT_TIMEOUT) as response:
+        body = response.read()
+    return json.loads(body) if body else None
+
+
+class ManagementApi:
+    """The Management API, held to the suite's vhost and to one test's prefix.
+
+    It lists the connections of that vhost and closes a connection only after finding
+    it there by the ``connection_name`` its client gave it, and only when that name
+    carries the test's prefix — a connection the test did not open is out of reach.
+    """
+
+    def __init__(self, url: str, vhost: str, prefix: str) -> None:
+        self._url = url
+        self.vhost = vhost
+        self.prefix = prefix
+
+    def connections_named(self, name: str) -> list[dict[str, Any]]:
+        """Connections of the vhost whose client named them *name*."""
+        listed = _management_request(
+            self._url, "GET", f"/api/vhosts/{quote(self.vhost, safe='')}/connections"
+        )
+        return [
+            connection
+            for connection in listed
+            if connection.get("vhost") == self.vhost
+            and (connection.get("client_properties") or {}).get("connection_name") == name
+        ]
+
+    def close_connection_named(self, name: str, reason: str) -> None:
+        """Close the one connection of the vhost named *name* by its client.
+
+        :raises ValueError: *name* lacks the test's prefix.
+        :raises AssertionError: The vhost has no connection by that name, or several.
+        """
+        if self.prefix not in name:
+            raise ValueError(f"{name!r} is outside this test's namespace {self.prefix!r}")
+        found = self.connections_named(name)
+        assert len(found) == 1, f"expected one connection named {name!r}, found {len(found)}"
+        _management_request(
+            self._url,
+            "DELETE",
+            f"/api/connections/{quote(found[0]['name'], safe='')}",
+            {"X-Reason": reason},
+        )
+
+
 # --- broker coordinates ---
 
 
@@ -279,6 +383,47 @@ def rmq_conn_id(rmq_url: str) -> Iterator[str]:
             os.environ.pop(variable, None)
         else:
             os.environ[variable] = previous
+
+
+@pytest.fixture(scope="session")
+def rmq_management_url(rmq_url: str) -> str:
+    """Management API base URL with credentials, checked against the suite's vhost.
+
+    A test that needs it is skipped when :data:`MANAGEMENT_URL_ENV` is not set, when
+    the URL carries no ``user:password``, and when the API answers 401 or 403 to a
+    listing of the vhost's connections: the user needs the ``management`` tag to see
+    and close its own connections, ``monitoring`` to see those of other users.
+    """
+    url = os.environ.get(MANAGEMENT_URL_ENV)
+    if not url:
+        pytest.skip(
+            f"{MANAGEMENT_URL_ENV} is not set: closing a connection from the broker's "
+            "side needs the Management API."
+        )
+    parts = urlsplit(url)
+    if not parts.username or parts.password is None:
+        pytest.skip(
+            f"{MANAGEMENT_URL_ENV} carries no credentials: it takes the form "
+            "https://<user>:<password>@host[:port][/path-prefix]."
+        )
+    vhost = vhost_of(rmq_url)
+    try:
+        _management_request(url, "GET", f"/api/vhosts/{quote(vhost, safe='')}/connections")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            pytest.skip(
+                f"the Management API answered {exc.code} listing the connections of vhost "
+                f"{vhost!r}: the user of {MANAGEMENT_URL_ENV} needs the 'management' or "
+                "'monitoring' tag and access to that vhost."
+            )
+        raise
+    return url
+
+
+@pytest.fixture
+def rmq_management(rmq_management_url: str, rmq_url: str, rmq_prefix: str) -> ManagementApi:
+    """Management API held to the suite's vhost and this test's prefix."""
+    return ManagementApi(rmq_management_url, vhost_of(rmq_url), rmq_prefix)
 
 
 # --- connections ---
