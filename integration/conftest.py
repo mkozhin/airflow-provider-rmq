@@ -453,7 +453,7 @@ def pika_channel(pika_connection: pika.BlockingConnection) -> Iterator[BlockingC
 
 @pytest.fixture
 async def aio_connection(rmq_url: str) -> AsyncIterator[aio_pika.abc.AbstractRobustConnection]:
-    """Robust aio_pika connection — the path the watcher and the trigger take."""
+    """Robust aio_pika connection — the path the watcher takes."""
     connection = await aio_pika.connect_robust(rmq_url)
     try:
         yield connection

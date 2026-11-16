@@ -1,12 +1,12 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/consumer.py:2953
+where: airflow_provider_rmq/watcher/consumer.py:2938
 added: 2026-11-15
 ---
 # Проверка живости watcher'а опирается на устаревший сбор метрик Management API
 
 **Контекст.** При заданном `management_url` проверка живости watcher'а
-(`_probe_consumers`, `watcher/consumer.py:2953`) спрашивает брокер о своих
+(`_probe_consumers`, `watcher/consumer.py:2938`) спрашивает брокер о своих
 консьюмерах через `GET /api/consumers/{vhost}` (`get_queue_consumers`,
 `utils/management.py:52`) и ищет в ответе точный тег каждой подписки. Этот
 эндпоинт отдаёт данные, которые собирает подсистема метрик Management-плагина, а

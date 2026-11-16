@@ -30,16 +30,18 @@ added: 2026-09-02
 `AssetWatcher` поверх `MessageQueueTrigger` из провайдера
 `common-messaging`. Триггер живёт в **triggerer'е**, слушает очередь и при
 сообщении публикует событие asset'а, на которое DAG запланирован. Это закрывает
-разом три пункта этого бэклога и одного открытого плана:
+разом два пункта этого бэклога и один открытый план:
 
 - HA: triggerer'ы распределяют триггеры между репликами сами — лидер-лок из
   reliability-hardening и кэш статусов между репликами
   ([[status-cache-stale-across-replicas]]) становятся ненужными;
-- таймауты `RMQTrigger` ([[rmq-trigger-has-no-amqp-timeouts]]) — та же работа,
-  что написать AMQP-реализацию `MessageQueueTrigger`;
 - пул соединений watcher'а с метабазой
   ([[trigger-dag-burst-exhausts-watcher-db-pool]]) — запуск идёт через события
   asset'а, а не через `trigger_dag` из 32 потоков.
+
+Ограниченные по времени шаги, которые нужны AMQP-реализации `MessageQueueTrigger`, уже
+есть в `RMQTrigger`: подключение, канал, declare, `get`, `consume` и ACK — каждый под
+`connect_timeout` / `rpc_timeout`, с повтором попытки — и переносятся туда как есть.
 
 Чего у встроенного механизма нет и что пришлось бы нести самим: cooldown через
 DLX, exchange-режим с provisioning биндингов, страница Subscriptions,

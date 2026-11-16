@@ -557,7 +557,7 @@
 - [x] integration: `pytest integration/ -q`
 
 ### Task 7: [Final] Документация, CHANGELOG и бэклог
-- [ ] `readme.md` / `readme_ru.md`:
+- [x] `readme.md` / `readme_ru.md`:
   - таблица ключей `extra` (`:117-122`): `connect_timeout`, `rpc_timeout` — «Used by»: RMQ Watcher и
     `RMQTrigger`; строка `heartbeat` верна для обоих асинхронных путей (триггер переподключается сам);
   - таблица параметров сенсора: `trigger_mode` вместо `mode`, строка про `mode` базового класса;
@@ -572,23 +572,23 @@
     даёт ошибку, ACK совпавшего сообщения; `timeout` сенсора как верхняя граница ожидания в deferrable
     и её исход (FAILED с ретраями, SKIPPED при `soft_fail`; при `message_wait_timeout` > `timeout` —
     падение по `timeout`)
-- [ ] `utils/amqp.py`: комментарий `DEFAULT_HEARTBEAT` (`:19-22`), docstring `AmqpTimeouts.connect`
+- [x] `utils/amqp.py`: комментарий `DEFAULT_HEARTBEAT` (`:19-22`), docstring `AmqpTimeouts.connect`
       (`:48`) и `build_amqp_connection` (`:265`) описывают оба асинхронных потребителя, а не только
       `connect_robust`; docstring `aio_connection` в `integration/conftest.py:309` и строка таблицы
       фикстур `integration/README.md:99` — путь watcher'а, без триггера
-- [ ] `docs/adr/0002-four-consume-loops-not-unified.md` (`:6`, `:100-103`): триггер — `aiormq`, pull и
+- [x] `docs/adr/0002-four-consume-loops-not-unified.md` (`:6`, `:100-103`): триггер — `aiormq`, pull и
       push, своё соединение на попытку
-- [ ] новый `docs/adr/0011-trigger-owns-its-aiormq-connection.md`: почему у триггера своё
+- [x] новый `docs/adr/0011-trigger-owns-its-aiormq-connection.md`: почему у триггера своё
       `aiormq`-соединение на попытку, а не robust-пул из ADR-0007 (robust-слой восстанавливает каналы с
       консьюмерами, повторяет ошибки аутентификации и 404 внутри фабрики, держит недоступное
       соединение во время подключения); правило ACK совпавшего сообщения; ограничение `aiormq` на
       первом кадре handshake
-- [ ] `docs/example_dags/rmq_sensor_push.py`: `trigger_mode="push"` (`:3`, `:60`, `:104`); абзац `:26-29`
+- [x] `docs/example_dags/rmq_sensor_push.py`: `trigger_mode="push"` (`:3`, `:60`, `:104`); абзац `:26-29`
       — перебег до `rpc_timeout + CLOSE_TIMEOUT`, исход истёкшего `message_wait_timeout` —
       `AirflowSkipException` (задача SKIPPED), а не `RuntimeError`
-- [ ] тест, что `docs/example_dags/rmq_sensor_push.py` импортируется в `DagBag` без ошибок
+- [x] тест, что `docs/example_dags/rmq_sensor_push.py` импортируется в `DagBag` без ошибок
       (`test_example_dags_dagbag` проверяет только файлы с `rmq_trigger`); прогнать `pytest tests/ -q`
-- [ ] `CHANGELOG.md`, `v2.7.0`, по строке на пункт:
+- [x] `CHANGELOG.md`, `v2.7.0`, по строке на пункт:
   - Changed: шаги `RMQTrigger` ограничены по времени (`connect_timeout`, `rpc_timeout`), при таймауте
     или потере соединения он пишет WARNING и подключается заново;
   - Changed: deferrable `RMQSensor` соблюдает свой `timeout`;
@@ -598,19 +598,19 @@
   - Deprecated: `RMQSensor(mode="pull"|"push")`;
   - Fixed: push-триггер замечает консьюмера, отменённого брокером;
   - Fixed: `RMQSensor` в `reschedule` пишет строку о промахах по каждому `poke`
-- [ ] новый пункт бэклога `docs/backlog/aiormq-silent-handshake-leaks-socket.md` (`worth: later`,
+- [x] новый пункт бэклога `docs/backlog/aiormq-silent-handshake-leaks-socket.md` (`worth: later`,
       `where: airflow_provider_rmq/triggers/rmq.py`): отмена `aiormq.Connection.connect()` на первом кадре
       handshake оставляет сокет; что решило бы (исправление в `aiormq`, своя фабрика транспорта) и почему
       отложено
-- [ ] `git rm docs/backlog/rmq-trigger-has-no-amqp-timeouts.md docs/backlog/sensor-mode-shadows-base-parameter.md`;
+- [x] `git rm docs/backlog/rmq-trigger-has-no-amqp-timeouts.md docs/backlog/sensor-mode-shadows-base-parameter.md`;
       в `docs/backlog/airflow-3-migration-path.md` заменить ссылку `[[rmq-trigger-has-no-amqp-timeouts]]`
       фразой о том, что ограниченные по времени шаги уже есть в `RMQTrigger` и переносятся в
       `MessageQueueTrigger`
-- [ ] пересверить ссылки бэклога после всех правок: `grep -rn "where:\|\.py:[0-9]" docs/backlog/` по
+- [x] пересверить ссылки бэклога после всех правок: `grep -rn "where:\|\.py:[0-9]" docs/backlog/` по
       файлам `watcher/consumer.py`, `utils/amqp.py`, `triggers/rmq.py`, `sensors/rmq.py` — каждое
       `where:` и каждая ссылка `файл:строка` в тексте пунктов указывает на ту же конструкцию в текущем
       коде; у нового пункта `aiormq-silent-handshake-leaks-socket` — `where:` со строкой
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/` (skipped - the harness moves the plan after all phases finish)
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*

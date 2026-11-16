@@ -1,12 +1,12 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/consumer.py:3186
+where: airflow_provider_rmq/watcher/consumer.py:3172
 added: 2026-08-31
 ---
 # Два потребительских цикла написаны дважды, вместе с границей отмены
 
-**Симптом.** Тела `_consume_subscription` (`airflow_provider_rmq/watcher/consumer.py:3186`)
-и `_consume_fire_queue` (`consumer.py:3558`) — один и тот же цикл: `while True`
+**Симптом.** Тела `_consume_subscription` (`airflow_provider_rmq/watcher/consumer.py:3172`)
+и `_consume_fire_queue` (`consumer.py:3545`) — один и тот же цикл: `while True`
 → статус `connecting` → канал под `call_with_timeout` → passive declare →
 consumer-тег с nonce → `_attached(...)` → статус `listening` → метрика →
 `async for` с внутренним перехватом, поднимающим флаг доставки → внешний
@@ -18,22 +18,22 @@ consumer-тег с nonce → `_attached(...)` → статус `listening` → �
 Различаются копии в следующем:
 
 - откуда берётся соединение: поиск в пуле на каждый проход
-  (`_get_or_create_connection`, `consumer.py:3218`) против объекта, выданного при
+  (`_get_or_create_connection`, `consumer.py:3204`) против объекта, выданного при
   запуске;
 - суффикс тега: `sub_id` против `fire`;
 - что делается при attach: подписочный цикл присваивает `state.connection` и
-  сбрасывает `state.not_ready_streak` (`consumer.py:3236-3238`), fire-цикл — только
+  сбрасывает `state.not_ready_streak` (`consumer.py:3222-3224`), fire-цикл — только
   `consumer_tag` и `channel`;
 - тело обработки доставки. В подписочном цикле внутри `async for` стоит разбор
   вердикта фильтра — `match(message, msg_filter)`, ветки `FilterVerdict.ERROR`
   (`nack_and_sleep`) и `FilterVerdict.MISS` (`handle_miss`), `miss_state.on_match()`
   — и выбор между `_handle_cooldown_delivery` и `_handle_immediate_delivery`
-  (`consumer.py:3256-3283`). Fire-цикл отдаёт доставку целиком в
+  (`consumer.py:3242-3269`). Fire-цикл отдаёт доставку целиком в
   `_handle_fire_delivery`. Подписочная копия тем самым держит внутри границы отмены
   собственную логику фильтра, которой у второй копии нет.
 
 **Почему это важно.** Продублирована в том числе граница `delivery_fault` /
-`_raised_while_cancelling` (`consumer.py:3252-3295` и `:3588-3606`) — самая тонкая
+`_raised_while_cancelling` (`consumer.py:3238-3281` и `:3575-3593`) — самая тонкая
 логика в файле: ADR-0007 отводит отдельный раздел объяснению, почему признак
 «исключение пришло из обработки доставки» обязан жить в кадре самого цикла, а не
 на объекте исключения. Это знание существует в двух местах, обязанных меняться

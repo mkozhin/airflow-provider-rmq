@@ -12,10 +12,17 @@
 - `RMQPublishOperator` fails the task when the broker rejects a message (nack) or closes the channel (404 on a missing exchange, 403).
 - `RMQHook.queue_declare`, `RMQHook.exchange_declare` and `RMQQueueManagementOperator` declare durable queues and exchanges by default (`durable=True`).
 - `RMQHook` does not send `global_qos` to the broker and logs a WARNING when it is set (deprecated RabbitMQ feature `global_qos`).
+- `RMQTrigger` bounds every broker call by `connect_timeout` / `rpc_timeout`; on a timeout or a lost connection it logs a WARNING and reconnects.
+- Deferrable `RMQSensor` honours its `timeout`: the task fails (or is skipped with `soft_fail=True`) when it runs out.
+- `RMQSensor` rejects `mode` values other than `poke` and `reschedule` (and the deprecated `pull`/`push`).
 
 ### Added
 - `RMQHook(publisher_confirms=…)` and `RMQHook.basic_publish(mandatory=…)`.
 - `RMQPublishOperator` logs a WARNING when there is nothing to publish (`message=None` or an empty list).
+- `RMQSensor(trigger_mode=…)` selects the trigger's `pull` or `push` mode.
+
+### Deprecated
+- `RMQSensor(mode="pull"|"push")`; use `trigger_mode`.
 
 ### Fixed
 - Unreadable `@rmq_trigger` arguments are no longer silently replaced by defaults.
@@ -25,6 +32,8 @@
 - A `heartbeat` under one second (in `RMQHook`) or above 65535 (in `RMQHook` and on the async path) falls back to the default with a WARNING.
 - `RMQHook.queue_info` returns `consumer_count` for a missing queue as well.
 - `RMQHook.__del__` does not raise at interpreter shutdown.
+- Push-mode `RMQTrigger` notices a consumer cancelled by the broker.
+- `RMQSensor` in `reschedule` mode logs a filter-miss line for every poke.
 
 ### Upgrade notes
 - RabbitMQ 4.3 or newer is required: on earlier versions a requeueing nack spends a quorum queue's `delivery-limit`, so redelivered messages can be dead-lettered or dropped.

@@ -120,7 +120,7 @@ exclusive-очередь с `durable=False`, `basic.qos` только с `prefet
 | `rmq_url` | AMQP-URL брокера после проверки vhost'а |
 | `rmq_conn_id` | брокер, опубликованный как Airflow-подключение через `AIRFLOW_CONN_*` — для оператора и сенсора, которые ходят через `RMQHook` |
 | `pika_connection`, `pika_channel` | синхронный путь: оператор и сенсор |
-| `aio_connection`, `aio_channel` | асинхронный путь: watcher и триггер |
+| `aio_connection`, `aio_channel` | асинхронный путь watcher'а: robust-соединение `aio_pika` |
 | `rmq_management_url` | URL Management API из `RMQ_TEST_MANAGEMENT_URL` после проверки: учётные данные есть, список соединений vhost'а отдаётся; иначе тест скипается |
 | `rmq_management` | `ManagementApi` на этом URL, привязанный к vhost'у набора и префиксу теста |
 | `rmq_prefix` | префикс этого теста |

@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/consumer.py:3752
+where: airflow_provider_rmq/watcher/consumer.py:3739
 added: 2026-09-02
 ---
 # Всплеск доставок исчерпывает пул соединений watcher'а с метабазой
@@ -21,7 +21,7 @@ overflow 10 reached`.
 Что watcher делает с базой на одну доставку в immediate-режиме, всё в потоках
 пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:180`), куда их
 отправляют `_trigger_dag` и `_trigger_fire_dag` через `self._executor.run`
-(`consumer.py:3729-3772`):
+(`consumer.py:3716-3757`):
 
 | шаг | где | соединений |
 |---|---|---|

@@ -19,7 +19,8 @@ AMQPS_PORT = 5671
 #: Seconds between AMQP heartbeat frames. ``aiormq`` allows three missed intervals
 #: (``HEARTBEAT_GRACE_MULTIPLIER``) and checks every half-interval, so a broken link
 #: surfaces as an exception in about ``3 * DEFAULT_HEARTBEAT`` seconds — some 90 s at
-#: the default — and ``connect_robust`` reconnects.
+#: the default. The watcher's robust connection then reconnects, and ``RMQTrigger``
+#: ends the attempt and starts a new one on a connection of its own.
 DEFAULT_HEARTBEAT = 30
 #: Longest heartbeat AMQP can carry: ``Connection.Tune`` holds it in an unsigned short.
 MAX_HEARTBEAT = 65535
@@ -45,7 +46,9 @@ _MIN_TIMEOUT = 1e-9
 class AmqpTimeouts:
     """Timeouts applied to asynchronous AMQP calls.
 
-    :param connect: Seconds allowed for ``connect_robust``.
+    :param connect: Seconds allowed for establishing a connection — the TCP connect
+        and the AMQP handshake: the watcher's ``RobustConnection.connect()``, the
+        trigger's ``aiormq.Connection.connect()``.
     :param rpc: Seconds allowed for a single AMQP RPC.
     """
 
@@ -292,16 +295,19 @@ def build_amqp_connection(
     conn_info: Any,
     vhost_override: str | None = None,
 ) -> tuple[str, ssl.SSLContext | None]:
-    """Build aio_pika-compatible AMQP URL and SSL context from Airflow connection.
+    """Build the AMQP URL and SSL context of an Airflow connection for the async path.
 
     :param conn_info: Airflow Connection object (``airflow.models.Connection``).
     :param vhost_override: Optional vhost to use instead of ``conn_info.schema``.
-    :returns: ``(url, ssl_context)`` — pass ``ssl_context`` to ``connect_robust()`` if not None.
+    :returns: ``(url, ssl_context)``. Both async consumers open their connections
+        from them — the watcher an ``aio_pika.RobustConnection``, the trigger an
+        ``aiormq.Connection`` — passing ``ssl_context`` on when it is not None.
 
     The URL carries a ``heartbeat`` query parameter taken from the ``heartbeat``
     key of ``extra`` (the same key the synchronous hook reads) or from
     :data:`DEFAULT_HEARTBEAT`. Heartbeats are what turn a broken link into an
-    exception, which is what lets ``connect_robust`` reconnect.
+    exception: the watcher's robust connection reconnects on it, and the trigger
+    ends the attempt and starts a new one.
     """
     extras = conn_info.extra_dejson
     ssl_context = build_ssl_context(extras)

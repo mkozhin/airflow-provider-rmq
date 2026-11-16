@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/consumer.py:3878
+where: airflow_provider_rmq/watcher/consumer.py:3863
 added: 2026-09-02
 ---
 # Очередь `{exchange}.log` копит весь трафик exchange'а без ограничения длины
@@ -14,11 +14,11 @@ exchange-подписок мал, и последние 8 часов трафи�
 rabbitmqctl list_queues -p <vhost> name consumers messages message_bytes | grep '\.log'
 ```
 
-**Как устроено.** `_ensure_exchange_infrastructure` (`consumer.py:3829`) на
+**Как устроено.** `_ensure_exchange_infrastructure` (`consumer.py:3814`) на
 каждом reconcile-цикле объявляет для exchange-подписки очередь `{exchange}.log`
-(`consumer.py:3878`). Очередь durable, из аргументов у неё только
+(`consumer.py:3863`). Очередь durable, из аргументов у неё только
 `x-message-ttl` (8 часов), и она привязана к exchange'у ключом `#`
-(`consumer.py:3886`). Консьюмера у очереди нет, лимита длины тоже. В итоге в ней
+(`consumer.py:3871`). Консьюмера у очереди нет, лимита длины тоже. В итоге в ней
 всегда лежит полная копия последних 8 часов трафика exchange'а, включая
 сообщения, адресованные другим системам.
 
@@ -43,7 +43,7 @@ Airflow. При малом трафике цена другая: лишний д
 **Ограничение для любого решения в коде.** Аргументы существующей очереди не
 меняются: если провайдер объявит `.log` с `x-max-length`, а на брокере она уже
 создана со старыми аргументами, брокер ответит 406 `PRECONDITION_FAILED`.
-`_provision_exchange_group` (`consumer.py:2320-2336`) считает это отказом всей
+`_provision_exchange_group` (`consumer.py:2306-2322`) считает это отказом всей
 группы exchange'а: работающие подписки продолжают получать сообщения, но новые
 DAG'и и изменения routing keys не применяются, и каждый цикл пишется ERROR.
 Поэтому код обязан принимать уже существующую очередь как есть.

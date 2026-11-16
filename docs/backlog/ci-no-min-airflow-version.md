@@ -18,7 +18,7 @@ request, ни push в `main` тестов не запускают. Регрес�
 обнаруживается в момент выпуска, когда job `publish` уже ждёт зелёного `test`.
 
 **Почему это важно.** Провайдер напрямую импортирует и инстанцирует
-внутренние ORM-модели Airflow (`DagModel` в `watcher/consumer.py:282` и
+внутренние ORM-модели Airflow (`DagModel` в `watcher/consumer.py:281` и
 `watcher/models.py:304`, вызов `airflow.api.common.trigger_dag` в
 `watcher/consumer.py:277`). Такие обращения — первое, что ломается между
 минорными версиями Airflow, и покрытие одной версией это не ловит. Зелёный
