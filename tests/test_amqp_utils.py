@@ -447,6 +447,67 @@ class TestMatchAndAck:
         with pytest.raises(TypeError):
             await match_and_ack(_make_aio_message(), MessageFilter())
 
+    @pytest.mark.asyncio
+    async def test_given_verdict_is_used_without_evaluating_the_filter(self):
+        """A message the filter would reject is acknowledged on a handed-over MATCH."""
+        msg = _make_aio_message(headers={"type": "payment"})
+        f = MessageFilter(filter_headers={"type": "order"})
+        with patch.object(MessageFilter, "evaluate") as evaluate:
+            result = await match_and_ack(
+                msg, f, _make_miss_state(), verdict=(FilterVerdict.MATCH, None)
+            )
+        assert result is True
+        evaluate.assert_not_called()
+        msg.ack.assert_awaited_once()
+        msg.nack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_given_miss_verdict_returns_the_message_to_the_queue(self):
+        msg = _make_aio_message(headers={"type": "order"})
+        f = MessageFilter(filter_headers={"type": "order"})
+        state = _make_miss_state()
+        with patch.object(MessageFilter, "evaluate") as evaluate, patch(
+            "airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock
+        ):
+            result = await match_and_ack(msg, f, state, verdict=(FilterVerdict.MISS, None))
+        assert result is False
+        evaluate.assert_not_called()
+        msg.nack.assert_awaited_once_with(requeue=True)
+        assert state.streak == 1
+
+    @pytest.mark.asyncio
+    async def test_given_error_verdict_carries_its_reason(self, caplog):
+        msg = _make_aio_message()
+        state = _make_miss_state()
+        with patch.object(MessageFilter, "evaluate") as evaluate, patch(
+            "airflow_provider_rmq.utils.amqp.asyncio.sleep", new_callable=AsyncMock
+        ), caplog.at_level("WARNING", logger="test.miss.state"):
+            result = await match_and_ack(
+                msg, MessageFilter(), state, verdict=(FilterVerdict.ERROR, "KeyError: 'x'")
+            )
+        assert result is False
+        evaluate.assert_not_called()
+        msg.nack.assert_awaited_once_with(requeue=True)
+        msg.ack.assert_not_awaited()
+        assert state.error_streak == 1
+        assert "KeyError: 'x'" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_without_verdict_the_filter_is_evaluated_once(self):
+        msg = _make_aio_message(headers={"type": "order"})
+        f = MessageFilter(filter_headers={"type": "order"})
+        calls = []
+        real_evaluate = MessageFilter.evaluate
+
+        def _counting(self, props, body):
+            calls.append(body)
+            return real_evaluate(self, props, body)
+
+        with patch.object(MessageFilter, "evaluate", _counting):
+            result = await match_and_ack(msg, f, _make_miss_state())
+        assert result is True
+        assert len(calls) == 1
+
 
 class TestHandleMiss:
     @pytest.mark.asyncio

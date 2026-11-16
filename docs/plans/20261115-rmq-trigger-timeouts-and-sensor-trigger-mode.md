@@ -370,43 +370,43 @@
 - Modify: `tests/test_trigger.py`
 - Modify: `tests/test_amqp_utils.py`
 
-- [ ] `pyproject.toml`: прямая зависимость `aiormq` (диапазон — по проверке нижней границы из Testing
+- [x] `pyproject.toml`: прямая зависимость `aiormq` (диапазон — по проверке нижней границы из Testing
       Strategy)
-- [ ] помощник `_step(awaitable, timeout, name)` по Solution Overview: `asyncio.wait({task,
+- [x] помощник `_step(awaitable, timeout, name)` по Solution Overview: `asyncio.wait({task,
       connection.closing}, FIRST_COMPLETED)`; отмена из самого `asyncio.wait` — отмена `run()`,
       пробрасывается; отменённая задача или завершённый `closing` → `_ConnectionLost`; ничего не
       завершилось → `_StepTimeout`; брошенная задача отменяется и её исход читается (`abandon_call`)
-- [ ] попытка: `aiormq.Connection(url, context=ssl_context)`, `connect()`, `channel(publisher_confirms=
+- [x] попытка: `aiormq.Connection(url, context=ssl_context)`, `connect()`, `channel(publisher_confirms=
       False)`, `queue_declare(passive=True)` — каждый шаг через `_step` (`connect` / `rpc`);
       `try/finally` с `close_quietly(connection, ..., log)`, в том числе при отмене `run()`
-- [ ] pull: `basic_get(no_ack=False)` через `_step`; `GetEmpty` → пауза `poll_interval`; доставка →
+- [x] pull: `basic_get(no_ack=False)` через `_step`; `GetEmpty` → пауза `poll_interval`; доставка →
       `IncomingMessage` → вердикт `match()` → `match_and_ack(..., verdict=)` через `_step`
-- [ ] `match_and_ack(message, msg_filter, miss_state, verdict=None)`: переданный вердикт (с причиной)
+- [x] `match_and_ack(message, msg_filter, miss_state, verdict=None)`: переданный вердикт (с причиной)
       используется вместо повторной оценки; тесты в `tests/test_amqp_utils.py` — с вердиктом фильтр не
       вызывается, без него поведение прежнее
-- [ ] push: `basic_consume` с колбэком в `asyncio.Queue` и тегом попытки через `_step`; ожидание через
+- [x] push: `basic_consume` с колбэком в `asyncio.Queue` и тегом попытки через `_step`; ожидание через
       `asyncio.wait({get_task, channel.closing}, ..., return_when=FIRST_COMPLETED)`; проверка
       `tag in channel.consumers`; висящий `get_task` отменяется при выходе
-- [ ] любая неудача шага `ack` при вердикте `MATCH` (`_StepTimeout`, `_ConnectionLost`,
+- [x] любая неудача шага `ack` при вердикте `MATCH` (`_StepTimeout`, `_ConnectionLost`,
       `ChannelInvalidStateError`, `ConnectionError`) → success-событие с телом и WARNING
-- [ ] тест `_step` на настоящем `aiormq.Connection` против локального сервера, который закрывает
+- [x] тест `_step` на настоящем `aiormq.Connection` против локального сервера, который закрывает
       сокет посреди шага: шаг завершается `_ConnectionLost` по `connection.closing`, а не по таймауту
-- [ ] перевести 24 мока `connect_robust` в `tests/test_trigger.py` (в т.ч. проверки kwargs `:300-339`) на
+- [x] перевести 24 мока `connect_robust` в `tests/test_trigger.py` (в т.ч. проверки kwargs `:300-339`) на
       фейки уровня `aiormq`
-- [ ] тесты успеха: pull и push доставляют совпавшее сообщение, payload прежний; `serialize()` —
+- [x] тесты успеха: pull и push доставляют совпавшее сообщение, payload прежний; `serialize()` —
       прежний набор полей; триггер из сериализованных kwargs с `mode` восстанавливается
-- [ ] тесты границ: молчащий handshake (локальный TCP-сервер, принимает и молчит) → таймаут
+- [x] тесты границ: молчащий handshake (локальный TCP-сервер, принимает и молчит) → таймаут
       `connect_timeout`, объект соединения закрыт; зависшие `channel()`, `queue_declare`, `basic_get`,
       `basic_consume`, ACK → таймаут `rpc_timeout`; отмена `run()` посреди ожидания закрывает соединение и
       не оставляет висящих задач
-- [ ] тесты ACK: таймаут ACK совпавшего сообщения и обрыв соединения во время этого ACK →
+- [x] тесты ACK: таймаут ACK совпавшего сообщения и обрыв соединения во время этого ACK →
       success-событие и WARNING; таймаут NACK промаха → не success
-- [ ] тест ожидания push: сообщение, уже лежащее в локальной очереди, обрабатывается сразу, без
+- [x] тест ожидания push: сообщение, уже лежащее в локальной очереди, обрабатывается сразу, без
       ожидания `rpc_timeout`
-- [ ] тесты `_step`: отмена `run()` при уже закрытом соединении (соединение закрылось во время
+- [x] тесты `_step`: отмена `run()` при уже закрытом соединении (соединение закрылось во время
       `poll_interval` и во время шага) → `CancelledError` пробрасывается, повтора нет; отменённая
       aiormq-задача при живом `run()` → `_ConnectionLost`
-- [ ] прогнать `pytest tests/ -q` — всё зелёное до задачи 3
+- [x] прогнать `pytest tests/ -q` — всё зелёное до задачи 3
 
 ### Task 3: `RMQTrigger`: цикл попыток, классификация, пауза и дедлайн
 

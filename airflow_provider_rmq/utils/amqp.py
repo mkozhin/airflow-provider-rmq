@@ -556,6 +556,7 @@ async def match_and_ack(
     message: Any,
     msg_filter: MessageFilter,
     miss_state: FilterMissState,
+    verdict: tuple[FilterVerdict, str | None] | None = None,
 ) -> bool:
     """Evaluate message against filter, ACK on match, dispose of the rest by verdict.
 
@@ -564,6 +565,11 @@ async def match_and_ack(
     :param msg_filter: Pre-built :class:`~airflow_provider_rmq.utils.filters.MessageFilter`.
     :param miss_state: Counters of the consuming loop; it also carries the
         ``ack_unmatched`` decision read from the subscription or the task parameter.
+    :param verdict: ``(verdict, reason)`` the caller has already obtained from
+        :func:`match` for this message. It is used as given and the filter is not
+        evaluated again, so a caller that needs the verdict before the broker call —
+        to tell what a failed call means — reads the same one this call acts on.
+        ``None`` evaluates the filter here.
     :returns: ``True`` if the message matched and was ACKed, ``False`` otherwise.
 
     A message the filter rejected goes to :func:`handle_miss`, which acknowledges it when
@@ -577,12 +583,12 @@ async def match_and_ack(
         the queue. Use dedicated queues per DAG: a foreign message on a shared queue
         circulates without end.
     """
-    verdict, reason = match(message, msg_filter)
-    if verdict is FilterVerdict.MATCH:
+    outcome, reason = verdict if verdict is not None else match(message, msg_filter)
+    if outcome is FilterVerdict.MATCH:
         miss_state.on_match()
         await message.ack()
         return True
-    if verdict is FilterVerdict.ERROR:
+    if outcome is FilterVerdict.ERROR:
         miss_state.on_error(reason)
         await nack_and_sleep(message)
         return False
