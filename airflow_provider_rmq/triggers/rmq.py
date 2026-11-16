@@ -20,6 +20,7 @@ from aiormq.exceptions import (
     ChannelClosed,
     ChannelInvalidStateError,
     ChannelNotFoundEntity,
+    ChannelPreconditionFailed,
     ConnectionCommandInvalid,
     ConnectionFrameError,
     ConnectionNotAllowed,
@@ -83,8 +84,9 @@ class _ConnectionLost(Exception):
     :param step: Name of the step that was running.
     :param reason: Exception the connection or the channel was closed with, read off
         its ``closing`` future. ``aiormq`` closes a connection whose heartbeat stopped
-        with a bare :exc:`asyncio.CancelledError` and one the peer hung up on with a
-        bare :exc:`Exception`; a broker that closed the channel itself leaves its reply
+        with a bare :exc:`asyncio.CancelledError` and one the peer hung up on with
+        :exc:`~aiormq.exceptions.AMQPConnectionError` ("Server connection unexpectedly
+        closed"); a broker that closed the channel itself leaves its reply
         here (``ChannelNotFoundEntity`` for a 404, and so on). ``None`` when the step
         ended by cancellation while ``closing`` was still pending.
     """
@@ -115,8 +117,8 @@ class _Attempt:
     :param step: Name of the step the attempt is in or last ran.
     :param waiting: Whether the attempt got as far as waiting for a message.
     :param give_back: What leaving the push consumer takes once the attempt has a
-        result: cancelling it and returning its unread deliveries. ``None`` when there
-        is nothing to give back.
+        result, has met the deadline or is cancelled: cancelling the consumer and
+        returning its unread deliveries. ``None`` when there is nothing to give back.
     """
 
     number: int
@@ -279,19 +281,25 @@ def _retryable(exc: BaseException, attempt: _Attempt) -> bool:
     1. A step out of time is retried.
     2. A refusal (:func:`_refused`) is an error on any attempt — also when it is the
        reason a connection or a channel was closed with.
-    3. A connect step that was refused or cut off — the socket refused or reset, the
+    3. A 406 PRECONDITION_FAILED in answer to ``basic_consume`` is an error on any
+       attempt: RabbitMQ gives it to a consumer on a stream queue, which takes none
+       without a prefetch limit, and the same call meets it on every attempt. A 406
+       that closes the channel later on — ``consumer_timeout`` — is retried.
+    4. A connect step that was refused or cut off — the socket refused or reset, the
        handshake ending in EOF, a ``Connection.Close`` in the middle of it — is an error
        on the first attempt and retried on every later one: a broker that took the
        first attempt and is now restarting looks exactly like that.
-    4. A lost connection or channel, a consumer the broker cancelled, and a call on a
+    5. A lost connection or channel, a consumer the broker cancelled, and a call on a
        connection or a channel that has closed are retried.
-    5. Anything else is an error.
+    6. Anything else is an error.
     """
     if isinstance(exc, _StepTimeout):
         return True
     if isinstance(exc, _ConnectionLost):
         return not _refused(exc.reason)
     if _refused(exc):
+        return False
+    if attempt.step == "consume" and isinstance(exc, ChannelPreconditionFailed):
         return False
     if attempt.step == "connect" and isinstance(exc, (OSError, EOFError, StopAsyncIteration, AMQPInternalError)):
         return attempt.number > 1
@@ -410,7 +418,8 @@ class RMQTrigger(BaseTrigger):
     later ones. An error event ends ``run()`` on any attempt for a wrong password, no
     access to the vhost, a 403 or a 404 on the queue (except the 404 of a durable
     queue whose node is restarting, which is retried), a connection the broker closed
-    with 540, 501 or 503, and for any other exception.
+    with 540, 501 or 503, a 406 in answer to ``basic_consume`` (push mode on a stream
+    queue), and for any other exception.
 
     **Acknowledgement.** A matching message is acknowledged before the success event is
     fired. When that acknowledgement cannot be confirmed — it timed out, or the
@@ -426,8 +435,9 @@ class RMQTrigger(BaseTrigger):
     task cleared — finds the event already handed over, so an acknowledged message is
     never left without it.
 
-    **Leaving the push consumer.** On a match and on ``message_wait_timeout`` the
-    consumer is cancelled and every delivery the broker had already sent and the
+    **Leaving the push consumer.** On a match, on ``message_wait_timeout`` and on a
+    cancellation of ``run()`` — the sensor's ``timeout``, the task cleared, the
+    triggerer stopping — the consumer is cancelled and every delivery the broker had already sent and the
     trigger had not looked at is NACKed back with ``requeue=True`` before the
     connection closes: a quorum queue counts a delivery dropped with its connection
     against ``delivery-limit``, a NACK it does not. Both get one ``rpc_timeout`` between
@@ -671,9 +681,10 @@ class RMQTrigger(BaseTrigger):
         ``aiormq`` drops the tag when the broker cancels the consumer, and nothing else
         puts a consumer back on this channel.
 
-        A match and an expired deadline hand :meth:`_give_back` to the attempt
-        (:attr:`_Attempt.give_back`), with the time it may take counted from that moment;
-        :meth:`_leave` runs it once the event has been fired.
+        A match, an expired deadline and a cancellation of ``run()`` hand
+        :meth:`_give_back` to the attempt (:attr:`_Attempt.give_back`), with the time it
+        may take counted from that moment; :meth:`_leave` runs it once the event has been
+        fired, or on the way out of the cancelled ``run()``.
         """
         buffer: deque[DeliveredMessage] = deque()
         arrived = asyncio.Event()
@@ -721,7 +732,7 @@ class RMQTrigger(BaseTrigger):
                     raise _ConsumerCancelled(
                         f"consumer on queue {self.queue_name!r} was cancelled by the broker"
                     )
-        except _DeadlineReached:
+        except (_DeadlineReached, asyncio.CancelledError):
             _hand_over_give_back()
             raise
 
@@ -740,8 +751,9 @@ class RMQTrigger(BaseTrigger):
         taken off the buffer had its ACK or NACK queued for writing ahead of this one,
         so one ``basic.nack`` with ``multiple=True`` up to the last buffered tag returns
         exactly the buffer. The cancellation and the NACK share the time up to ``until``
-        (:meth:`_Attempt.exit_by`): the deadline has been met or the result is in hand,
-        and this is what may overrun the deadline. A failure changes nothing about the
+        (:meth:`_Attempt.exit_by`): the deadline has been met, the result is in hand or
+        ``run()`` is cancelled, and this is what may overrun the deadline or delay the
+        cancellation. A failure changes nothing about the
         outcome — the connection is closed next, and the broker puts back whatever is
         still unacknowledged. On a connection or a channel that has closed already
         there is nothing to send, and the broker has put the deliveries back itself.

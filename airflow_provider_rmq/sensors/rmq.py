@@ -107,10 +107,29 @@ class RMQSensor(BaseSensorOperator):
         ``"reschedule"`` — and the base class checks its value. ``mode="pull"`` and
         ``mode="push"`` are accepted as deprecated spellings of ``trigger_mode`` with an
         :class:`~airflow.exceptions.AirflowProviderDeprecationWarning`; the base class
-        then gets its default ``"poke"``. ``mode=None`` counts as not given.
+        then gets its default ``"poke"``. ``mode=None`` counts as not given. The same
+        holds for ``"mode"`` in ``default_args`` — of the DAG or of the sensor — when
+        ``mode`` itself is not given: ``"pull"``/``"push"`` there is taken as
+        ``trigger_mode`` with the same warning unless ``trigger_mode`` is given, and the
+        base class gets its default ``"poke"``.
         """
         if "mode" in kwargs and kwargs["mode"] is None:
             del kwargs["mode"]
+        default_args = kwargs.get("default_args") or {}
+        if "mode" not in kwargs and default_args.get("mode") in _TRIGGER_MODES:
+            default_mode = default_args["mode"]
+            warnings.warn(
+                f"RMQSensor with mode={default_mode!r} in default_args is deprecated; use "
+                f"trigger_mode={default_mode!r}. The mode parameter takes the sensor's "
+                "'poke' or 'reschedule'.",
+                AirflowProviderDeprecationWarning,
+                stacklevel=2,
+            )
+            if trigger_mode is None:
+                trigger_mode = default_mode
+            # The base class's own __init__ merges the DAG's default_args again, so
+            # "mode" is given to it explicitly rather than dropped from default_args.
+            kwargs["mode"] = "poke"
         if kwargs.get("mode") in _TRIGGER_MODES:
             if trigger_mode is not None:
                 raise ValueError(

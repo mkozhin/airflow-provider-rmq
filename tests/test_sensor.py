@@ -5,9 +5,11 @@ import logging
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+import pendulum
 import pika.exceptions
 import pytest
 from airflow.exceptions import AirflowException, AirflowProviderDeprecationWarning
+from airflow.models.dag import DAG
 
 from airflow_provider_rmq.sensors.rmq import RMQSensor
 from tests.conftest import (
@@ -628,6 +630,12 @@ def _deferred_trigger(sensor):
     return mock_defer.call_args.kwargs["trigger"], mock_defer.call_args.kwargs
 
 
+def _dag(default_args: dict) -> DAG:
+    return DAG(
+        "d", start_date=pendulum.datetime(2024, 1, 1), schedule=None, default_args=default_args
+    )
+
+
 class TestTriggerMode:
     def test_defaults(self):
         sensor = RMQSensor(task_id="t", queue_name="q")
@@ -654,6 +662,47 @@ class TestTriggerMode:
             sensor = RMQSensor(task_id="t", queue_name="q", deferrable=True, mode="push")
         trigger, _ = _deferred_trigger(sensor)
         assert trigger.mode == "push"
+
+    @pytest.mark.parametrize("value", ["pull", "push"])
+    def test_deprecated_mode_in_dag_default_args_moves_to_trigger_mode(self, value):
+        default_args = {"mode": value, "retries": 2}
+        with (
+            pytest.warns(AirflowProviderDeprecationWarning, match=f"trigger_mode='{value}'"),
+            _dag(default_args),
+        ):
+            sensor = RMQSensor(task_id="t", queue_name="q", deferrable=True)
+        assert sensor.trigger_mode == value
+        assert sensor.mode == "poke"
+        assert sensor.retries == 2
+        assert default_args == {"mode": value, "retries": 2}
+        trigger, _ = _deferred_trigger(sensor)
+        assert trigger.mode == value
+
+    def test_deprecated_mode_in_sensor_default_args_moves_to_trigger_mode(self):
+        with pytest.warns(AirflowProviderDeprecationWarning, match="trigger_mode='push'"):
+            sensor = RMQSensor(task_id="t", queue_name="q", default_args={"mode": "push"})
+        assert sensor.trigger_mode == "push"
+        assert sensor.mode == "poke"
+
+    def test_trigger_mode_wins_over_mode_in_default_args(self):
+        with pytest.warns(AirflowProviderDeprecationWarning), _dag({"mode": "push"}):
+            sensor = RMQSensor(task_id="t", queue_name="q", trigger_mode="pull")
+        assert sensor.trigger_mode == "pull"
+        assert sensor.mode == "poke"
+
+    def test_explicit_mode_wins_over_mode_in_default_args(self, recwarn):
+        with _dag({"mode": "push"}):
+            sensor = RMQSensor(task_id="t", queue_name="q", mode="reschedule")
+        assert sensor.mode == "reschedule"
+        assert sensor.trigger_mode == "pull"
+        assert not [w for w in recwarn if issubclass(w.category, AirflowProviderDeprecationWarning)]
+
+    def test_reschedule_in_default_args_reaches_the_base_class(self, recwarn):
+        with _dag({"mode": "reschedule"}):
+            sensor = RMQSensor(task_id="t", queue_name="q")
+        assert sensor.mode == "reschedule"
+        assert sensor.trigger_mode == "pull"
+        assert not [w for w in recwarn if issubclass(w.category, AirflowProviderDeprecationWarning)]
 
     def test_mode_none_counts_as_not_given(self, recwarn):
         sensor = RMQSensor(task_id="t", queue_name="q", mode=None)

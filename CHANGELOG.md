@@ -23,7 +23,7 @@
 - Dependency `aiormq` (`>=6.8.0,<7.0.0`).
 
 ### Deprecated
-- `RMQSensor(mode="pull"|"push")`; use `trigger_mode`.
+- `RMQSensor(mode="pull"|"push")`, also through `default_args`; use `trigger_mode`.
 
 ### Fixed
 - Unreadable `@rmq_trigger` arguments are no longer silently replaced by defaults.
