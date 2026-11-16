@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+import pendulum
+import pika.exceptions
 import pytest
+from airflow.exceptions import AirflowException, AirflowProviderDeprecationWarning
+from airflow.models.dag import DAG
 
 from airflow_provider_rmq.sensors.rmq import RMQSensor
 from tests.conftest import (
@@ -20,6 +25,8 @@ from tests.conftest import (
 
 
 HOOK_PATH = "airflow_provider_rmq.sensors.rmq.RMQHook"
+#: Start of the batch line when nothing matched, with or without the dropped clause.
+_NOTHING_MATCHED_TEXT = "read from queue 'q' passed the filter"
 
 
 def _make_raw_msg(body="msg", delivery_tag=1, routing_key="rk", exchange="", headers=None):
@@ -309,15 +316,15 @@ class TestExecuteComplete:
             sensor.execute_complete(context={}, event=event)
 
 # ---------------------------------------------------------------------------
-# Deferrable mode — new mode / message_wait_timeout parameters
+# Deferrable mode — trigger_mode / message_wait_timeout parameters
 # ---------------------------------------------------------------------------
 class TestDeferrableNewParams:
-    def test_defer_passes_mode_push_to_trigger(self):
+    def test_defer_passes_trigger_mode_push_to_trigger(self):
         from airflow_provider_rmq.triggers.rmq import RMQTrigger
 
         sensor = RMQSensor(
             task_id="t", queue_name="orders", poke_interval=1,
-            deferrable=True, mode="push",
+            deferrable=True, trigger_mode="push",
         )
         with patch.object(sensor, "defer") as mock_defer:
             sensor._defer()
@@ -332,7 +339,7 @@ class TestDeferrableNewParams:
 
         sensor = RMQSensor(
             task_id="t", queue_name="orders", poke_interval=1,
-            deferrable=True, mode="push", message_wait_timeout=30.0,
+            deferrable=True, trigger_mode="push", message_wait_timeout=30.0,
         )
         with patch.object(sensor, "defer") as mock_defer:
             sensor._defer()
@@ -348,11 +355,29 @@ class TestDeferrableNewParams:
             sensor.execute_complete(context={}, event={"status": "timeout"})
 
     def test_message_wait_timeout_with_pull_mode_raises_value_error(self):
-        with pytest.raises(ValueError, match="message_wait_timeout is only supported in push mode"):
+        with pytest.raises(
+            ValueError, match="message_wait_timeout is only supported with trigger_mode='push'",
+        ):
             RMQSensor(
                 task_id="t", queue_name="q", poke_interval=1,
-                mode="pull", message_wait_timeout=10,
+                trigger_mode="pull", message_wait_timeout=10,
             )
+
+    def test_message_wait_timeout_with_the_default_trigger_mode_raises_value_error(self):
+        with pytest.raises(ValueError, match="trigger_mode='push'"):
+            RMQSensor(
+                task_id="t", queue_name="q", poke_interval=1,
+                deferrable=True, message_wait_timeout=10,
+            )
+
+    def test_message_wait_timeout_with_deprecated_mode_push_is_accepted(self):
+        with pytest.warns(AirflowProviderDeprecationWarning):
+            sensor = RMQSensor(
+                task_id="t", queue_name="q", poke_interval=1,
+                deferrable=True, mode="push", message_wait_timeout=10,
+            )
+        assert sensor.trigger_mode == "push"
+        assert sensor.message_wait_timeout == 10
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +396,7 @@ class TestTemplateFields:
 
         sensor = RMQSensor(
             task_id="t", queue_name="q", poke_interval=1,
-            deferrable=True, mode="push",
+            deferrable=True, trigger_mode="push",
         )
         # Имитируем результат рендера Jinja-шаблона: строка вместо float
         sensor.message_wait_timeout = "3600.0"
@@ -390,7 +415,7 @@ class TestTemplateFields:
 
         sensor = RMQSensor(
             task_id="t", queue_name="q", poke_interval=1,
-            deferrable=True, mode="push",
+            deferrable=True, trigger_mode="push",
         )
         sensor.message_wait_timeout = "1800"
 
@@ -406,7 +431,7 @@ class TestTemplateFields:
 
         sensor = RMQSensor(
             task_id="t", queue_name="q", poke_interval=1,
-            deferrable=True, mode="push",
+            deferrable=True, trigger_mode="push",
         )
         assert sensor.message_wait_timeout is None
 
@@ -521,7 +546,7 @@ class TestAckUnmatched:
         """``mode`` keeps whatever it had; ``ack_unmatched`` does not reach it."""
         assert RMQSensor(
             task_id="t", queue_name="q", poke_interval=1, ack_unmatched=True,
-        ).mode == "pull"
+        ).mode == "poke"
         assert RMQSensor(
             task_id="t", queue_name="q", poke_interval=1,
             mode="reschedule", ack_unmatched=True,
@@ -548,9 +573,8 @@ class TestAckUnmatched:
 
     def test_reschedule_never_reaches_the_threshold(self, mock_hook, caplog):
         """``AirflowRescheduleException`` ends the task instance, so the next poke runs
-        on a new object and the run of misses starts over. The visibility of a miss is
-        absent in that mode — see the readme and the backlog item on the shadowed
-        ``mode`` parameter."""
+        on a new object and the run of misses starts over. The streak threshold is out
+        of reach in that mode; the line per poke reports the misses instead."""
         _, hook = mock_hook
         hook.consume_messages.return_value = [
             _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
@@ -565,9 +589,11 @@ class TestAckUnmatched:
                 assert sensor._miss_state.streak == 1
 
         assert log_lines(caplog, STREAK_TEXT) == []
+        assert len(log_lines(caplog, EMPTY_BATCH_TEXT)) == 100
 
     def test_a_hundred_pokes_report_no_batch_line(self, mock_hook, caplog):
-        """``on_batch_done`` is the operator's: a line per poke is the noise the threshold avoids.
+        """In ``poke`` mode the counters span the pokes: a line per poke is the noise the
+        threshold avoids, so a poke reports no batch.
 
         The run and the total are the same hundred here, so they are one line — the run's,
         which already says the messages were acknowledged and dropped.
@@ -585,9 +611,391 @@ class TestAckUnmatched:
             for _ in range(100):
                 sensor.poke(context={})
 
-        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+        assert log_lines(caplog, _NOTHING_MATCHED_TEXT) == []
         assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
         streak_lines = log_lines(caplog, STREAK_TEXT)
         assert len(streak_lines) == 1
         assert "acknowledged and dropped" in streak_lines[0].getMessage()
         assert log_lines(caplog, DROPPED_TEXT) == []
+
+
+# ---------------------------------------------------------------------------
+# trigger_mode and the base class's mode
+# ---------------------------------------------------------------------------
+def _deferred_trigger(sensor):
+    """The trigger and the ``defer`` kwargs ``_defer`` hands to ``self.defer``."""
+    with patch.object(sensor, "defer") as mock_defer:
+        sensor._defer()
+    mock_defer.assert_called_once()
+    return mock_defer.call_args.kwargs["trigger"], mock_defer.call_args.kwargs
+
+
+def _dag(default_args: dict) -> DAG:
+    return DAG(
+        "d", start_date=pendulum.datetime(2024, 1, 1), schedule=None, default_args=default_args
+    )
+
+
+class TestTriggerMode:
+    def test_defaults(self):
+        sensor = RMQSensor(task_id="t", queue_name="q")
+        assert sensor.trigger_mode == "pull"
+        assert sensor.mode == "poke"
+        assert sensor.reschedule is False
+
+    def test_trigger_mode_push(self, recwarn):
+        sensor = RMQSensor(task_id="t", queue_name="q", trigger_mode="push")
+        assert sensor.trigger_mode == "push"
+        assert sensor.mode == "poke"
+        assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
+
+    @pytest.mark.parametrize("value", ["pull", "push"])
+    def test_deprecated_mode_moves_to_trigger_mode(self, value):
+        with pytest.warns(AirflowProviderDeprecationWarning, match=f"trigger_mode='{value}'") as rec:
+            sensor = RMQSensor(task_id="t", queue_name="q", mode=value)
+        assert sensor.trigger_mode == value
+        assert sensor.mode == "poke"
+        assert rec[0].filename == __file__
+
+    def test_deprecated_mode_push_reaches_the_trigger(self):
+        with pytest.warns(AirflowProviderDeprecationWarning):
+            sensor = RMQSensor(task_id="t", queue_name="q", deferrable=True, mode="push")
+        trigger, _ = _deferred_trigger(sensor)
+        assert trigger.mode == "push"
+
+    @pytest.mark.parametrize("value", ["pull", "push"])
+    def test_deprecated_mode_in_dag_default_args_moves_to_trigger_mode(self, value):
+        default_args = {"mode": value, "retries": 2}
+        with (
+            pytest.warns(AirflowProviderDeprecationWarning, match=f"trigger_mode='{value}'"),
+            _dag(default_args),
+        ):
+            sensor = RMQSensor(task_id="t", queue_name="q", deferrable=True)
+        assert sensor.trigger_mode == value
+        assert sensor.mode == "poke"
+        assert sensor.retries == 2
+        assert default_args == {"mode": value, "retries": 2}
+        trigger, _ = _deferred_trigger(sensor)
+        assert trigger.mode == value
+
+    def test_deprecated_mode_in_sensor_default_args_moves_to_trigger_mode(self):
+        with pytest.warns(AirflowProviderDeprecationWarning, match="trigger_mode='push'"):
+            sensor = RMQSensor(task_id="t", queue_name="q", default_args={"mode": "push"})
+        assert sensor.trigger_mode == "push"
+        assert sensor.mode == "poke"
+
+    def test_trigger_mode_wins_over_mode_in_default_args(self):
+        with pytest.warns(AirflowProviderDeprecationWarning), _dag({"mode": "push"}):
+            sensor = RMQSensor(task_id="t", queue_name="q", trigger_mode="pull")
+        assert sensor.trigger_mode == "pull"
+        assert sensor.mode == "poke"
+
+    def test_explicit_mode_wins_over_mode_in_default_args(self, recwarn):
+        with _dag({"mode": "push"}):
+            sensor = RMQSensor(task_id="t", queue_name="q", mode="reschedule")
+        assert sensor.mode == "reschedule"
+        assert sensor.trigger_mode == "pull"
+        assert not [w for w in recwarn if issubclass(w.category, AirflowProviderDeprecationWarning)]
+
+    @pytest.mark.parametrize("value", ["pull", "push"])
+    def test_deprecated_mode_given_and_in_default_args(self, value):
+        with pytest.warns(AirflowProviderDeprecationWarning), _dag({"mode": "push"}):
+            sensor = RMQSensor(task_id="t", queue_name="q", mode=value)
+        assert sensor.trigger_mode == value
+        assert sensor.mode == "poke"
+
+    def test_deprecated_mode_given_with_reschedule_in_default_args(self):
+        with pytest.warns(AirflowProviderDeprecationWarning), _dag({"mode": "reschedule"}):
+            sensor = RMQSensor(task_id="t", queue_name="q", mode="push")
+        assert sensor.trigger_mode == "push"
+        assert sensor.mode == "reschedule"
+
+    def test_reschedule_in_default_args_reaches_the_base_class(self, recwarn):
+        with _dag({"mode": "reschedule"}):
+            sensor = RMQSensor(task_id="t", queue_name="q")
+        assert sensor.mode == "reschedule"
+        assert sensor.trigger_mode == "pull"
+        assert not [w for w in recwarn if issubclass(w.category, AirflowProviderDeprecationWarning)]
+
+    def test_mode_none_counts_as_not_given(self, recwarn):
+        sensor = RMQSensor(task_id="t", queue_name="q", mode=None)
+        assert sensor.mode == "poke"
+        assert sensor.trigger_mode == "pull"
+        assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
+
+    def test_mode_none_with_trigger_mode(self):
+        sensor = RMQSensor(task_id="t", queue_name="q", mode=None, trigger_mode="push")
+        assert sensor.mode == "poke"
+        assert sensor.trigger_mode == "push"
+
+    def test_reschedule_with_deferrable_hands_pull_to_the_trigger(self):
+        sensor = RMQSensor(task_id="t", queue_name="q", mode="reschedule", deferrable=True)
+        assert sensor.mode == "reschedule"
+        assert sensor.reschedule is True
+        trigger, _ = _deferred_trigger(sensor)
+        assert trigger.mode == "pull"
+
+    def test_reschedule_and_trigger_mode_push_coexist(self):
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", mode="reschedule", trigger_mode="push", deferrable=True,
+        )
+        assert sensor.mode == "reschedule"
+        trigger, _ = _deferred_trigger(sensor)
+        assert trigger.mode == "push"
+
+    def test_unknown_mode_is_rejected_by_the_base_class(self):
+        with pytest.raises(AirflowException, match="bogus"):
+            RMQSensor(task_id="t", queue_name="q", mode="bogus")
+
+    @pytest.mark.parametrize("value", ["pull", "push"])
+    def test_both_parameters_raise(self, value):
+        with pytest.raises(ValueError, match="trigger_mode"):
+            RMQSensor(task_id="t", queue_name="q", mode=value, trigger_mode="push")
+
+    @pytest.mark.parametrize("value", ["bogus", "poke", "", "PUSH"])
+    def test_invalid_trigger_mode_raises(self, value):
+        with pytest.raises(ValueError, match="trigger_mode must be 'pull' or 'push'"):
+            RMQSensor(task_id="t", queue_name="q", trigger_mode=value)
+
+    def test_debug_executor_switches_mode_and_keeps_trigger_mode(self):
+        """``DebugExecutor`` is the executor with ``change_sensor_mode_to_reschedule``."""
+        from airflow.executors.debug_executor import DebugExecutor
+
+        assert DebugExecutor.change_sensor_mode_to_reschedule is True
+        sensor = RMQSensor(task_id="t", queue_name="q", trigger_mode="push", deferrable=True)
+        with patch(
+            "airflow.sensors.base.ExecutorLoader.import_default_executor_cls",
+            return_value=(DebugExecutor, None),
+        ):
+            task = sensor.prepare_for_execution()
+        assert task.mode == "reschedule"
+        assert task.trigger_mode == "push"
+
+
+# ---------------------------------------------------------------------------
+# _defer — the sensor's timeout bounds the deferral
+# ---------------------------------------------------------------------------
+class TestDeferTimeout:
+    def test_default_timeout_reaches_defer(self):
+        sensor = RMQSensor(task_id="t", queue_name="q", deferrable=True)
+        _, kwargs = _deferred_trigger(sensor)
+        assert kwargs["timeout"] == timedelta(seconds=sensor.timeout)
+        assert kwargs["method_name"] == "execute_complete"
+
+    def test_timeout_in_seconds(self):
+        sensor = RMQSensor(task_id="t", queue_name="q", deferrable=True, timeout=120)
+        _, kwargs = _deferred_trigger(sensor)
+        assert kwargs["timeout"] == timedelta(seconds=120)
+
+    def test_timeout_as_timedelta(self):
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", deferrable=True, timeout=timedelta(minutes=5),
+        )
+        assert sensor.timeout == 300
+        _, kwargs = _deferred_trigger(sensor)
+        assert kwargs["timeout"] == timedelta(minutes=5)
+
+    @pytest.mark.parametrize("trigger_mode", ["pull", "push"])
+    def test_trigger_gets_the_trigger_mode(self, trigger_mode):
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", deferrable=True, trigger_mode=trigger_mode,
+        )
+        trigger, _ = _deferred_trigger(sensor)
+        assert trigger.mode == trigger_mode
+
+    def test_execute_raises_task_deferred_with_the_timeout(self):
+        from airflow.exceptions import TaskDeferred
+
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", deferrable=True, trigger_mode="push", timeout=90,
+        )
+        with pytest.raises(TaskDeferred) as exc_info:
+            sensor.execute(context={})
+        assert exc_info.value.timeout == timedelta(seconds=90)
+        assert exc_info.value.trigger.mode == "push"
+
+    @pytest.mark.parametrize("timeout", [float("inf"), 1e12, 1e15], ids=["inf", "past-9999", "huge"])
+    def test_timeout_no_date_can_reach_defers_without_a_limit(self, timeout):
+        """Airflow 2.9 keeps ``timeout`` as given; later versions refuse some of these
+        values in the constructor, so the value is set on the built sensor."""
+        from airflow.exceptions import TaskDeferred
+
+        sensor = RMQSensor(task_id="t", queue_name="q", deferrable=True)
+        sensor.timeout = timeout
+        with pytest.raises(TaskDeferred) as exc_info:
+            sensor.execute(context={})
+        assert exc_info.value.timeout is None
+
+
+# ---------------------------------------------------------------------------
+# reschedule — one batch line per poke
+# ---------------------------------------------------------------------------
+class TestReschedulePokeReport:
+    def _sensor(self, mode, **kwargs):
+        return RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1, mode=mode,
+            filter_headers={"x-type": "order"}, **kwargs,
+        )
+
+    def test_poke_without_a_match_reports_the_batch(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+            _make_raw_msg(body="b", delivery_tag=2, headers={"x-type": "receipt"}),
+        ]
+        sensor = self._sensor("reschedule")
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is False
+
+        lines = log_lines(caplog, EMPTY_BATCH_TEXT)
+        assert len(lines) == 1
+        assert lines[0].getMessage().startswith("None of the 2 messages")
+        assert lines[0].name == "airflow.task"
+        assert "acknowledged and dropped" not in lines[0].getMessage()
+
+    def test_poke_without_a_match_reports_what_it_dropped(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+            _make_raw_msg(body="b", delivery_tag=2, headers={"x-type": "receipt"}),
+        ]
+        sensor = self._sensor("reschedule", ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            sensor.poke(context={})
+
+        lines = log_lines(caplog, _NOTHING_MATCHED_TEXT)
+        assert len(lines) == 1
+        assert "2 of them were acknowledged and dropped" in lines[0].getMessage()
+
+    def test_match_after_dropped_misses_reports_the_drops(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+            _make_raw_msg(body="b", delivery_tag=2, headers={"x-type": "order"}),
+            _make_raw_msg(body="c", delivery_tag=3, headers={"x-type": "invoice"}),
+        ]
+        sensor = self._sensor("reschedule", ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is True
+
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+        lines = log_lines(caplog, BATCH_DROPPED_TEXT)
+        assert len(lines) == 1
+        assert lines[0].getMessage().startswith("1 of the 2 messages")
+
+    def test_match_without_drops_reports_nothing(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+            _make_raw_msg(body="b", delivery_tag=2, headers={"x-type": "order"}),
+        ]
+        sensor = self._sensor("reschedule")
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is True
+
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+        assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
+
+    def test_errors_are_not_evaluated(self, mock_hook, caplog):
+        """A body the filter could not read says nothing about ``filter_data``."""
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1),
+            _make_raw_msg(body="b", delivery_tag=2, headers={"x-type": "invoice"}),
+        ]
+        calls = iter([RuntimeError("boom"), False])
+
+        def _filter(props, body):
+            outcome = next(calls)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1, mode="reschedule",
+            filter_callable=_filter,
+        )
+        with caplog.at_level(logging.WARNING):
+            sensor.poke(context={})
+
+        lines = log_lines(caplog, EMPTY_BATCH_TEXT)
+        assert len(lines) == 1
+        assert lines[0].getMessage().startswith("None of the 1 messages")
+
+    def test_only_errors_report_no_batch(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [_make_raw_msg(body="a", delivery_tag=1)]
+
+        def _boom(props, body):
+            raise RuntimeError("boom")
+
+        sensor = RMQSensor(
+            task_id="t", queue_name="q", poke_interval=1, mode="reschedule",
+            filter_callable=_boom,
+        )
+        with caplog.at_level(logging.WARNING):
+            sensor.poke(context={})
+
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+        assert len(log_lines(caplog, ERROR_TEXT)) == 1
+
+    def test_empty_queue_reports_nothing(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = []
+        sensor = self._sensor("reschedule")
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is False
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+
+    def test_each_poke_reports_only_its_own_drops(self, mock_hook, caplog):
+        """The counters on one instance are cumulative; the line counts this poke only."""
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+        ]
+        sensor = self._sensor("reschedule", ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            sensor.poke(context={})
+            sensor.poke(context={})
+
+        lines = log_lines(caplog, _NOTHING_MATCHED_TEXT)
+        assert len(lines) == 2
+        assert all(
+            "1 of them were acknowledged and dropped" in line.getMessage() for line in lines
+        )
+
+    def test_poke_mode_reports_no_batch(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+            _make_raw_msg(body="b", delivery_tag=2, headers={"x-type": "receipt"}),
+        ]
+        sensor = self._sensor("poke", ack_unmatched=True)
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is False
+
+        assert log_lines(caplog, _NOTHING_MATCHED_TEXT) == []
+        assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
+
+    def test_poke_mode_reports_no_batch_without_ack_unmatched(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.return_value = [
+            _make_raw_msg(body="a", delivery_tag=1, headers={"x-type": "invoice"}),
+        ]
+        sensor = self._sensor("poke")
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is False
+
+        assert log_lines(caplog, EMPTY_BATCH_TEXT) == []
+
+    def test_queue_closed_by_the_broker_reports_no_batch(self, mock_hook, caplog):
+        _, hook = mock_hook
+        hook.consume_messages.side_effect = pika.exceptions.ChannelClosedByBroker(404, "NOT_FOUND")
+        sensor = self._sensor("reschedule")
+        with caplog.at_level(logging.WARNING):
+            assert sensor.poke(context={}) is False
+
+        assert log_lines(caplog, _NOTHING_MATCHED_TEXT) == []
+        assert log_lines(caplog, BATCH_DROPPED_TEXT) == []
+        (line,) = log_lines(caplog, "is not available")
+        assert "NOT_FOUND" in line.getMessage()

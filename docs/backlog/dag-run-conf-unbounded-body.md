@@ -1,11 +1,11 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/consumer.py:3762
+where: airflow_provider_rmq/watcher/consumer.py:3749
 added: 2026-09-02
 ---
 # Тело сообщения кладётся в `dag_run.conf` без ограничения размера
 
-**Контекст.** `_trigger_dag` (`airflow_provider_rmq/watcher/consumer.py:3752`)
+**Контекст.** `_trigger_dag` (`airflow_provider_rmq/watcher/consumer.py:3739`)
 собирает `conf` для run'а из декодированного тела сообщения и всех его
 заголовков целиком. AMQP не ограничивает тело: сообщение в несколько мегабайт
 штатно. `DagRun.conf` в Airflow 2.x — `PickleType`, хранится в строке
@@ -24,7 +24,7 @@ added: 2026-09-02
   метабазе и в логах без ведома автора DAG'а.
 
 Тот же путь у заголовков: `dict(message.headers or {})` без фильтра
-(`consumer.py:3763`). README (`readme.md:646`, `800`) показывает `conf["body"]`
+(`consumer.py:3750`). README (`readme.md:646`, `800`) показывает `conf["body"]`
 в примерах, но о размере тела ничего не говорит.
 
 **Чего не хватает для решения.** Неизвестны реальные размеры тел на живых

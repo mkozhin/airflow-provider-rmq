@@ -30,6 +30,7 @@ from airflow_provider_rmq.utils.amqp import (
     FilterMissState,
     build_amqp_connection,
     call_with_timeout,
+    close_quietly,
     get_amqp_timeouts,
     handle_miss,
     match,
@@ -68,17 +69,15 @@ _ROLE_PUBLISH = "publish"
 # Timeouts — seconds one call is given before the caller stops waiting for it
 # ---------------------------------------------------------------------------
 
-#: A best-effort ``close()`` of a connection or channel.
-_CLOSE_TIMEOUT = 5.0
-
 #: A cancelled task, before the cycle moves on without it. A task that ignores its
 #: cancellation must not hold up the cycle that cancelled it.
 _CANCEL_TIMEOUT = 30.0
 #: Seconds ``stop()`` waits for cancelled tasks. Shorter than the listener's own
 #: ``_STOP_TIMEOUT`` on purpose: the wait, the status pass and the closing share that one
 #: budget, and a wait that spends all of it leaves connections and the HTTP client open.
-#: The closing costs at most the two roles of one conn_id — one :data:`_CLOSE_TIMEOUT`
-#: each — however many connections there are, because ``stop()`` closes them all at once.
+#: The closing costs at most the two roles of one conn_id — one
+#: :data:`~airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT` each — however many connections
+#: there are, because ``stop()`` closes them all at once.
 _STOP_CANCEL_TIMEOUT = 10.0
 
 #: A blocking database write. The worker stays busy until the call itself returns — a
@@ -637,23 +636,6 @@ async def _await_connected(task: asyncio.Task, timeout: float, what: str) -> Non
     task.result()
 
 
-async def _close_quietly(closeable: Any, what: str, method: str = "close") -> None:
-    """Close ``closeable``, giving up after :data:`_CLOSE_TIMEOUT`.
-
-    Closing is best effort wherever it happens: the caller has already stopped using the
-    object and what happens next does not depend on the answer. The failure is logged
-    rather than swallowed — a close that fails or never returns is a broker or a socket
-    behaving oddly, and that is worth a line.
-
-    :param what: What is being closed, for the log line.
-    :param method: Name of the closing coroutine — ``httpx`` spells it ``aclose``.
-    """
-    try:
-        await call_with_timeout(getattr(closeable, method)(), timeout=_CLOSE_TIMEOUT)
-    except Exception as exc:
-        log.warning("Closing %s failed: %s — continuing without it", what, exc)
-
-
 @asynccontextmanager
 async def _attached(queue: Any, consumer_tag: str, timeout: float) -> AsyncIterator[Any]:
     """Register ``consumer_tag`` on ``queue`` and hand out the iterator of that consumer.
@@ -664,10 +646,11 @@ async def _attached(queue: Any, consumer_tag: str, timeout: float) -> AsyncItera
     subscription as attached and hand the liveness check a tag the broker never
     registered, and the connection would read as healthy with nothing consuming.
 
-    Leaving the block cancels the consumer under :data:`_CLOSE_TIMEOUT` — aio_pika
-    cancels it with no bound of its own, and ``basic.cancel`` is exactly the call a
-    zombie connection never answers, which would leave the cancelled task and its
-    channel alive for as long as the process runs.
+    Leaving the block cancels the consumer under
+    :data:`~airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT` — aio_pika cancels it with no
+    bound of its own, and ``basic.cancel`` is exactly the call a zombie connection never
+    answers, which would leave the cancelled task and its channel alive for as long as the
+    process runs.
 
     :param timeout: Seconds the broker is given to confirm the registration.
     """
@@ -676,7 +659,7 @@ async def _attached(queue: Any, consumer_tag: str, timeout: float) -> AsyncItera
     try:
         yield q_iter
     finally:
-        await _close_quietly(q_iter, f"the consumer {consumer_tag!r}")
+        await close_quietly(q_iter, f"the consumer {consumer_tag!r}", log)
 
 
 def _cancelled_by_broker(state: _ConsumerState) -> bool:
@@ -1350,18 +1333,19 @@ class RMQConsumerManager:
 
             # Every close runs at once, so what the budget has to cover is the slowest
             # of them rather than their sum. A broker that has gone silent answers no
-            # ``close`` at all and each one costs its full :data:`_CLOSE_TIMEOUT`; run
-            # one after another, a handful of pooled connections would take the whole
-            # stop over the bound the caller sets, and the ones behind the bound — and
-            # the HTTP client with them — would be left open for the loop that replaces
-            # this one to compete with.
+            # ``close`` at all and each one costs its full
+            # :data:`~airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT`; run one after
+            # another, a handful of pooled connections would take the whole stop over the
+            # bound the caller sets, and the ones behind the bound — and the HTTP client
+            # with them — would be left open for the loop that replaces this one to
+            # compete with.
             closes: list[Any] = [
                 self._drop_connection(conn_id) for conn_id in list(self._conns)
             ]
             client, self._http_client = self._http_client, None
             if client is not None:
                 closes.append(
-                    _close_quietly(client, "the Management API client", "aclose")
+                    close_quietly(client, "the Management API client", log, "aclose")
                 )
             # Nothing here raises in the ordinary course — closing is best effort
             # wherever it happens — and one that did must still not leave the closes
@@ -1723,8 +1707,8 @@ class RMQConsumerManager:
                 for dag_id in cooldown_dag_ids:
                     await _ensure_pending_queue(setup_channel, dag_id, timeout=rpc_timeout)
             finally:
-                await _close_quietly(
-                    setup_channel, f"the cooldown setup channel of conn_id={conn_id!r}"
+                await close_quietly(
+                    setup_channel, f"the cooldown setup channel of conn_id={conn_id!r}", log
                 )
         except asyncio.CancelledError:
             raise
@@ -1886,8 +1870,8 @@ class RMQConsumerManager:
                 state.publish_channel = None
             if connection is None:
                 continue
-            await _close_quietly(
-                connection, f"the {pooled_role} connection of conn_id={conn_id!r}"
+            await close_quietly(
+                connection, f"the {pooled_role} connection of conn_id={conn_id!r}", log
             )
         if role is None:
             # Only a full drop feeds the liveness rate limit: the publish role has its
@@ -1936,8 +1920,8 @@ class RMQConsumerManager:
         # the one every later caller reads.
         pooled = state.publish_channel
         if pooled is not None and not pooled.is_closed:
-            await _close_quietly(
-                channel, f"the second publish channel of conn_id={conn_id!r}"
+            await close_quietly(
+                channel, f"the second publish channel of conn_id={conn_id!r}", log
             )
             return pooled
         state.publish_channel = channel
@@ -2074,7 +2058,7 @@ class RMQConsumerManager:
             # Closed outside the lock, and closed rather than dropped: the object owns a
             # reconnect task that goes on trying for the life of the process, and the
             # socket under it is the broker's to keep until somebody says otherwise.
-            await _close_quietly(discarded, f"the replaced {what}")
+            await close_quietly(discarded, f"the replaced {what}", log)
 
         try:
             await _await_connected(task, timeouts.connect, what)
@@ -2110,7 +2094,7 @@ class RMQConsumerManager:
         # the pool cannot reach costs the broker a connection for the life of the
         # process.
         log.info("%s was replaced while it connected — closing the connection it built", what)
-        await _close_quietly(connection, what)
+        await close_quietly(connection, what, log)
         if replacement is not None:
             return replacement
         raise ConnectionError(f"{what} was replaced while it connected")
@@ -2312,9 +2296,10 @@ class RMQConsumerManager:
                     if provisioned:
                         self._exchange_tracker.mark_provisioned({dag_id})
             finally:
-                await _close_quietly(
+                await close_quietly(
                     setup_channel,
                     f"the provisioning channel of conn_id={conn_id!r}",
+                    log,
                 )
         except asyncio.CancelledError:
             raise
@@ -3179,8 +3164,8 @@ class RMQConsumerManager:
             return False, reason
         finally:
             if channel is not None:
-                await _close_quietly(
-                    channel, f"the liveness probe channel of conn_id={conn_id!r}"
+                await close_quietly(
+                    channel, f"the liveness probe channel of conn_id={conn_id!r}", log
                 )
         return True, None
 
@@ -3298,8 +3283,8 @@ class RMQConsumerManager:
                     state.consumer_tag = None
                     state.connection = None
                     state.channel = None
-                    await _close_quietly(
-                        channel, f"the channel of subscription {sub_id}"
+                    await close_quietly(
+                        channel, f"the channel of subscription {sub_id}", log
                     )
 
                 await _pause_before_reattaching()
@@ -3609,8 +3594,8 @@ class RMQConsumerManager:
                 finally:
                     state.consumer_tag = None
                     state.channel = None
-                    await _close_quietly(
-                        channel, f"the fire consumer channel of conn_id={conn_id!r}"
+                    await close_quietly(
+                        channel, f"the fire consumer channel of conn_id={conn_id!r}", log
                     )
 
                 await _pause_before_reattaching()

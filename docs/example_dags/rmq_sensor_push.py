@@ -1,8 +1,8 @@
 """Example DAG: Deferrable sensor in push mode.
 
-Demonstrates RMQSensor with ``mode="push"`` — the triggerer subscribes to the
-queue via AMQP ``basic_consume`` and the broker delivers messages instantly as
-they arrive, without polling delay.
+Demonstrates RMQSensor with ``trigger_mode="push"`` — the triggerer subscribes
+to the queue via AMQP ``basic_consume`` and the broker delivers messages
+instantly as they arrive, without polling delay.
 
 When to use push vs pull
 ------------------------
@@ -24,11 +24,14 @@ never redelivered.
 message_wait_timeout
 --------------------
 The optional ``message_wait_timeout`` sets how long (in seconds) the trigger
-waits for a matching message before giving up with a ``RuntimeError``. The
-actual wait may slightly exceed this value while the AMQP consumer is cancelled
-gracefully (``basic_cancel`` round-trip to the broker).
-``None`` (default) means wait indefinitely — the sensor's own ``timeout``
-parameter still applies at the DAG level.
+waits for a matching message, across every reconnect, before giving up: the
+sensor then raises ``AirflowSkipException`` and the task is SKIPPED. The skip may
+come up to ``rpc_timeout`` + ``CLOSE_TIMEOUT`` (5 s) after the deadline: the
+trigger cancels its consumer, returns the messages the broker had already sent
+and it had not read to the queue, and closes the connection.
+``None`` (default) means wait until the sensor's own ``timeout``, which bounds
+the whole deferred wait: when it runs out the task FAILS (or is SKIPPED with
+``soft_fail=True``).
 """
 
 from __future__ import annotations
@@ -57,7 +60,7 @@ QUEUE_NAME = "example_push"
     doc_md="""
     ### Push Mode Sensor Example
 
-    Uses `deferrable=True` with `mode="push"` — the broker delivers messages
+    Uses `deferrable=True` with `trigger_mode="push"` — the broker delivers messages
     instantly via `basic_consume` instead of periodic polling.
 
     Key differences from the deferrable pull mode:
@@ -101,7 +104,7 @@ def rmq_sensor_push():
         rmq_conn_id=RMQ_CONN_ID,
         filter_headers={"x-type": "order"},
         deferrable=True,
-        mode="push",
+        trigger_mode="push",
         message_wait_timeout=60,
         timeout=120,
     )

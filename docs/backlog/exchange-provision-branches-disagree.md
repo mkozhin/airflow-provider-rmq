@@ -1,26 +1,26 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/consumer.py:2166
+where: airflow_provider_rmq/watcher/consumer.py:2151
 added: 2026-08-29
 ---
 # Две одинаковые ветки `_provision_one_exchange_sub` возвращают разное
 
 **Симптом.** `RMQConsumerManager._provision_one_exchange_sub`
-(`airflow_provider_rmq/watcher/consumer.py:2131`) объявляет sub-очередь
-exchange-подписки (`_ensure_sub_queue`, `consumer.py:2152`) и затем синхронизирует
+(`airflow_provider_rmq/watcher/consumer.py:2116`) объявляет sub-очередь
+exchange-подписки (`_ensure_sub_queue`, `consumer.py:2137`) и затем синхронизирует
 её биндинги. Обе предпосылки bind-diff проверяются подряд и описывают одну
 ситуацию — Management API спросить нечем:
 
 ```python
-if management_url is None:                                   # consumer.py:2157
+if management_url is None:                                   # consumer.py:2142
     log.error("management_url not set on conn_id=%r — skipping bind-diff "
               "for DAG %r (queue %s%s still declared, will retry next cycle)", ...)
-    return True                                              # consumer.py:2164
+    return True                                              # consumer.py:2149
 
-if conn_info.login is None or conn_info.password is None:     # consumer.py:2166
+if conn_info.login is None or conn_info.password is None:     # consumer.py:2151
     log.error("conn_id=%r has no login/password set — skipping bind-diff "
               "for DAG %r (queue %s%s still declared, will retry next cycle)", ...)
-    return False                                             # consumer.py:2173
+    return False                                             # consumer.py:2158
 ```
 
 Тексты почти совпадают, и оба верны: `_ensure_sub_queue` отработал выше, очередь
@@ -30,20 +30,20 @@ if conn_info.login is None or conn_info.password is None:     # consumer.py:2166
 
 ```python
 if provisioned:
-    self._exchange_tracker.mark_provisioned({dag_id})        # consumer.py:2311-2312
+    self._exchange_tracker.mark_provisioned({dag_id})        # consumer.py:2296-2297
 ```
 
 **Трасса.** У `conn_id` задан `management_url`, но в Airflow Connection нет логина и
 пароля. Очередь `rmq_watcher.sub.{dag_id}` создана, а `dag_id` **не попадает** в
 `_exchange_tracker`. Позже подписку убирают из DAG-файла:
-`_check_orphaned_exchange_bindings` (`consumer.py:1765`) не находит `dag_id` среди
+`_check_orphaned_exchange_bindings` (`consumer.py:1750`) не находит `dag_id` среди
 провиженных, и WARNING про осиротевшую очередь не выдаётся — хотя очередь на брокере
 объявлена и остаётся там с биндингами.
 
 Это ровно тот единственный сигнал, ради которого трекер существует: ADR-0005
 (`docs/adr/0005-exchange-orphan-no-auto-unbind.md`) отказывается снимать биндинги
 автоматически и оставляет оператору предупреждение с готовой командой очистки.
-Третья ветка того же метода — отказ самого Management API (`consumer.py:2181-2188`) —
+Третья ветка того же метода — отказ самого Management API (`consumer.py:2166-2173`) —
 отвечает `True`, то есть верный ответ для «bind-diff не сделан, очередь есть» здесь
 уже написан дважды из трёх.
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import warnings
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Literal, Sequence
 
 import pika.exceptions
-from airflow.exceptions import AirflowSkipException
+from airflow.exceptions import AirflowProviderDeprecationWarning, AirflowSkipException
 from airflow.sensors.base import BaseSensorOperator
 
 from airflow_provider_rmq.hooks.rmq import RMQHook
@@ -13,12 +15,26 @@ from airflow_provider_rmq.utils.filters import FilterVerdict, MessageFilter
 
 log = logging.getLogger("airflow.task")
 
+#: Values of ``trigger_mode``, and the deprecated spellings ``mode`` still takes for it.
+_TRIGGER_MODES = ("pull", "push")
+
 
 class RMQSensor(BaseSensorOperator):
     """Wait for a message in a RabbitMQ queue matching optional conditions.
 
-    Supports classic poke mode and deferrable mode (via RMQTrigger).
-    The matching message is returned via XCom.
+    Supports the ``poke`` and ``reschedule`` modes of
+    :class:`~airflow.sensors.base.BaseSensorOperator` and deferrable mode (via
+    :class:`~airflow_provider_rmq.triggers.rmq.RMQTrigger`). The matching message is
+    returned via XCom.
+
+    In deferrable mode the sensor's own ``timeout`` bounds the whole wait in the
+    triggerer. When it runs out the scheduler ends the task with
+    ``TaskDeferralError("Trigger/execution timeout")`` — FAILED and retried as the DAG
+    says, every retry waiting the full ``timeout`` again — or SKIPPED with
+    ``soft_fail=True``; ``execute_complete`` is not called. A ``message_wait_timeout``
+    longer than ``timeout`` therefore never comes into play: the task fails by
+    ``timeout`` instead of being skipped. A ``timeout`` that takes the deadline past the
+    year 9999 leaves the deferred wait without a limit.
 
     A message the filter read and rejected is disposed of according to
     ``ack_unmatched``: NACKed with requeue=True by default, so it stays in the queue for
@@ -53,7 +69,7 @@ class RMQSensor(BaseSensorOperator):
         filter_callable: Callable[[Any, str], bool] | None = None,
         deferrable: bool = False,
         poke_batch_size: int = 100,
-        mode: Literal["pull", "push"] = "pull",
+        trigger_mode: Literal["pull", "push"] | None = None,
         message_wait_timeout: float | None = None,
         ack_unmatched: bool = False,
         **kwargs,
@@ -67,20 +83,71 @@ class RMQSensor(BaseSensorOperator):
             Not supported with ``deferrable=True``.
         :param deferrable: Run in deferrable mode using :class:`RMQTrigger`.
         :param poke_batch_size: Max messages to fetch per poke cycle.
-        :param mode: Delivery mode for deferrable trigger — ``"pull"`` (periodic polling,
-            default) or ``"push"`` (broker-pushed via ``basic_consume``). Only used when
-            ``deferrable=True``.
-        :param message_wait_timeout: Maximum seconds to wait for a matching message in push
-            mode. ``None`` means wait indefinitely. Only valid when ``mode="push"`` and
-            ``deferrable=True``. Note: actual wait may slightly exceed this value while the
-            AMQP consumer is cancelled gracefully.
+        :param trigger_mode: How the trigger reads the queue when ``deferrable=True`` —
+            ``"pull"`` (``basic_get`` in a loop with a pause on an empty queue, the
+            default) or ``"push"`` (``basic_consume``, the broker sends messages as they
+            arrive). Ignored without ``deferrable=True``.
+        :param message_wait_timeout: Maximum seconds to wait for a matching message with
+            ``trigger_mode="push"``; on expiry the task is skipped. ``None`` means wait
+            until the sensor's ``timeout``. Only valid with ``trigger_mode="push"``. The
+            wait may run over by at most ``rpc_timeout`` plus
+            :data:`~airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT` seconds: the trigger
+            cancels its consumer, returns the messages the broker had already sent and
+            it had not read to the queue, and closes the connection.
         :param ack_unmatched: What to do with a message the filter rejected. ``False``
             (default) returns it to the queue. ``True`` acknowledges it instead: the
             message leaves the broker for good — DLX does not fire on an
             acknowledgement. Use it only on a queue this sensor owns. Must be a
             ``bool``: the string ``"false"`` is truthy, and the parameter destroys
             messages.
+
+        ``mode`` is the parameter of
+        :class:`~airflow.sensors.base.BaseSensorOperator` — ``"poke"`` (default) or
+        ``"reschedule"`` — and the base class checks its value. ``mode="pull"`` and
+        ``mode="push"`` are accepted as deprecated spellings of ``trigger_mode`` with an
+        :class:`~airflow.exceptions.AirflowProviderDeprecationWarning`; the base class
+        then gets its default ``"poke"``. ``mode=None`` counts as not given. The same
+        holds for ``"mode"`` in ``default_args`` — of the DAG or of the sensor — when
+        ``mode`` itself is not given: ``"pull"``/``"push"`` there is taken as
+        ``trigger_mode`` with the same warning unless ``trigger_mode`` is given, and the
+        base class gets its default ``"poke"`` — also when ``mode`` is given as
+        ``"pull"``/``"push"`` and ``default_args`` holds one of them too.
         """
+        if "mode" in kwargs and kwargs["mode"] is None:
+            del kwargs["mode"]
+        default_args = kwargs.get("default_args") or {}
+        if "mode" not in kwargs and default_args.get("mode") in _TRIGGER_MODES:
+            default_mode = default_args["mode"]
+            warnings.warn(
+                f"RMQSensor with mode={default_mode!r} in default_args is deprecated; use "
+                f"trigger_mode={default_mode!r}. The mode parameter takes the sensor's "
+                "'poke' or 'reschedule'.",
+                AirflowProviderDeprecationWarning,
+                stacklevel=2,
+            )
+            if trigger_mode is None:
+                trigger_mode = default_mode
+            # The base class's own __init__ merges the DAG's default_args again, so
+            # "mode" is given to it explicitly rather than dropped from default_args.
+            kwargs["mode"] = "poke"
+        if kwargs.get("mode") in _TRIGGER_MODES:
+            if trigger_mode is not None:
+                raise ValueError(
+                    f"Both trigger_mode={trigger_mode!r} and mode={kwargs['mode']!r} are "
+                    "given. Pass the trigger's delivery mode as trigger_mode only; mode "
+                    "takes the sensor's 'poke' or 'reschedule'."
+                )
+            warnings.warn(
+                f"RMQSensor(mode={kwargs['mode']!r}) is deprecated; use "
+                f"trigger_mode={kwargs['mode']!r}. The mode parameter takes the sensor's "
+                "'poke' or 'reschedule'.",
+                AirflowProviderDeprecationWarning,
+                stacklevel=2,
+            )
+            trigger_mode = kwargs.pop("mode")
+            if default_args.get("mode") in _TRIGGER_MODES:
+                # The base class would take that one from default_args instead.
+                kwargs["mode"] = "poke"
         super().__init__(**kwargs)
         self.queue_name = queue_name
         self.rmq_conn_id = rmq_conn_id
@@ -88,15 +155,22 @@ class RMQSensor(BaseSensorOperator):
         self.filter_callable = filter_callable
         self.deferrable = deferrable
         self.poke_batch_size = poke_batch_size
-        self.mode = mode
+        self.trigger_mode = "pull" if trigger_mode is None else trigger_mode
         self.message_wait_timeout = message_wait_timeout
         self.ack_unmatched = ack_unmatched
         self._return_value: dict | None = None
 
-        # One state per sensor instance, and the instance is what BaseSensorOperator.execute
-        # reuses across its poke calls: a streak of misses spanning many pokes reaches the
-        # threshold, which a counter created inside poke never could past poke_batch_size.
+        # One state per sensor instance. In ``poke`` mode BaseSensorOperator.execute reuses
+        # the instance across its poke calls, so a streak of misses spanning many pokes
+        # reaches the threshold, which a counter created inside poke never could past
+        # poke_batch_size. In ``reschedule`` mode every poke is a task run of its own on a
+        # new instance and starts from zero; poke reports each of them as a batch.
         self._miss_state: FilterMissState | None = None
+
+        if self.trigger_mode not in _TRIGGER_MODES:
+            raise ValueError(
+                f"trigger_mode must be 'pull' or 'push'; received {self.trigger_mode!r}."
+            )
 
         if not isinstance(ack_unmatched, bool):
             raise ValueError("'ack_unmatched' must be a bool.")  # noqa: TRY004
@@ -108,10 +182,10 @@ class RMQSensor(BaseSensorOperator):
                 "Use dict-based filter_headers instead, or disable deferrable mode."
             )
 
-        if self.message_wait_timeout is not None and self.mode != "push":
+        if self.message_wait_timeout is not None and self.trigger_mode != "push":
             raise ValueError(
-                "message_wait_timeout is only supported in push mode (mode='push'). "
-                "Either set mode='push' or remove message_wait_timeout."
+                "message_wait_timeout is only supported with trigger_mode='push'. "
+                "Either set trigger_mode='push' or remove message_wait_timeout."
             )
 
     def execute(self, context: Any) -> dict | None:
@@ -132,12 +206,30 @@ class RMQSensor(BaseSensorOperator):
                 rmq_conn_id=self.rmq_conn_id,
                 queue_name=self.queue_name,
                 filter_data=msg_filter.serialize(),
-                mode=self.mode,
+                mode=self.trigger_mode,
                 message_wait_timeout=timeout,
                 ack_unmatched=self.ack_unmatched,
             ),
             method_name="execute_complete",
+            timeout=self._defer_timeout(),
         )
+
+    def _defer_timeout(self) -> timedelta | None:
+        """The sensor's ``timeout`` as ``defer()`` takes it.
+
+        ``None`` — no limit on the deferred wait — for a ``timeout`` no date can be
+        counted to: a number of seconds that takes the deadline past the year 9999, or
+        ``float("inf")`` set on the sensor once it is built (the base class's
+        constructor rejects it).
+        """
+        try:
+            timeout = timedelta(seconds=self.timeout)
+            # Only probes for OverflowError: defer() counts its deadline the same way,
+            # and one past the year 9999 cannot be counted.
+            _deadline = datetime.now(timezone.utc) + timeout
+        except OverflowError:
+            return None
+        return timeout
 
     def execute_complete(self, context: Any, event: dict[str, Any]) -> dict | None:
         if event.get("status") == "success":
@@ -159,6 +251,8 @@ class RMQSensor(BaseSensorOperator):
                 self.queue_name, log, ack_unmatched=self.ack_unmatched
             )
         miss_state = self._miss_state
+        dropped_before = miss_state.dropped
+        evaluated = 0
 
         hook = RMQHook(rmq_conn_id=self.rmq_conn_id)
         try:
@@ -177,6 +271,8 @@ class RMQSensor(BaseSensorOperator):
 
             for i, msg in enumerate(messages):
                 verdict, reason = msg_filter.evaluate(msg["properties"], msg["body"])
+                if verdict is not FilterVerdict.ERROR:
+                    evaluated += 1
                 if verdict is FilterVerdict.MATCH:
                     miss_state.on_match()
                     hook.ack(msg["method"].delivery_tag)
@@ -191,12 +287,42 @@ class RMQSensor(BaseSensorOperator):
                     # messages that may well match.
                     for remaining in messages[i + 1:]:
                         hook.nack(remaining["method"].delivery_tag, requeue=True)
+                    self._report_poke(
+                        miss_state, matched=1, evaluated=evaluated, dropped_before=dropped_before
+                    )
                     return True
                 if verdict is FilterVerdict.ERROR:
                     miss_state.on_error(reason)
                     hook.nack(msg["method"].delivery_tag, requeue=True)
                 else:
                     handle_miss_sync(hook, msg["method"].delivery_tag, miss_state)
+            self._report_poke(miss_state, matched=0, evaluated=evaluated, dropped_before=dropped_before)
             return False
         finally:
             hook.close()
+
+    def _report_poke(
+        self, miss_state: FilterMissState, matched: int, evaluated: int, dropped_before: int
+    ) -> None:
+        """Report one poke as a batch in ``reschedule`` mode.
+
+        :param miss_state: Counters of the sensor.
+        :param matched: Messages of the poke that passed the filter.
+        :param evaluated: Messages the filter reached a verdict on — a message it could
+            not be evaluated on says nothing about ``filter_data``.
+        :param dropped_before: ``miss_state.dropped`` when the poke started.
+
+        Every poke in ``reschedule`` mode runs on a new sensor instance, so ``streak``
+        never outlives one poke and its threshold is out of reach past
+        ``poke_batch_size``; a line per poke that matched nothing is what makes the
+        misses visible there. Every such poke is a task run with a log of its own, so the
+        line is one per run. In ``poke`` mode the instance and its counters span every
+        poke, and the thresholds do the reporting.
+        """
+        if not self.reschedule:
+            return
+        miss_state.on_batch_done(
+            matched=matched,
+            evaluated=evaluated,
+            dropped_in_batch=miss_state.dropped - dropped_before,
+        )

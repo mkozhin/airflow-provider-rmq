@@ -19,7 +19,8 @@ AMQPS_PORT = 5671
 #: Seconds between AMQP heartbeat frames. ``aiormq`` allows three missed intervals
 #: (``HEARTBEAT_GRACE_MULTIPLIER``) and checks every half-interval, so a broken link
 #: surfaces as an exception in about ``3 * DEFAULT_HEARTBEAT`` seconds — some 90 s at
-#: the default — and ``connect_robust`` reconnects.
+#: the default. The watcher's robust connection then reconnects, and ``RMQTrigger``
+#: ends the attempt and starts a new one on a connection of its own.
 DEFAULT_HEARTBEAT = 30
 #: Longest heartbeat AMQP can carry: ``Connection.Tune`` holds it in an unsigned short.
 MAX_HEARTBEAT = 65535
@@ -27,6 +28,8 @@ MAX_HEARTBEAT = 65535
 DEFAULT_CONNECT_TIMEOUT = 15
 #: Seconds allowed for a single AMQP RPC: ``channel()``, declare, bind, publish.
 DEFAULT_RPC_TIMEOUT = 30
+#: Seconds a best-effort ``close()`` of a connection, channel or client is given.
+CLOSE_TIMEOUT = 5.0
 
 #: ``extra`` keys of an Airflow connection that tune the AMQP connection.
 HEARTBEAT_KEY = "heartbeat"
@@ -45,7 +48,9 @@ _MIN_TIMEOUT = 1e-9
 class AmqpTimeouts:
     """Timeouts applied to asynchronous AMQP calls.
 
-    :param connect: Seconds allowed for ``connect_robust``.
+    :param connect: Seconds allowed for establishing a connection — the TCP connect
+        and the AMQP handshake: the watcher's ``RobustConnection.connect()``, the
+        trigger's ``aiormq.Connection.connect()``.
     :param rpc: Seconds allowed for a single AMQP RPC.
     """
 
@@ -172,7 +177,7 @@ def get_amqp_timeouts(conn_info: Any) -> AmqpTimeouts:
     )
 
 
-def _abandon_call(future: Any) -> None:
+def abandon_call(future: Any) -> None:
     """Stop watching ``future``, whenever it may end.
 
     A cancelled call takes as long as it takes to notice — an ``aiormq`` RPC answers a
@@ -234,7 +239,7 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
     except asyncio.CancelledError:
         future.remove_done_callback(_on_done)
         future.cancel()
-        _abandon_call(future)
+        abandon_call(future)
         raise
     finally:
         timer.cancel()
@@ -242,7 +247,7 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
     future.remove_done_callback(_on_done)
     if not future.done():
         # Already cancelled by the timer; it is left to run its cancellation out.
-        _abandon_call(future)
+        abandon_call(future)
         raise asyncio.TimeoutError()
 
     try:
@@ -251,6 +256,28 @@ async def call_with_timeout(awaitable: Any, timeout: float) -> Any:
         if expired:
             raise asyncio.TimeoutError() from None
         raise
+
+
+async def close_quietly(
+    closeable: Any, what: str, logger: logging.Logger, method: str = "close"
+) -> None:
+    """Close ``closeable``, giving up after :data:`CLOSE_TIMEOUT`.
+
+    Closing is best effort wherever it happens: the caller has already stopped using the
+    object and what happens next does not depend on the answer. The failure is logged
+    rather than swallowed — a close that fails or never returns is a broker or a socket
+    behaving oddly, and that is worth a line.
+
+    :param closeable: Object to close.
+    :param what: What is being closed, for the log line.
+    :param logger: Logger the failure is reported to — the caller's own, so the line
+        lands where the caller's other lines do.
+    :param method: Name of the closing coroutine — ``httpx`` spells it ``aclose``.
+    """
+    try:
+        await call_with_timeout(getattr(closeable, method)(), timeout=CLOSE_TIMEOUT)
+    except Exception as exc:
+        logger.warning("Closing %s failed: %s — continuing without it", what, exc)
 
 
 class _PropsShim:
@@ -266,16 +293,19 @@ def build_amqp_connection(
     conn_info: Any,
     vhost_override: str | None = None,
 ) -> tuple[str, ssl.SSLContext | None]:
-    """Build aio_pika-compatible AMQP URL and SSL context from Airflow connection.
+    """Build the AMQP URL and SSL context of an Airflow connection for the async path.
 
     :param conn_info: Airflow Connection object (``airflow.models.Connection``).
     :param vhost_override: Optional vhost to use instead of ``conn_info.schema``.
-    :returns: ``(url, ssl_context)`` — pass ``ssl_context`` to ``connect_robust()`` if not None.
+    :returns: ``(url, ssl_context)``. Both async consumers open their connections
+        from them — the watcher an ``aio_pika.RobustConnection``, the trigger an
+        ``aiormq.Connection`` — passing ``ssl_context`` on when it is not None.
 
     The URL carries a ``heartbeat`` query parameter taken from the ``heartbeat``
     key of ``extra`` (the same key the synchronous hook reads) or from
     :data:`DEFAULT_HEARTBEAT`. Heartbeats are what turn a broken link into an
-    exception, which is what lets ``connect_robust`` reconnect.
+    exception: the watcher's robust connection reconnects on it, and the trigger
+    ends the attempt and starts a new one.
     """
     extras = conn_info.extra_dejson
     ssl_context = build_ssl_context(extras)
@@ -331,7 +361,10 @@ class FilterMissState:
     The object holds nothing about any single message: no keys, no broker calls, no
     coroutines, so the same class serves the asynchronous and the synchronous paths.
     Its lifetime is the owner's — a consumer task in the watcher, one ``run()`` in the
-    trigger, one task run in the operator, the sensor instance across its ``poke`` calls.
+    trigger, one task run in the operator, the sensor instance. A sensor in ``poke`` mode
+    keeps its instance, and the counters with it, across its ``poke`` calls; in
+    ``reschedule`` mode every ``poke`` is a task run on a new instance and starts from
+    zero.
 
     :param queue_name: Queue the counters belong to; it names the queue in every line.
     :param logger: Logger the WARNING goes to, kept on the object as ``log``. It is the
@@ -438,10 +471,11 @@ class FilterMissState:
         :param evaluated: Messages the filter reached a verdict on.
         :param dropped_in_batch: Messages acknowledged because they missed the filter.
 
-        A batch is the operator's whole task run, so a line here comes out at most once
-        per run and needs no threshold: it carries the visibility ``streak`` cannot give
-        to a counter that never outlives a single ``max_messages`` batch. A batch that
-        matched nothing and dropped everything is one line and not two.
+        A batch is the operator's whole task run, or one ``poke`` of a sensor in
+        ``reschedule`` mode, which is a task run of its own. Either way a line here comes
+        out at most once per run and needs no threshold: it carries the visibility
+        ``streak`` cannot give to a counter that never outlives a single batch. A batch
+        that matched nothing and dropped everything is one line and not two.
         """
         if evaluated > 0 and matched == 0:
             dropped_clause = (
@@ -530,6 +564,7 @@ async def match_and_ack(
     message: Any,
     msg_filter: MessageFilter,
     miss_state: FilterMissState,
+    evaluation: tuple[FilterVerdict, str | None] | None = None,
 ) -> bool:
     """Evaluate message against filter, ACK on match, dispose of the rest by verdict.
 
@@ -538,6 +573,11 @@ async def match_and_ack(
     :param msg_filter: Pre-built :class:`~airflow_provider_rmq.utils.filters.MessageFilter`.
     :param miss_state: Counters of the consuming loop; it also carries the
         ``ack_unmatched`` decision read from the subscription or the task parameter.
+    :param evaluation: ``(verdict, reason)`` the caller has already obtained from
+        :func:`match` for this message. It is used as given and the filter is not
+        evaluated again, so a caller that needs the verdict before the broker call —
+        to tell what a failed call means — reads the same one this call acts on.
+        ``None`` evaluates the filter here.
     :returns: ``True`` if the message matched and was ACKed, ``False`` otherwise.
 
     A message the filter rejected goes to :func:`handle_miss`, which acknowledges it when
@@ -551,7 +591,7 @@ async def match_and_ack(
         the queue. Use dedicated queues per DAG: a foreign message on a shared queue
         circulates without end.
     """
-    verdict, reason = match(message, msg_filter)
+    verdict, reason = evaluation if evaluation is not None else match(message, msg_filter)
     if verdict is FilterVerdict.MATCH:
         miss_state.on_match()
         await message.ack()

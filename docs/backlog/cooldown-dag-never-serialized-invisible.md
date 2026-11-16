@@ -1,6 +1,6 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/consumer.py:3696
+where: airflow_provider_rmq/watcher/consumer.py:3675
 added: 2026-08-31
 ---
 # Cooldown-DAG, который не сериализуется никогда, виден только в логе
@@ -8,12 +8,12 @@ added: 2026-08-31
 **Контекст.** Подписка с `cooldown > 0` DAG не запускает: сопоставленная
 доставка заменяется плейсхолдером в `rmq_watcher.fire`, а по истечении окна
 DAG триггерит fire-consumer. Его состояние — `_ConsumerState(None, …)`
-(`_launch_fire_task`, `consumer.py:2384`), то есть строки на странице
+(`_launch_fire_task`, `consumer.py:2370`), то есть строки на странице
 Subscriptions у него нет вовсе: `write` выходит на
-`if self._sub_id is None: return` (`consumer.py:1041`).
+`if self._sub_id is None: return` (`consumer.py:1025`).
 
 Когда триггер отвечает `DagNotFound`, обработчик fire-доставки
-(`_handle_fire_delivery`, ветка `_DagNotReady`, `consumer.py:3688-3704`)
+(`_handle_fire_delivery`, ветка `_DagNotReady`, `consumer.py:3675-3691`)
 возвращает событие в очередь с растущей паузой, считает события по `dag_id`
 в `_fire_not_ready` и пишет строку в лог — INFO, а на каждом десятом событии
 одного DAG'а WARNING.
@@ -32,7 +32,7 @@ cooldown-DAG, который не станет сериализуемым ник
 страницу, отличить эти два случая не может.
 
 Сам брокер этот круг не обрывает. `_ensure_fire_infrastructure`
-(`consumer.py:3789`) объявляет `rmq_watcher.fire` без `x-queue-type` и без
+(`consumer.py:3776`) объявляет `rmq_watcher.fire` без `x-queue-type` и без
 dead-letter exchange, то есть classic-очередью. `delivery-limit` бывает только
 у quorum-очереди, так что событие несериализуемого DAG'а возвращается в очередь
 столько, сколько живёт процесс.
@@ -41,7 +41,7 @@ dead-letter exchange, то есть classic-очередью. `delivery-limit` �
 её консьюмер и `trigger_backoff` — одни на все cooldown-DAG'и. Пока событие
 несериализуемого DAG'а возвращается в очередь, обработчик выдерживает паузу,
 доросшую до 60 секунд, и на это время не берёт из очереди ничего — доставки
-обрабатываются по одной (`_consume_fire_queue`, `consumer.py:3590-3593`): события
+обрабатываются по одной (`_consume_fire_queue`, `consumer.py:3577-3580`): события
 исправных cooldown-DAG'ов ждут своей очереди за ним. Один DAG, который не
 станет сериализуемым, замедляет запуск по истёкшим окнам у всех остальных.
 

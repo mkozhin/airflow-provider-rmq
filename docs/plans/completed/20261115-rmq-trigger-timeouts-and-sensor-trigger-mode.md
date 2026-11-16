@@ -341,25 +341,25 @@
 - Modify: `tests/test_amqp_utils.py`
 - Modify: `docs/adr/0007-connection-liveness-two-tier-check.md`
 
-- [ ] перенести `_CLOSE_TIMEOUT` и `_close_quietly` в `utils/amqp.py` как `CLOSE_TIMEOUT` и
+- [x] перенести `_CLOSE_TIMEOUT` и `_close_quietly` в `utils/amqp.py` как `CLOSE_TIMEOUT` и
       `close_quietly(closeable, what, logger, method="close")`; WARNING — в переданный логгер;
       docstring нейтральный
-- [ ] `watcher/consumer.py` импортирует их и передаёт свой модульный `log` — строки и логгер прежние;
+- [x] `watcher/consumer.py` импортирует их и передаёт свой модульный `log` — строки и логгер прежние;
       ссылки `:data:`_CLOSE_TIMEOUT`` и упоминания `_close_quietly` в комментариях и docstring'ах
       (`:80`, `:641`, `:667`, `:1353` и прочие) указывают на новые имена
-- [ ] ADR-0007 (`:228`, `:479` и прочие упоминания) — новые имена; итоговый
+- [x] ADR-0007 (`:228`, `:479` и прочие упоминания) — новые имена; итоговый
       `grep -rnw --include='*.py' --include='*.md' "_close_quietly\|_CLOSE_TIMEOUT" docs airflow_provider_rmq tests`
       пуст, кроме `docs/plans/completed/` и этого файла плана
-- [ ] `_abandon_call` в `utils/amqp.py` становится публичным `abandon_call` (им пользуются
+- [x] `_abandon_call` в `utils/amqp.py` становится публичным `abandon_call` (им пользуются
       `call_with_timeout` и `_step` триггера); обновить его вызовы и упоминания
-- [ ] `tests/watcher/test_consumer.py`: прямой импорт `_CLOSE_TIMEOUT` из `watcher.consumer`
+- [x] `tests/watcher/test_consumer.py`: прямой импорт `_CLOSE_TIMEOUT` из `watcher.consumer`
       (`:408-416`) → `CLOSE_TIMEOUT` из `utils.amqp`; все 8 `patch(...consumer._CLOSE_TIMEOUT...)` →
       `airflow_provider_rmq.utils.amqp.CLOSE_TIMEOUT` (константу читает `close_quietly` из своего модуля);
       прочие упоминания `_close_quietly` в тестах — на новое имя; тест `:4341-4346`, проверяющий
       WARNING через `consumer.log`, проходит без изменения цели патча
-- [ ] тесты `close_quietly` в `tests/test_amqp_utils.py`: закрытие удалось; исключение → WARNING в
+- [x] тесты `close_quietly` в `tests/test_amqp_utils.py`: закрытие удалось; исключение → WARNING в
       переданный логгер и возврат; зависшее закрытие → возврат через `CLOSE_TIMEOUT`; `method="aclose"`
-- [ ] прогнать `pytest tests/ -q` — всё зелёное до задачи 2
+- [x] прогнать `pytest tests/ -q` — всё зелёное до задачи 2
 
 ### Task 2: `RMQTrigger`: попытка на своём `aiormq`-соединении
 
@@ -370,43 +370,43 @@
 - Modify: `tests/test_trigger.py`
 - Modify: `tests/test_amqp_utils.py`
 
-- [ ] `pyproject.toml`: прямая зависимость `aiormq` (диапазон — по проверке нижней границы из Testing
+- [x] `pyproject.toml`: прямая зависимость `aiormq` (диапазон — по проверке нижней границы из Testing
       Strategy)
-- [ ] помощник `_step(awaitable, timeout, name)` по Solution Overview: `asyncio.wait({task,
+- [x] помощник `_step(awaitable, timeout, name)` по Solution Overview: `asyncio.wait({task,
       connection.closing}, FIRST_COMPLETED)`; отмена из самого `asyncio.wait` — отмена `run()`,
       пробрасывается; отменённая задача или завершённый `closing` → `_ConnectionLost`; ничего не
       завершилось → `_StepTimeout`; брошенная задача отменяется и её исход читается (`abandon_call`)
-- [ ] попытка: `aiormq.Connection(url, context=ssl_context)`, `connect()`, `channel(publisher_confirms=
+- [x] попытка: `aiormq.Connection(url, context=ssl_context)`, `connect()`, `channel(publisher_confirms=
       False)`, `queue_declare(passive=True)` — каждый шаг через `_step` (`connect` / `rpc`);
       `try/finally` с `close_quietly(connection, ..., log)`, в том числе при отмене `run()`
-- [ ] pull: `basic_get(no_ack=False)` через `_step`; `GetEmpty` → пауза `poll_interval`; доставка →
+- [x] pull: `basic_get(no_ack=False)` через `_step`; `GetEmpty` → пауза `poll_interval`; доставка →
       `IncomingMessage` → вердикт `match()` → `match_and_ack(..., verdict=)` через `_step`
-- [ ] `match_and_ack(message, msg_filter, miss_state, verdict=None)`: переданный вердикт (с причиной)
+- [x] `match_and_ack(message, msg_filter, miss_state, verdict=None)`: переданный вердикт (с причиной)
       используется вместо повторной оценки; тесты в `tests/test_amqp_utils.py` — с вердиктом фильтр не
       вызывается, без него поведение прежнее
-- [ ] push: `basic_consume` с колбэком в `asyncio.Queue` и тегом попытки через `_step`; ожидание через
+- [x] push: `basic_consume` с колбэком в `asyncio.Queue` и тегом попытки через `_step`; ожидание через
       `asyncio.wait({get_task, channel.closing}, ..., return_when=FIRST_COMPLETED)`; проверка
       `tag in channel.consumers`; висящий `get_task` отменяется при выходе
-- [ ] любая неудача шага `ack` при вердикте `MATCH` (`_StepTimeout`, `_ConnectionLost`,
+- [x] любая неудача шага `ack` при вердикте `MATCH` (`_StepTimeout`, `_ConnectionLost`,
       `ChannelInvalidStateError`, `ConnectionError`) → success-событие с телом и WARNING
-- [ ] тест `_step` на настоящем `aiormq.Connection` против локального сервера, который закрывает
+- [x] тест `_step` на настоящем `aiormq.Connection` против локального сервера, который закрывает
       сокет посреди шага: шаг завершается `_ConnectionLost` по `connection.closing`, а не по таймауту
-- [ ] перевести 24 мока `connect_robust` в `tests/test_trigger.py` (в т.ч. проверки kwargs `:300-339`) на
+- [x] перевести 24 мока `connect_robust` в `tests/test_trigger.py` (в т.ч. проверки kwargs `:300-339`) на
       фейки уровня `aiormq`
-- [ ] тесты успеха: pull и push доставляют совпавшее сообщение, payload прежний; `serialize()` —
+- [x] тесты успеха: pull и push доставляют совпавшее сообщение, payload прежний; `serialize()` —
       прежний набор полей; триггер из сериализованных kwargs с `mode` восстанавливается
-- [ ] тесты границ: молчащий handshake (локальный TCP-сервер, принимает и молчит) → таймаут
+- [x] тесты границ: молчащий handshake (локальный TCP-сервер, принимает и молчит) → таймаут
       `connect_timeout`, объект соединения закрыт; зависшие `channel()`, `queue_declare`, `basic_get`,
       `basic_consume`, ACK → таймаут `rpc_timeout`; отмена `run()` посреди ожидания закрывает соединение и
       не оставляет висящих задач
-- [ ] тесты ACK: таймаут ACK совпавшего сообщения и обрыв соединения во время этого ACK →
+- [x] тесты ACK: таймаут ACK совпавшего сообщения и обрыв соединения во время этого ACK →
       success-событие и WARNING; таймаут NACK промаха → не success
-- [ ] тест ожидания push: сообщение, уже лежащее в локальной очереди, обрабатывается сразу, без
+- [x] тест ожидания push: сообщение, уже лежащее в локальной очереди, обрабатывается сразу, без
       ожидания `rpc_timeout`
-- [ ] тесты `_step`: отмена `run()` при уже закрытом соединении (соединение закрылось во время
+- [x] тесты `_step`: отмена `run()` при уже закрытом соединении (соединение закрылось во время
       `poll_interval` и во время шага) → `CancelledError` пробрасывается, повтора нет; отменённая
       aiormq-задача при живом `run()` → `_ConnectionLost`
-- [ ] прогнать `pytest tests/ -q` — всё зелёное до задачи 3
+- [x] прогнать `pytest tests/ -q` — всё зелёное до задачи 3
 
 ### Task 3: `RMQTrigger`: цикл попыток, классификация, пауза и дедлайн
 
@@ -414,55 +414,58 @@
 - Modify: `airflow_provider_rmq/triggers/rmq.py`
 - Modify: `tests/test_trigger.py`
 
-- [ ] `_StepTimeout` проверяется раньше `OSError` (на 3.11+ `asyncio.TimeoutError ⊂ OSError`);
+- [x] `_StepTimeout` проверяется раньше `OSError` (на 3.11+ `asyncio.TimeoutError ⊂ OSError`);
       `_ConnectionLost` — повтор, если его причина не из п. 1
-- [ ] 404 «home node … down» распознаётся по тексту ответа (`str(exc)`; у исключений aiormq нет атрибута
+- [x] 404 «home node … down» распознаётся по тексту ответа (`str(exc)`; у исключений aiormq нет атрибута
       `reply_text`) и идёт в п. 3
-- [ ] `AMQPInternalError` с кадром `Connection.Close` (`exc.args[1]`): 403 и 530 «access to vhost …
+- [x] `AMQPInternalError` с кадром `Connection.Close` (`exc.args[1]`): 403 и 530 «access to vhost …
       refused» — п. 1; другие код или текст (541, 320, 530 лимита соединений) — п. 2
-- [ ] цикл попыток с классификацией в порядке из Solution Overview (п. 1 проверяется раньше п. 2–3:
+- [x] цикл попыток с классификацией в порядке из Solution Overview (п. 1 проверяется раньше п. 2–3:
       `ProbableAuthenticationError`, `ConnectionNotAllowed` — наследники `AMQPConnectionError` /
       `ConnectionError`; `AMQPInternalError` — по коду и тексту кадра, см. выше)
-- [ ] пауза через `next_backoff` 15 → 60 с, сброс после попытки, дошедшей до ожидания сообщения
-- [ ] push: `channel.closing` завершился → `_ConnectionLost(reason)` и классификация по его причине;
+- [x] пауза через `next_backoff` 15 → 60 с, сброс после попытки, дошедшей до ожидания сообщения
+- [x] push: `channel.closing` завершился → `_ConnectionLost(reason)` и классификация по его причине;
       тега нет в `channel.consumers` → WARNING «consumer cancelled by the broker» и новая попытка
-- [ ] push, штатный выход (совпадение, дедлайн): `basic_cancel` и `basic_nack(requeue=True)` для
+- [x] push, штатный выход (совпадение, дедлайн): `basic_cancel` и `basic_nack(requeue=True)` для
       непрочитанных доставок под `rpc`, затем закрытие; неудача этих шагов исход не меняет
-- [ ] имя соединения `rmq-trigger:<queue>` через `?name=` в URL
-- [ ] `message_wait_timeout` (push) — дедлайн от начала `run()`, проверяется перед каждым шагом
+- [x] имя соединения `rmq-trigger:<queue>` через `?name=` в URL
+- [x] `message_wait_timeout` (push) — дедлайн от начала `run()`, проверяется перед каждым шагом
       (включая паузу); граница шага — `min(своя, остаток)`; истёк → `{"status": "timeout"}`
-- [ ] docstring класса и `run()`: какие шаги ограничены, чем (`connect_timeout`, `rpc_timeout` из
+- [x] docstring класса и `run()`: какие шаги ограничены, чем (`connect_timeout`, `rpc_timeout` из
       `extra`), что повторяется и что даёт ошибку, ACK совпавшего сообщения, перебег дедлайна не больше
       `rpc_timeout + CLOSE_TIMEOUT` (возврат буфера через `basic_cancel` и NACK, затем закрытие);
       docstring класса и параметров `mode` / `message_wait_timeout` (`triggers/rmq.py:17-36`, `:57-60`)
       описывают `basic_get` / `basic_consume` на `aiormq`, без `queue.get()` и `queue.iterator()`
-- [ ] тесты классификации: `ProbableAuthenticationError`, `AuthenticationError`, `AMQPInternalError` с
+- [x] тесты классификации: `ProbableAuthenticationError`, `AuthenticationError`, `AMQPInternalError` с
       `Connection.Close` 530, `ConnectionNotAllowed`, 403, 404 → error на первой и на третьей попытке;
       refused / `IncompatibleProtocolError` / `EOFError` / `ConnectionClosed` 320 при handshake → error на
       первой, повтор на второй; таймаут подключения на первой попытке → повтор (тест не зависит от
       версии Python: таймаут приходит как `_StepTimeout`); закрытие соединения посреди pull (в
       `basic_get` и между вызовами), закрытие канала с не-404/403 → повтор; прочее исключение → error
-- [ ] тесты потери по heartbeat: `connection.closing` и `channel.closing` с `CancelledError()`
+- [x] тесты потери по heartbeat: `connection.closing` и `channel.closing` с `CancelledError()`
       как исключением, шаг pull завершается отменой → `_ConnectionLost`, WARNING и повтор, `run()` не
       завершается; отмена самого `run()` → `CancelledError` пробрасывается, соединение закрыто
-- [ ] тесты push: тег пропал → WARNING и новая попытка, на ней 404 → error; `channel.closing` с 404 →
+- [x] тесты push: тег пропал → WARNING и новая попытка, на ней 404 → error; `channel.closing` с 404 →
       error; 404 с текстом «home node … is down or inaccessible» (на passive declare, `basic_get`,
       `basic_consume` и причиной `channel.closing`) → WARNING и повтор, на следующей попытке очередь
       доступна → сообщение доставляется; `channel.closing` с `CancelledError()` (heartbeat) и с `Exception()` (EOF) → WARNING и
       повтор, `run()` не завершается; сообщение, пришедшее между оборотами, обрабатывается как обычно
-- [ ] тесты штатного выхода push: после совпадения при двух непрочитанных доставках в буфере —
+- [x] тесты штатного выхода push: после совпадения при двух непрочитанных доставках в буфере —
       `basic_cancel`, затем `basic_nack(requeue=True)` для обеих, затем закрытие; то же при истёкшем
       `message_wait_timeout`; зависший `basic_cancel` не задерживает выход дольше `rpc`
-- [ ] тесты паузы и дедлайна: 15 → 30 → 60 → 60 и сброс (время подменено); дедлайн истекает во время
+- [x] тесты паузы и дедлайна: 15 → 30 → 60 → 60 и сброс (время подменено); дедлайн истекает во время
       паузы и между шагами попытки → timeout-событие; без буфера перебег не больше `CLOSE_TIMEOUT`, с
       зависшим `basic_cancel` — не больше `rpc_timeout + CLOSE_TIMEOUT`
-- [ ] тесты handshake на настоящем `aiormq.Connection` против локального сервера: `Connection.Close`
+- [x] тесты handshake на настоящем `aiormq.Connection` против локального сервера: `Connection.Close`
       320 после `StartOk`, `Connection.Close` 541 «vhost is down» и 320 в ответ на `Connection.Open`,
       EOF сразу после TCP-подключения — на первой попытке → error-событие (не `_ConnectionLost`), на
       второй → повтор; `Connection.Close` 530 «access to vhost '…' refused» на `Open` → error на любой
       попытке; 404 с текстом «home node … down» — распознаётся по `str(exc)` настоящего
       `ChannelNotFoundEntity`
-- [ ] прогнать `pytest tests/ -q` — всё зелёное до задачи 4
+- [x] прогнать `pytest tests/ -q` — всё зелёное до задачи 4
+- ⚠️ ожидание push: буфер — `deque` и `asyncio.Event` (колбэк дописывает доставку и ставит событие),
+  ожидание — `asyncio.wait({event.wait(), channel.closing}, ...)`; доставка снимается с буфера только
+  после проверки дедлайна, поэтому необработанная остаётся в буфере для `basic_nack`
 
 ### Task 4: `RMQSensor`: `trigger_mode`, `timeout` в `defer()`, промахи в `reschedule`
 
@@ -471,40 +474,40 @@
 - Modify: `airflow_provider_rmq/utils/amqp.py`
 - Modify: `tests/test_sensor.py`
 
-- [ ] параметр `trigger_mode: Literal["pull", "push"] | None = None`; `mode` остаётся базовому классу;
+- [x] параметр `trigger_mode: Literal["pull", "push"] | None = None`; `mode` остаётся базовому классу;
       явный `mode=None` удаляется; `mode="pull"`/`"push"` → `AirflowProviderDeprecationWarning` и
       перенос в `trigger_mode`; оба заданы → `ValueError`; недопустимый `trigger_mode` → `ValueError`
-- [ ] проверка `message_wait_timeout` опирается на `trigger_mode`; тексты ошибок называют
+- [x] проверка `message_wait_timeout` опирается на `trigger_mode`; тексты ошибок называют
       `trigger_mode`
-- [ ] `_defer`: `RMQTrigger(mode=self.trigger_mode, ...)` и `timeout=timedelta(seconds=self.timeout)` в
+- [x] `_defer`: `RMQTrigger(mode=self.trigger_mode, ...)` и `timeout=timedelta(seconds=self.timeout)` в
       `self.defer(...)`
-- [ ] `poke`: при `self.reschedule` в конце каждого вызова — `miss_state.on_batch_done(matched,
+- [x] `poke`: при `self.reschedule` в конце каждого вызова — `miss_state.on_batch_done(matched,
       evaluated, dropped_in_batch)` по этому `poke` (ERROR-вердикты не считаются в `evaluated`, как у
       оператора); docstring `on_batch_done` (`utils/amqp.py:441-444`) — что батч может быть и одним
       `poke` сенсора в `reschedule`; комментарий к `self._miss_state` (`sensors/rmq.py:96-98`) и
       docstring `FilterMissState` (`utils/amqp.py:333-334`) — состояние живёт между `poke` только в
       режиме `poke`, в `reschedule` каждый `poke` начинает с нуля
-- [ ] docstring класса и параметров: `trigger_mode`, `mode` базового класса, граница `timeout` в
+- [x] docstring класса и параметров: `trigger_mode`, `mode` базового класса, граница `timeout` в
       deferrable и её исход (FAILED с ретраями, SKIPPED при `soft_fail`); `message_wait_timeout`
       (`sensors/rmq.py:73-76`) — действует при `trigger_mode="push"`, перебег не больше
       `rpc_timeout + CLOSE_TIMEOUT` (отмена консьюмера и возврат непрочитанных сообщений)
-- [ ] обновить существующие тесты: `mode="push"` `:320-409` → `trigger_mode="push"` (и отдельный тест
+- [x] обновить существующие тесты: `mode="push"` `:320-409` → `trigger_mode="push"` (и отдельный тест
       на предупреждение), текст ошибки `:354`, `test_the_base_sensor_mode_is_untouched` `:520-528`,
       docstring `test_reschedule_never_reaches_the_threshold` (`:550-553`, ссылка на пункт бэклога
       `:552`), docstring `test_a_hundred_pokes_report_no_batch_line` (`:570-574`, «`on_batch_done` is
       the operator's»)
-- [ ] новые тесты: умолчание (`trigger_mode="pull"`, `mode="poke"`, `reschedule` False); `mode="push"` →
+- [x] новые тесты: умолчание (`trigger_mode="pull"`, `mode="poke"`, `reschedule` False); `mode="push"` →
       предупреждение, `trigger_mode="push"`, `mode="poke"`; `mode=None` → как без `mode`;
       `mode="reschedule"` + `deferrable=True` → в триггер уходит `pull`; `mode="bogus"` → ошибка базового
       класса; оба параметра → `ValueError`; `prepare_for_execution()` под `DebugExecutor` (единственный
       executor с `change_sensor_mode_to_reschedule`) переводит `mode` в `reschedule` и оставляет
       `trigger_mode="push"`
-- [ ] тесты `_defer`: `defer` получает `timeout=timedelta(seconds=sensor.timeout)` (и при `timeout`,
+- [x] тесты `_defer`: `defer` получает `timeout=timedelta(seconds=sensor.timeout)` (и при `timeout`,
       заданном `timedelta`) и `RMQTrigger` с `mode=trigger_mode`; `message_wait_timeout` без `push` →
       `ValueError`
-- [ ] тесты `reschedule`: `poke` без совпадений → строка `on_batch_done`; в режиме `poke` строки по
+- [x] тесты `reschedule`: `poke` без совпадений → строка `on_batch_done`; в режиме `poke` строки по
       батчу нет
-- [ ] прогнать `pytest tests/ -q` — всё зелёное до задачи 5
+- [x] прогнать `pytest tests/ -q` — всё зелёное до задачи 5
 
 ### Task 5: Integration-тесты триггера на живом брокере
 
@@ -513,46 +516,48 @@
 - Modify: `integration/conftest.py`
 - Modify: `integration/README.md`
 
-- [ ] `integration/conftest.py`: `_load_env` переносит из `.env` и `RMQ_TEST_MANAGEMENT_URL`; фикстура
+- [x] `integration/conftest.py`: `_load_env` переносит из `.env` и `RMQ_TEST_MANAGEMENT_URL`; фикстура
       `rmq_management_url` — тест, которому она нужна, пропускается, если переменной нет, и
       пропускается с понятной причиной при 401/403 (пользователю нужен тег `management` или
       `monitoring`); vhost — тот же `test`; запросы к Management API затрагивают только соединения,
       которые тест нашёл по имени
-- [ ] pull и push: `RMQTrigger.run()` получает опубликованное сообщение в scratch-очереди и отдаёт
+  ⚠️ в этом окружении `RMQ_TEST_MANAGEMENT_URL` без учётных данных — тест закрытия соединения
+  брокером скипается с причиной; клиент Management API проверен на локальном HTTP-фейке
+- [x] pull и push: `RMQTrigger.run()` получает опубликованное сообщение в scratch-очереди и отдаёт
       success-событие с прежними полями
-- [ ] push на quorum-очереди (`scratch.declare_queue(..., arguments={"x-queue-type": "quorum"})`): за
+- [x] push на quorum-очереди (`scratch.declare_queue(..., arguments={"x-queue-type": "quorum"})`): за
       совпадающим сообщением лежат ещё два; после success-события оба на месте, и при следующем чтении
       у них нет заголовка `x-delivery-count` (возврат через `basic.nack` его не увеличивает, обрыв
       соединения увеличил бы)
-- [ ] push: очередь удаляется, пока триггер ждёт (подключение с `rpc_timeout` 2 с через свой
+- [x] push: очередь удаляется, пока триггер ждёт (подключение с `rpc_timeout` 2 с через свой
       `AIRFLOW_CONN_*`, константа паузы подменена на 0,1 с) → WARNING об отмене консьюмера, затем
       error-событие с 404 не позже чем через 10 с
-- [ ] push: соединение триггера закрывается со стороны брокера — `GET /api/vhosts/test/connections`,
+- [x] push: соединение триггера закрывается со стороны брокера — `GET /api/vhosts/test/connections`,
       соединение с `client_properties.connection_name == "rmq-trigger:<scratch-очередь>"`, `DELETE
       /api/connections/{name}` только для него → WARNING и новая попытка, затем опубликованное
       сообщение доставляется; соединение фикстуры `scratch` не затронуто
-- [ ] push: `message_wait_timeout` 3 с без сообщений и с пустым буфером → timeout-событие не позже
+- [x] push: `message_wait_timeout` 3 с без сообщений и с пустым буфером → timeout-событие не позже
       чем через 3 с + `CLOSE_TIMEOUT`
-- [ ] неверный пароль в `AIRFLOW_CONN_*` → error-событие на первой попытке
-- [ ] `integration/README.md`: что проверяет `test_trigger.py`; переменная `RMQ_TEST_MANAGEMENT_URL` в
+- [x] неверный пароль в `AIRFLOW_CONN_*` → error-событие на первой попытке
+- [x] `integration/README.md`: что проверяет `test_trigger.py`; переменная `RMQ_TEST_MANAGEMENT_URL` в
       таблице переменных (формат, тег пользователя, тест пропускается без неё), фикстура
       `rmq_management_url` в таблице фикстур
-- [ ] прогнать `pytest integration/ -q` на vhost `test` — всё зелёное
+- [x] прогнать `pytest integration/ -q` на vhost `test` — всё зелёное
 
 ### Task 6: Verify acceptance criteria
-- [ ] все сценарии зависания из Overview ограничены по времени и видны в логе задачи
-- [ ] исходы без повтора — по классификации (auth, vhost, 403, 404 всегда; отказ и обрыв handshake на
+- [x] все сценарии зависания из Overview ограничены по времени и видны в логе задачи
+- [x] исходы без повтора — по классификации (auth, vhost, 403, 404 всегда; отказ и обрыв handshake на
       первой попытке)
-- [ ] после выхода и после отмены `run()` соединение попытки закрыто и висящих задач нет (кроме
+- [x] после выхода и после отмены `run()` соединение попытки закрыто и висящих задач нет (кроме
       описанного ограничения `aiormq` на первом кадре handshake)
-- [ ] сериализованный в метабазе триггер с `mode` восстанавливается; `mode="push"` у сенсора работает
+- [x] сериализованный в метабазе триггер с `mode` восстанавливается; `mode="push"` у сенсора работает
       с предупреждением
-- [ ] пункты проверки Airflow 2.9.1 и нижней границы `aiormq` из Testing Strategy подтверждены
-- [ ] полный прогон: `pytest tests/ -q`
-- [ ] integration: `pytest integration/ -q`
+- [x] пункты проверки Airflow 2.9.1 и нижней границы `aiormq` из Testing Strategy подтверждены
+- [x] полный прогон: `pytest tests/ -q`
+- [x] integration: `pytest integration/ -q`
 
 ### Task 7: [Final] Документация, CHANGELOG и бэклог
-- [ ] `readme.md` / `readme_ru.md`:
+- [x] `readme.md` / `readme_ru.md`:
   - таблица ключей `extra` (`:117-122`): `connect_timeout`, `rpc_timeout` — «Used by»: RMQ Watcher и
     `RMQTrigger`; строка `heartbeat` верна для обоих асинхронных путей (триггер переподключается сам);
   - таблица параметров сенсора: `trigger_mode` вместо `mode`, строка про `mode` базового класса;
@@ -567,23 +572,23 @@
     даёт ошибку, ACK совпавшего сообщения; `timeout` сенсора как верхняя граница ожидания в deferrable
     и её исход (FAILED с ретраями, SKIPPED при `soft_fail`; при `message_wait_timeout` > `timeout` —
     падение по `timeout`)
-- [ ] `utils/amqp.py`: комментарий `DEFAULT_HEARTBEAT` (`:19-22`), docstring `AmqpTimeouts.connect`
+- [x] `utils/amqp.py`: комментарий `DEFAULT_HEARTBEAT` (`:19-22`), docstring `AmqpTimeouts.connect`
       (`:48`) и `build_amqp_connection` (`:265`) описывают оба асинхронных потребителя, а не только
       `connect_robust`; docstring `aio_connection` в `integration/conftest.py:309` и строка таблицы
       фикстур `integration/README.md:99` — путь watcher'а, без триггера
-- [ ] `docs/adr/0002-four-consume-loops-not-unified.md` (`:6`, `:100-103`): триггер — `aiormq`, pull и
+- [x] `docs/adr/0002-four-consume-loops-not-unified.md` (`:6`, `:100-103`): триггер — `aiormq`, pull и
       push, своё соединение на попытку
-- [ ] новый `docs/adr/0011-trigger-owns-its-aiormq-connection.md`: почему у триггера своё
+- [x] новый `docs/adr/0011-trigger-owns-its-aiormq-connection.md`: почему у триггера своё
       `aiormq`-соединение на попытку, а не robust-пул из ADR-0007 (robust-слой восстанавливает каналы с
       консьюмерами, повторяет ошибки аутентификации и 404 внутри фабрики, держит недоступное
       соединение во время подключения); правило ACK совпавшего сообщения; ограничение `aiormq` на
       первом кадре handshake
-- [ ] `docs/example_dags/rmq_sensor_push.py`: `trigger_mode="push"` (`:3`, `:60`, `:104`); абзац `:26-29`
+- [x] `docs/example_dags/rmq_sensor_push.py`: `trigger_mode="push"` (`:3`, `:60`, `:104`); абзац `:26-29`
       — перебег до `rpc_timeout + CLOSE_TIMEOUT`, исход истёкшего `message_wait_timeout` —
       `AirflowSkipException` (задача SKIPPED), а не `RuntimeError`
-- [ ] тест, что `docs/example_dags/rmq_sensor_push.py` импортируется в `DagBag` без ошибок
+- [x] тест, что `docs/example_dags/rmq_sensor_push.py` импортируется в `DagBag` без ошибок
       (`test_example_dags_dagbag` проверяет только файлы с `rmq_trigger`); прогнать `pytest tests/ -q`
-- [ ] `CHANGELOG.md`, `v2.7.0`, по строке на пункт:
+- [x] `CHANGELOG.md`, `v2.7.0`, по строке на пункт:
   - Changed: шаги `RMQTrigger` ограничены по времени (`connect_timeout`, `rpc_timeout`), при таймауте
     или потере соединения он пишет WARNING и подключается заново;
   - Changed: deferrable `RMQSensor` соблюдает свой `timeout`;
@@ -593,19 +598,19 @@
   - Deprecated: `RMQSensor(mode="pull"|"push")`;
   - Fixed: push-триггер замечает консьюмера, отменённого брокером;
   - Fixed: `RMQSensor` в `reschedule` пишет строку о промахах по каждому `poke`
-- [ ] новый пункт бэклога `docs/backlog/aiormq-silent-handshake-leaks-socket.md` (`worth: later`,
+- [x] новый пункт бэклога `docs/backlog/aiormq-silent-handshake-leaks-socket.md` (`worth: later`,
       `where: airflow_provider_rmq/triggers/rmq.py`): отмена `aiormq.Connection.connect()` на первом кадре
       handshake оставляет сокет; что решило бы (исправление в `aiormq`, своя фабрика транспорта) и почему
       отложено
-- [ ] `git rm docs/backlog/rmq-trigger-has-no-amqp-timeouts.md docs/backlog/sensor-mode-shadows-base-parameter.md`;
+- [x] `git rm docs/backlog/rmq-trigger-has-no-amqp-timeouts.md docs/backlog/sensor-mode-shadows-base-parameter.md`;
       в `docs/backlog/airflow-3-migration-path.md` заменить ссылку `[[rmq-trigger-has-no-amqp-timeouts]]`
       фразой о том, что ограниченные по времени шаги уже есть в `RMQTrigger` и переносятся в
       `MessageQueueTrigger`
-- [ ] пересверить ссылки бэклога после всех правок: `grep -rn "where:\|\.py:[0-9]" docs/backlog/` по
+- [x] пересверить ссылки бэклога после всех правок: `grep -rn "where:\|\.py:[0-9]" docs/backlog/` по
       файлам `watcher/consumer.py`, `utils/amqp.py`, `triggers/rmq.py`, `sensors/rmq.py` — каждое
       `where:` и каждая ссылка `файл:строка` в тексте пунктов указывает на ту же конструкцию в текущем
       коде; у нового пункта `aiormq-silent-handshake-leaks-socket` — `where:` со строкой
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/` (skipped - the harness moves the plan after all phases finish)
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*

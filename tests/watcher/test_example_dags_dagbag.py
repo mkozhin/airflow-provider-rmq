@@ -95,6 +95,31 @@ class TestExampleDagsImportCleanly:
             ), f"{path.name} produced no DAGs in the DagBag"
 
 
+class TestSensorPushExample:
+    """``rmq_sensor_push.py`` carries no ``@rmq_trigger``, so it is checked by name."""
+
+    FILE = "rmq_sensor_push.py"
+
+    def test_imports_without_errors(self, dagbag):
+        errors = {Path(path).name: text for path, text in dagbag.import_errors.items()}
+        assert self.FILE not in errors, errors.get(self.FILE)
+
+    def test_sensor_reads_the_queue_in_push_mode(self, dagbag):
+        sensor = dagbag.dags["rmq_sensor_push"].get_task("wait_for_order")
+        assert sensor.trigger_mode == "push"
+        assert sensor.mode == "poke"
+        assert sensor.message_wait_timeout == 60
+
+    def test_imports_without_deprecation_warnings(self, dagbag):
+        captured = getattr(dagbag, "captured_warnings", None)
+        if captured is None:
+            pytest.skip("this Airflow's DagBag does not capture import warnings")
+        warnings_of_file = [
+            text for path, texts in captured.items() if Path(path).name == self.FILE for text in texts
+        ]
+        assert not [text for text in warnings_of_file if "DeprecationWarning" in text], warnings_of_file
+
+
 class TestExampleDagsOutsideDagsFolder:
     def test_loading_another_folder_than_dags_folder_is_an_import_error(self, tmp_path):
         """A ``DagBag`` over a folder that is not ``DAGS_FOLDER`` — a CI check that

@@ -5,12 +5,12 @@ added: 2026-08-30
 ---
 # Смена exchange в декораторе оставляет старые биндинги
 
-**Симптом.** `_provision_one_exchange_sub` (`airflow_provider_rmq/watcher/consumer.py:2131`)
-сверяет биндинги через `get_current_bindings(..., exchange, ...)` (`consumer.py:2178`),
+**Симптом.** `_provision_one_exchange_sub` (`airflow_provider_rmq/watcher/consumer.py:2116`)
+сверяет биндинги через `get_current_bindings(..., exchange, ...)` (`consumer.py:2163`),
 где `exchange` — тот, что назван в декораторе сейчас. Ответ Management API
 фильтруется по нему (`b.get("source") == exchange`,
 `airflow_provider_rmq/utils/management.py:49`), а `_sync_bindings`
-(`consumer.py:3908`) снимает биндинги только с переданного exchange'а. Поэтому в
+(`consumer.py:3895`) снимает биндинги только с переданного exchange'а. Поэтому в
 сверку попадают только биндинги нового exchange'а: недостающие добавляются,
 лишние на **прежнем** exchange не видны и не удаляются. Прежний exchange нигде не
 хранится — метаданные exchange-подписки берутся из текущего скана
