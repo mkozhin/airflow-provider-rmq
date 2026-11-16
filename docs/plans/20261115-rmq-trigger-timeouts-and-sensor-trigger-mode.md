@@ -414,55 +414,58 @@
 - Modify: `airflow_provider_rmq/triggers/rmq.py`
 - Modify: `tests/test_trigger.py`
 
-- [ ] `_StepTimeout` проверяется раньше `OSError` (на 3.11+ `asyncio.TimeoutError ⊂ OSError`);
+- [x] `_StepTimeout` проверяется раньше `OSError` (на 3.11+ `asyncio.TimeoutError ⊂ OSError`);
       `_ConnectionLost` — повтор, если его причина не из п. 1
-- [ ] 404 «home node … down» распознаётся по тексту ответа (`str(exc)`; у исключений aiormq нет атрибута
+- [x] 404 «home node … down» распознаётся по тексту ответа (`str(exc)`; у исключений aiormq нет атрибута
       `reply_text`) и идёт в п. 3
-- [ ] `AMQPInternalError` с кадром `Connection.Close` (`exc.args[1]`): 403 и 530 «access to vhost …
+- [x] `AMQPInternalError` с кадром `Connection.Close` (`exc.args[1]`): 403 и 530 «access to vhost …
       refused» — п. 1; другие код или текст (541, 320, 530 лимита соединений) — п. 2
-- [ ] цикл попыток с классификацией в порядке из Solution Overview (п. 1 проверяется раньше п. 2–3:
+- [x] цикл попыток с классификацией в порядке из Solution Overview (п. 1 проверяется раньше п. 2–3:
       `ProbableAuthenticationError`, `ConnectionNotAllowed` — наследники `AMQPConnectionError` /
       `ConnectionError`; `AMQPInternalError` — по коду и тексту кадра, см. выше)
-- [ ] пауза через `next_backoff` 15 → 60 с, сброс после попытки, дошедшей до ожидания сообщения
-- [ ] push: `channel.closing` завершился → `_ConnectionLost(reason)` и классификация по его причине;
+- [x] пауза через `next_backoff` 15 → 60 с, сброс после попытки, дошедшей до ожидания сообщения
+- [x] push: `channel.closing` завершился → `_ConnectionLost(reason)` и классификация по его причине;
       тега нет в `channel.consumers` → WARNING «consumer cancelled by the broker» и новая попытка
-- [ ] push, штатный выход (совпадение, дедлайн): `basic_cancel` и `basic_nack(requeue=True)` для
+- [x] push, штатный выход (совпадение, дедлайн): `basic_cancel` и `basic_nack(requeue=True)` для
       непрочитанных доставок под `rpc`, затем закрытие; неудача этих шагов исход не меняет
-- [ ] имя соединения `rmq-trigger:<queue>` через `?name=` в URL
-- [ ] `message_wait_timeout` (push) — дедлайн от начала `run()`, проверяется перед каждым шагом
+- [x] имя соединения `rmq-trigger:<queue>` через `?name=` в URL
+- [x] `message_wait_timeout` (push) — дедлайн от начала `run()`, проверяется перед каждым шагом
       (включая паузу); граница шага — `min(своя, остаток)`; истёк → `{"status": "timeout"}`
-- [ ] docstring класса и `run()`: какие шаги ограничены, чем (`connect_timeout`, `rpc_timeout` из
+- [x] docstring класса и `run()`: какие шаги ограничены, чем (`connect_timeout`, `rpc_timeout` из
       `extra`), что повторяется и что даёт ошибку, ACK совпавшего сообщения, перебег дедлайна не больше
       `rpc_timeout + CLOSE_TIMEOUT` (возврат буфера через `basic_cancel` и NACK, затем закрытие);
       docstring класса и параметров `mode` / `message_wait_timeout` (`triggers/rmq.py:17-36`, `:57-60`)
       описывают `basic_get` / `basic_consume` на `aiormq`, без `queue.get()` и `queue.iterator()`
-- [ ] тесты классификации: `ProbableAuthenticationError`, `AuthenticationError`, `AMQPInternalError` с
+- [x] тесты классификации: `ProbableAuthenticationError`, `AuthenticationError`, `AMQPInternalError` с
       `Connection.Close` 530, `ConnectionNotAllowed`, 403, 404 → error на первой и на третьей попытке;
       refused / `IncompatibleProtocolError` / `EOFError` / `ConnectionClosed` 320 при handshake → error на
       первой, повтор на второй; таймаут подключения на первой попытке → повтор (тест не зависит от
       версии Python: таймаут приходит как `_StepTimeout`); закрытие соединения посреди pull (в
       `basic_get` и между вызовами), закрытие канала с не-404/403 → повтор; прочее исключение → error
-- [ ] тесты потери по heartbeat: `connection.closing` и `channel.closing` с `CancelledError()`
+- [x] тесты потери по heartbeat: `connection.closing` и `channel.closing` с `CancelledError()`
       как исключением, шаг pull завершается отменой → `_ConnectionLost`, WARNING и повтор, `run()` не
       завершается; отмена самого `run()` → `CancelledError` пробрасывается, соединение закрыто
-- [ ] тесты push: тег пропал → WARNING и новая попытка, на ней 404 → error; `channel.closing` с 404 →
+- [x] тесты push: тег пропал → WARNING и новая попытка, на ней 404 → error; `channel.closing` с 404 →
       error; 404 с текстом «home node … is down or inaccessible» (на passive declare, `basic_get`,
       `basic_consume` и причиной `channel.closing`) → WARNING и повтор, на следующей попытке очередь
       доступна → сообщение доставляется; `channel.closing` с `CancelledError()` (heartbeat) и с `Exception()` (EOF) → WARNING и
       повтор, `run()` не завершается; сообщение, пришедшее между оборотами, обрабатывается как обычно
-- [ ] тесты штатного выхода push: после совпадения при двух непрочитанных доставках в буфере —
+- [x] тесты штатного выхода push: после совпадения при двух непрочитанных доставках в буфере —
       `basic_cancel`, затем `basic_nack(requeue=True)` для обеих, затем закрытие; то же при истёкшем
       `message_wait_timeout`; зависший `basic_cancel` не задерживает выход дольше `rpc`
-- [ ] тесты паузы и дедлайна: 15 → 30 → 60 → 60 и сброс (время подменено); дедлайн истекает во время
+- [x] тесты паузы и дедлайна: 15 → 30 → 60 → 60 и сброс (время подменено); дедлайн истекает во время
       паузы и между шагами попытки → timeout-событие; без буфера перебег не больше `CLOSE_TIMEOUT`, с
       зависшим `basic_cancel` — не больше `rpc_timeout + CLOSE_TIMEOUT`
-- [ ] тесты handshake на настоящем `aiormq.Connection` против локального сервера: `Connection.Close`
+- [x] тесты handshake на настоящем `aiormq.Connection` против локального сервера: `Connection.Close`
       320 после `StartOk`, `Connection.Close` 541 «vhost is down» и 320 в ответ на `Connection.Open`,
       EOF сразу после TCP-подключения — на первой попытке → error-событие (не `_ConnectionLost`), на
       второй → повтор; `Connection.Close` 530 «access to vhost '…' refused» на `Open` → error на любой
       попытке; 404 с текстом «home node … down» — распознаётся по `str(exc)` настоящего
       `ChannelNotFoundEntity`
-- [ ] прогнать `pytest tests/ -q` — всё зелёное до задачи 4
+- [x] прогнать `pytest tests/ -q` — всё зелёное до задачи 4
+- ⚠️ ожидание push: буфер — `deque` и `asyncio.Event` (колбэк дописывает доставку и ставит событие),
+  ожидание — `asyncio.wait({event.wait(), channel.closing}, ...)`; доставка снимается с буфера только
+  после проверки дедлайна, поэтому необработанная остаётся в буфере для `basic_nack`
 
 ### Task 4: `RMQSensor`: `trigger_mode`, `timeout` в `defer()`, промахи в `reschedule`
 
