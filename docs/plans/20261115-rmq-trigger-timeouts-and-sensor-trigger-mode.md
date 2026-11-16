@@ -474,40 +474,40 @@
 - Modify: `airflow_provider_rmq/utils/amqp.py`
 - Modify: `tests/test_sensor.py`
 
-- [ ] параметр `trigger_mode: Literal["pull", "push"] | None = None`; `mode` остаётся базовому классу;
+- [x] параметр `trigger_mode: Literal["pull", "push"] | None = None`; `mode` остаётся базовому классу;
       явный `mode=None` удаляется; `mode="pull"`/`"push"` → `AirflowProviderDeprecationWarning` и
       перенос в `trigger_mode`; оба заданы → `ValueError`; недопустимый `trigger_mode` → `ValueError`
-- [ ] проверка `message_wait_timeout` опирается на `trigger_mode`; тексты ошибок называют
+- [x] проверка `message_wait_timeout` опирается на `trigger_mode`; тексты ошибок называют
       `trigger_mode`
-- [ ] `_defer`: `RMQTrigger(mode=self.trigger_mode, ...)` и `timeout=timedelta(seconds=self.timeout)` в
+- [x] `_defer`: `RMQTrigger(mode=self.trigger_mode, ...)` и `timeout=timedelta(seconds=self.timeout)` в
       `self.defer(...)`
-- [ ] `poke`: при `self.reschedule` в конце каждого вызова — `miss_state.on_batch_done(matched,
+- [x] `poke`: при `self.reschedule` в конце каждого вызова — `miss_state.on_batch_done(matched,
       evaluated, dropped_in_batch)` по этому `poke` (ERROR-вердикты не считаются в `evaluated`, как у
       оператора); docstring `on_batch_done` (`utils/amqp.py:441-444`) — что батч может быть и одним
       `poke` сенсора в `reschedule`; комментарий к `self._miss_state` (`sensors/rmq.py:96-98`) и
       docstring `FilterMissState` (`utils/amqp.py:333-334`) — состояние живёт между `poke` только в
       режиме `poke`, в `reschedule` каждый `poke` начинает с нуля
-- [ ] docstring класса и параметров: `trigger_mode`, `mode` базового класса, граница `timeout` в
+- [x] docstring класса и параметров: `trigger_mode`, `mode` базового класса, граница `timeout` в
       deferrable и её исход (FAILED с ретраями, SKIPPED при `soft_fail`); `message_wait_timeout`
       (`sensors/rmq.py:73-76`) — действует при `trigger_mode="push"`, перебег не больше
       `rpc_timeout + CLOSE_TIMEOUT` (отмена консьюмера и возврат непрочитанных сообщений)
-- [ ] обновить существующие тесты: `mode="push"` `:320-409` → `trigger_mode="push"` (и отдельный тест
+- [x] обновить существующие тесты: `mode="push"` `:320-409` → `trigger_mode="push"` (и отдельный тест
       на предупреждение), текст ошибки `:354`, `test_the_base_sensor_mode_is_untouched` `:520-528`,
       docstring `test_reschedule_never_reaches_the_threshold` (`:550-553`, ссылка на пункт бэклога
       `:552`), docstring `test_a_hundred_pokes_report_no_batch_line` (`:570-574`, «`on_batch_done` is
       the operator's»)
-- [ ] новые тесты: умолчание (`trigger_mode="pull"`, `mode="poke"`, `reschedule` False); `mode="push"` →
+- [x] новые тесты: умолчание (`trigger_mode="pull"`, `mode="poke"`, `reschedule` False); `mode="push"` →
       предупреждение, `trigger_mode="push"`, `mode="poke"`; `mode=None` → как без `mode`;
       `mode="reschedule"` + `deferrable=True` → в триггер уходит `pull`; `mode="bogus"` → ошибка базового
       класса; оба параметра → `ValueError`; `prepare_for_execution()` под `DebugExecutor` (единственный
       executor с `change_sensor_mode_to_reschedule`) переводит `mode` в `reschedule` и оставляет
       `trigger_mode="push"`
-- [ ] тесты `_defer`: `defer` получает `timeout=timedelta(seconds=sensor.timeout)` (и при `timeout`,
+- [x] тесты `_defer`: `defer` получает `timeout=timedelta(seconds=sensor.timeout)` (и при `timeout`,
       заданном `timedelta`) и `RMQTrigger` с `mode=trigger_mode`; `message_wait_timeout` без `push` →
       `ValueError`
-- [ ] тесты `reschedule`: `poke` без совпадений → строка `on_batch_done`; в режиме `poke` строки по
+- [x] тесты `reschedule`: `poke` без совпадений → строка `on_batch_done`; в режиме `poke` строки по
       батчу нет
-- [ ] прогнать `pytest tests/ -q` — всё зелёное до задачи 5
+- [x] прогнать `pytest tests/ -q` — всё зелёное до задачи 5
 
 ### Task 5: Integration-тесты триггера на живом брокере
 

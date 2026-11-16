@@ -357,7 +357,10 @@ class FilterMissState:
     The object holds nothing about any single message: no keys, no broker calls, no
     coroutines, so the same class serves the asynchronous and the synchronous paths.
     Its lifetime is the owner's — a consumer task in the watcher, one ``run()`` in the
-    trigger, one task run in the operator, the sensor instance across its ``poke`` calls.
+    trigger, one task run in the operator, the sensor instance. A sensor in ``poke`` mode
+    keeps its instance, and the counters with it, across its ``poke`` calls; in
+    ``reschedule`` mode every ``poke`` is a task run on a new instance and starts from
+    zero.
 
     :param queue_name: Queue the counters belong to; it names the queue in every line.
     :param logger: Logger the WARNING goes to, kept on the object as ``log``. It is the
@@ -464,10 +467,11 @@ class FilterMissState:
         :param evaluated: Messages the filter reached a verdict on.
         :param dropped_in_batch: Messages acknowledged because they missed the filter.
 
-        A batch is the operator's whole task run, so a line here comes out at most once
-        per run and needs no threshold: it carries the visibility ``streak`` cannot give
-        to a counter that never outlives a single ``max_messages`` batch. A batch that
-        matched nothing and dropped everything is one line and not two.
+        A batch is the operator's whole task run, or one ``poke`` of a sensor in
+        ``reschedule`` mode, which is a task run of its own. Either way a line here comes
+        out at most once per run and needs no threshold: it carries the visibility
+        ``streak`` cannot give to a counter that never outlives a single batch. A batch
+        that matched nothing and dropped everything is one line and not two.
         """
         if evaluated > 0 and matched == 0:
             dropped_clause = (
