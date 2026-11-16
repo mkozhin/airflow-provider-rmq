@@ -19,6 +19,7 @@ from aiormq.exceptions import (
     ChannelAccessRefused,
     ChannelClosed,
     ChannelInvalidStateError,
+    ChannelLockedResource,
     ChannelNotFoundEntity,
     ChannelPreconditionFailed,
     ConnectionCommandInvalid,
@@ -242,7 +243,9 @@ def _refused(exc: BaseException | None) -> bool:
     """Whether the broker refused the trigger for good: no attempt can get further.
 
     A wrong or changed password, no access to the vhost, no access to the queue, a
-    queue that is not there, and a connection the broker closed with 540 NOT_IMPLEMENTED
+    queue that is not there, an exclusive queue another connection holds (405
+    RESOURCE_LOCKED — it goes away with that connection, and the next attempt meets a
+    404), and a connection the broker closed with 540 NOT_IMPLEMENTED
     (``basic_get`` on a stream queue), 501 FRAME_ERROR or 503 COMMAND_INVALID — the
     same call meets the same answer on every attempt. The 404 of a durable classic queue
     whose node is restarting is not one of them: the queue comes back with its node.
@@ -257,6 +260,7 @@ def _refused(exc: BaseException | None) -> bool:
             AuthenticationError,
             ConnectionNotAllowed,
             ChannelAccessRefused,
+            ChannelLockedResource,
             ConnectionNotImplemented,
             ConnectionFrameError,
             ConnectionCommandInvalid,
@@ -416,7 +420,7 @@ class RMQTrigger(BaseTrigger):
     itself once the broker is back. A refused or cut-off handshake is an error on the
     first attempt — a wrong host or port, a broker that is not there — and retried on
     later ones. An error event ends ``run()`` on any attempt for a wrong password, no
-    access to the vhost, a 403 or a 404 on the queue (except the 404 of a durable
+    access to the vhost, a 403, 404 or 405 on the queue (except the 404 of a durable
     queue whose node is restarting, which is retried), a connection the broker closed
     with 540, 501 or 503, a 406 in answer to ``basic_consume`` (push mode on a stream
     queue), and for any other exception.
@@ -432,14 +436,17 @@ class RMQTrigger(BaseTrigger):
     **Event before cleanup.** The success event is fired while the attempt still holds its
     connection; the push consumer is left and the connection is closed after it. A
     cancellation of ``run()`` that lands while they run — the triggerer stopping, the
-    task cleared — finds the event already handed over, so an acknowledged message is
-    never left without it.
+    task cleared — finds the event already handed over. A cancellation that lands while
+    the acknowledgement of the match is on its way leaves no event: ``aiormq`` has
+    queued the ACK frame by then, so the message is gone from the queue. When the task
+    itself is ending — its ``timeout``, a clear — the event would have nobody to take
+    it; a triggerer that stops in that window loses the message.
 
     **Leaving the push consumer.** On a match, on ``message_wait_timeout`` and on a
     cancellation of ``run()`` — the sensor's ``timeout``, the task cleared, the
-    triggerer stopping — the consumer is cancelled and every delivery the broker had already sent and the
-    trigger had not looked at is NACKed back with ``requeue=True`` before the
-    connection closes: a quorum queue counts a delivery dropped with its connection
+    triggerer stopping — the consumer is cancelled and every delivery the broker had
+    already sent and the trigger had not looked at is NACKed back with
+    ``requeue=True`` before the connection closes: a quorum queue counts a delivery dropped with its connection
     against ``delivery-limit``, a NACK it does not. Both get one ``rpc_timeout`` between
     them; if they fail, the connection is closed all the same and the broker puts the
     deliveries back itself. The consumer takes no prefetch limit: the broker sends it
@@ -556,7 +563,14 @@ class RMQTrigger(BaseTrigger):
                 attempt = _Attempt(number, deadline)
                 # Created before the first await, so the finally closes it whatever ends the
                 # attempt — a result, a failure, or a cancellation of run() by the triggerer.
-                connection = aiormq.Connection(url, context=ssl_context)
+                try:
+                    connection = aiormq.Connection(url, context=ssl_context)
+                except Exception as e:
+                    # The URL itself is rejected (a port out of range, a broken IPv6 host):
+                    # every attempt would meet the same.
+                    log.exception("RMQTrigger encountered an error")
+                    yield TriggerEvent({"status": "error", "error": str(e)})
+                    return
                 try:
                     try:
                         result = await self._attempt(connection, timeouts, attempt, msg_filter, miss_state)

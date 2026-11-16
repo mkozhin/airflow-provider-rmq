@@ -22,6 +22,7 @@ from aiormq.exceptions import (
     AuthenticationError,
     ChannelAccessRefused,
     ChannelInvalidStateError,
+    ChannelLockedResource,
     ChannelNotFoundEntity,
     ChannelPreconditionFailed,
     ConnectionClosed,
@@ -134,7 +135,10 @@ class FakeBroker:
     ``consume``, ``ack``, ``nack``, ``cancel``, ``close`` — to a coroutine function
     called with the connection and the channel before the step does its work. Every
     step lands in ``calls``. A call on a closed channel raises
-    :exc:`ChannelInvalidStateError`, as it does in ``aiormq``.
+    :exc:`ChannelInvalidStateError`, as it does in ``aiormq``. The ACK is recorded
+    before its ``ack`` hook runs, the way ``aiormq`` queues the frame before waiting
+    for the drain; ``ack:write`` is a hook that runs before the frame is queued, and
+    does not land in ``calls``.
     """
 
     pending: deque = field(default_factory=deque)
@@ -150,6 +154,11 @@ class FakeBroker:
         self.connections.append(connection)
         connection.attempt = len(self.connections)
         return connection
+
+    async def before_write(self, step, connection, channel):
+        hook = self.hooks.get(f"{step}:write")
+        if hook is not None:
+            await hook(connection=connection, channel=channel)
 
     async def call(self, step, connection, channel=None):
         self.calls.append(step)
@@ -277,9 +286,12 @@ class FakeChannel:
         await asyncio.sleep(0)
 
     async def basic_ack(self, delivery_tag, multiple=False):
+        # aiormq puts the Basic.Ack frame on the write queue before it waits for the
+        # drain: an ACK that hangs or is cancelled in the "ack" hook has been sent.
         self._check_open()
-        await self.broker.call("ack", self.connection, self)
+        await self.broker.before_write("ack", self.connection, self)
         self.broker.acked.append(self.in_flight.pop(delivery_tag))
+        await self.broker.call("ack", self.connection, self)
 
     async def basic_nack(self, delivery_tag, multiple=False, requeue=True):
         self._check_open()
@@ -541,6 +553,24 @@ class TestRunError:
         assert events[0]["status"] == "error"
         assert "refused" in events[0]["error"]
         assert broker.connections[0].close_calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["pull", "push"])
+    async def test_url_the_connection_rejects_yields_error_event(self, mode, caplog):
+        """``aiormq.Connection`` raises on a URL ``build_amqp_connection`` lets through."""
+        trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode=mode)
+
+        def _reject(url, *, context=None):
+            raise ValueError("Port out of range 0-65535")
+
+        with patch.object(aiormq, "Connection", _reject), patch(
+            "airflow_provider_rmq.triggers.rmq.BaseHook"
+        ) as mock_base, caplog.at_level("ERROR"):
+            mock_base.get_connection = MagicMock(return_value=FakeAirflowConnection())
+            events = await asyncio.wait_for(_collect_events(trigger), 2)
+
+        assert events == [{"status": "error", "error": "Port out of range 0-65535"}]
+        assert log_lines(caplog, "RMQTrigger encountered an error")
 
     @pytest.mark.asyncio
     async def test_push_connection_error_yields_error_event(self):
@@ -1113,7 +1143,7 @@ class TestAckOfMatchingMessage:
         trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q")
         first, again = Msg(body=b"payload"), Msg(body=b"payload again")
         broker = _broker(first, tail=[again])
-        broker.hooks["ack"] = on(fail(ChannelInvalidStateError("closed")), 1)
+        broker.hooks["ack:write"] = on(fail(ChannelInvalidStateError("closed")), 1)
 
         with caplog.at_level("WARNING"):
             events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
@@ -1197,7 +1227,7 @@ class TestAckOfMatchingMessage:
             connection.lose(ConnectionClosed(320, "CONNECTION_FORCED"))
             raise ChannelInvalidStateError("closed")
 
-        broker.hooks["ack"] = on(_lose_then_refuse, 1)
+        broker.hooks["ack:write"] = on(_lose_then_refuse, 1)
 
         with caplog.at_level("WARNING"):
             events = await asyncio.wait_for(_run_against(trigger, broker, _timeouts(rpc=30)), 2)
@@ -1856,6 +1886,11 @@ REFUSALS = [
         id="403",
     ),
     pytest.param(
+        "declare",
+        fail(ChannelLockedResource("RESOURCE_LOCKED - cannot obtain exclusive access to locked queue 'q'")),
+        "RESOURCE_LOCKED", id="405",
+    ),
+    pytest.param(
         "declare", fail(ChannelNotFoundEntity("NOT_FOUND - no queue 'q'")), "NOT_FOUND - no queue 'q'",
         id="404",
     ),
@@ -2207,7 +2242,8 @@ class TestPushGiveBack:
     @pytest.mark.asyncio
     async def test_cancelled_run_cancels_then_nacks_the_unread_then_closes(self):
         """The sensor's timeout, a cleared task or a stopping triggerer cancel ``run()``: the
-        unread deliveries go back by NACK, and so does the one whose ACK was cut short."""
+        unread deliveries go back by NACK. The match whose ACK the cancellation cut short
+        had its frame queued already: it is acknowledged, and no event carries it."""
         trigger = RMQTrigger(rmq_conn_id="conn", queue_name="q", mode="push")
         first, second, third = Msg(body=b"first"), Msg(body=b"second"), Msg(body=b"third")
         broker = _broker(first, second, third, hooks={"ack": hang()})
@@ -2221,8 +2257,8 @@ class TestPushGiveBack:
                 await asyncio.wait_for(task, 2)
 
         assert broker.calls[-3:] == ["cancel", "nack", "close"]
-        assert broker.acked == []
-        assert broker.nacked == [(first, True), (second, True), (third, True)]
+        assert broker.acked == [first]
+        assert broker.nacked == [(second, True), (third, True)]
         assert broker.connections[0].close_calls == 1
 
     @pytest.mark.asyncio

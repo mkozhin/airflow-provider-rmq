@@ -33,9 +33,8 @@ class RMQSensor(BaseSensorOperator):
     says, every retry waiting the full ``timeout`` again — or SKIPPED with
     ``soft_fail=True``; ``execute_complete`` is not called. A ``message_wait_timeout``
     longer than ``timeout`` therefore never comes into play: the task fails by
-    ``timeout`` instead of being skipped. A ``timeout`` no date can be counted to —
-    ``float("inf")``, or one past the year 9999 — leaves the deferred wait without a
-    limit.
+    ``timeout`` instead of being skipped. A ``timeout`` that takes the deadline past the
+    year 9999 leaves the deferred wait without a limit.
 
     A message the filter read and rejected is disposed of according to
     ``ack_unmatched``: NACKed with requeue=True by default, so it stays in the queue for
@@ -111,7 +110,8 @@ class RMQSensor(BaseSensorOperator):
         holds for ``"mode"`` in ``default_args`` — of the DAG or of the sensor — when
         ``mode`` itself is not given: ``"pull"``/``"push"`` there is taken as
         ``trigger_mode`` with the same warning unless ``trigger_mode`` is given, and the
-        base class gets its default ``"poke"``.
+        base class gets its default ``"poke"`` — also when ``mode`` is given as
+        ``"pull"``/``"push"`` and ``default_args`` holds one of them too.
         """
         if "mode" in kwargs and kwargs["mode"] is None:
             del kwargs["mode"]
@@ -145,6 +145,9 @@ class RMQSensor(BaseSensorOperator):
                 stacklevel=2,
             )
             trigger_mode = kwargs.pop("mode")
+            if default_args.get("mode") in _TRIGGER_MODES:
+                # The base class would take that one from default_args instead.
+                kwargs["mode"] = "poke"
         super().__init__(**kwargs)
         self.queue_name = queue_name
         self.rmq_conn_id = rmq_conn_id
@@ -215,8 +218,9 @@ class RMQSensor(BaseSensorOperator):
         """The sensor's ``timeout`` as ``defer()`` takes it.
 
         ``None`` — no limit on the deferred wait — for a ``timeout`` no date can be
-        counted to: ``float("inf")``, which the base class accepts, or a number of
-        seconds that takes the deadline past the year 9999.
+        counted to: a number of seconds that takes the deadline past the year 9999, or
+        ``float("inf")`` set on the sensor once it is built (the base class's
+        constructor rejects it).
         """
         try:
             timeout = timedelta(seconds=self.timeout)
