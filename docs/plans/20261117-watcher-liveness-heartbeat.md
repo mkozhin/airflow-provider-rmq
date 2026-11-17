@@ -491,12 +491,13 @@
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] каждое состояние таблицы и каждый сценарий из Task 3 покрыт тестом
-- [ ] тест отдельным интерпретатором из Task 5 проходит: плагин не загружает
+- [x] каждое состояние таблицы и каждый сценарий из Task 3 покрыт тестом
+      (`tests/watcher/test_liveness.py`: `TestStates`, `TestScenarios`, `TestRowsReadFromDatabase`)
+- [x] тест отдельным интерпретатором из Task 5 проходит: плагин не загружает
       `airflow.www.utils`; `ensure_table_exists` (вызываемый `on_load` в шедулере) таблицу
       heartbeat не создаёт
-- [ ] run full test suite: `.venv/bin/python -m pytest tests/ -q`
-- [ ] run linters: `.venv/bin/ruff check airflow_provider_rmq tests` (новых ошибок нет)
+- [x] run full test suite: `.venv/bin/python -m pytest tests/ -q`
+- [x] run linters: `.venv/bin/ruff check airflow_provider_rmq tests` (новых ошибок нет)
 
 ### Task 8: [Final] Update documentation
 
