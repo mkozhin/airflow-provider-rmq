@@ -404,42 +404,42 @@
 - Modify: `tests/watcher/test_listener.py`
 - Modify: `tests/watcher/test_runner.py`
 
-- [ ] `run`: `WatcherIdentity` (hostname — `get_hostname()`); константы
+- [x] `run`: `WatcherIdentity` (hostname — `get_hostname()`); константы
       `_HEARTBEAT_TIMEOUT`, `_PRUNE_TIMEOUT`; шаг `"heartbeat"` вызывает
       `ensure_heartbeat_table()`, пока флаг готовности не стоит
-- [ ] старт: после первого `_refresh_settings` процесса, перед первым проходом — шаг
+- [x] старт: после первого `_refresh_settings` процесса, перед первым проходом — шаг
       `"heartbeat"` с `record_heartbeat_start` и `due_at = now + H + B + H`; перезапуск
       `_main` старт не пишет
-- [ ] перед проходом: если бюджет вырос против сохранённого срока — шаг `"heartbeat"` с
+- [x] перед проходом: если бюджет вырос против сохранённого срока — шаг `"heartbeat"` с
       `record_heartbeat_due`
-- [ ] конец прохода в бюджете без запрошенной остановки: шаг `"heartbeat"` с
+- [x] конец прохода в бюджете без запрошенной остановки: шаг `"heartbeat"` с
       `record_heartbeat_cycle`, затем шаг `"heartbeat_prune"`; `_StopRequested` — тихо,
       сбой, `_StepInFlight`, `PoolSaturated` — WARNING
-- [ ] `mark_stopped()`: при первом вызове и созданной идентичности — поток с
+- [x] `mark_stopped()`: при первом вызове и созданной идентичности — поток с
       `record_heartbeat_stop` своей сессией, ожидание не дольше 2 с, сбой и таймаут —
       WARNING; `request_stop` не меняется
-- [ ] runner, ветка полученного сигнала: `request_stop()`, затем `mark_stopped()` только
+- [x] runner, ветка полученного сигнала: `request_stop()`, затем `mark_stopped()` только
       если `getppid()` равен PID шедулера; ветка смены `getppid()` — только `request_stop()`
-- [ ] тесты (`test_listener.py`): строка старта несёт срок из переопределённого бюджета
+- [x] тесты (`test_listener.py`): строка старта несёт срок из переопределённого бюджета
       (Variable `rmq_watcher_cycle_timeout`); рост бюджета публикует новый срок до прохода и
       не двигает `last_cycle_at`; проход в бюджете двигает `last_cycle_at` и `due_at`;
       проход, упёршийся в бюджет, — нет; перезапуск `_main` после краша сохраняет `id` и
       `started_at`
-- [ ] тесты (`test_listener.py`): `mark_stopped` пишет `stopped_at`, пока reconcile ещё
+- [x] тесты (`test_listener.py`): `mark_stopped` пишет `stopped_at`, пока reconcile ещё
       идёт, и не ждёт дольше 2 с при зависшей записи; повторный вызов второй записи не
       делает; вызов до `run` ничего не пишет; stop, пришедший до подачи записи старта, —
       запись старта не подаётся; stop, пришедший, пока запись старта идёт в воркере, —
       итоговая строка со `stopped_at`; проход, записанный после отметки, `stopped_at` не
       стирает; краш `_main` `stopped_at` не ставит; остановка не даёт WARNING о heartbeat
       прохода
-- [ ] тесты (`test_listener.py`): сбой записи и сбой чистки не прерывают цикл и не мешают
+- [x] тесты (`test_listener.py`): сбой записи и сбой чистки не прерывают цикл и не мешают
       `cycle_completed`; сбой чистки не откатывает отметку; зависшая запись не подаётся
       повторно; сбой и зависание `ensure_heartbeat_table` внутри шага старта — WARNING по
       границе `H`, цикл стартует, следующая запись создаёт таблицу
-- [ ] тесты (`test_runner.py`): штатный SIGTERM при живом родителе — `request_stop`, затем
+- [x] тесты (`test_runner.py`): штатный SIGTERM при живом родителе — `request_stop`, затем
       `mark_stopped`; смена `getppid()` и SIGTERM после смены родителя — только
       `request_stop`
-- [ ] run tests — must pass before task 5
+- [x] run tests — must pass before task 5
 
 ### Task 5: Баннер на главной странице Airflow
 
