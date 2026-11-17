@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from markupsafe import Markup
+
+from airflow_provider_rmq.watcher.liveness import (
+    SUBSCRIPTIONS_PATH,
+    LivenessState,
+    ProcessState,
+    assess_liveness,
+    banner_text,
+    masks_statuses,
+)
+from airflow_provider_rmq.watcher.models import (
+    WatcherIdentity,
+    get_heartbeats,
+    record_heartbeat_cycle,
+)
+
+#: Reference moment of the tests, naive UTC like the times the watcher writes.
+T0 = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+
+
+@dataclass
+class Row:
+    """A heartbeat row with the attributes of ``RMQWatcherHeartbeat``."""
+
+    id: str = "run-1"
+    hostname: str = "scheduler-1"
+    pid: int = 4242
+    started_at: datetime = T0
+    last_cycle_at: datetime | None = None
+    due_at: datetime = T0 + timedelta(minutes=10)
+    stopped_at: datetime | None = None
+
+
+def _assess(rows, now, *, enabled=True, fresh=False):
+    return assess_liveness(rows, now, has_enabled_subscriptions=enabled, has_fresh_reconcile=fresh)
+
+
+def _cycled(row_id="run-1", *, cycle=T0 + timedelta(minutes=1), due=None, **kwargs):
+    return Row(
+        id=row_id,
+        last_cycle_at=cycle,
+        due_at=due if due is not None else cycle + timedelta(minutes=10),
+        **kwargs,
+    )
+
+
+class TestStates:
+    def test_unused_without_enabled_subscriptions(self):
+        verdict = _assess([], T0, enabled=False, fresh=False)
+        assert verdict.state is LivenessState.UNUSED
+
+    def test_unused_wins_over_dead_rows(self):
+        dead = _cycled(due=T0)
+        verdict = _assess([dead], T0 + timedelta(hours=1), enabled=False)
+        assert verdict.state is LivenessState.UNUSED
+        assert verdict.processes[0].state is ProcessState.DEAD
+
+    def test_ok_with_alive_row_that_completed_a_cycle(self):
+        verdict = _assess([_cycled()], T0 + timedelta(minutes=2))
+        assert verdict.state is LivenessState.OK
+        assert verdict.processes[0].state is ProcessState.ALIVE
+
+    def test_starting_with_alive_rows_without_a_cycle(self):
+        rows = [Row(id="a"), Row(id="b", started_at=T0 + timedelta(seconds=5))]
+        verdict = _assess(rows, T0 + timedelta(minutes=1))
+        assert verdict.state is LivenessState.STARTING
+        assert {p.state for p in verdict.processes} == {ProcessState.STARTING}
+
+    def test_unconfirmed_without_alive_rows_and_fresh_reconcile(self):
+        verdict = _assess([], T0, fresh=True)
+        assert verdict.state is LivenessState.UNCONFIRMED
+
+    def test_down_without_alive_rows_and_stale_reconcile(self):
+        verdict = _assess([], T0, fresh=False)
+        assert verdict.state is LivenessState.DOWN
+
+    def test_row_is_alive_exactly_at_due_at(self):
+        row = _cycled(due=T0 + timedelta(minutes=5))
+        assert _assess([row], T0 + timedelta(minutes=5)).state is LivenessState.OK
+        late = _assess([row], T0 + timedelta(minutes=5, microseconds=1))
+        assert late.state is LivenessState.DOWN
+        assert late.processes[0].state is ProcessState.DEAD
+
+    @pytest.mark.parametrize("due_offset", [timedelta(hours=-1), timedelta(0), timedelta(hours=1)])
+    def test_stopped_row_is_never_alive(self, due_offset):
+        now = T0 + timedelta(minutes=3)
+        row = _cycled(stopped_at=T0 + timedelta(minutes=2), due=now + due_offset)
+        verdict = _assess([row], now)
+        assert verdict.state is LivenessState.DOWN
+        assert verdict.processes[0].state is ProcessState.STOPPED
+
+    def test_one_alive_row_with_a_cycle_gives_ok_among_dead_ones(self):
+        now = T0 + timedelta(hours=1)
+        rows = [
+            _cycled("dead-1", due=T0 + timedelta(minutes=10)),
+            _cycled("stopped", stopped_at=T0 + timedelta(minutes=20)),
+            _cycled("alive", cycle=now - timedelta(minutes=1)),
+            Row(id="starting", started_at=now - timedelta(seconds=30), due_at=now + timedelta(minutes=5)),
+        ]
+        verdict = _assess(rows, now)
+        assert verdict.state is LivenessState.OK
+        states = {p.id: p.state for p in verdict.processes}
+        assert states == {
+            "dead-1": ProcessState.DEAD,
+            "stopped": ProcessState.STOPPED,
+            "alive": ProcessState.ALIVE,
+            "starting": ProcessState.STARTING,
+        }
+
+    def test_reconcile_is_read_only_without_alive_rows(self):
+        calls = []
+
+        def fresh():
+            calls.append(1)
+            return True
+
+        assert _assess([_cycled()], T0 + timedelta(minutes=2), fresh=fresh).state is LivenessState.OK
+        assert _assess([Row()], T0 + timedelta(minutes=1), fresh=fresh).state is LivenessState.STARTING
+        assert _assess([], T0, enabled=False, fresh=fresh).state is LivenessState.UNUSED
+        assert calls == []
+        assert _assess([], T0, fresh=fresh).state is LivenessState.UNCONFIRMED
+        assert calls == [1]
+
+    def test_processes_are_ordered_latest_mark_first(self):
+        rows = [
+            Row(id="old", started_at=T0),
+            _cycled("newer", cycle=T0 + timedelta(minutes=3)),
+            _cycled("newest", stopped_at=T0 + timedelta(minutes=4)),
+        ]
+        verdict = _assess(rows, T0 + timedelta(minutes=5))
+        assert [p.id for p in verdict.processes] == ["newest", "newer", "old"]
+        assert verdict.latest_mark == T0 + timedelta(minutes=4)
+        assert verdict.latest_is_stop is True
+
+    def test_last_mark_and_its_age(self):
+        row = _cycled(cycle=T0 + timedelta(minutes=1))
+        process = _assess([row], T0 + timedelta(minutes=3)).processes[0]
+        assert process.last_mark == T0 + timedelta(minutes=1)
+        assert process.last_mark_age_seconds == 120.0
+
+    def test_age_of_a_mark_from_the_future_is_zero(self):
+        row = Row(started_at=T0 + timedelta(seconds=30))
+        assert _assess([row], T0).processes[0].last_mark_age_seconds == 0.0
+
+    def test_aware_times_are_compared_as_naive_utc(self):
+        aware = timezone(timedelta(hours=3))
+        row = Row(
+            started_at=(T0 + timedelta(hours=3)).replace(tzinfo=aware),
+            last_cycle_at=(T0 + timedelta(hours=3, minutes=1)).replace(tzinfo=aware),
+            due_at=(T0 + timedelta(hours=3, minutes=5)).replace(tzinfo=aware),
+        )
+        verdict = _assess([row], (T0 + timedelta(minutes=2)).replace(tzinfo=timezone.utc))
+        assert verdict.state is LivenessState.OK
+        assert verdict.processes[0].last_mark == T0 + timedelta(minutes=1)
+        assert verdict.assessed_at == T0 + timedelta(minutes=2)
+
+
+class TestMasksStatuses:
+    @pytest.mark.parametrize("state", list(LivenessState))
+    def test_only_down_masks(self, state):
+        rows_and_args = {
+            LivenessState.UNUSED: ([], {"enabled": False}),
+            LivenessState.OK: ([_cycled()], {}),
+            LivenessState.STARTING: ([Row()], {}),
+            LivenessState.UNCONFIRMED: ([], {"fresh": True}),
+            LivenessState.DOWN: ([], {}),
+        }
+        rows, kwargs = rows_and_args[state]
+        verdict = _assess(rows, T0 + timedelta(minutes=2), **kwargs)
+        assert verdict.state is state
+        assert masks_statuses(verdict) is (state is LivenessState.DOWN)
+
+
+class TestBannerText:
+    def test_no_banner_unless_down(self):
+        assert banner_text(_assess([_cycled()], T0 + timedelta(minutes=2))) is None
+        assert banner_text(_assess([], T0, fresh=True)) is None
+        assert banner_text(_assess([Row()], T0)) is None
+        assert banner_text(_assess([], T0, enabled=False)) is None
+
+    def test_not_running_without_rows(self):
+        text = banner_text(_assess([], T0))
+        assert isinstance(text, Markup)
+        assert text.startswith("RMQ watcher is not running — subscriptions are not consumed")
+        assert f'<a href="{SUBSCRIPTIONS_PATH}">' in text
+
+    def test_stopped_when_the_latest_row_stopped(self):
+        rows = [_cycled(stopped_at=T0 + timedelta(minutes=7, seconds=5))]
+        text = banner_text(_assess(rows, T0 + timedelta(minutes=30)))
+        assert text.startswith(
+            "RMQ watcher stopped at 2026-11-17 12:07:05 UTC and no Scheduler runs it"
+        )
+        assert f'<a href="{SUBSCRIPTIONS_PATH}">' in text
+
+    def test_no_cycle_since_the_latest_mark(self):
+        rows = [
+            _cycled("old", stopped_at=T0 + timedelta(minutes=2)),
+            _cycled("dead", cycle=T0 + timedelta(minutes=4), due=T0 + timedelta(minutes=9)),
+        ]
+        text = banner_text(_assess(rows, T0 + timedelta(minutes=30)))
+        assert text.startswith(
+            "RMQ watcher has not completed a cycle since 2026-11-17 12:04:00 UTC"
+        )
+
+    def test_no_cycle_since_start_when_none_completed(self):
+        row = Row(started_at=T0, due_at=T0 + timedelta(minutes=6))
+        text = banner_text(_assess([row], T0 + timedelta(minutes=7)))
+        assert "has not completed a cycle since 2026-11-17 12:00:00 UTC" in text
+
+    def test_text_names_neither_hostname_nor_pid(self):
+        row = _cycled(hostname="secret-host.internal", pid=98765, due=T0 + timedelta(minutes=5))
+        text = banner_text(_assess([row], T0 + timedelta(hours=1)))
+        assert "secret-host" not in text
+        assert "98765" not in text
+
+    def test_link_is_markup_and_substituted_link_is_escaped(self):
+        text = banner_text(_assess([], T0), link='/x?a=1&b="2"')
+        assert '<a href="/x?a=1&amp;b=&#34;2&#34;">RMQ Subscriptions</a>' in text
+
+
+class TestScenarios:
+    """Sequences of the verdict as the watcher fleet changes."""
+
+    def test_sole_watcher_killed(self):
+        # kill -9 right after a cycle: the row stays as written, no stopped_at
+        cycle = T0 + timedelta(minutes=10)
+        due = cycle + timedelta(minutes=7)
+        row = _cycled(cycle=cycle, due=due)
+        assert _assess([row], due, fresh=True).state is LivenessState.OK
+        assert _assess([row], due + timedelta(seconds=1), fresh=True).state is (
+            LivenessState.UNCONFIRMED
+        )
+        verdict = _assess([row], due + timedelta(minutes=5), fresh=False)
+        assert verdict.state is LivenessState.DOWN
+        assert masks_statuses(verdict)
+        assert "has not completed a cycle since 2026-11-17 12:10:00 UTC" in banner_text(verdict)
+
+    def test_scheduler_stopped(self):
+        # docker stop: SIGTERM while the parent is alive marks stopped_at
+        cycle = T0 + timedelta(minutes=10)
+        row = _cycled(cycle=cycle, stopped_at=cycle + timedelta(seconds=20))
+        soon = _assess([row], cycle + timedelta(minutes=1), fresh=True)
+        assert soon.state is LivenessState.UNCONFIRMED
+        assert banner_text(soon) is None
+        later = _assess([row], cycle + timedelta(minutes=10), fresh=False)
+        assert later.state is LivenessState.DOWN
+        assert "stopped at 2026-11-17 12:10:20 UTC" in banner_text(later)
+
+    def test_scheduler_restarted(self):
+        # the previous run died without a stop mark; the new run starts, then cycles
+        old = _cycled("old", cycle=T0, due=T0 + timedelta(minutes=7))
+        restart = T0 + timedelta(minutes=3)
+        new = Row(id="new", started_at=restart, due_at=restart + timedelta(minutes=6))
+        starting = _assess([old, new], restart + timedelta(minutes=5))
+        assert starting.state is LivenessState.STARTING
+        new_cycled = Row(
+            id="new",
+            started_at=restart,
+            last_cycle_at=restart + timedelta(minutes=5),
+            due_at=restart + timedelta(minutes=12),
+        )
+        running = _assess([old, new_cycled], restart + timedelta(minutes=8))
+        assert running.state is LivenessState.OK
+        states = {p.id: p.state for p in running.processes}
+        assert states == {"old": ProcessState.DEAD, "new": ProcessState.ALIVE}
+
+    def test_webserver_upgraded_before_scheduler(self):
+        verdict = _assess([], T0, fresh=True)
+        assert verdict.state is LivenessState.UNCONFIRMED
+        assert verdict.processes == ()
+        assert not masks_statuses(verdict)
+
+    def test_no_rows_and_stale_reconcile(self):
+        verdict = _assess([], T0, fresh=False)
+        assert verdict.state is LivenessState.DOWN
+        assert banner_text(verdict).startswith("RMQ watcher is not running")
+
+
+class TestRowsReadFromDatabase:
+    def test_rows_from_get_heartbeats(self, heartbeat_session):
+        identity = WatcherIdentity(id="db-run", hostname="host", pid=17, started_at=T0)
+        cycle = T0 + timedelta(minutes=1)
+        record_heartbeat_cycle(heartbeat_session, identity, cycle, cycle + timedelta(minutes=7))
+        rows = get_heartbeats(heartbeat_session, since=T0 - timedelta(days=1))
+        heartbeat_session.close()
+
+        now = datetime.now(timezone.utc)
+        verdict = _assess(rows, T0 + timedelta(minutes=2))
+        assert verdict.state is LivenessState.OK
+        process = verdict.processes[0]
+        assert (process.id, process.hostname, process.pid) == ("db-run", "host", 17)
+        assert process.last_cycle_at == cycle
+        assert _assess(rows, now).state is LivenessState.DOWN

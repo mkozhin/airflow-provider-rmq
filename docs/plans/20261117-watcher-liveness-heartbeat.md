@@ -377,24 +377,24 @@
 - Create: `airflow_provider_rmq/watcher/liveness.py`
 - Create: `tests/watcher/test_liveness.py`
 
-- [ ] `LivenessVerdict` (состояние `unused | ok | starting | unconfirmed | down`; строки с
+- [x] `LivenessVerdict` (состояние `unused | ok | starting | unconfirmed | down`; строки с
       состоянием alive / starting / dead / stopped; самая свежая последняя отметка и
       признак «она — штатная остановка»)
-- [ ] `assess_liveness(heartbeats, now, has_enabled_subscriptions, has_fresh_reconcile)` —
+- [x] `assess_liveness(heartbeats, now, has_enabled_subscriptions, has_fresh_reconcile)` —
       правила из Technical Details
-- [ ] `banner_text(verdict)`, `masks_statuses(verdict)` — три текста `down` без hostname и
+- [x] `banner_text(verdict)`, `masks_statuses(verdict)` — три текста `down` без hostname и
       PID; подмена статусов только для `down`
-- [ ] тесты: каждое состояние таблицы; граница `due_at` (ровно `due_at` — жива); строка со
+- [x] тесты: каждое состояние таблицы; граница `due_at` (ровно `due_at` — жива); строка со
       `stopped_at` не жива при любом `due_at`; несколько строк — одна живая с проходом даёт
       `ok`, даже если другие мертвы; каждый из трёх текстов `down`
-- [ ] тесты сценариев: единственный watcher убит (`kill -9`) — `down` после `due_at`;
+- [x] тесты сценариев: единственный watcher убит (`kill -9`) — `down` после `due_at`;
       `docker stop` шедулера — `down` с текстом про остановку после устаревания
       `last_reconcile_at`; рестарт шедулера — `starting`, затем `ok`, мёртвая строка
       прежнего запуска не мешает; webserver обновлён раньше шедулера (строк нет, свежий
       `last_reconcile_at`) — `unconfirmed`; строк нет, отметка устарела — `down`
-- [ ] тест на строках, прочитанных из БД (`get_heartbeats` с настоящей строкой): без
+- [x] тест на строках, прочитанных из БД (`get_heartbeats` с настоящей строкой): без
       `TypeError`, `ok`
-- [ ] run tests — must pass before task 4
+- [x] run tests — must pass before task 4
 
 ### Task 4: Запись heartbeat из watcher-процесса
 
