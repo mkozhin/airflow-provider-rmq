@@ -590,8 +590,13 @@ class RMQWatcherListener:
         self._heartbeat_started = False
         # Set by ``_run_loop`` when it restarts ``_main`` after a crash: the deadline the
         # row carries covered a pass of the crashed loop, so the restarted loop records a
-        # new one before its first pass.
+        # new one before its first pass — when the run has earned it, see below.
         self._heartbeat_restarted = False
+        # Whether the run has recorded its start or marked a pass since the last deadline
+        # written for a restart. A restart deadline spends it and a marked pass grants it
+        # again, so a loop whose passes keep running out of budget gets one deadline after
+        # its last mark and its row then goes past due.
+        self._heartbeat_restart_earned = True
         # Cycle budget the last recorded deadline was computed with; a pass that runs
         # under a larger one records a new deadline before it starts.
         self._heartbeat_budget: float | None = None
@@ -1002,16 +1007,21 @@ class RMQWatcherListener:
         deadline when ``_main`` has been restarted after a crash — the crashed loop's
         pass, the consumers' stop and the pause before the restart outlast the deadline
         the row carries — or when its budget is larger than the one the stored deadline
-        was computed with. Either leaves ``last_cycle_at`` as it is. The deadline covers
-        the rest of this write, the pass and the write that marks it:
+        was computed with. Either leaves ``last_cycle_at`` as it is. A restart gets its
+        deadline once per start record or marked pass: a restart that follows another
+        restart deadline with no mark in between records nothing, so a loop whose
+        passes keep running out of budget leaves its row to go past due. The deadline
+        covers the rest of this write, the pass and the write that marks it:
         ``now + H + budget + H`` with ``H`` = :data:`_HEARTBEAT_TIMEOUT`.
         """
         identity = self._identity
         if identity is None:
             return
-        if not self._heartbeat_started or self._heartbeat_restarted:
+        restarted, self._heartbeat_restarted = self._heartbeat_restarted, False
+        if not self._heartbeat_started:
             self._heartbeat_started = True
-            self._heartbeat_restarted = False
+        elif restarted and self._heartbeat_restart_earned:
+            self._heartbeat_restart_earned = False
         elif self._heartbeat_budget is None or budget <= self._heartbeat_budget:
             return
         due_at = utcnow() + timedelta(seconds=_HEARTBEAT_TIMEOUT + budget + _HEARTBEAT_TIMEOUT)
@@ -1051,6 +1061,7 @@ class RMQWatcherListener:
         ):
             return
         self._heartbeat_budget = budget
+        self._heartbeat_restart_earned = True
         await self._heartbeat_step(
             "heartbeat_prune", _PRUNE_TIMEOUT,
             _prune_other_heartbeats, identity.id, now,

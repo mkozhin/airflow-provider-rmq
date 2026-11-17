@@ -47,6 +47,11 @@ from airflow_provider_rmq.watcher.listener import (
     _read_settings,
 )
 from airflow_provider_rmq.watcher import models
+from airflow_provider_rmq.watcher.liveness import (
+    LivenessState,
+    ProcessState,
+    assess_liveness,
+)
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
     RMQWatcherHeartbeat,
@@ -6485,6 +6490,87 @@ class TestHeartbeatRecords:
         assert row["pid"] == os.getpid()
         assert row["last_cycle_at"] is not None
         assert row["stopped_at"] is None
+
+    def test_passes_that_keep_running_out_of_budget_end_with_a_dead_row(
+        self, heartbeat_db, monkeypatch
+    ):
+        """Every pass runs out of budget and the loop restarts ``_main`` each time: the
+        start and the first restart record a deadline, later restarts record none, and
+        once that deadline has passed the row is ``dead`` and, with a stale
+        ``last_reconcile_at``, the verdict is ``DOWN``."""
+        listener = _cycle_listener()
+        listener._stop_event = _instant_stop_event()
+        listener._cycle_timeout_override = 0.05
+        manager = _fake_manager()
+        passes = []
+
+        async def reconcile(subs):
+            passes.append(1)
+            if len(passes) == 4:
+                listener._stop_event.set()
+                return
+            await _never_returns()
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+        writes = _spy_writes(monkeypatch)
+
+        with _heartbeat_cycle_patches(manager):
+            listener.run(parent_pid=os.getppid())
+
+        assert len(passes) == 4
+        assert writes == ["record_heartbeat_deadline", "record_heartbeat_deadline"]
+        row = _the_row(heartbeat_db)
+        assert row["last_cycle_at"] is None
+        assert row["stopped_at"] is None
+        with sessionmaker(bind=heartbeat_db)() as session:
+            rows = session.query(RMQWatcherHeartbeat).all()
+            verdict = assess_liveness(
+                rows,
+                row["due_at"] + timedelta(seconds=1),
+                has_enabled_subscriptions=True,
+                has_fresh_reconcile=lambda: False,
+            )
+        assert [p.state for p in verdict.processes] == [ProcessState.DEAD]
+        assert verdict.state is LivenessState.DOWN
+
+    def test_a_marked_pass_earns_the_next_restart_a_deadline(
+        self, heartbeat_db, monkeypatch
+    ):
+        """A restart records a deadline once per start record or marked pass: pass 1
+        runs out of budget (restart with a deadline), pass 2 is marked and the loop
+        crashes after it (restart with a deadline), pass 3 runs out of budget (restart
+        without one)."""
+        listener = _cycle_listener()
+        listener._stop_event = _instant_stop_event()
+        listener._cycle_timeout_override = 0.05
+        manager = _fake_manager()
+        passes = []
+
+        async def reconcile(subs):
+            passes.append(1)
+            if len(passes) in (1, 3):
+                await _never_returns()
+            elif len(passes) == 4:
+                listener._stop_event.set()
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+
+        async def wait():
+            if not listener._stop_event.is_set():
+                raise RuntimeError("the loop blew up")
+
+        listener._wait_for_next_cycle = AsyncMock(side_effect=wait)
+        writes = _spy_writes(monkeypatch)
+
+        with _heartbeat_cycle_patches(manager):
+            listener.run(parent_pid=os.getppid())
+
+        assert len(passes) == 4
+        assert writes == [
+            "record_heartbeat_deadline",
+            "record_heartbeat_deadline", "record_heartbeat_cycle",
+            "record_heartbeat_deadline",
+        ]
 
     @pytest.mark.asyncio
     async def test_old_rows_of_other_runs_are_pruned_after_the_mark(self, heartbeat_db):
