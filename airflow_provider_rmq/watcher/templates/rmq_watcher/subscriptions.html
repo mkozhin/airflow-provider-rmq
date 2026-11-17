@@ -80,7 +80,7 @@
                       title="The process has started and has not completed its first cycle yet.">○ starting</span>
               {% elif p.state == 'dead' %}
                 <span class="label label-danger"
-                      title="The process has not left its next mark by the due time and has not stopped in an orderly way: it died, hangs, or its scheduler went away without stopping it. With other processes alive, this is the watcher of one scheduler replica while the others consume the subscriptions.">✕ dead</span>
+                      title="The process has not left its next mark by the due time and has not stopped in an orderly way: it died, hangs, or its scheduler went away without stopping it. With other processes alive, subscriptions are still consumed: this is an earlier run or the watcher of another scheduler replica.">✕ dead</span>
               {% elif p.state == 'stopped' %}
                 <span class="label label-default"
                       title="The process stopped in an orderly way on its scheduler's signal.">■ stopped</span>

@@ -260,7 +260,8 @@ class RMQWatcherPlugin(AirflowPlugin):
 
     @classmethod
     def on_load(cls, *args, **kwargs):
-        """Create rmq_watcher_* tables when the plugin is first loaded."""
+        """Create the WatcherBase tables (rmq_watcher_subscriptions,
+        rmq_watcher_conn_status) when the plugin is first loaded."""
         try:
             ensure_table_exists()
         except Exception:

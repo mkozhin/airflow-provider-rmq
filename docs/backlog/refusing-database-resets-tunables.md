@@ -1,20 +1,20 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/tunables.py:102
+where: airflow_provider_rmq/watcher/tunables.py:106
 added: 2026-09-01
 ---
 # Отказавшая метабаза молча сбрасывает reconcile-интервал на умолчание
 
 **Контекст.** `read_positive` читает `rmq_watcher_reconcile_interval` и
 `rmq_watcher_cycle_timeout` через `Variable.get(name, default_var=None)`
-(`tunables.py:102`). `Variable.get_variable_from_secrets` в самом Airflow
+(`tunables.py:106`). `Variable.get_variable_from_secrets` в самом Airflow
 (`airflow/models/variable.py:351-364` в 2.11.2) обходит секретные backend'ы
 в try/except: отказ каждого он пишет в лог и идёт к следующему, а когда не
 ответил ни один — возвращает `None`. С `default_var=None` это `None` и
 приезжает наружу. Для `read_positive` оно неотличимо от незаданной переменной,
 и обе он возвращает одинаково.
 
-Дальше `_refresh_settings` (`listener.py:1070-1073`) на `None` ставит
+Дальше `_refresh_settings` (`listener.py:1378-1381`) на `None` ставит
 `DEFAULT_RECONCILE_INTERVAL` и снимает `_cycle_timeout_override`. То есть
 метабаза, отвечающая отказом, переводит петлю с настроенных оператором значений
 на встроенные: интервал в 300 секунд становится 60, бюджет цикла — своим
@@ -22,7 +22,7 @@ added: 2026-09-01
 не отвечает, watcher работает не на том, что задано.
 
 Обрабатывается только зависшее чтение: оно упирается в `_VARIABLE_TIMEOUT`, и
-обработчик исключения (`listener.py:1062-1068`) оставляет в силе уже действующие значения с
+обработчик исключения (`listener.py:1370-1376`) оставляет в силе уже действующие значения с
 предупреждением в логе. У отказа такого обработчика нет — исключение до него не
 доходит.
 
@@ -32,7 +32,7 @@ added: 2026-09-01
 `RMQ Watcher tunables in effect: ...` при смене действующих значений, и читается
 она как «кто-то поменял переменную», а не «переменную не удалось прочесть».
 Страница подписок в этот момент считает порог устаревания по тем же умолчаниям
-(`_reconcile_interval` и `_stale_after`, `views.py:286`, `310`), так что и она
+(`_reconcile_interval` и `_stale_after`, `views.py:305`, `329`), так что и она
 показывает не ту границу, по которой на самом деле идёт петля.
 
 **Что решит, стоит ли делать.** Эффект ограничен окном, пока база отвечает

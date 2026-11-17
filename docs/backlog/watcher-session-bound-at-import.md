@@ -1,11 +1,11 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/models.py:96
+where: airflow_provider_rmq/watcher/models.py:157
 added: 2026-11-17
 ---
 # Фабрика `WatcherSession` привязывается к движку Airflow при импорте модуля
 
-`WatcherSession = _make_session_factory()` (`watcher/models.py:96`) создаётся при импорте и
+`WatcherSession = _make_session_factory()` (`watcher/models.py:157`) создаётся при импорте и
 берёт `airflow.settings.engine` в этот момент. Модуль импортирует `plugin.py`, то есть это
 происходит в каждом процессе Airflow, загружающем плагины. Импорт до `configure_orm` даёт
 `sessionmaker(bind=None)`, а пересозданный движок (например, `settings.reconfigure_orm`)

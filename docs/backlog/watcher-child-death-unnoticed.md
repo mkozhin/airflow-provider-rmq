@@ -1,11 +1,11 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/listener.py:641
+where: airflow_provider_rmq/watcher/listener.py:731
 added: 2026-11-17
 ---
 # Умерший watcher-процесс не перезапускается, о его смерти никто не узнаёт сам
 
-Watcher — дочерний процесс шедулера (`_spawn_child`, `listener.py:641`). Процесс, умерший
+Watcher — дочерний процесс шедулера (`_spawn_child`, `listener.py:731`). Процесс, умерший
 сам (OOM, segfault, SIGKILL), не перезапускается до рестарта шедулера: в процессе шедулера
 нет ни потока, ни обработчика SIGCHLD, которые заметили бы его смерть (ADR 0008, раздел
 «Перезапуска нет, работу показывают heartbeat и метрика»). До рестарта подписки не

@@ -6,7 +6,7 @@ added: 2026-09-05
 # Вердикт `ERROR` крутится до TTL, и `ack_unmatched` этого не убирает
 
 **Симптом.** `ERROR` возвращается в очередь всегда. Ветка вердикта:
-`utils/amqp.py:599` (`match_and_ack`), `watcher/consumer.py:3243`,
+`utils/amqp.py:599` (`match_and_ack`), `watcher/consumer.py:3244`,
 `operators/rmq_consume.py:118`, `sensors/rmq.py:271` — в каждой из них
 `nack(requeue=True)` стоит следующей строкой или через одну.
 Для сбоя, который пройдёт сам (упавший `filter_callable`,

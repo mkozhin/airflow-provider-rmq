@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/models.py:296
+where: airflow_provider_rmq/watcher/models.py:390
 added: 2026-08-09
 ---
 # Запрос активных `dag_id` для бейджа сканирует всю таблицу `dag`
@@ -12,11 +12,11 @@ added: 2026-08-09
 всех активных id, даже когда спрашивают про один `dag_id`.
 
 **Два вызывающих.** Бейдж `⚠ dag not found` — на каждый рендер страницы
-Subscriptions (`views.py:428`). И `_sync_to_db` через `_read_active_dag_ids`
-(`listener.py:223-244`, вызов в `listener.py:1714-1720`) — только на цикле, где
+Subscriptions (`views.py:606`). И `_sync_to_db` через `_read_active_dag_ids`
+(`listener.py:296-317`, вызов в `listener.py:2022-2028`) — только на цикле, где
 у включённой `dag_file`-строки, пропавшей из скана, счётчик промахов стоит в
 окне `_INACTIVE_DAG_MISSES <= absent_cycles < _ABSENT_GRACE_CYCLES`, то есть
-`2 <= absent_cycles < 3` (`listener.py:78`, `83`). На практике это примерно
+`2 <= absent_cycles < 3` (`listener.py:103`, `108`). На практике это примерно
 один запрос на каждое исчезновение строки, а не каждый цикл выкатки.
 
 **Почему отложено.** Вызов из цикла редкий: на цикле, где все ключи скана на
