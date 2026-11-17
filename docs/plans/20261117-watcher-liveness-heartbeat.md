@@ -501,13 +501,13 @@
 
 ### Task 8: [Final] Update documentation
 
-- [ ] `readme.md` и `readme_ru.md`, раздел «The watcher process»: абзац о неперезапуске
+- [x] `readme.md` и `readme_ru.md`, раздел «The watcher process»: абзац о неперезапуске
       (`readme.md:973`) описывает баннер на главной и панель на Subscriptions; новый абзац о
       heartbeat — вопрос баннера («ни один watcher не подтверждает работу»), состояния,
       задержка до `due_at` и устаревания `last_reconcile_at`, мёртвая строка реплики в HA на
       панели, суточная чистка, краткий `down` после прохода, упёршегося в бюджет; абзац
       «Liveness metric» описывает метрику как дополнение для внешнего мониторинга
-- [ ] новый `docs/adr/0012-watcher-liveness-heartbeat.md`: строка на запуск процесса, срок
+- [x] новый `docs/adr/0012-watcher-liveness-heartbeat.md`: строка на запуск процесса, срок
       `due_at` от watcher'а, вердикт «есть ли подтверждённая работа», `stopped_at` по
       штатному сигналу, отдельная декларативная база таблицы, `UIAlert` с ленивым импортом;
       отвергнутые варианты — тревога по каждому шедулеру через сопоставление строк с
@@ -515,14 +515,14 @@
       репликах на одном hostname), поллинг из хуков шедулера, внешний мониторинг,
       health-check DAG, flash на каждой странице, общая строка `rmq_watcher_conn_status`,
       фоновый пинг
-- [ ] `docs/adr/0008-watcher-child-process.md`: раздел о живости (:311) в настоящем времени
+- [x] `docs/adr/0008-watcher-child-process.md`: раздел о живости (:311) в настоящем времени
       — процесс не перезапускается, работу показывают heartbeat (ADR 0012) и метрика
-- [ ] `CHANGELOG.md`, раздел `## v2.7.0` → Added: по одной строке на пункт (баннер на
+- [x] `CHANGELOG.md`, раздел `## v2.7.0` → Added: по одной строке на пункт (баннер на
       главной, панель процессов на Subscriptions, таблица `rmq_watcher_heartbeat`)
-- [ ] `docs/backlog/watcher-child-death-unnoticed.md`: сузить до неперезапуска, отсутствия
+- [x] `docs/backlog/watcher-child-death-unnoticed.md`: сузить до неперезапуска, отсутствия
       push-уведомлений и тревоги по отдельной реплике в HA
-- [ ] ссылки в документации — только относительные
-- [ ] move this plan to `docs/plans/completed/`
+- [x] ссылки в документации — только относительные
+- [x] move this plan to `docs/plans/completed/` (left for the harness, which moves the plan after all phases)
 
 ## Post-Completion
 

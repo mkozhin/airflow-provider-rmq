@@ -21,6 +21,9 @@
 - `RMQPublishOperator` logs a WARNING when there is nothing to publish (`message=None` or an empty list).
 - `RMQSensor(trigger_mode=…)` selects the trigger's `pull` or `push` mode.
 - Dependency `aiormq` (`>=6.8.0,<7.0.0`).
+- Airflow's home page shows every user a red banner when subscriptions are enabled and no watcher process confirms its work.
+- The Subscriptions page lists watcher processes with their state and shows recorded statuses as `unknown` while no watcher confirms its work.
+- Table `rmq_watcher_heartbeat`: one row per watcher-process run, created by the watcher process and the webserver.
 
 ### Deprecated
 - `RMQSensor(mode="pull"|"push")`, also through `default_args`; use `trigger_mode`.
