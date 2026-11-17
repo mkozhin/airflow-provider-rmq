@@ -62,12 +62,31 @@
   отличает webserver от CLI FAB, который тоже регистрирует блюпринт); образец колбэка
   `_grant_op_access(state)` (:122) и его регистрация `_bp.record_once(_grant_op_access)`
   (:216); `on_load` (:232, `ensure_table_exists` в каждом процессе).
-- Airflow (сверено по 2.11.2): `airflow.www.utils.UIAlert` (`__init__` присваивает
-  `message`, `category`, `roles`, `html`; `message = Markup(message) if html else message`;
-  `should_show(appbuilder)`), `airflow.settings.DASHBOARD_UIALERTS`, отбор `should_show` в
-  `www/views.py` (:1070-1071), вывод `m.message` / `m.category` в
-  `www/templates/airflow/dags.html` (:84-85) с автоэкранированием — при рендере, позже отбора.
-  Для 2.9.1 сверяется в Task 1.
+- Airflow (сверено по 2.9.1 и 2.11.2, расхождений в используемом API нет):
+  - `airflow.www.utils.UIAlert`: `__init__` присваивает `category`, `roles`, `html`,
+    `message` (`Markup(message) if html else message`); `should_show(self, appbuilder)` —
+    один позиционный аргумент; `html` после `__init__` нигде не читается;
+  - `airflow.settings.DASHBOARD_UIALERTS` — модульный список; `import_local_settings`
+    копирует имена из `airflow_local_settings` в глобалы `airflow.settings`, так что там
+    может оказаться и кортеж;
+  - `views.Airflow.index` (`@expose("/home")`) на каждый запрос строит список
+    `[fm for fm in settings.DASHBOARD_UIALERTS if fm.should_show(get_airflow_app().appbuilder)]`
+    (2.9.1 `www/views.py:1001-1003`, 2.11.2 :1070-1072), читая `settings.DASHBOARD_UIALERTS`
+    через модуль (`from airflow import settings`), и передаёт его в `render_template` того же
+    вызова — отбор и рендер идут в одном контексте запроса, `flask.g` у них общий;
+  - `www/templates/airflow/dags.html` (:84-85, одинаково) выводит
+    `show_message(m.message, m.category)`; макрос `_messages.html` подставляет
+    `{{ category }}` в класс и `{{ content }}` в тело с автоэкранированием Flask для `.html`;
+  - `airflow.utils.net.get_hostname()` в обеих версиях одинаков:
+    `conf.getimport("core", "hostname_callable", fallback="airflow.utils.net.getfqdn")()`;
+  - `create_app` вызывает `init_appbuilder_views` (регистрирует `views.Airflow`, эндпоинт
+    `Airflow.index`) раньше `init_plugins` (регистрирует блюпринты плагинов) — в 2.9.1 и
+    2.11.2. FAB CLI (`airflow users` / `roles` / `sync-perm`) в 2.9.1 приходит из
+    `apache-airflow-providers-fab>=1.0.2`: `get_application_builder` вызывает
+    `init_appbuilder` и `init_plugins`, но не `init_appbuilder_views`, а индекс-вид FAB по
+    умолчанию — `IndexView.index`. Поэтому `_serves_the_web_ui(state.app)` в колбэке
+    `record_once` отличает webserver от CLI FAB одинаково для `_grant_op_access` и для
+    колбэка баннера.
 - Тесты: `tests/watcher/test_models.py`, `test_listener.py`, `test_runner.py`,
   `test_views.py`, `test_plugin.py`; образец проверки импортов отдельным интерпретатором —
   `TestDagFileScanImportFootprint` в `tests/watcher/test_dag_file_scan.py`.
@@ -265,9 +284,11 @@
   и `category` — свойства без записи, читающие снимок вердикта из `flask.g`. `message`
   возвращает `markupsafe.Markup`, собранный `Markup(template).format(...)`: ссылка остаётся
   разметкой, подставленное время экранируется.
-- `should_show(self, *args, **kwargs)` берёт вердикт из кэша, кладёт его в `flask.g` и
-  возвращает `True` только для `down`; `message` и `category` при рендере читают только
-  `flask.g` и в БД не ходят, так что отбор и текст одного запроса не расходятся.
+- `should_show(self, *args, **kwargs)` (Airflow 2.9.1–2.11.2 передаёт один позиционный
+  `appbuilder`) берёт вердикт из кэша, кладёт его в `flask.g` и возвращает `True` только для
+  `down`; `message` и `category` при рендере читают только `flask.g` и в БД не ходят, так что
+  отбор и текст одного запроса не расходятся. Атрибут `html` не задаётся: Airflow читает его
+  только в `UIAlert.__init__`.
 - Кэш — неизменяемая пара `(expires_at, verdict)`, заменяемая целиком, 30 с на процесс
   воркера webserver'а; перечтение под `threading.Lock`, чтобы промах кэша не дал залп
   запросов. Промах — пока флаг готовности не стоит, `ensure_heartbeat_table()`; затем
@@ -310,16 +331,18 @@
 **Files:**
 - Modify: `docs/plans/20261117-watcher-liveness-heartbeat.md`
 
-- [ ] по исходникам Airflow 2.9.1 (тег `2.9.1` в apache/airflow) подтвердить: атрибуты,
+- [x] по исходникам Airflow 2.9.1 (тег `2.9.1` в apache/airflow) подтвердить: атрибуты,
       которые `UIAlert.__init__` присваивает, сигнатуру `should_show`, что
       `views.Airflow.index` фильтрует `settings.DASHBOARD_UIALERTS` вызовом `should_show`
       на каждый запрос, что `dags.html` читает `m.message` и `m.category` при рендере с
       автоэкранированием, что `flask.g` доступен в обоих местах одного запроса
-- [ ] подтвердить для 2.9.1 `airflow.utils.net.get_hostname()` и то, что
+- [x] подтвердить для 2.9.1 `airflow.utils.net.get_hostname()` и то, что
       `_serves_the_web_ui(state.app)` отличает webserver от CLI FAB так же, как для
       `_grant_op_access`
-- [ ] записать расхождения с 2.11.2 в этот план (⚠️) и поправить Technical Details
-- [ ] тестов задача не добавляет: она меняет только план
+- [x] записать расхождения с 2.11.2 в этот план (⚠️) и поправить Technical Details
+      (расхождений в используемом API нет — различаются только номера строк `views.py`;
+      сверка записана в Context, уточнение `should_show` / `html` — в «Баннер в webserver'е»)
+- [x] тестов задача не добавляет: она меняет только план
 
 ### Task 2: Модель `RMQWatcherHeartbeat` и функции записи
 
