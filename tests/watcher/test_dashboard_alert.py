@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,9 +28,10 @@ from airflow_provider_rmq.watcher.tunables import (
     MIN_CYCLE_TIMEOUT,
     VARIABLE_TIMEOUT,
 )
+from tests.watcher.conftest import HEARTBEAT_T0, heartbeat_row
 
 #: Reference moment of the tests, naive UTC like the times the watcher writes.
-T0 = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+T0 = HEARTBEAT_T0
 
 #: The reconcile interval and the cycle budget with no Variable set.
 I = DEFAULT_RECONCILE_INTERVAL
@@ -351,31 +352,17 @@ class TestCache:
 # ---------------------------------------------------------------------------
 
 
-def _row(**overrides):
-    values = {
-        "id": "run-1",
-        "hostname": "scheduler-1",
-        "pid": 4242,
-        "started_at": T0 - timedelta(minutes=10),
-        "last_cycle_at": T0 - timedelta(minutes=1),
-        "due_at": T0 + timedelta(minutes=5),
-        "stopped_at": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
 def _verdict(state: LivenessState):
     if state is LivenessState.UNUSED:
         return assess_liveness([], T0, False, _no)
     if state is LivenessState.OK:
-        return assess_liveness([_row()], T0, True, _no)
+        return assess_liveness([heartbeat_row()], T0, True, _no)
     if state is LivenessState.STARTING:
-        return assess_liveness([_row(last_cycle_at=None)], T0, True, _no)
+        return assess_liveness([heartbeat_row(last_cycle_at=None)], T0, True, _no)
     if state is LivenessState.UNCONFIRMED:
         return assess_liveness([], T0, True, _yes)
     return assess_liveness(
-        [_row(stopped_at=T0 - timedelta(minutes=2))], T0, True, _no
+        [heartbeat_row(stopped_at=T0 - timedelta(minutes=2))], T0, True, _no
     )
 
 
@@ -393,7 +380,7 @@ def app():
 
 @pytest.fixture
 def alert():
-    return dashboard_alert._make_alert()
+    return dashboard_alert._alert_class()()
 
 
 def _answer_with(monkeypatch, verdict) -> None:
@@ -456,7 +443,7 @@ class TestAlert:
 
     def test_the_substituted_time_is_escaped(self, app, alert, monkeypatch):
         _answer_with(monkeypatch, _verdict(LivenessState.DOWN))
-        monkeypatch.setattr(liveness, "_format_time", lambda value: "<b>noon</b>")
+        monkeypatch.setattr(liveness, "format_utc", lambda value: "<b>noon</b>")
 
         with app.test_request_context("/home"):
             alert.should_show(SimpleNamespace())
@@ -473,10 +460,10 @@ class TestAlert:
             alert.should_show(SimpleNamespace())
             message = alert.message
 
-        assert f'<a href="{liveness.SUBSCRIPTIONS_PATH}">' in message
+        assert '<a href="/rmq-watcher/subscriptions">' in message
 
     def test_outside_a_request_the_link_is_the_page_path(self):
-        assert views.subscriptions_link() == liveness.SUBSCRIPTIONS_PATH
+        assert views.subscriptions_link() == "/rmq-watcher/subscriptions"
 
     def test_message_and_category_read_the_request_and_not_the_database(
         self, app, alert, monkeypatch
@@ -555,7 +542,7 @@ def no_ddl(monkeypatch):
 
 
 def _ours(alerts):
-    return [a for a in alerts if getattr(a, dashboard_alert._MARKER, False) is True]
+    return [a for a in alerts if isinstance(a, dashboard_alert._alert_class())]
 
 
 class TestInstall:

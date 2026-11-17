@@ -4,7 +4,7 @@ import logging
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from flask import flash, redirect, request, url_for
@@ -16,12 +16,12 @@ from sqlalchemy.sql import func
 from werkzeug.routing import BuildError
 
 from airflow_provider_rmq.watcher.liveness import (
-    SUBSCRIPTIONS_PATH,
     LivenessVerdict,
     ProcessRow,
     ProcessState,
     assess_liveness,
     banner_text,
+    format_utc,
     masks_statuses,
 )
 from airflow_provider_rmq.watcher.models import (
@@ -350,16 +350,14 @@ def _build_conn_status_rows(
     approximate age. NULL — a freshly migrated row the watcher has not stamped
     yet — counts as "no data" and is shown as an em dash.
     """
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = utcnow()
     rows: list[ConnStatusRow] = []
     for cs in conn_statuses:
         last = cs.last_reconcile_at
         age_seconds: float | None = None
         is_stale = False
         if last is not None:
-            if last.tzinfo is not None:
-                last = last.astimezone(timezone.utc).replace(tzinfo=None)
-            age_seconds = max((now - last).total_seconds(), 0.0)
+            age_seconds = max((now - naive_utc(last)).total_seconds(), 0.0)
             is_stale = age_seconds > stale_seconds
         rows.append(
             ConnStatusRow(
@@ -405,9 +403,8 @@ _RECONCILE_TAIL = 60.0
 #: Endpoint of this page, which the watcher banner links to.
 _SUBSCRIPTIONS_ENDPOINT = "RMQWatcherView.subscriptions"
 
-
-def _format_utc(value: datetime) -> str:
-    return value.strftime("%Y-%m-%d %H:%M:%S")
+#: Route of this page under :attr:`RMQWatcherView.route_base`.
+_SUBSCRIPTIONS_ROUTE = "/subscriptions"
 
 
 @dataclass(frozen=True)
@@ -438,10 +435,10 @@ def _build_process_rows(processes: Iterable[ProcessRow]) -> list[WatcherProcessR
         WatcherProcessRow(
             hostname=p.hostname,
             pid=p.pid,
-            started_display=_format_utc(p.started_at),
-            last_mark_display=_format_utc(p.last_mark),
+            started_display=format_utc(p.started_at),
+            last_mark_display=format_utc(p.last_mark),
             age_display=format_duration(p.last_mark_age_seconds),
-            due_display="—" if p.state is ProcessState.STOPPED else _format_utc(p.due_at),
+            due_display="—" if p.state is ProcessState.STOPPED else format_utc(p.due_at),
             state=p.state.value,
         )
         for p in processes
@@ -480,8 +477,8 @@ def read_liveness(
             ensure_heartbeat_table()
         except Exception:
             log.warning(
-                "RMQ Watcher: failed to create the rmq_watcher_heartbeat table — the "
-                "watcher liveness is judged by last_reconcile_at alone",
+                "Failed to create the rmq_watcher_heartbeat table — the watcher "
+                "liveness is judged by last_reconcile_at alone",
                 exc_info=True,
             )
     rows = get_heartbeats(session, now) if is_heartbeat_table_ready() else []
@@ -508,7 +505,7 @@ def subscriptions_link() -> str:
     try:
         return url_for(_SUBSCRIPTIONS_ENDPOINT)
     except (BuildError, RuntimeError):
-        return SUBSCRIPTIONS_PATH
+        return RMQWatcherView.route_base + _SUBSCRIPTIONS_ROUTE
 
 
 def _read_liveness(stale_seconds: float | None) -> LivenessVerdict | None:
@@ -546,7 +543,7 @@ class RMQWatcherView(BaseView):
         "edit_group": "edit",
     }
 
-    @expose("/subscriptions")
+    @expose(_SUBSCRIPTIONS_ROUTE)
     @has_access
     def subscriptions(self):
         subscriptions_error = None

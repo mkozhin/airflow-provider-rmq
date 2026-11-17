@@ -604,8 +604,7 @@ class TestSchemaMigration:
                 return []
 
         engine = _Engine()
-        # ``inspect`` is imported inside the function, so the patch goes to its source.
-        with patch("sqlalchemy.inspect", return_value=_Inspector()):
+        with patch.object(models, "inspect", return_value=_Inspector()):
             complete = models._add_missing_columns(engine)
 
         assert complete is True
@@ -663,7 +662,7 @@ class TestSchemaMigration:
             def get_columns(self, table_name):
                 return []
 
-        monkeypatch.setattr("sqlalchemy.inspect", lambda engine: _BlindInspector())
+        monkeypatch.setattr(models, "inspect", lambda engine: _BlindInspector())
 
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.models"):
             ensure_table_exists()
@@ -676,7 +675,7 @@ class TestSchemaMigration:
             def get_columns(self, table_name):
                 raise OperationalError("SELECT 1", {}, Exception("no such table"))
 
-        monkeypatch.setattr("sqlalchemy.inspect", lambda engine: _BrokenInspector())
+        monkeypatch.setattr(models, "inspect", lambda engine: _BrokenInspector())
 
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.models"):
             ensure_table_exists()

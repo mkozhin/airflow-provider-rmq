@@ -172,11 +172,10 @@ def _add_missing_columns(engine) -> bool:
     when every table matches the model; a False result keeps the schema marked
     as not ready so that the next call tries again.
     """
-    from sqlalchemy import inspect as sa_inspect
     from sqlalchemy import text
 
     complete = True
-    inspector = sa_inspect(engine)
+    inspector = inspect(engine)
     for table in WatcherBase.metadata.sorted_tables:
         try:
             present = {col["name"] for col in inspector.get_columns(table.name)}
@@ -401,7 +400,7 @@ def get_active_dag_ids(session: Session) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Heartbeat writes — each call is its own transaction and commits it
+# Heartbeat rows — each write is its own transaction and commits it; reads do not
 # ---------------------------------------------------------------------------
 
 #: How long a row past its deadline keeps counting after its last mark: the verdict

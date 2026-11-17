@@ -27,9 +27,6 @@ from markupsafe import Markup
 
 from airflow_provider_rmq.watcher.models import naive_utc
 
-#: Path of the Subscriptions page, which every banner text links to for the details.
-SUBSCRIPTIONS_PATH = "/rmq-watcher/subscriptions"
-
 
 class LivenessState(enum.Enum):
     """Verdict on whether subscriptions are being consumed.
@@ -189,37 +186,35 @@ _NOT_RUNNING = (
     "event-triggered DAGs do not run."
 )
 _STOPPED = (
-    "RMQ watcher stopped at {time} and no Scheduler runs it — "
+    "RMQ watcher stopped at {when} and no Scheduler runs it — "
     "subscriptions are not consumed."
 )
 _NO_CYCLE = (
-    "RMQ watcher has not completed a cycle since {time} — subscriptions are not "
+    "RMQ watcher has not completed a cycle since {when} — subscriptions are not "
     "consumed and event-triggered DAGs do not run."
 )
 _DETAILS = ' See <a href="{link}">RMQ Subscriptions</a> for details.'
 
 
-def _format_time(value: datetime) -> str:
-    return value.strftime("%Y-%m-%d %H:%M:%S UTC")
+def format_utc(value: datetime) -> str:
+    """``value`` — a naive UTC time — as the web UI shows watcher times."""
+    return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def banner_text(verdict: LivenessVerdict, link: str = SUBSCRIPTIONS_PATH) -> Markup | None:
+def banner_text(verdict: LivenessVerdict, link: str) -> Markup | None:
     """The banner for a ``DOWN`` verdict, or ``None`` for any other.
 
     The text names neither hostname nor PID — every user of the UI sees the banner —
     and links to the Subscriptions page, where the runs are listed. The template is
     markup and the substituted values are escaped.
 
-    :param link: URL of the Subscriptions page; the web UI passes the one it resolves
-        under its own base URL.
+    :param link: URL of the Subscriptions page, as the web UI resolves it under its own
+        base URL.
     """
     if verdict.state is not LivenessState.DOWN:
         return None
     if verdict.latest_mark is None:
-        template = _NOT_RUNNING
-    elif verdict.latest_is_stop:
-        template = _STOPPED
-    else:
-        template = _NO_CYCLE
-    time = _format_time(verdict.latest_mark) if verdict.latest_mark else ""
-    return Markup(template + _DETAILS).format(time=time, link=link)
+        return Markup(_NOT_RUNNING + _DETAILS).format(link=link)
+    template = _STOPPED if verdict.latest_is_stop else _NO_CYCLE
+    when = format_utc(verdict.latest_mark) + " UTC"
+    return Markup(template + _DETAILS).format(when=when, link=link)

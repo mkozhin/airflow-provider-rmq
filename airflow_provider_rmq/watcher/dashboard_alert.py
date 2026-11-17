@@ -16,6 +16,7 @@ callback that installs the banner, and ``airflow.www.utils`` is imported only by
 """
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
@@ -35,10 +36,6 @@ _CACHE_SECONDS = 30.0
 
 #: Name under which the banner text decided for the request is kept in :data:`flask.g`.
 _G_ATTR = "rmq_watcher_liveness_alert"
-
-#: Attribute that marks the alert this module installs, so a second installation in the
-#: same process finds the first one in the list.
-_MARKER = "is_rmq_watcher_liveness_alert"
 
 #: ``(expires_at, verdict)`` on the :func:`time.monotonic` clock. ``None`` as the verdict
 #: means the last read failed and the banner stays hidden until the next read. The pair
@@ -92,8 +89,13 @@ def _decide() -> Markup | None:
     return message
 
 
-def _make_alert() -> Any:
-    """Define the alert class on Airflow's ``UIAlert`` and return its one instance."""
+@functools.cache
+def _alert_class() -> type:
+    """The alert class, defined on Airflow's ``UIAlert`` once per process.
+
+    One class per process lets a second installation recognise the alert the first one
+    added by its type.
+    """
     from airflow.www.utils import UIAlert
 
     class _WatcherLivenessAlert(UIAlert):
@@ -106,7 +108,6 @@ def _make_alert() -> Any:
 
         roles = None
         category = "error"
-        is_rmq_watcher_liveness_alert = True
 
         def __init__(self) -> None:
             pass
@@ -133,7 +134,7 @@ def _make_alert() -> Any:
                 )
                 return False
 
-    return _WatcherLivenessAlert()
+    return _WatcherLivenessAlert
 
 
 def install_dashboard_alert() -> None:
@@ -146,7 +147,8 @@ def install_dashboard_alert() -> None:
     """
     from airflow import settings
 
+    alert_class = _alert_class()
     current = list(settings.DASHBOARD_UIALERTS)
-    if any(getattr(alert, _MARKER, False) is True for alert in current):
+    if any(isinstance(alert, alert_class) for alert in current):
         return
-    settings.DASHBOARD_UIALERTS = [*current, _make_alert()]
+    settings.DASHBOARD_UIALERTS = [*current, alert_class()]

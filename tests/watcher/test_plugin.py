@@ -48,7 +48,7 @@ def dashboard_alerts(monkeypatch):
 def _watcher_alerts(settings) -> list:
     return [
         alert for alert in settings.DASHBOARD_UIALERTS
-        if getattr(alert, dashboard_alert._MARKER, False) is True
+        if isinstance(alert, dashboard_alert._alert_class())
     ]
 
 

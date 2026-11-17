@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import signal
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from sqlalchemy import create_engine
@@ -143,15 +146,34 @@ def session():
 
 
 @pytest.fixture(scope="function")
-def heartbeat_session():
-    """SQLite in-memory session carrying the watcher schema and the heartbeat table."""
-    engine = _memory_engine()
-    WatcherBase.metadata.create_all(engine)
-    HeartbeatBase.metadata.create_all(engine)
-    s = sessionmaker(bind=engine)()
-    yield s
-    s.close()
-    engine.dispose()
+def heartbeat_session(session):
+    """The :func:`session` with the heartbeat table created next to the watcher schema."""
+    HeartbeatBase.metadata.create_all(session.get_bind())
+    return session
+
+
+#: Reference moment of the heartbeat tests, naive UTC like the times the watcher writes.
+HEARTBEAT_T0 = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+
+
+def heartbeat_row(**overrides: Any) -> SimpleNamespace:
+    """A stand-in for an ``RMQWatcherHeartbeat`` row, with the same attributes.
+
+    By default the run is alive at :data:`HEARTBEAT_T0` with a completed cycle: started
+    ten minutes before it, its last cycle a minute before, its deadline five minutes
+    after. ``overrides`` replace any attribute.
+    """
+    values: dict[str, Any] = {
+        "id": "run-1",
+        "hostname": "scheduler-1",
+        "pid": 4242,
+        "started_at": HEARTBEAT_T0 - timedelta(minutes=10),
+        "last_cycle_at": HEARTBEAT_T0 - timedelta(minutes=1),
+        "due_at": HEARTBEAT_T0 + timedelta(minutes=5),
+        "stopped_at": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 @pytest.fixture(scope="function")

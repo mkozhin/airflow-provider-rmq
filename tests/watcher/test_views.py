@@ -30,7 +30,11 @@ from airflow_provider_rmq.watcher.models import (
     WatcherBase,
     ensure_heartbeat_table,
 )
-from tests.watcher.conftest import SUBSCRIPTIONS_DDL_PRE_MIGRATION
+from tests.watcher.conftest import (
+    HEARTBEAT_T0,
+    SUBSCRIPTIONS_DDL_PRE_MIGRATION,
+    heartbeat_row,
+)
 
 # ---------------------------------------------------------------------------
 # Patch has_access → identity before loading views, so the class is built
@@ -125,7 +129,7 @@ def _naive_utc_ago(seconds: float) -> datetime:
 
 
 #: Reference moment of the liveness tests, naive UTC like the times the watcher writes.
-_T0 = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+_T0 = HEARTBEAT_T0
 
 
 def _session_ctx(first_sub=None, subs=None):
@@ -2768,21 +2772,6 @@ def _yes() -> bool:
     return True
 
 
-def _heartbeat(**overrides) -> SimpleNamespace:
-    """A heartbeat row of a run alive at :data:`_T0` with a completed cycle."""
-    values = {
-        "id": "run-1",
-        "hostname": "scheduler-1",
-        "pid": 4242,
-        "started_at": _T0 - timedelta(minutes=10),
-        "last_cycle_at": _T0 - timedelta(minutes=1),
-        "due_at": _T0 + timedelta(minutes=5),
-        "stopped_at": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
 def _dead_heartbeat(**overrides) -> SimpleNamespace:
     values = {
         "id": "run-0",
@@ -2793,7 +2782,7 @@ def _dead_heartbeat(**overrides) -> SimpleNamespace:
         "due_at": _T0 - timedelta(hours=1),
     }
     values.update(overrides)
-    return _heartbeat(**values)
+    return heartbeat_row(**values)
 
 
 def _liveness(state: LivenessState):
@@ -2801,9 +2790,9 @@ def _liveness(state: LivenessState):
     if state is LivenessState.UNUSED:
         return assess_liveness([], _T0, False, _no)
     if state is LivenessState.OK:
-        return assess_liveness([_heartbeat()], _T0, True, _no)
+        return assess_liveness([heartbeat_row()], _T0, True, _no)
     if state is LivenessState.STARTING:
-        return assess_liveness([_heartbeat(last_cycle_at=None)], _T0, True, _no)
+        return assess_liveness([heartbeat_row(last_cycle_at=None)], _T0, True, _no)
     if state is LivenessState.UNCONFIRMED:
         return assess_liveness([], _T0, True, _yes)
     return assess_liveness([_dead_heartbeat()], _T0, True, _no)
@@ -2864,8 +2853,8 @@ class TestWatcherProcessesBlock:
         verdict = assess_liveness(
             [
                 _dead_heartbeat(),
-                _heartbeat(),
-                _heartbeat(
+                heartbeat_row(),
+                heartbeat_row(
                     id="run-2",
                     hostname="scheduler-3",
                     pid=5,
@@ -2891,7 +2880,7 @@ class TestWatcherProcessesBlock:
         assert rows[2].age_display == "2h 0m"
 
     def test_the_dead_row_is_highlighted_and_the_alive_one_is_not(self, app, view, monkeypatch):
-        verdict = assess_liveness([_heartbeat(), _dead_heartbeat()], _T0, True, _no)
+        verdict = assess_liveness([heartbeat_row(), _dead_heartbeat()], _T0, True, _no)
         html = _render_page(_page_kwargs(app, view, monkeypatch, verdict))
 
         alive_row, dead_row = _process_rows_html(html)
@@ -2903,7 +2892,7 @@ class TestWatcherProcessesBlock:
     def test_a_stopped_process_renders_its_label_and_no_due_time(
         self, app, view, monkeypatch
     ):
-        stopped = _heartbeat(stopped_at=_T0 - timedelta(minutes=2))
+        stopped = heartbeat_row(stopped_at=_T0 - timedelta(minutes=2))
         verdict = assess_liveness([stopped], _T0, True, _no)
         html = _render_page(_page_kwargs(app, view, monkeypatch, verdict))
 

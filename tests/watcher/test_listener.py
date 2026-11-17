@@ -6608,6 +6608,99 @@ class TestHeartbeatRecords:
         write.assert_not_called()
 
 
+class TestHeartbeatKeeper:
+    """The deadlines the run's row carries, decided without the loop."""
+
+    NOW = models.utcnow()
+    H = listener_module._HEARTBEAT_TIMEOUT
+
+    def _keeper(self):
+        return listener_module._HeartbeatKeeper()
+
+    def _started(self, budget=60.0):
+        keeper = self._keeper()
+        assert keeper.deadline_before_pass(budget, self.NOW) is not None
+        keeper.deadline_recorded(budget)
+        return keeper
+
+    def test_the_first_pass_records_the_start(self):
+        due = self._keeper().deadline_before_pass(60.0, self.NOW)
+        assert due == self.NOW + timedelta(seconds=self.H + 60.0 + self.H)
+
+    def test_a_later_pass_under_the_same_or_a_smaller_budget_records_nothing(self):
+        keeper = self._started(60.0)
+        assert keeper.deadline_before_pass(60.0, self.NOW) is None
+        assert keeper.deadline_before_pass(30.0, self.NOW) is None
+
+    def test_a_larger_budget_records_a_deadline(self):
+        keeper = self._started(60.0)
+        due = keeper.deadline_before_pass(90.0, self.NOW)
+        assert due == self.NOW + timedelta(seconds=self.H + 90.0 + self.H)
+
+    def test_an_unwritten_start_leaves_no_budget_to_grow_from(self):
+        keeper = self._keeper()
+        keeper.deadline_before_pass(60.0, self.NOW)
+        assert keeper.deadline_before_pass(90.0, self.NOW) is None
+
+    def test_the_start_earns_one_restart_deadline(self):
+        keeper = self._started()
+        keeper.note_restart()
+        assert keeper.deadline_before_pass(60.0, self.NOW) is not None
+        keeper.deadline_recorded(60.0)
+        keeper.note_restart()
+        assert keeper.deadline_before_pass(60.0, self.NOW) is None
+
+    def test_a_restart_is_consumed_by_the_next_decision(self):
+        keeper = self._started()
+        keeper.note_restart()
+        keeper.deadline_before_pass(60.0, self.NOW)
+        keeper.deadline_recorded(60.0)
+        assert keeper.deadline_before_pass(60.0, self.NOW) is None
+
+    def test_a_marked_pass_earns_the_next_restart_a_deadline(self):
+        keeper = self._started()
+        keeper.note_restart()
+        keeper.deadline_before_pass(60.0, self.NOW)
+        keeper.deadline_recorded(60.0)
+        keeper.deadline_after_pass(60.0, 30, self.NOW)
+        keeper.pass_marked(60.0)
+        keeper.note_restart()
+        assert keeper.deadline_before_pass(60.0, self.NOW) is not None
+
+    def test_restarts_without_a_mark_get_no_further_deadline(self):
+        keeper = self._started()
+        decisions = []
+        for _ in range(4):
+            keeper.note_restart()
+            due = keeper.deadline_before_pass(60.0, self.NOW)
+            if due is not None:
+                keeper.deadline_recorded(60.0)
+            decisions.append(due is not None)
+        assert decisions == [True, False, False, False]
+
+    def test_the_deadline_after_a_pass_covers_everything_until_the_next_mark(self):
+        due = self._started().deadline_after_pass(60.0, 30, self.NOW)
+        expected = (
+            self.H + listener_module._PRUNE_TIMEOUT + 30
+            + listener_module.VARIABLE_TIMEOUT + 60.0 + self.H
+        )
+        assert due == self.NOW + timedelta(seconds=expected)
+
+    def test_the_stop_mark_repeats_the_last_decided_deadline(self):
+        keeper = self._started()
+        due = keeper.deadline_after_pass(60.0, 30, self.NOW)
+        assert keeper.stop_mark_due(self.NOW + timedelta(seconds=5)) == due
+
+    def test_the_stop_mark_before_any_deadline_carries_the_stop_time(self):
+        stopped_at = self.NOW + timedelta(seconds=5)
+        assert self._keeper().stop_mark_due(stopped_at) == stopped_at
+
+    def test_the_stop_mark_is_claimed_once(self):
+        keeper = self._started()
+        assert keeper.stop_mark_due(self.NOW) is not None
+        assert keeper.stop_mark_due(self.NOW) is None
+
+
 class TestHeartbeatStopMark:
     """An orderly stop marks the row from a thread of its own, bounded."""
 

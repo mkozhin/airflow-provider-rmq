@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 
 import pytest
 from markupsafe import Markup
 
 from airflow_provider_rmq.watcher.liveness import (
-    SUBSCRIPTIONS_PATH,
     LivenessState,
     ProcessState,
     assess_liveness,
@@ -19,22 +17,25 @@ from airflow_provider_rmq.watcher.models import (
     get_heartbeats,
     record_heartbeat_cycle,
 )
+from tests.watcher.conftest import HEARTBEAT_T0, heartbeat_row
 
 #: Reference moment of the tests, naive UTC like the times the watcher writes.
-T0 = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+T0 = HEARTBEAT_T0
+
+#: URL of the Subscriptions page the banner texts link to.
+LINK = "/rmq-watcher/subscriptions"
 
 
-@dataclass
-class Row:
-    """A heartbeat row with the attributes of ``RMQWatcherHeartbeat``."""
+def _row(**overrides):
+    """A heartbeat row of a run started at :data:`T0` that has completed no cycle and
+    owes its first mark ten minutes later."""
+    values = {"started_at": T0, "last_cycle_at": None, "due_at": T0 + timedelta(minutes=10)}
+    values.update(overrides)
+    return heartbeat_row(**values)
 
-    id: str = "run-1"
-    hostname: str = "scheduler-1"
-    pid: int = 4242
-    started_at: datetime = T0
-    last_cycle_at: datetime | None = None
-    due_at: datetime = T0 + timedelta(minutes=10)
-    stopped_at: datetime | None = None
+
+def _banner(verdict):
+    return banner_text(verdict, LINK)
 
 
 def _assess(rows, now, *, enabled=True, fresh=False):
@@ -46,7 +47,7 @@ def _assess(rows, now, *, enabled=True, fresh=False):
 
 def _cycled(row_id="run-1", *, cycle=T0 + timedelta(minutes=1), due=None, **kwargs):
     kwargs.setdefault("hostname", row_id)
-    return Row(
+    return _row(
         id=row_id,
         last_cycle_at=cycle,
         due_at=due if due is not None else cycle + timedelta(minutes=10),
@@ -71,7 +72,7 @@ class TestStates:
         assert verdict.processes[0].state is ProcessState.ALIVE
 
     def test_starting_with_alive_rows_without_a_cycle(self):
-        rows = [Row(id="a", hostname="a"), Row(id="b", hostname="b", started_at=T0 + timedelta(seconds=5))]
+        rows = [_row(id="a", hostname="a"), _row(id="b", hostname="b", started_at=T0 + timedelta(seconds=5))]
         verdict = _assess(rows, T0 + timedelta(minutes=1))
         assert verdict.state is LivenessState.STARTING
         assert {p.state for p in verdict.processes} == {ProcessState.STARTING}
@@ -105,7 +106,7 @@ class TestStates:
             _cycled("dead-1", due=T0 + timedelta(minutes=10)),
             _cycled("stopped", stopped_at=T0 + timedelta(minutes=20)),
             _cycled("alive", cycle=now - timedelta(minutes=1)),
-            Row(id="starting", hostname="starting", started_at=now - timedelta(seconds=30), due_at=now + timedelta(minutes=5)),
+            _row(id="starting", hostname="starting", started_at=now - timedelta(seconds=30), due_at=now + timedelta(minutes=5)),
         ]
         verdict = _assess(rows, now)
         assert verdict.state is LivenessState.OK
@@ -125,7 +126,7 @@ class TestStates:
             return True
 
         assert _assess([_cycled()], T0 + timedelta(minutes=2), fresh=fresh).state is LivenessState.OK
-        assert _assess([Row()], T0 + timedelta(minutes=1), fresh=fresh).state is LivenessState.STARTING
+        assert _assess([_row()], T0 + timedelta(minutes=1), fresh=fresh).state is LivenessState.STARTING
         assert _assess([], T0, enabled=False, fresh=fresh).state is LivenessState.UNUSED
         assert calls == []
         assert _assess([], T0, fresh=fresh).state is LivenessState.UNCONFIRMED
@@ -133,7 +134,7 @@ class TestStates:
 
     def test_processes_are_ordered_latest_mark_first(self):
         rows = [
-            Row(id="old", hostname="old", started_at=T0),
+            _row(id="old", hostname="old", started_at=T0),
             _cycled("newer", cycle=T0 + timedelta(minutes=3)),
             _cycled("newest", stopped_at=T0 + timedelta(minutes=4)),
         ]
@@ -149,12 +150,12 @@ class TestStates:
         assert process.last_mark_age_seconds == 120.0
 
     def test_age_of_a_mark_from_the_future_is_zero(self):
-        row = Row(started_at=T0 + timedelta(seconds=30))
+        row = _row(started_at=T0 + timedelta(seconds=30))
         assert _assess([row], T0).processes[0].last_mark_age_seconds == 0.0
 
     def test_aware_times_are_compared_as_naive_utc(self):
         aware = timezone(timedelta(hours=3))
-        row = Row(
+        row = _row(
             started_at=(T0 + timedelta(hours=3)).replace(tzinfo=aware),
             last_cycle_at=(T0 + timedelta(hours=3, minutes=1)).replace(tzinfo=aware),
             due_at=(T0 + timedelta(hours=3, minutes=5)).replace(tzinfo=aware),
@@ -170,7 +171,7 @@ class TestMasksStatuses:
         rows_and_args = {
             LivenessState.UNUSED: ([], {"enabled": False}),
             LivenessState.OK: ([_cycled()], {}),
-            LivenessState.STARTING: ([Row()], {}),
+            LivenessState.STARTING: ([_row()], {}),
             LivenessState.UNCONFIRMED: ([], {"fresh": True}),
             LivenessState.DOWN: ([], {}),
         }
@@ -182,43 +183,43 @@ class TestMasksStatuses:
 
 class TestBannerText:
     def test_no_banner_unless_down(self):
-        assert banner_text(_assess([_cycled()], T0 + timedelta(minutes=2))) is None
-        assert banner_text(_assess([], T0, fresh=True)) is None
-        assert banner_text(_assess([Row()], T0)) is None
-        assert banner_text(_assess([], T0, enabled=False)) is None
+        assert _banner(_assess([_cycled()], T0 + timedelta(minutes=2))) is None
+        assert _banner(_assess([], T0, fresh=True)) is None
+        assert _banner(_assess([_row()], T0)) is None
+        assert _banner(_assess([], T0, enabled=False)) is None
 
     def test_not_running_without_rows(self):
-        text = banner_text(_assess([], T0))
+        text = _banner(_assess([], T0))
         assert isinstance(text, Markup)
         assert text.startswith("RMQ watcher is not running — subscriptions are not consumed")
-        assert f'<a href="{SUBSCRIPTIONS_PATH}">' in text
+        assert f'<a href="{LINK}">' in text
 
     def test_stopped_when_the_latest_row_stopped(self):
         rows = [_cycled(stopped_at=T0 + timedelta(minutes=7, seconds=5))]
-        text = banner_text(_assess(rows, T0 + timedelta(minutes=30)))
+        text = _banner(_assess(rows, T0 + timedelta(minutes=30)))
         assert text.startswith(
             "RMQ watcher stopped at 2026-11-17 12:07:05 UTC and no Scheduler runs it"
         )
-        assert f'<a href="{SUBSCRIPTIONS_PATH}">' in text
+        assert f'<a href="{LINK}">' in text
 
     def test_no_cycle_since_the_latest_mark(self):
         rows = [
             _cycled("old", stopped_at=T0 + timedelta(minutes=2)),
             _cycled("dead", cycle=T0 + timedelta(minutes=4), due=T0 + timedelta(minutes=9)),
         ]
-        text = banner_text(_assess(rows, T0 + timedelta(minutes=30)))
+        text = _banner(_assess(rows, T0 + timedelta(minutes=30)))
         assert text.startswith(
             "RMQ watcher has not completed a cycle since 2026-11-17 12:04:00 UTC"
         )
 
     def test_no_cycle_since_start_when_none_completed(self):
-        row = Row(started_at=T0, due_at=T0 + timedelta(minutes=6))
-        text = banner_text(_assess([row], T0 + timedelta(minutes=7)))
+        row = _row(started_at=T0, due_at=T0 + timedelta(minutes=6))
+        text = _banner(_assess([row], T0 + timedelta(minutes=7)))
         assert "has not completed a cycle since 2026-11-17 12:00:00 UTC" in text
 
     def test_text_names_neither_hostname_nor_pid(self):
         row = _cycled(hostname="secret-host.internal", pid=98765, due=T0 + timedelta(minutes=5))
-        text = banner_text(_assess([row], T0 + timedelta(hours=1)))
+        text = _banner(_assess([row], T0 + timedelta(hours=1)))
         assert "secret-host" not in text
         assert "98765" not in text
 
@@ -242,7 +243,7 @@ class TestScenarios:
         verdict = _assess([row], due + timedelta(minutes=5), fresh=False)
         assert verdict.state is LivenessState.DOWN
         assert masks_statuses(verdict)
-        assert "has not completed a cycle since 2026-11-17 12:10:00 UTC" in banner_text(verdict)
+        assert "has not completed a cycle since 2026-11-17 12:10:00 UTC" in _banner(verdict)
 
     def test_scheduler_stopped(self):
         # docker stop: SIGTERM while the parent is alive marks stopped_at
@@ -250,19 +251,19 @@ class TestScenarios:
         row = _cycled(cycle=cycle, stopped_at=cycle + timedelta(seconds=20))
         soon = _assess([row], cycle + timedelta(minutes=1), fresh=True)
         assert soon.state is LivenessState.UNCONFIRMED
-        assert banner_text(soon) is None
+        assert _banner(soon) is None
         later = _assess([row], cycle + timedelta(minutes=10), fresh=False)
         assert later.state is LivenessState.DOWN
-        assert "stopped at 2026-11-17 12:10:20 UTC" in banner_text(later)
+        assert "stopped at 2026-11-17 12:10:20 UTC" in _banner(later)
 
     def test_scheduler_restarted(self):
         # the previous run died without a stop mark; the new run starts, then cycles
         old = _cycled("old", cycle=T0, due=T0 + timedelta(minutes=7))
         restart = T0 + timedelta(minutes=3)
-        new = Row(id="new", hostname="new", started_at=restart, due_at=restart + timedelta(minutes=6))
+        new = _row(id="new", hostname="new", started_at=restart, due_at=restart + timedelta(minutes=6))
         starting = _assess([old, new], restart + timedelta(minutes=5))
         assert starting.state is LivenessState.STARTING
-        new_cycled = Row(
+        new_cycled = _row(
             id="new",
             hostname="new",
             started_at=restart,
@@ -283,7 +284,7 @@ class TestScenarios:
     def test_no_rows_and_stale_reconcile(self):
         verdict = _assess([], T0, fresh=False)
         assert verdict.state is LivenessState.DOWN
-        assert banner_text(verdict).startswith("RMQ watcher is not running")
+        assert _banner(verdict).startswith("RMQ watcher is not running")
 
 
 class TestRowsReadFromDatabase:
