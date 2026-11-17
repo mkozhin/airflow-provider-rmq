@@ -1091,4 +1091,37 @@ class TestHeartbeatPruneAndRead:
 
         rows = get_heartbeats(heartbeat_session, self._NOW)
 
-        assert [row.id for row in rows] == ["starting", "dead-4", "dead-3"]
+        assert [row.id for row in rows] == ["starting", "dead-4", "dead-3", "dead-2"]
+
+    def test_the_limit_never_drops_an_alive_row(self, heartbeat_session, monkeypatch):
+        monkeypatch.setattr(models, "HEARTBEAT_ROWS_LIMIT", 3)
+        ahead = self._NOW + timedelta(minutes=10)
+        for minute in range(5):
+            record_heartbeat_deadline(
+                heartbeat_session, _other(f"alive-{minute}", "2026-11-18T11:00:00"), ahead,
+            )
+
+        rows = get_heartbeats(heartbeat_session, self._NOW)
+
+        assert {row.id for row in rows} == {f"alive-{minute}" for minute in range(5)}
+
+    def test_stopped_rows_within_their_deadline_do_not_crowd_out_the_alive_one(
+        self, heartbeat_session
+    ):
+        ahead = self._NOW + timedelta(minutes=10)
+        record_heartbeat_cycle(
+            heartbeat_session, _other("alive", "2026-11-18T10:00:00"),
+            self._NOW - timedelta(minutes=30), ahead,
+        )
+        stopped_count = models.HEARTBEAT_ROWS_LIMIT + 5
+        for index in range(stopped_count):
+            record_heartbeat_stop(
+                heartbeat_session, _other(f"stopped-{index}", "2026-11-18T11:00:00"),
+                ahead, self._NOW - timedelta(seconds=index + 1),
+            )
+
+        rows = get_heartbeats(heartbeat_session, self._NOW)
+
+        assert rows[0].id == "alive"
+        stopped = [row.id for row in rows[1:]]
+        assert stopped == [f"stopped-{index}" for index in range(models.HEARTBEAT_ROWS_LIMIT)]

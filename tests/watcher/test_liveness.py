@@ -13,9 +13,11 @@ from airflow_provider_rmq.watcher.liveness import (
     masks_statuses,
 )
 from airflow_provider_rmq.watcher.models import (
+    HEARTBEAT_ROWS_LIMIT,
     WatcherIdentity,
     get_heartbeats,
     record_heartbeat_cycle,
+    record_heartbeat_stop,
 )
 from tests.watcher.conftest import HEARTBEAT_T0, heartbeat_row
 
@@ -302,3 +304,25 @@ class TestRowsReadFromDatabase:
         assert process.last_mark == cycle
         past_due = (cycle + timedelta(minutes=8)).replace(tzinfo=timezone.utc)
         assert _assess(rows, past_due).state is LivenessState.DOWN
+
+    def test_an_alive_run_counts_behind_many_newer_stopped_runs(self, heartbeat_session):
+        now = T0 + timedelta(minutes=30)
+        due = now + timedelta(minutes=5)
+        alive = WatcherIdentity(id="alive", hostname="host", pid=1, started_at=T0)
+        record_heartbeat_cycle(heartbeat_session, alive, T0 + timedelta(minutes=1), due)
+        for index in range(HEARTBEAT_ROWS_LIMIT + 5):
+            stopped = WatcherIdentity(
+                id=f"stopped-{index}", hostname="host", pid=100 + index,
+                started_at=T0 + timedelta(minutes=2),
+            )
+            record_heartbeat_stop(
+                heartbeat_session, stopped, due, now - timedelta(seconds=index + 1),
+            )
+        rows = get_heartbeats(heartbeat_session, now)
+        heartbeat_session.close()
+
+        verdict = _assess(rows, now, fresh=False)
+
+        assert verdict.state is LivenessState.OK
+        alive_rows = [p for p in verdict.processes if p.state is ProcessState.ALIVE]
+        assert [p.pid for p in alive_rows] == [1]

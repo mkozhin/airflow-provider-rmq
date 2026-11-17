@@ -15,8 +15,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    case,
+    and_,
     inspect,
+    not_,
     or_,
 )
 from sqlalchemy.exc import IntegrityError
@@ -408,9 +409,9 @@ def get_active_dag_ids(session: Session) -> set[str]:
 #: deletes other runs' rows once it is over.
 HEARTBEAT_WINDOW = timedelta(days=1)
 
-#: Most heartbeat rows :func:`get_heartbeats` returns. A Scheduler that keeps
-#: restarting adds a row per restart; the rows within their deadline come first, so
-#: the limit only drops the oldest of the others.
+#: Most rows of stopped or past-deadline runs :func:`get_heartbeats` returns. A
+#: Scheduler that keeps restarting adds a row per restart; the limit drops the oldest
+#: of these rows and never an alive one.
 HEARTBEAT_ROWS_LIMIT = 50
 
 
@@ -517,20 +518,28 @@ def prune_heartbeats(session: Session, keep_id: str, now: datetime) -> int:
 def get_heartbeats(session: Session, now: datetime) -> list[RMQWatcherHeartbeat]:
     """Return the rows that count at ``now``.
 
-    Every row whose deadline is still ahead (``due_at >= now``), then the rows past
-    their deadline that were last marked within :data:`HEARTBEAT_WINDOW` of ``now``,
-    latest mark first — at most :data:`HEARTBEAT_ROWS_LIMIT` rows in all.
+    Every alive row (no ``stopped_at``, ``due_at >= now``), then the other rows that
+    are either within their deadline or were last marked within
+    :data:`HEARTBEAT_WINDOW` of ``now`` — at most :data:`HEARTBEAT_ROWS_LIMIT` of
+    these. Each group is ordered latest mark first.
     """
-    current = case((RMQWatcherHeartbeat.due_at >= now, 0), else_=1)
-    return (
+    is_alive = and_(
+        RMQWatcherHeartbeat.stopped_at.is_(None),
+        RMQWatcherHeartbeat.due_at >= now,
+    )
+    latest_first = _last_mark_column().desc()
+    alive = session.query(RMQWatcherHeartbeat).filter(is_alive).order_by(latest_first).all()
+    others = (
         session.query(RMQWatcherHeartbeat)
         .filter(
+            not_(is_alive),
             or_(
                 RMQWatcherHeartbeat.due_at >= now,
                 _last_mark_column() >= now - HEARTBEAT_WINDOW,
-            )
+            ),
         )
-        .order_by(current, _last_mark_column().desc())
+        .order_by(latest_first)
         .limit(HEARTBEAT_ROWS_LIMIT)
         .all()
     )
+    return alive + others
