@@ -350,26 +350,26 @@
 - Modify: `airflow_provider_rmq/watcher/models.py`
 - Modify: `tests/watcher/test_models.py`
 
-- [ ] frozen-dataclass `WatcherIdentity(id, hostname, pid, started_at)`
-- [ ] `HeartbeatBase`, модель `RMQWatcherHeartbeat` (колонки из Technical Details),
+- [x] frozen-dataclass `WatcherIdentity(id, hostname, pid, started_at)`
+- [x] `HeartbeatBase`, модель `RMQWatcherHeartbeat` (колонки из Technical Details),
       `ensure_heartbeat_table()`
-- [ ] `record_heartbeat_start(session, identity, due_at)`,
+- [x] `record_heartbeat_start(session, identity, due_at)`,
       `record_heartbeat_due(session, identity, due_at)`,
       `record_heartbeat_cycle(session, identity, last_cycle_at, due_at)` — upsert'ы, не
       трогающие `stopped_at`; старт не сбрасывает `last_cycle_at`
-- [ ] `record_heartbeat_stop(session, identity, due_at, stopped_at)` — upsert с полной
+- [x] `record_heartbeat_stop(session, identity, due_at, stopped_at)` — upsert с полной
       идентичностью; `prune_heartbeats(session, keep_id, older_than)` — по последней
       отметке; `get_heartbeats(session, since)`
-- [ ] тесты: `ensure_heartbeat_table` создаёт таблицу и идемпотентен; `ensure_table_exists`
+- [x] тесты: `ensure_heartbeat_table` создаёт таблицу и идемпотентен; `ensure_table_exists`
       её не создаёт; upsert старта поверх строки с `last_cycle_at` и со `stopped_at` их
       сохраняет; upsert прохода поверх существующей и отсутствующей строки; запись срока не
       трогает `last_cycle_at`; stop на существующей и на отсутствующей строке
-- [ ] тесты: вставка, упавшая на `IntegrityError` (строка с тем же `id` появилась между
+- [x] тесты: вставка, упавшая на `IntegrityError` (строка с тем же `id` появилась между
       SELECT и INSERT), повторяется как UPDATE — для stop `stopped_at` ложится, для старта
       `stopped_at` не стирается
-- [ ] тесты: чистка не трогает свою строку и свежие чужие и удаляет старые по каждой из
+- [x] тесты: чистка не трогает свою строку и свежие чужие и удаляет старые по каждой из
       трёх отметок
-- [ ] run tests — must pass before task 3
+- [x] run tests — must pass before task 3
 
 ### Task 3: Оценка живости `assess_liveness`
 

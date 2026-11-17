@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.sql import func
 
@@ -82,6 +84,49 @@ class RMQConnStatus(WatcherBase):
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
 
+#: Declarative base of the watcher-process heartbeat table. Kept apart from
+#: :data:`WatcherBase` so that :func:`ensure_table_exists`, which every Airflow process
+#: runs from the plugin's ``on_load``, never issues DDL for it: only the watcher process
+#: and the webserver create it, through :func:`ensure_heartbeat_table`.
+HeartbeatBase = declarative_base()
+
+
+@dataclass(frozen=True)
+class WatcherIdentity:
+    """One run of a watcher process: the key of its heartbeat row."""
+
+    id: str
+    hostname: str
+    pid: int
+    started_at: datetime
+
+
+class RMQWatcherHeartbeat(HeartbeatBase):
+    """Heartbeat of one watcher-process run — one row per :class:`WatcherIdentity`.
+
+    Times are naive UTC, written by the watcher process. ``due_at`` is the moment by
+    which this run, under the settings it works with, owes its next mark; a row whose
+    ``due_at`` has passed without a ``stopped_at`` belongs to a run that is not working.
+    """
+
+    __tablename__ = "rmq_watcher_heartbeat"
+
+    id = Column(String(36), primary_key=True)
+    hostname = Column(String(500), nullable=False)
+    pid = Column(Integer, nullable=False)
+    started_at = Column(DateTime, nullable=False)
+    # when the run recorded its last cycle that finished within its budget
+    last_cycle_at = Column(DateTime, nullable=True)
+    due_at = Column(DateTime, nullable=False)
+    # set by an orderly stop only
+    stopped_at = Column(DateTime, nullable=True)
+
+    @property
+    def last_mark(self) -> datetime:
+        """The row's latest mark: ``stopped_at``, else ``last_cycle_at``, else ``started_at``."""
+        return self.stopped_at or self.last_cycle_at or self.started_at
+
+
 #: Marker for an argument the caller left out, which ``None`` cannot express here:
 #: ``None`` is itself a meaningful value for the nullable columns below. Callers pass
 #: it to say "keep what the row holds".
@@ -146,7 +191,7 @@ def _add_missing_columns(engine) -> bool:
 
 
 def ensure_table_exists() -> None:
-    """Create rmq_watcher_* tables and add columns missing from an older schema.
+    """Create the :data:`WatcherBase` tables and add columns missing from an older schema.
 
     Safe to call multiple times: once a call completes without errors the
     schema is marked ready and further calls return immediately. Until then
@@ -160,6 +205,29 @@ def ensure_table_exists() -> None:
     WatcherBase.metadata.create_all(engine, checkfirst=True)
     if _add_missing_columns(engine):
         _schema_ready = True
+
+
+_heartbeat_ready = False
+
+
+def is_heartbeat_table_ready() -> bool:
+    """Whether the heartbeat table is known to exist in this process."""
+    return _heartbeat_ready
+
+
+def ensure_heartbeat_table() -> None:
+    """Create ``rmq_watcher_heartbeat`` if it is missing.
+
+    Safe to call multiple times: once a call succeeds the table is marked ready and
+    further calls return immediately. A failure propagates and leaves the flag unset,
+    so the next call tries again.
+    """
+    global _heartbeat_ready
+    if _heartbeat_ready:
+        return
+    from airflow.settings import engine
+    HeartbeatBase.metadata.create_all(engine, checkfirst=True)
+    _heartbeat_ready = True
 
 
 # ---------------------------------------------------------------------------
@@ -304,3 +372,118 @@ def get_active_dag_ids(session: Session) -> set[str]:
         .filter(DagModel.is_active.is_(True))
         .all()
     }
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat writes — each call is its own transaction and commits it
+# ---------------------------------------------------------------------------
+
+def _identity_values(identity: WatcherIdentity) -> dict[str, Any]:
+    return {
+        "hostname": identity.hostname,
+        "pid": identity.pid,
+        "started_at": identity.started_at,
+    }
+
+
+def _update_heartbeat(session: Session, row_id: str, values: dict[str, Any]) -> int:
+    """UPDATE the row ``row_id`` with ``values``; return how many rows matched."""
+    return (
+        session.query(RMQWatcherHeartbeat)
+        .filter(RMQWatcherHeartbeat.id == row_id)
+        .update(values, synchronize_session=False)
+    )
+
+
+def _upsert_heartbeat(session: Session, identity: WatcherIdentity, **fields: Any) -> None:
+    """Write ``fields`` and the identity onto the row of ``identity`` and commit.
+
+    Columns outside ``fields`` keep what the row holds; a row that does not exist yet
+    is inserted with them empty. An INSERT that fails on ``IntegrityError`` means
+    another writer committed the same row in between: the INSERT is rolled back and
+    the same values go in as an UPDATE, so the write lands on that row instead of
+    being lost.
+    """
+    values = {**_identity_values(identity), **fields}
+    if _update_heartbeat(session, identity.id, values) == 0:
+        try:
+            session.execute(
+                RMQWatcherHeartbeat.__table__.insert().values(id=identity.id, **values)
+            )
+        except IntegrityError:
+            session.rollback()
+            _update_heartbeat(session, identity.id, values)
+    session.commit()
+
+
+def record_heartbeat_start(
+    session: Session, identity: WatcherIdentity, due_at: datetime,
+) -> None:
+    """Record the start of a watcher run with its first deadline. Commits.
+
+    ``last_cycle_at`` and ``stopped_at`` keep what the row already holds.
+    """
+    _upsert_heartbeat(session, identity, due_at=due_at)
+
+
+def record_heartbeat_due(
+    session: Session, identity: WatcherIdentity, due_at: datetime,
+) -> None:
+    """Record a new deadline without a completed cycle. Commits."""
+    _upsert_heartbeat(session, identity, due_at=due_at)
+
+
+def record_heartbeat_cycle(
+    session: Session, identity: WatcherIdentity, last_cycle_at: datetime, due_at: datetime,
+) -> None:
+    """Record a cycle that finished within its budget and the next deadline. Commits.
+
+    ``stopped_at`` keeps what the row already holds.
+    """
+    _upsert_heartbeat(session, identity, last_cycle_at=last_cycle_at, due_at=due_at)
+
+
+def record_heartbeat_stop(
+    session: Session, identity: WatcherIdentity, due_at: datetime, stopped_at: datetime,
+) -> None:
+    """Record an orderly stop of a watcher run. Commits.
+
+    The write carries the full identity, so the mark lands even on a row the start
+    record has not committed yet.
+    """
+    _upsert_heartbeat(session, identity, due_at=due_at, stopped_at=stopped_at)
+
+
+def _last_mark_column():
+    return func.coalesce(
+        RMQWatcherHeartbeat.stopped_at,
+        RMQWatcherHeartbeat.last_cycle_at,
+        RMQWatcherHeartbeat.started_at,
+    )
+
+
+def prune_heartbeats(session: Session, keep_id: str, older_than: datetime) -> int:
+    """Delete other runs' rows whose last mark is older than ``older_than``. Commits.
+
+    The row ``keep_id`` stays whatever its age. Returns the deleted count.
+    """
+    deleted = (
+        session.query(RMQWatcherHeartbeat)
+        .filter(
+            RMQWatcherHeartbeat.id != keep_id,
+            _last_mark_column() < older_than,
+        )
+        .delete(synchronize_session=False)
+    )
+    session.commit()
+    return deleted
+
+
+def get_heartbeats(session: Session, since: datetime) -> list[RMQWatcherHeartbeat]:
+    """Return rows whose last mark is at or after ``since``, latest mark first."""
+    return (
+        session.query(RMQWatcherHeartbeat)
+        .filter(_last_mark_column() >= since)
+        .order_by(_last_mark_column().desc())
+        .all()
+    )

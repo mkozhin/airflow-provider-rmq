@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from airflow_provider_rmq.watcher import dag_file_scan, models
-from airflow_provider_rmq.watcher.models import WatcherBase
+from airflow_provider_rmq.watcher.models import HeartbeatBase, WatcherBase
 
 #: rmq_watcher_subscriptions as an installation that has not run the migration yet has
 #: it: the columns of the first release, without the miss counter and without the
@@ -143,11 +143,24 @@ def session():
 
 
 @pytest.fixture(scope="function")
+def heartbeat_session():
+    """SQLite in-memory session carrying the watcher schema and the heartbeat table."""
+    engine = _memory_engine()
+    WatcherBase.metadata.create_all(engine)
+    HeartbeatBase.metadata.create_all(engine)
+    s = sessionmaker(bind=engine)()
+    yield s
+    s.close()
+    engine.dispose()
+
+
+@pytest.fixture(scope="function")
 def schema_engine(monkeypatch):
     """Engine standing in for Airflow's, with the migration flag reset."""
     engine = _memory_engine()
     monkeypatch.setattr("airflow.settings.engine", engine, raising=False)
     monkeypatch.setattr(models, "_schema_ready", False)
+    monkeypatch.setattr(models, "_heartbeat_ready", False)
     yield engine
     engine.dispose()
 
