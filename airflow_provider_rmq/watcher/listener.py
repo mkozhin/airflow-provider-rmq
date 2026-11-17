@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import site
+import socket
 import subprocess
 import sys
 import sysconfig
@@ -13,7 +14,7 @@ import traceback
 import uuid
 from collections.abc import Collection
 from concurrent.futures import Future
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -47,23 +48,21 @@ from airflow_provider_rmq.watcher.models import (
     is_schema_ready,
     prune_heartbeats,
     record_heartbeat_cycle,
-    record_heartbeat_due,
-    record_heartbeat_start,
+    record_heartbeat_deadline,
     record_heartbeat_stop,
     upsert_subscription,
+    utcnow,
 )
 from airflow_provider_rmq.watcher.tunables import (
     CYCLE_TIMEOUT_VAR,
     DEFAULT_RECONCILE_INTERVAL,
     RECONCILE_INTERVAL_VAR,
+    VARIABLE_TIMEOUT,
     cycle_timeout,
     read_positive,
 )
 
 log = logging.getLogger(__name__)
-
-#: Seconds allowed for reading the tunables out of the Airflow Variables table.
-_VARIABLE_TIMEOUT = 15.0
 
 #: Seconds allowed for one schema-migration attempt.
 _MIGRATION_TIMEOUT = 30.0
@@ -84,9 +83,6 @@ _HEARTBEAT_TIMEOUT = 10.0
 
 #: Seconds allowed for deleting other runs' heartbeat rows after a recorded pass.
 _PRUNE_TIMEOUT = 10.0
-
-#: Age of its last mark past which another run's heartbeat row is deleted.
-_HEARTBEAT_RETENTION = timedelta(days=1)
 
 #: Seconds :meth:`RMQWatcherListener.mark_stopped` waits for the stop mark to be written.
 #: The runner calls it on its way out, and the process does not wait on a database that
@@ -249,11 +245,6 @@ def _read_active_subs(exchange_meta: dict) -> list[dict]:
     return active_subs
 
 
-def _utcnow() -> datetime:
-    """The current time as naive UTC, the form every watcher timestamp is stored in."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
 def _write_heartbeat(write: Any, identity: WatcherIdentity, *args: Any) -> None:
     """Run the heartbeat write ``write`` for ``identity`` in a session of its own.
 
@@ -266,10 +257,29 @@ def _write_heartbeat(write: Any, identity: WatcherIdentity, *args: Any) -> None:
         write(session, identity, *args)
 
 
-def _prune_other_heartbeats(keep_id: str, older_than: datetime) -> int:
-    """Delete other runs' heartbeat rows last marked before ``older_than``. Blocking."""
+def _run_hostname() -> str:
+    """The host name the heartbeat row shows: Airflow's ``get_hostname()``.
+
+    Airflow resolves it through ``[core] hostname_callable``; a callable that fails
+    leaves the socket's host name, with a WARNING — the name only labels the row.
+    """
+    from airflow.utils.net import get_hostname
+
+    try:
+        return get_hostname()
+    except Exception:
+        hostname = socket.gethostname()
+        log.warning(
+            "RMQ Watcher: Airflow's get_hostname() failed — the heartbeat row shows the "
+            "host as %s", hostname, exc_info=True,
+        )
+        return hostname
+
+
+def _prune_other_heartbeats(keep_id: str, now: datetime) -> int:
+    """Delete other runs' heartbeat rows that have stopped counting at ``now``. Blocking."""
     with WatcherSession() as session:
-        return prune_heartbeats(session, keep_id, older_than)
+        return prune_heartbeats(session, keep_id, now)
 
 
 def _read_active_dag_ids() -> set[str] | None:
@@ -578,6 +588,10 @@ class RMQWatcherListener:
         # Whether the start record of this run has been attempted. A restart of
         # ``_main`` inside the process keeps the run, so it does not record a start.
         self._heartbeat_started = False
+        # Set by ``_run_loop`` when it restarts ``_main`` after a crash: the deadline the
+        # row carries covered a pass of the crashed loop, so the restarted loop records a
+        # new one before its first pass.
+        self._heartbeat_restarted = False
         # Cycle budget the last recorded deadline was computed with; a pass that runs
         # under a larger one records a new deadline before it starts.
         self._heartbeat_budget: float | None = None
@@ -791,7 +805,7 @@ class RMQWatcherListener:
             if self._stop_marked:
                 return
             self._stop_marked = True
-        stopped_at = _utcnow()
+        stopped_at = utcnow()
         due_at = self._heartbeat_due_at or stopped_at
         try:
             thread = threading.Thread(
@@ -863,14 +877,12 @@ class RMQWatcherListener:
         The run's :class:`WatcherIdentity` is created here, before the loop: every
         restart of the loop inside this process keeps it, and with it the heartbeat row.
         """
-        from airflow.utils.net import get_hostname
-
         self._parent_pid = parent_pid
         self._identity = WatcherIdentity(
             id=str(uuid.uuid4()),
-            hostname=get_hostname(),
+            hostname=_run_hostname(),
             pid=os.getpid(),
-            started_at=_utcnow(),
+            started_at=utcnow(),
         )
         log.info(
             "RMQ Watcher loop started with the default reconcile interval of %ss and "
@@ -928,6 +940,7 @@ class RMQWatcherListener:
                 loop.run_until_complete(self._main())
             except Exception:
                 log.exception("RMQ Watcher loop crashed — restarting in 30s")
+                self._heartbeat_restarted = True
             finally:
                 # Both thread pools belong to the listener, not to the loop, so the
                 # next loop reuses them. loop.shutdown_default_executor() is
@@ -985,26 +998,27 @@ class RMQWatcherListener:
 
         :param budget: Seconds the pass is given.
 
-        The run's first pass records the start of the run; a later pass records a new
-        deadline only when its budget is larger than the one the stored deadline was
-        computed with, and leaves ``last_cycle_at`` as it is. The deadline covers the
-        rest of this write, the pass and the write that marks it:
+        The run's first pass records the start of the run. A later pass records a new
+        deadline when ``_main`` has been restarted after a crash — the crashed loop's
+        pass, the consumers' stop and the pause before the restart outlast the deadline
+        the row carries — or when its budget is larger than the one the stored deadline
+        was computed with. Either leaves ``last_cycle_at`` as it is. The deadline covers
+        the rest of this write, the pass and the write that marks it:
         ``now + H + budget + H`` with ``H`` = :data:`_HEARTBEAT_TIMEOUT`.
         """
         identity = self._identity
         if identity is None:
             return
-        if not self._heartbeat_started:
+        if not self._heartbeat_started or self._heartbeat_restarted:
             self._heartbeat_started = True
-            write = record_heartbeat_start
-        elif self._heartbeat_budget is not None and budget > self._heartbeat_budget:
-            write = record_heartbeat_due
-        else:
+            self._heartbeat_restarted = False
+        elif self._heartbeat_budget is None or budget <= self._heartbeat_budget:
             return
-        due_at = _utcnow() + timedelta(seconds=_HEARTBEAT_TIMEOUT + budget + _HEARTBEAT_TIMEOUT)
+        due_at = utcnow() + timedelta(seconds=_HEARTBEAT_TIMEOUT + budget + _HEARTBEAT_TIMEOUT)
         self._heartbeat_due_at = due_at
         if await self._heartbeat_step(
-            "heartbeat", _HEARTBEAT_TIMEOUT, _write_heartbeat, write, identity, due_at
+            "heartbeat", _HEARTBEAT_TIMEOUT,
+            _write_heartbeat, record_heartbeat_deadline, identity, due_at,
         ):
             self._heartbeat_budget = budget
 
@@ -1016,17 +1030,19 @@ class RMQWatcherListener:
         between passes, the settings read, the next pass and its write —
         ``now + H + P + interval + V + budget + H`` with ``H`` =
         :data:`_HEARTBEAT_TIMEOUT`, ``P`` = :data:`_PRUNE_TIMEOUT` and ``V`` =
-        :data:`_VARIABLE_TIMEOUT`. Rows of other runs whose last mark is older than
-        :data:`_HEARTBEAT_RETENTION` are deleted after the mark is committed, in a
-        transaction of their own: a failed prune leaves the mark in place.
+        :data:`VARIABLE_TIMEOUT`. Rows of other runs past their deadline and last marked
+        more than :data:`~.models.HEARTBEAT_WINDOW` ago are deleted after the mark is
+        committed, in a transaction of their own: a failed prune leaves the mark in place.
         """
         identity = self._identity
+        # Checked here and not left to the step: once a stop has been requested the
+        # deadline the stop mark repeats stays the one the last write carried.
         if identity is None or self._stop_event.is_set():
             return
-        now = _utcnow()
+        now = utcnow()
         due_at = now + timedelta(
             seconds=_HEARTBEAT_TIMEOUT + _PRUNE_TIMEOUT + self._reconcile_interval
-            + _VARIABLE_TIMEOUT + budget + _HEARTBEAT_TIMEOUT
+            + VARIABLE_TIMEOUT + budget + _HEARTBEAT_TIMEOUT
         )
         self._heartbeat_due_at = due_at
         if not await self._heartbeat_step(
@@ -1037,7 +1053,7 @@ class RMQWatcherListener:
         self._heartbeat_budget = budget
         await self._heartbeat_step(
             "heartbeat_prune", _PRUNE_TIMEOUT,
-            _prune_other_heartbeats, identity.id, now - _HEARTBEAT_RETENTION,
+            _prune_other_heartbeats, identity.id, now,
         )
 
     async def _heartbeat_step(
@@ -1054,7 +1070,7 @@ class RMQWatcherListener:
         except _StopRequested:
             return False
         except _StepInFlight as exc:
-            log.warning("RMQ Watcher: heartbeat not written — %s", exc)
+            log.warning("RMQ Watcher: the %r step is skipped — %s", name, exc)
             return False
         except Exception:
             log.warning(
@@ -1206,8 +1222,8 @@ class RMQWatcherListener:
         except asyncio.TimeoutError:
             incr("rmq_watcher.cycle_step_timed_out")
             log.warning(
-                "RMQ Watcher: the %r step did not finish within %ss — ending this cycle; "
-                "its worker stays busy until the call itself returns",
+                "RMQ Watcher: the %r step did not finish within %ss; its worker stays "
+                "busy until the call itself returns",
                 name, timeout,
             )
             raise
@@ -1288,7 +1304,7 @@ class RMQWatcherListener:
         """
         try:
             interval, cycle_timeout = await self._cycle_step(
-                "settings", _read_settings, timeout=_VARIABLE_TIMEOUT
+                "settings", _read_settings, timeout=VARIABLE_TIMEOUT
             )
         except (_StepInFlight, _StopRequested):
             return

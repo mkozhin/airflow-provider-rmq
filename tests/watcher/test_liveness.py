@@ -38,10 +38,14 @@ class Row:
 
 
 def _assess(rows, now, *, enabled=True, fresh=False):
-    return assess_liveness(rows, now, has_enabled_subscriptions=enabled, has_fresh_reconcile=fresh)
+    answer = fresh if callable(fresh) else (lambda: fresh)
+    return assess_liveness(
+        rows, now, has_enabled_subscriptions=enabled, has_fresh_reconcile=answer
+    )
 
 
 def _cycled(row_id="run-1", *, cycle=T0 + timedelta(minutes=1), due=None, **kwargs):
+    kwargs.setdefault("hostname", row_id)
     return Row(
         id=row_id,
         last_cycle_at=cycle,
@@ -67,7 +71,7 @@ class TestStates:
         assert verdict.processes[0].state is ProcessState.ALIVE
 
     def test_starting_with_alive_rows_without_a_cycle(self):
-        rows = [Row(id="a"), Row(id="b", started_at=T0 + timedelta(seconds=5))]
+        rows = [Row(id="a", hostname="a"), Row(id="b", hostname="b", started_at=T0 + timedelta(seconds=5))]
         verdict = _assess(rows, T0 + timedelta(minutes=1))
         assert verdict.state is LivenessState.STARTING
         assert {p.state for p in verdict.processes} == {ProcessState.STARTING}
@@ -101,11 +105,11 @@ class TestStates:
             _cycled("dead-1", due=T0 + timedelta(minutes=10)),
             _cycled("stopped", stopped_at=T0 + timedelta(minutes=20)),
             _cycled("alive", cycle=now - timedelta(minutes=1)),
-            Row(id="starting", started_at=now - timedelta(seconds=30), due_at=now + timedelta(minutes=5)),
+            Row(id="starting", hostname="starting", started_at=now - timedelta(seconds=30), due_at=now + timedelta(minutes=5)),
         ]
         verdict = _assess(rows, now)
         assert verdict.state is LivenessState.OK
-        states = {p.id: p.state for p in verdict.processes}
+        states = {p.hostname: p.state for p in verdict.processes}
         assert states == {
             "dead-1": ProcessState.DEAD,
             "stopped": ProcessState.STOPPED,
@@ -129,12 +133,12 @@ class TestStates:
 
     def test_processes_are_ordered_latest_mark_first(self):
         rows = [
-            Row(id="old", started_at=T0),
+            Row(id="old", hostname="old", started_at=T0),
             _cycled("newer", cycle=T0 + timedelta(minutes=3)),
             _cycled("newest", stopped_at=T0 + timedelta(minutes=4)),
         ]
         verdict = _assess(rows, T0 + timedelta(minutes=5))
-        assert [p.id for p in verdict.processes] == ["newest", "newer", "old"]
+        assert [p.hostname for p in verdict.processes] == ["newest", "newer", "old"]
         assert verdict.latest_mark == T0 + timedelta(minutes=4)
         assert verdict.latest_is_stop is True
 
@@ -158,7 +162,6 @@ class TestStates:
         verdict = _assess([row], (T0 + timedelta(minutes=2)).replace(tzinfo=timezone.utc))
         assert verdict.state is LivenessState.OK
         assert verdict.processes[0].last_mark == T0 + timedelta(minutes=1)
-        assert verdict.assessed_at == T0 + timedelta(minutes=2)
 
 
 class TestMasksStatuses:
@@ -256,18 +259,19 @@ class TestScenarios:
         # the previous run died without a stop mark; the new run starts, then cycles
         old = _cycled("old", cycle=T0, due=T0 + timedelta(minutes=7))
         restart = T0 + timedelta(minutes=3)
-        new = Row(id="new", started_at=restart, due_at=restart + timedelta(minutes=6))
+        new = Row(id="new", hostname="new", started_at=restart, due_at=restart + timedelta(minutes=6))
         starting = _assess([old, new], restart + timedelta(minutes=5))
         assert starting.state is LivenessState.STARTING
         new_cycled = Row(
             id="new",
+            hostname="new",
             started_at=restart,
             last_cycle_at=restart + timedelta(minutes=5),
             due_at=restart + timedelta(minutes=12),
         )
         running = _assess([old, new_cycled], restart + timedelta(minutes=8))
         assert running.state is LivenessState.OK
-        states = {p.id: p.state for p in running.processes}
+        states = {p.hostname: p.state for p in running.processes}
         assert states == {"old": ProcessState.DEAD, "new": ProcessState.ALIVE}
 
     def test_webserver_upgraded_before_scheduler(self):
@@ -287,13 +291,13 @@ class TestRowsReadFromDatabase:
         identity = WatcherIdentity(id="db-run", hostname="host", pid=17, started_at=T0)
         cycle = T0 + timedelta(minutes=1)
         record_heartbeat_cycle(heartbeat_session, identity, cycle, cycle + timedelta(minutes=7))
-        rows = get_heartbeats(heartbeat_session, since=T0 - timedelta(days=1))
+        rows = get_heartbeats(heartbeat_session, T0 + timedelta(minutes=2))
         heartbeat_session.close()
 
-        now = datetime.now(timezone.utc)
         verdict = _assess(rows, T0 + timedelta(minutes=2))
         assert verdict.state is LivenessState.OK
         process = verdict.processes[0]
-        assert (process.id, process.hostname, process.pid) == ("db-run", "host", 17)
-        assert process.last_cycle_at == cycle
-        assert _assess(rows, now).state is LivenessState.DOWN
+        assert (process.hostname, process.pid) == ("host", 17)
+        assert process.last_mark == cycle
+        past_due = (cycle + timedelta(minutes=8)).replace(tzinfo=timezone.utc)
+        assert _assess(rows, past_due).state is LivenessState.DOWN

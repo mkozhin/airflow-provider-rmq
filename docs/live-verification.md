@@ -456,6 +456,10 @@ cooldown-доставка переотправлялась чаще раза в 
 4. После рестарта в брокере ровно столько consumer'ов, сколько подписок, и все
    с новым `pid` в теге — PID нового процесса runner'а. Старых тегов нет.
 5. Строки `conn_id` не остаются в `error` навсегда.
+6. В блоке Watcher processes страницы Subscriptions строка прежнего запуска —
+   `■ stopped`, в колонке Due у неё `—`; строка нового запуска — `○ starting`,
+   после первого цикла — `● alive`. Красного баннера на главной странице Airflow
+   нет.
 
 **Допустимо.** WARNING `RMQ Watcher process <pid> still running 5s after
 SIGTERM — killing it` и код выхода `-9`: остановка consumer'ов не уложилась в
@@ -519,8 +523,8 @@ runner'а под ним; `kill -9 <PID airflow scheduler>` с хоста (`docke
 что это видно.
 
 **Как.** `kill -9 <PID runner'а>` с хоста, затем `docker top airflow-scheduler`,
-`rabbitmqctl list_consumers -p <vhost>`, страница Subscriptions и метрики. В
-конце — `docker restart airflow-scheduler`.
+`rabbitmqctl list_consumers -p <vhost>`, страница Subscriptions, главная
+страница Airflow и метрики. В конце — `docker restart airflow-scheduler`.
 
 **Ожидаемо.**
 
@@ -531,17 +535,33 @@ runner'а под ним; `kill -9 <PID airflow scheduler>` с хоста (`docke
 3. Теги в брокере пропадают: соединения убитого процесса закрыты. Сообщения в
    очередях копятся, DAG'и по ним не запускаются.
 4. `rmq_watcher.cycle_completed` перестаёт расти.
-5. Статусы подписок остаются теми, что были записаны до смерти (`listening`), —
-   писать `disconnected` некому. Last reconcile каждой строки `conn_id`
-   помечается предупреждением через интервал плюс бюджет цикла (320 с при
-   интервале 20 с).
-6. После `docker restart` — в логе `RMQ Watcher process <pid> had already exited
+5. Last reconcile каждой строки `conn_id` помечается предупреждением через
+   интервал плюс бюджет цикла (320 с при интервале 20 с).
+6. В блоке Watcher processes строка убитого запуска становится `✕ dead` и
+   выделяется, когда проходит её Due — 365 с после последней отметки при
+   интервале 20 с.
+7. Когда устаревает и `last_reconcile_at` — 395 с после последней отметки, плюс
+   до 30 с кэша воркера веб-сервера, — главная страница Airflow показывает всем
+   пользователям красный баннер «RMQ watcher has not completed a cycle since …»
+   со ссылкой на страницу Subscriptions. На странице Subscriptions вверху тот же
+   баннер, а статусы строк `conn_id` и включённых подписок выводятся как
+   `? unknown` с последним записанным статусом в подсказке.
+8. После `docker restart` — в логе `RMQ Watcher process <pid> had already exited
    with code -9`, новый процесс runner'а стартует, накопленные сообщения
-   запускают DAG'и.
+   запускают DAG'и. Баннер исчезает с первой записью нового запуска (до 30 с
+   кэша), статусы снова показываются как записаны, строка убитого запуска
+   остаётся `dead` рядом со строкой нового.
+
+**Ещё одна проверка — разные версии провайдера.** Webserver с этой версией
+провайдера, scheduler — с версией, которая не пишет heartbeat. Пока свежа
+`last_reconcile_at`, баннера на главной нет, а в блоке Watcher processes —
+пояснение о том, что ни один процесс не подтверждает работу через heartbeat,
+но отметка reconcile свежая.
 
 **Провал.** Смерть процесса watcher'а задела scheduler. Или она не видна ни в
-`docker top`, ни по метрике, ни по Last reconcile. Или после рестарта
-scheduler'а watcher не вернулся.
+`docker top`, ни по метрике, ни по Last reconcile, ни строкой `dead`. Или
+баннера нет через 8 минут после последней отметки. Или баннер не исчез после
+рестарта scheduler'а. Или после рестарта scheduler'а watcher не вернулся.
 
 **Время.** 10 минут.
 

@@ -84,8 +84,6 @@
               {% elif p.state == 'stopped' %}
                 <span class="label label-default"
                       title="The process stopped in an orderly way on its scheduler's signal.">■ stopped</span>
-              {% else %}
-                <span class="label label-default">{{ p.state }}</span>
               {% endif %}
             </td>
           </tr>

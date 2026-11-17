@@ -4,7 +4,9 @@ from, the alert Airflow asks and renders, and its installation in the webserver.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import flask
@@ -13,8 +15,7 @@ from markupsafe import Markup
 from sqlalchemy import inspect
 from sqlalchemy.orm import sessionmaker
 
-from airflow_provider_rmq.watcher import dashboard_alert, liveness, models
-from airflow_provider_rmq.watcher.listener import _VARIABLE_TIMEOUT
+from airflow_provider_rmq.watcher import dashboard_alert, liveness, models, views
 from airflow_provider_rmq.watcher.liveness import LivenessState, assess_liveness
 from airflow_provider_rmq.watcher.models import (
     RMQConnStatus,
@@ -22,7 +23,11 @@ from airflow_provider_rmq.watcher.models import (
     RMQWatcherHeartbeat,
     WatcherBase,
 )
-from airflow_provider_rmq.watcher.tunables import DEFAULT_RECONCILE_INTERVAL, MIN_CYCLE_TIMEOUT
+from airflow_provider_rmq.watcher.tunables import (
+    DEFAULT_RECONCILE_INTERVAL,
+    MIN_CYCLE_TIMEOUT,
+    VARIABLE_TIMEOUT,
+)
 
 #: Reference moment of the tests, naive UTC like the times the watcher writes.
 T0 = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
@@ -69,7 +74,7 @@ def db(schema_engine, monkeypatch):
     monkeypatch.setattr(
         "airflow_provider_rmq.watcher.views.read_positive", lambda name, cast: None
     )
-    monkeypatch.setattr(dashboard_alert, "_utcnow", lambda: T0)
+    monkeypatch.setattr(dashboard_alert, "utcnow", lambda: T0)
     return schema_engine
 
 
@@ -102,6 +107,18 @@ def _alive_heartbeat() -> RMQWatcherHeartbeat:
     )
 
 
+def _no() -> bool:
+    return False
+
+
+def _yes() -> bool:
+    return True
+
+
+def _never_fresh():
+    return assess_liveness([], T0, True, _no)
+
+
 def _has_heartbeat_table(engine) -> bool:
     return inspect(engine).has_table("rmq_watcher_heartbeat")
 
@@ -118,7 +135,7 @@ def _refusing_ensure(monkeypatch, failures: int):
         calls.append("created")
         models.ensure_heartbeat_table()
 
-    monkeypatch.setattr(dashboard_alert, "ensure_heartbeat_table", ensure)
+    monkeypatch.setattr(views, "ensure_heartbeat_table", ensure)
     return calls
 
 
@@ -128,16 +145,16 @@ def _refusing_ensure(monkeypatch, failures: int):
 
 
 class TestReadVerdict:
-    def test_a_creation_that_failed_at_install_is_retried_on_the_next_miss(
+    def test_a_creation_that_failed_is_retried_on_the_next_miss(
         self, db, clock, monkeypatch
     ):
         calls = _refusing_ensure(monkeypatch, failures=1)
-        monkeypatch.setattr("airflow.settings.DASHBOARD_UIALERTS", [])
 
-        dashboard_alert.install_dashboard_alert()
+        dashboard_alert.cached_verdict()
         assert calls == ["failed"]
         assert not _has_heartbeat_table(db)
 
+        clock.advance(dashboard_alert._CACHE_SECONDS)
         dashboard_alert.cached_verdict()
 
         assert calls == ["failed", "created"]
@@ -180,27 +197,27 @@ class TestReadVerdict:
         assert dashboard_alert.cached_verdict().state is LivenessState.UNCONFIRMED
 
     def test_a_stamp_past_the_whole_threshold_is_stale(self, db, clock):
-        threshold = I + B + _VARIABLE_TIMEOUT + dashboard_alert._RECONCILE_TAIL
+        threshold = I + B + VARIABLE_TIMEOUT + views._RECONCILE_TAIL
         _add(db, _subscription(), _stamp(age_seconds=threshold + 1))
 
         assert dashboard_alert.cached_verdict().state is LivenessState.DOWN
 
     def test_a_stamp_at_the_threshold_is_still_fresh(self, db, clock):
-        threshold = I + B + _VARIABLE_TIMEOUT + dashboard_alert._RECONCILE_TAIL
+        threshold = I + B + VARIABLE_TIMEOUT + views._RECONCILE_TAIL
         _add(db, _subscription(), _stamp(age_seconds=threshold))
 
         assert dashboard_alert.cached_verdict().state is LivenessState.UNCONFIRMED
 
     def test_an_aware_stamp_is_compared_as_utc(self, db, monkeypatch):
+        # 30 s before T0, written as the wall time three hours west of UTC: only the
+        # conversion to UTC makes it fresh, its wall time alone is hours old
+        west = timezone(timedelta(hours=-3))
+        stamp = (T0 - timedelta(seconds=30)).replace(tzinfo=timezone.utc).astimezone(west)
         with sessionmaker(bind=db)() as session:
             monkeypatch.setattr(
-                session,
-                "query",
-                lambda *a: SimpleNamespace(
-                    scalar=lambda: (T0 - timedelta(seconds=30)).replace(tzinfo=timezone.utc)
-                ),
+                session, "query", lambda *a: SimpleNamespace(scalar=lambda: stamp)
             )
-            assert dashboard_alert._reconcile_is_fresh(session, T0) is True
+            assert views._reconcile_is_fresh(session, T0, I + B) is True
 
     def test_the_stamp_and_threshold_are_not_read_while_a_run_is_alive(
         self, db, clock, monkeypatch
@@ -211,12 +228,12 @@ class TestReadVerdict:
         def refuse():
             raise AssertionError("the threshold is read only without an alive run")
 
-        monkeypatch.setattr(dashboard_alert, "_stale_after", refuse)
+        monkeypatch.setattr(views, "_stale_after", refuse)
 
         verdict = dashboard_alert.cached_verdict()
 
         assert verdict.state is LivenessState.OK
-        assert [p.id for p in verdict.processes] == ["run-1"]
+        assert [p.hostname for p in verdict.processes] == ["scheduler-1"]
 
     def test_no_enabled_subscription_is_unused(self, db, clock):
         _add(db, _subscription(enabled=False), _stamp(age_seconds=3600))
@@ -226,7 +243,8 @@ class TestReadVerdict:
     def test_rows_older_than_the_window_are_not_read(self, db, clock):
         models.ensure_heartbeat_table()
         old = _alive_heartbeat()
-        old.last_cycle_at = T0 - dashboard_alert.HEARTBEAT_WINDOW - timedelta(minutes=1)
+        old.started_at = T0 - models.HEARTBEAT_WINDOW - timedelta(minutes=10)
+        old.last_cycle_at = T0 - models.HEARTBEAT_WINDOW - timedelta(minutes=1)
         old.due_at = old.last_cycle_at + timedelta(minutes=5)
         _add(db, _subscription(), old)
 
@@ -235,6 +253,21 @@ class TestReadVerdict:
         assert verdict.state is LivenessState.DOWN
         assert verdict.processes == ()
 
+    def test_a_row_within_its_deadline_is_read_whatever_its_last_mark(self, db, clock):
+        """A run whose budget is longer than the window marks less often than once a
+        window: its deadline still ahead keeps it counting."""
+        models.ensure_heartbeat_table()
+        slow = _alive_heartbeat()
+        slow.started_at = T0 - models.HEARTBEAT_WINDOW - timedelta(hours=2)
+        slow.last_cycle_at = T0 - models.HEARTBEAT_WINDOW - timedelta(hours=1)
+        slow.due_at = T0 + timedelta(hours=1)
+        _add(db, _subscription(), slow)
+
+        verdict = dashboard_alert.cached_verdict()
+
+        assert verdict.state is LivenessState.OK
+        assert [p.hostname for p in verdict.processes] == ["scheduler-1"]
+
 
 class TestCache:
     def test_the_database_is_not_read_again_within_the_period(self, clock, monkeypatch):
@@ -242,7 +275,7 @@ class TestCache:
 
         def read():
             reads.append(1)
-            return assess_liveness([], T0, True, False)
+            return _never_fresh()
 
         monkeypatch.setattr(dashboard_alert, "_read_verdict", read)
 
@@ -278,14 +311,39 @@ class TestCache:
             warnings = [r for r in caplog.records if "failed to read" in r.getMessage()]
             assert len(warnings) == 2
 
-    def test_the_cache_entry_is_one_immutable_pair(self, clock, monkeypatch):
-        verdict = assess_liveness([], T0, True, False)
-        monkeypatch.setattr(dashboard_alert, "_read_verdict", lambda: verdict)
+    def test_one_request_reads_an_expired_cache_and_the_others_take_its_verdict(
+        self, monkeypatch
+    ):
+        requests = 8
+        barrier = threading.Barrier(requests)
+        reading = threading.Event()
+        release = threading.Event()
+        reads: list[int] = []
 
-        dashboard_alert.cached_verdict()
+        def slow_read():
+            reads.append(1)
+            reading.set()
+            release.wait(timeout=5)
+            return _never_fresh()
 
-        assert dashboard_alert._cache == (clock.now + dashboard_alert._CACHE_SECONDS, verdict)
-        assert isinstance(dashboard_alert._cache, tuple)
+        monkeypatch.setattr(dashboard_alert, "_read_verdict", slow_read)
+        results: list = []
+
+        def request() -> None:
+            barrier.wait(timeout=5)
+            results.append(dashboard_alert.cached_verdict())
+
+        threads = [threading.Thread(target=request) for _ in range(requests)]
+        for thread in threads:
+            thread.start()
+        assert reading.wait(timeout=5)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert len(reads) == 1
+        assert len(results) == requests
+        assert all(result is results[0] for result in results)
 
 
 # ---------------------------------------------------------------------------
@@ -309,15 +367,15 @@ def _row(**overrides):
 
 def _verdict(state: LivenessState):
     if state is LivenessState.UNUSED:
-        return assess_liveness([], T0, False, False)
+        return assess_liveness([], T0, False, _no)
     if state is LivenessState.OK:
-        return assess_liveness([_row()], T0, True, False)
+        return assess_liveness([_row()], T0, True, _no)
     if state is LivenessState.STARTING:
-        return assess_liveness([_row(last_cycle_at=None)], T0, True, False)
+        return assess_liveness([_row(last_cycle_at=None)], T0, True, _no)
     if state is LivenessState.UNCONFIRMED:
-        return assess_liveness([], T0, True, True)
+        return assess_liveness([], T0, True, _yes)
     return assess_liveness(
-        [_row(stopped_at=T0 - timedelta(minutes=2))], T0, True, False
+        [_row(stopped_at=T0 - timedelta(minutes=2))], T0, True, _no
     )
 
 
@@ -367,20 +425,34 @@ class TestAlert:
             assert alert.should_show(appbuilder=SimpleNamespace()) is True
 
     def test_down_renders_as_an_error_with_a_real_link(self, app, alert, monkeypatch):
+        """Rendered the way Airflow's home page renders its alerts: through
+        ``show_message`` of ``airflow/_messages.html``, with autoescaping on."""
+        import airflow
+        from jinja2 import FileSystemLoader
+
+        app.jinja_loader = FileSystemLoader(
+            str(Path(airflow.__file__).parent / "www" / "templates")
+        )
         _answer_with(monkeypatch, _verdict(LivenessState.DOWN))
+        page = (
+            "{% from 'airflow/_messages.html' import show_message %}"
+            "{% for m in dashboard_alerts %}"
+            "{{ show_message(m.message, m.category) }}"
+            "{% endfor %}"
+        )
 
         with app.test_request_context("/home", base_url="http://airflow.local/airflow"):
-            alert.should_show(SimpleNamespace())
+            shown = [a for a in [alert] if a.should_show(SimpleNamespace())]
             message = alert.message
-            category = alert.category
-            rendered = flask.render_template_string("{{ m }}", m=message)
+            rendered = flask.render_template_string(page, dashboard_alerts=shown)
 
         assert isinstance(message, Markup)
-        assert category == "error"
+        assert alert.category == "error"
+        assert '<div class="alert alert-error">' in rendered
         link = '<a href="/airflow/rmq-watcher/subscriptions">RMQ Subscriptions</a>'
         assert link in message
         assert link in rendered
-        assert "stopped at 2026-11-17 11:58:00 UTC" in message
+        assert "stopped at 2026-11-17 11:58:00 UTC" in rendered
 
     def test_the_substituted_time_is_escaped(self, app, alert, monkeypatch):
         _answer_with(monkeypatch, _verdict(LivenessState.DOWN))
@@ -402,6 +474,9 @@ class TestAlert:
             message = alert.message
 
         assert f'<a href="{liveness.SUBSCRIPTIONS_PATH}">' in message
+
+    def test_outside_a_request_the_link_is_the_page_path(self):
+        assert views.subscriptions_link() == liveness.SUBSCRIPTIONS_PATH
 
     def test_message_and_category_read_the_request_and_not_the_database(
         self, app, alert, monkeypatch
@@ -437,9 +512,7 @@ class TestAlert:
     def test_a_request_without_a_decision_renders_nothing(self, app, alert):
         with app.test_request_context("/home"):
             assert alert.message == Markup("")
-            assert alert.category == "info"
         assert alert.message == Markup("")
-        assert alert.category == "info"
 
     def test_a_failed_read_hides_the_banner_without_an_exception(
         self, app, alert, clock, monkeypatch
@@ -452,7 +525,6 @@ class TestAlert:
         with app.test_request_context("/home"):
             assert alert.should_show(SimpleNamespace()) is False
             assert alert.message == Markup("")
-            assert alert.category == "info"
 
     def test_any_failure_of_the_decision_hides_the_banner(
         self, app, alert, monkeypatch, caplog
@@ -478,7 +550,7 @@ class TestAlert:
 @pytest.fixture
 def no_ddl(monkeypatch):
     calls: list[int] = []
-    monkeypatch.setattr(dashboard_alert, "ensure_heartbeat_table", lambda: calls.append(1))
+    monkeypatch.setattr(views, "ensure_heartbeat_table", lambda: calls.append(1))
     return calls
 
 
@@ -516,24 +588,16 @@ class TestInstall:
         assert alerts[:2] == [first, second]
         assert len(_ours(alerts)) == 1
 
-    def test_installation_creates_the_heartbeat_table(self, schema_engine, monkeypatch):
-        monkeypatch.setattr("airflow.settings.DASHBOARD_UIALERTS", [])
-
-        dashboard_alert.install_dashboard_alert()
-
-        assert _has_heartbeat_table(schema_engine)
-
-    def test_a_failed_creation_still_installs_the_banner(self, monkeypatch, caplog):
+    def test_installation_reads_no_database(self, monkeypatch, no_ddl):
         from airflow import settings
 
         def refuse():
-            raise RuntimeError("permission denied")
+            raise AssertionError("installation opens no session")
 
-        monkeypatch.setattr(dashboard_alert, "ensure_heartbeat_table", refuse)
         monkeypatch.setattr(settings, "DASHBOARD_UIALERTS", [])
+        monkeypatch.setattr(dashboard_alert, "WatcherSession", refuse)
 
-        with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            dashboard_alert.install_dashboard_alert()
+        dashboard_alert.install_dashboard_alert()
 
         assert len(_ours(settings.DASHBOARD_UIALERTS)) == 1
-        assert "failed to create the rmq_watcher_heartbeat table" in caplog.text
+        assert no_ddl == []

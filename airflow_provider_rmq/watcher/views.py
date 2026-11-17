@@ -10,28 +10,39 @@ from typing import Any
 from flask import flash, redirect, request, url_for
 from flask_appbuilder import BaseView, expose
 from flask_appbuilder.security.decorators import has_access
-from markupsafe import Markup
+from sqlalchemy import exists
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
+from werkzeug.routing import BuildError
 
 from airflow_provider_rmq.watcher.liveness import (
+    SUBSCRIPTIONS_PATH,
     LivenessVerdict,
     ProcessRow,
     ProcessState,
+    assess_liveness,
     banner_text,
     masks_statuses,
 )
 from airflow_provider_rmq.watcher.models import (
+    RMQConnStatus,
     RMQSubscription,
     WatcherSession,
+    ensure_heartbeat_table,
     get_active_dag_ids,
     get_conn_statuses,
+    get_heartbeats,
+    is_heartbeat_table_ready,
+    naive_utc,
     upsert_subscription,
+    utcnow,
 )
 from airflow_provider_rmq.watcher.subscription_form import parse_cooldown, parse_filter_data
 from airflow_provider_rmq.watcher.tunables import (
     CYCLE_TIMEOUT_VAR,
     DEFAULT_RECONCILE_INTERVAL,
     RECONCILE_INTERVAL_VAR,
+    VARIABLE_TIMEOUT,
     cycle_timeout,
     read_positive,
     stale_after,
@@ -386,6 +397,14 @@ UNCONFIRMED_NOTE = (
     "watcher banner once that stamp goes stale."
 )
 
+#: Seconds of a cycle's work after its ``last_reconcile_at`` stamp: writing the
+#: subscription statuses and the heartbeat. A stamp is fresh while it is younger than the
+#: page's staleness threshold plus the Variable read and this tail.
+_RECONCILE_TAIL = 60.0
+
+#: Endpoint of this page, which the watcher banner links to.
+_SUBSCRIPTIONS_ENDPOINT = "RMQWatcherView.subscriptions"
+
 
 def _format_utc(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
@@ -396,7 +415,7 @@ class WatcherProcessRow:
     """One row of the Watcher processes table, formatted for display.
 
     Times are UTC. ``due_display`` is an em dash for a run stopped in an orderly way:
-    its deadline no longer bears on anything.
+    the deadline of a stopped run bears on nothing.
     """
 
     hostname: str
@@ -429,21 +448,78 @@ def _build_process_rows(processes: Iterable[ProcessRow]) -> list[WatcherProcessR
     ]
 
 
-def _read_liveness() -> LivenessVerdict | None:
+def _reconcile_is_fresh(session: Session, now: datetime, stale_seconds: float) -> bool:
+    """Whether the latest ``last_reconcile_at`` of any conn_id is still fresh at ``now``.
+
+    Fresh means at most ``stale_seconds`` — the page's staleness threshold — plus
+    :data:`~.tunables.VARIABLE_TIMEOUT` plus :data:`_RECONCILE_TAIL` old. No stamp at
+    all is not fresh.
+    """
+    latest = session.query(func.max(RMQConnStatus.last_reconcile_at)).scalar()
+    if latest is None:
+        return False
+    threshold = stale_seconds + VARIABLE_TIMEOUT + _RECONCILE_TAIL
+    return (now - naive_utc(latest)).total_seconds() <= threshold
+
+
+def read_liveness(
+    session: Session, now: datetime, stale_seconds: float | None = None
+) -> LivenessVerdict:
+    """Read the facts the verdict needs and assess it.
+
+    The heartbeat table is created first while this process has not yet seen it exist.
+    When that fails the verdict is assessed without heartbeat rows, from the
+    ``last_reconcile_at`` stamp alone, so a failed DDL does not hide a watcher that is
+    down. The stamp — and the staleness threshold, unless the caller passes the one it
+    has already read as ``stale_seconds`` — are read only when no run is alive.
+
+    Blocking — it queries the metadata database; a failed read propagates.
+    """
+    if not is_heartbeat_table_ready():
+        try:
+            ensure_heartbeat_table()
+        except Exception:
+            log.warning(
+                "RMQ Watcher: failed to create the rmq_watcher_heartbeat table — the "
+                "watcher liveness is judged by last_reconcile_at alone",
+                exc_info=True,
+            )
+    rows = get_heartbeats(session, now) if is_heartbeat_table_ready() else []
+    has_enabled = session.query(exists().where(RMQSubscription.enabled.is_(True))).scalar()
+
+    def has_fresh_reconcile() -> bool:
+        threshold = _stale_after() if stale_seconds is None else stale_seconds
+        return _reconcile_is_fresh(session, now, threshold)
+
+    return assess_liveness(
+        rows,
+        now,
+        has_enabled_subscriptions=bool(has_enabled),
+        has_fresh_reconcile=has_fresh_reconcile,
+    )
+
+
+def subscriptions_link() -> str:
+    """URL of the Subscriptions page under the web UI's own base URL.
+
+    An application without the page's endpoint, or a call outside a request, gets the
+    page's path as the provider registers it.
+    """
+    try:
+        return url_for(_SUBSCRIPTIONS_ENDPOINT)
+    except (BuildError, RuntimeError):
+        return SUBSCRIPTIONS_PATH
+
+
+def _read_liveness(stale_seconds: float | None) -> LivenessVerdict | None:
     """The watcher liveness as of now, or ``None`` when the database cannot give it.
 
     Read in a session of its own, so a failed read leaves the rows the page has
-    already loaded untouched. The heartbeat rows are those of the last
-    :data:`~.dashboard_alert.HEARTBEAT_WINDOW`.
+    already loaded untouched.
     """
-    # dashboard_alert imports this module, so it is imported where it is used
-    from airflow_provider_rmq.watcher import dashboard_alert
-
     try:
         with WatcherSession() as session:
-            return dashboard_alert.read_liveness(
-                session, datetime.now(timezone.utc).replace(tzinfo=None)
-            )
+            return read_liveness(session, utcnow(), stale_seconds)
     except Exception:
         log.warning(
             "Failed to read the watcher liveness — the Watcher processes block is "
@@ -452,13 +528,6 @@ def _read_liveness() -> LivenessVerdict | None:
             exc_info=True,
         )
         return None
-
-
-def _liveness_banner(verdict: LivenessVerdict) -> Markup | None:
-    """The home page's watcher banner for ``verdict``, linking to this page."""
-    from airflow_provider_rmq.watcher import dashboard_alert
-
-    return banner_text(verdict, link=dashboard_alert.subscriptions_link())
 
 
 class RMQWatcherView(BaseView):
@@ -524,10 +593,12 @@ class RMQWatcherView(BaseView):
             stale_seconds = _stale_after()
             conn_status_rows = _build_conn_status_rows(conn_statuses, stale_seconds)
 
-        liveness = _read_liveness()
+        liveness = _read_liveness(stale_seconds if conn_statuses else None)
         liveness_error = LIVENESS_UNAVAILABLE_MESSAGE if liveness is None else None
         mask_statuses = liveness is not None and masks_statuses(liveness)
-        liveness_banner = _liveness_banner(liveness) if mask_statuses else None
+        liveness_banner = (
+            banner_text(liveness, link=subscriptions_link()) if mask_statuses else None
+        )
 
         # Separate session, opened only after the one above has closed:
         # render_template() below reads `rows`/`subs` as detached objects, and

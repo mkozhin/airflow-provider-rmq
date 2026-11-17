@@ -20,10 +20,12 @@ from __future__ import annotations
 import enum
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from markupsafe import Markup
+
+from airflow_provider_rmq.watcher.models import naive_utc
 
 #: Path of the Subscriptions page, which every banner text links to for the details.
 SUBSCRIPTIONS_PATH = "/rmq-watcher/subscriptions"
@@ -68,11 +70,9 @@ class ProcessRow:
     never negative.
     """
 
-    id: str
     hostname: str
     pid: int
     started_at: datetime
-    last_cycle_at: datetime | None
     due_at: datetime
     stopped_at: datetime | None
     last_mark: datetime
@@ -93,28 +93,16 @@ class LivenessVerdict:
     processes: tuple[ProcessRow, ...]
     latest_mark: datetime | None
     latest_is_stop: bool
-    assessed_at: datetime
-
-
-def _naive_utc(value: datetime) -> datetime:
-    """``value`` as naive UTC, which is how the watcher process writes its times.
-
-    A database driver may hand back an aware datetime; comparing it with a naive one
-    raises ``TypeError``, so an aware value is converted first.
-    """
-    if value.tzinfo is not None:
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
-    return value
 
 
 def _optional_naive_utc(value: datetime | None) -> datetime | None:
-    return None if value is None else _naive_utc(value)
+    return None if value is None else naive_utc(value)
 
 
 def _assess_row(row: Any, now: datetime) -> ProcessRow:
-    started_at = _naive_utc(row.started_at)
+    started_at = naive_utc(row.started_at)
     last_cycle_at = _optional_naive_utc(row.last_cycle_at)
-    due_at = _naive_utc(row.due_at)
+    due_at = naive_utc(row.due_at)
     stopped_at = _optional_naive_utc(row.stopped_at)
     last_mark = stopped_at or last_cycle_at or started_at
     if stopped_at is not None:
@@ -126,11 +114,9 @@ def _assess_row(row: Any, now: datetime) -> ProcessRow:
     else:
         state = ProcessState.STARTING
     return ProcessRow(
-        id=row.id,
         hostname=row.hostname,
         pid=row.pid,
         started_at=started_at,
-        last_cycle_at=last_cycle_at,
         due_at=due_at,
         stopped_at=stopped_at,
         last_mark=last_mark,
@@ -143,7 +129,7 @@ def assess_liveness(
     heartbeats: Iterable[Any],
     now: datetime,
     has_enabled_subscriptions: bool,
-    has_fresh_reconcile: bool | Callable[[], bool],
+    has_fresh_reconcile: Callable[[], bool],
 ) -> LivenessVerdict:
     """Decide whether any watcher run confirms that subscriptions are consumed.
 
@@ -157,11 +143,11 @@ def assess_liveness(
         object with the same attributes.
     :param now: The moment of assessment; naive UTC, an aware value is converted.
     :param has_enabled_subscriptions: Whether any subscription is enabled.
-    :param has_fresh_reconcile: Whether the latest ``last_reconcile_at`` is fresh, or a
-        callable answering that. A callable is called only when no run is alive, so
-        the stamp is read only when the verdict depends on it.
+    :param has_fresh_reconcile: Answers whether the latest ``last_reconcile_at`` is
+        fresh. It is called only when no run is alive, so the stamp is read only when
+        the verdict depends on it.
     """
-    now = _naive_utc(now)
+    now = naive_utc(now)
     processes = tuple(
         sorted(
             (_assess_row(row, now) for row in heartbeats),
@@ -179,7 +165,7 @@ def assess_liveness(
     elif alive:
         state = LivenessState.STARTING
     else:
-        fresh = has_fresh_reconcile() if callable(has_fresh_reconcile) else has_fresh_reconcile
+        fresh = has_fresh_reconcile()
         state = LivenessState.UNCONFIRMED if fresh else LivenessState.DOWN
 
     return LivenessVerdict(
@@ -187,7 +173,6 @@ def assess_liveness(
         processes=processes,
         latest_mark=latest.last_mark if latest else None,
         latest_is_stop=latest is not None and latest.stopped_at is not None,
-        assessed_at=now,
     )
 
 

@@ -33,16 +33,15 @@ from airflow_provider_rmq.watcher.tunables import (
 
 @pytest.fixture(autouse=True)
 def dashboard_alerts(monkeypatch):
-    """Airflow's list of home-page alerts, empty for every test, and no heartbeat DDL.
+    """Airflow's list of home-page alerts, empty for every test.
 
     Registering the blueprint in an application that serves the web UI installs the
-    watcher banner into ``airflow.settings.DASHBOARD_UIALERTS`` and creates the
-    heartbeat table; each test gets its own list and no database.
+    watcher banner into ``airflow.settings.DASHBOARD_UIALERTS``; each test gets its own
+    list.
     """
     from airflow import settings
 
     monkeypatch.setattr(settings, "DASHBOARD_UIALERTS", [])
-    monkeypatch.setattr(dashboard_alert, "ensure_heartbeat_table", lambda: None)
     return settings
 
 
@@ -929,6 +928,22 @@ class TestPluginImportFootprint:
             "import sys\n"
             "import airflow_provider_rmq.watcher.plugin\n"
             "print('airflow.www.utils' in sys.modules)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().splitlines()[-1] == "False"
+
+    def test_importing_the_plugin_leaves_the_banner_module_unloaded(self):
+        """The banner's module serves the web UI only; the plugin imports it from the
+        blueprint callback the webserver runs, so the scheduler process never loads it."""
+        probe = (
+            "import sys\n"
+            "import airflow_provider_rmq.watcher.plugin\n"
+            "print('airflow_provider_rmq.watcher.dashboard_alert' in sys.modules)\n"
         )
         result = subprocess.run(
             [sys.executable, "-c", probe],

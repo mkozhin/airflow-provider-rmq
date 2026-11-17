@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -14,6 +15,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    case,
+    inspect,
+    or_,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -22,6 +26,22 @@ from sqlalchemy.sql import func
 log = logging.getLogger(__name__)
 
 WatcherBase = declarative_base()
+
+
+def utcnow() -> datetime:
+    """The current time as naive UTC, the form every watcher timestamp is stored in."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def naive_utc(value: datetime) -> datetime:
+    """``value`` as naive UTC, the form every watcher timestamp is stored in.
+
+    A database driver may hand back an aware datetime; comparing it with a naive one
+    raises ``TypeError``, so an aware value is converted first.
+    """
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 class RMQSubscription(WatcherBase):
@@ -121,11 +141,6 @@ class RMQWatcherHeartbeat(HeartbeatBase):
     # set by an orderly stop only
     stopped_at = Column(DateTime, nullable=True)
 
-    @property
-    def last_mark(self) -> datetime:
-        """The row's latest mark: ``stopped_at``, else ``last_cycle_at``, else ``started_at``."""
-        return self.stopped_at or self.last_cycle_at or self.started_at
-
 
 #: Marker for an argument the caller left out, which ``None`` cannot express here:
 #: ``None`` is itself a meaningful value for the nullable columns below. Callers pass
@@ -208,6 +223,7 @@ def ensure_table_exists() -> None:
 
 
 _heartbeat_ready = False
+_heartbeat_lock = threading.Lock()
 
 
 def is_heartbeat_table_ready() -> bool:
@@ -218,16 +234,26 @@ def is_heartbeat_table_ready() -> bool:
 def ensure_heartbeat_table() -> None:
     """Create ``rmq_watcher_heartbeat`` if it is missing.
 
-    Safe to call multiple times: once a call succeeds the table is marked ready and
-    further calls return immediately. A failure propagates and leaves the flag unset,
-    so the next call tries again.
+    Safe to call multiple times and from several threads: the threads of one process
+    create the table one at a time, and once a call succeeds the table is marked ready
+    and further calls return immediately. A creation that fails while the table exists
+    afterwards — another process created it between the check and the ``CREATE`` —
+    counts as a success. Any other failure propagates and leaves the flag unset, so the
+    next call tries again.
     """
     global _heartbeat_ready
     if _heartbeat_ready:
         return
     from airflow.settings import engine
-    HeartbeatBase.metadata.create_all(engine, checkfirst=True)
-    _heartbeat_ready = True
+    with _heartbeat_lock:
+        if _heartbeat_ready:
+            return
+        try:
+            HeartbeatBase.metadata.create_all(engine, checkfirst=True)
+        except Exception:
+            if not inspect(engine).has_table(RMQWatcherHeartbeat.__tablename__):
+                raise
+        _heartbeat_ready = True
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +404,17 @@ def get_active_dag_ids(session: Session) -> set[str]:
 # Heartbeat writes — each call is its own transaction and commits it
 # ---------------------------------------------------------------------------
 
+#: How long a row past its deadline keeps counting after its last mark: the verdict
+#: and the Subscriptions page read such rows for this long, and a living watcher
+#: deletes other runs' rows once it is over.
+HEARTBEAT_WINDOW = timedelta(days=1)
+
+#: Most heartbeat rows :func:`get_heartbeats` returns. A Scheduler that keeps
+#: restarting adds a row per restart; the rows within their deadline come first, so
+#: the limit only drops the oldest of the others.
+HEARTBEAT_ROWS_LIMIT = 50
+
+
 def _identity_values(identity: WatcherIdentity) -> dict[str, Any]:
     return {
         "hostname": identity.hostname,
@@ -399,10 +436,10 @@ def _upsert_heartbeat(session: Session, identity: WatcherIdentity, **fields: Any
     """Write ``fields`` and the identity onto the row of ``identity`` and commit.
 
     Columns outside ``fields`` keep what the row holds; a row that does not exist yet
-    is inserted with them empty. An INSERT that fails on ``IntegrityError`` means
-    another writer committed the same row in between: the INSERT is rolled back and
-    the same values go in as an UPDATE, so the write lands on that row instead of
-    being lost.
+    is inserted with them empty. An INSERT that fails on ``IntegrityError`` while the
+    row exists — another writer committed it in between — is rolled back and the same
+    values go in as an UPDATE, so the write lands on that row instead of being lost.
+    An ``IntegrityError`` with no row behind it is a failed write and propagates.
     """
     values = {**_identity_values(identity), **fields}
     if _update_heartbeat(session, identity.id, values) == 0:
@@ -412,24 +449,19 @@ def _upsert_heartbeat(session: Session, identity: WatcherIdentity, **fields: Any
             )
         except IntegrityError:
             session.rollback()
-            _update_heartbeat(session, identity.id, values)
+            if _update_heartbeat(session, identity.id, values) == 0:
+                raise
     session.commit()
 
 
-def record_heartbeat_start(
+def record_heartbeat_deadline(
     session: Session, identity: WatcherIdentity, due_at: datetime,
 ) -> None:
-    """Record the start of a watcher run with its first deadline. Commits.
+    """Record a deadline for the run's next mark without a completed cycle. Commits.
 
-    ``last_cycle_at`` and ``stopped_at`` keep what the row already holds.
+    The start of a run is recorded this way too. ``last_cycle_at`` and ``stopped_at``
+    keep what the row already holds.
     """
-    _upsert_heartbeat(session, identity, due_at=due_at)
-
-
-def record_heartbeat_due(
-    session: Session, identity: WatcherIdentity, due_at: datetime,
-) -> None:
-    """Record a new deadline without a completed cycle. Commits."""
     _upsert_heartbeat(session, identity, due_at=due_at)
 
 
@@ -455,6 +487,7 @@ def record_heartbeat_stop(
 
 
 def _last_mark_column():
+    """A row's latest mark: ``stopped_at``, else ``last_cycle_at``, else ``started_at``."""
     return func.coalesce(
         RMQWatcherHeartbeat.stopped_at,
         RMQWatcherHeartbeat.last_cycle_at,
@@ -462,16 +495,19 @@ def _last_mark_column():
     )
 
 
-def prune_heartbeats(session: Session, keep_id: str, older_than: datetime) -> int:
-    """Delete other runs' rows whose last mark is older than ``older_than``. Commits.
+def prune_heartbeats(session: Session, keep_id: str, now: datetime) -> int:
+    """Delete other runs' rows that are past their deadline and were last marked more
+    than :data:`HEARTBEAT_WINDOW` before ``now``. Commits.
 
-    The row ``keep_id`` stays whatever its age. Returns the deleted count.
+    The row ``keep_id`` stays whatever its age, and so does a row whose deadline is
+    still ahead. Returns the deleted count.
     """
     deleted = (
         session.query(RMQWatcherHeartbeat)
         .filter(
             RMQWatcherHeartbeat.id != keep_id,
-            _last_mark_column() < older_than,
+            RMQWatcherHeartbeat.due_at < now,
+            _last_mark_column() < now - HEARTBEAT_WINDOW,
         )
         .delete(synchronize_session=False)
     )
@@ -479,11 +515,23 @@ def prune_heartbeats(session: Session, keep_id: str, older_than: datetime) -> in
     return deleted
 
 
-def get_heartbeats(session: Session, since: datetime) -> list[RMQWatcherHeartbeat]:
-    """Return rows whose last mark is at or after ``since``, latest mark first."""
+def get_heartbeats(session: Session, now: datetime) -> list[RMQWatcherHeartbeat]:
+    """Return the rows that count at ``now``.
+
+    Every row whose deadline is still ahead (``due_at >= now``), then the rows past
+    their deadline that were last marked within :data:`HEARTBEAT_WINDOW` of ``now``,
+    latest mark first — at most :data:`HEARTBEAT_ROWS_LIMIT` rows in all.
+    """
+    current = case((RMQWatcherHeartbeat.due_at >= now, 0), else_=1)
     return (
         session.query(RMQWatcherHeartbeat)
-        .filter(_last_mark_column() >= since)
-        .order_by(_last_mark_column().desc())
+        .filter(
+            or_(
+                RMQWatcherHeartbeat.due_at >= now,
+                _last_mark_column() >= now - HEARTBEAT_WINDOW,
+            )
+        )
+        .order_by(current, _last_mark_column().desc())
+        .limit(HEARTBEAT_ROWS_LIMIT)
         .all()
     )

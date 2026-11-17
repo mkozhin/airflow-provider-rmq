@@ -8,7 +8,6 @@ from airflow.plugins_manager import AirflowPlugin
 
 log = logging.getLogger(__name__)
 
-from airflow_provider_rmq.watcher import dashboard_alert
 from airflow_provider_rmq.watcher.listener import RMQWatcherListener
 from airflow_provider_rmq.watcher.models import ensure_table_exists
 from airflow_provider_rmq.watcher.tunables import (
@@ -232,6 +231,10 @@ def _install_liveness_alert(state) -> None:
         )
         return
     try:
+        # imported here: the module serves the web UI only, and the scheduler process,
+        # which loads this plugin too, has no use for it
+        from airflow_provider_rmq.watcher import dashboard_alert
+
         dashboard_alert.install_dashboard_alert()
     except Exception:
         log.warning(
