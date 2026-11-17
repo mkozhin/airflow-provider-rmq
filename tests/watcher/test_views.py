@@ -22,7 +22,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from airflow_provider_rmq.watcher.models import RMQSubscription, WatcherBase
+from airflow_provider_rmq.watcher.liveness import LivenessState, assess_liveness
+from airflow_provider_rmq.watcher.models import (
+    RMQSubscription,
+    RMQWatcherHeartbeat,
+    WatcherBase,
+    ensure_heartbeat_table,
+)
 from tests.watcher.conftest import SUBSCRIPTIONS_DDL_PRE_MIGRATION
 
 # ---------------------------------------------------------------------------
@@ -40,15 +46,18 @@ if "airflow_provider_rmq.watcher.views" in sys.modules:
 
 from airflow_provider_rmq.watcher.views import (  # noqa: E402
     DEFAULT_RECONCILE_INTERVAL,
+    LIVENESS_UNAVAILABLE_MESSAGE,
     SCHEMA_OUTDATED_MESSAGE,
     SHARED_QUEUE_ACK_WARNING,
     SHARED_QUEUE_WARNING,
     SUBSCRIPTIONS_SCHEMA_OUTDATED_MESSAGE,
+    UNCONFIRMED_NOTE,
     ConnStatusRow,
     RMQWatcherView,
     SubscriptionGroup,
     _build_conn_status_rows,
     _group_subscriptions,
+    _read_liveness,
     _reconcile_interval,
     _stale_after,
 )
@@ -114,6 +123,10 @@ def _naive_utc_ago(seconds: float) -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=seconds)
 
 
+#: Reference moment of the liveness tests, naive UTC like the times the watcher writes.
+_T0 = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+
+
 def _session_ctx(first_sub=None, subs=None):
     """Return (ctx, session) mock pair for WatcherSession."""
     session = MagicMock()
@@ -144,6 +157,20 @@ def view():
     v = RMQWatcherView()
     v.render_template = MagicMock(return_value="<html>mocked</html>")
     return v
+
+
+@pytest.fixture(autouse=True)
+def unused_liveness(monkeypatch):
+    """Every page request reads a verdict of no enabled subscriptions and no runs.
+
+    The watcher liveness is read in a session of its own; a test about the page's
+    other blocks keeps its session mocks to the blocks it is about. Tests of the
+    liveness block set their own verdict over this one.
+    """
+    monkeypatch.setattr(
+        "airflow_provider_rmq.watcher.views._read_liveness",
+        lambda: assess_liveness([], _T0, False, False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2726,3 +2753,293 @@ class TestAckUnmatchedFormTemplate:
             sub=_make_single_row(), is_dag_file=True
         )
         assert "disabled" not in _form_field(html, "enabled")
+
+
+# ---------------------------------------------------------------------------
+# Watcher processes block and the statuses it vouches for
+# ---------------------------------------------------------------------------
+
+def _heartbeat(**overrides) -> SimpleNamespace:
+    """A heartbeat row of a run alive at :data:`_T0` with a completed cycle."""
+    values = {
+        "id": "run-1",
+        "hostname": "scheduler-1",
+        "pid": 4242,
+        "started_at": _T0 - timedelta(minutes=10),
+        "last_cycle_at": _T0 - timedelta(minutes=1),
+        "due_at": _T0 + timedelta(minutes=5),
+        "stopped_at": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _dead_heartbeat(**overrides) -> SimpleNamespace:
+    values = {
+        "id": "run-0",
+        "hostname": "scheduler-2",
+        "pid": 77,
+        "started_at": _T0 - timedelta(hours=3),
+        "last_cycle_at": _T0 - timedelta(hours=2),
+        "due_at": _T0 - timedelta(hours=1),
+    }
+    values.update(overrides)
+    return _heartbeat(**values)
+
+
+def _liveness(state: LivenessState):
+    """A verdict in ``state``, assessed at :data:`_T0`."""
+    if state is LivenessState.UNUSED:
+        return assess_liveness([], _T0, False, False)
+    if state is LivenessState.OK:
+        return assess_liveness([_heartbeat()], _T0, True, False)
+    if state is LivenessState.STARTING:
+        return assess_liveness([_heartbeat(last_cycle_at=None)], _T0, True, False)
+    if state is LivenessState.UNCONFIRMED:
+        return assess_liveness([], _T0, True, True)
+    return assess_liveness([_dead_heartbeat()], _T0, True, False)
+
+
+def _page_kwargs(app, view, monkeypatch, verdict, *, subs=(), conn_statuses=()):
+    """Request the page with ``verdict`` as the liveness; return its template kwargs."""
+    monkeypatch.setattr(
+        "airflow_provider_rmq.watcher.views._read_liveness", lambda: verdict
+    )
+    ctx, _ = _session_ctx(subs=list(subs))
+    with app.test_request_context("/subscriptions"), \
+         patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+         patch(
+             "airflow_provider_rmq.watcher.views.get_conn_statuses",
+             return_value=list(conn_statuses),
+         ), \
+         patch("airflow_provider_rmq.watcher.views._stale_after", return_value=360.0), \
+         patch("airflow_provider_rmq.watcher.views.get_active_dag_ids", return_value=None):
+        view.subscriptions()
+    return view.render_template.call_args.kwargs
+
+
+def _render_page(kwargs) -> str:
+    """Feed the view's own kwargs to the real template."""
+    return _render_subscriptions_html(
+        kwargs["subscriptions"],
+        **{k: v for k, v in kwargs.items() if k != "subscriptions"},
+    )
+
+
+def _normalized(html: str) -> str:
+    return re.sub(r"\s+", " ", html)
+
+
+def _process_rows_html(html: str) -> list[str]:
+    """The ``<tr>`` rows of the Watcher processes table."""
+    normalized = _normalized(html)
+    block = normalized.split("<h4>Watcher processes</h4>", 1)[1].split("<h4>Connections</h4>", 1)[0]
+    return re.findall(r"<tr[^>]*>.*?</tr>", block.split("<tbody>", 1)[1]) if "<tbody>" in block else []
+
+
+class TestWatcherProcessesBlock:
+    def test_one_alive_process_is_listed(self, app, view, monkeypatch):
+        kwargs = _page_kwargs(app, view, monkeypatch, _liveness(LivenessState.OK))
+
+        [row] = kwargs["watcher_processes"]
+        assert (row.hostname, row.pid, row.state) == ("scheduler-1", 4242, "alive")
+        assert row.started_display == "2026-11-17 11:50:00"
+        assert row.last_mark_display == "2026-11-17 11:59:00"
+        assert row.age_display == "1m"
+        assert row.due_display == "2026-11-17 12:05:00"
+        assert not row.is_dead
+        assert kwargs["liveness_state"] == "ok"
+        assert kwargs["liveness_error"] is None
+
+    def test_several_processes_are_listed_latest_mark_first(self, app, view, monkeypatch):
+        verdict = assess_liveness(
+            [
+                _dead_heartbeat(),
+                _heartbeat(),
+                _heartbeat(
+                    id="run-2",
+                    hostname="scheduler-3",
+                    pid=5,
+                    last_cycle_at=_T0 - timedelta(minutes=30),
+                    stopped_at=_T0 - timedelta(minutes=20),
+                ),
+            ],
+            _T0,
+            True,
+            False,
+        )
+        kwargs = _page_kwargs(app, view, monkeypatch, verdict)
+
+        rows = kwargs["watcher_processes"]
+        assert [(r.hostname, r.state) for r in rows] == [
+            ("scheduler-1", "alive"),
+            ("scheduler-3", "stopped"),
+            ("scheduler-2", "dead"),
+        ]
+        assert [r.is_dead for r in rows] == [False, False, True]
+        assert rows[1].due_display == "—"
+        assert rows[1].last_mark_display == "2026-11-17 11:40:00"
+        assert rows[2].age_display == "2h 0m"
+
+    def test_the_dead_row_is_highlighted_and_the_alive_one_is_not(self, app, view, monkeypatch):
+        verdict = assess_liveness([_heartbeat(), _dead_heartbeat()], _T0, True, False)
+        html = _render_page(_page_kwargs(app, view, monkeypatch, verdict))
+
+        alive_row, dead_row = _process_rows_html(html)
+        assert "scheduler-1" in alive_row and 'class="danger"' not in alive_row
+        assert "● alive" in alive_row
+        assert "scheduler-2" in dead_row and dead_row.startswith('<tr class="danger">')
+        assert "✕ dead" in dead_row
+
+    def test_a_starting_process_renders_its_own_label(self, app, view, monkeypatch):
+        html = _render_page(
+            _page_kwargs(app, view, monkeypatch, _liveness(LivenessState.STARTING))
+        )
+
+        [row] = _process_rows_html(html)
+        assert "○ starting" in row
+
+    def test_no_runs_render_a_notice(self, app, view, monkeypatch):
+        html = _render_page(
+            _page_kwargs(app, view, monkeypatch, _liveness(LivenessState.UNCONFIRMED))
+        )
+
+        assert _process_rows_html(html) == []
+        assert "No watcher process has recorded a heartbeat in the last day." in html
+
+    @pytest.mark.parametrize("state", list(LivenessState))
+    def test_the_unconfirmed_note_is_shown_only_for_unconfirmed(
+        self, app, view, monkeypatch, state
+    ):
+        html = _render_page(_page_kwargs(app, view, monkeypatch, _liveness(state)))
+
+        assert (UNCONFIRMED_NOTE in html) is (state is LivenessState.UNCONFIRMED)
+
+
+class TestStatusesUnderTheVerdict:
+    @pytest.mark.parametrize("state", list(LivenessState))
+    def test_statuses_are_masked_and_the_banner_shown_only_for_down(
+        self, app, view, monkeypatch, state
+    ):
+        kwargs = _page_kwargs(app, view, monkeypatch, _liveness(state))
+
+        is_down = state is LivenessState.DOWN
+        assert kwargs["mask_statuses"] is is_down
+        assert (kwargs["liveness_banner"] is not None) is is_down
+
+    def test_down_renders_the_banner_at_the_top_and_every_status_as_unknown(
+        self, app, view, monkeypatch
+    ):
+        subs = [
+            _make_single_row(id=1, dag_id="single_dag", consumer_status="listening"),
+            _make_single_row(id=2, dag_id="off_dag", enabled=False, consumer_status="listening"),
+            _make_single_row(id=3, dag_id="grp_dag", queue_name="q1", group_key="grp"),
+            _make_single_row(id=4, dag_id="grp_dag", queue_name="q2", group_key="grp"),
+        ]
+        conn = _make_conn_status_row(last_reconcile_at=_naive_utc_ago(30))
+        kwargs = _page_kwargs(
+            app, view, monkeypatch, _liveness(LivenessState.DOWN),
+            subs=subs, conn_statuses=[conn],
+        )
+        html = _normalized(_render_page(kwargs))
+
+        banner = re.search(r'<div class="alert alert-danger">(.*?)</div>', html)
+        assert banner is not None
+        assert html.index(banner.group(0)) < html.index("<h4>Watcher processes</h4>")
+        assert "RMQ watcher has not completed a cycle since 2026-11-17 10:00:00 UTC" in banner.group(1)
+        assert '<a href="/rmq-watcher/subscriptions">RMQ Subscriptions</a>' in banner.group(1)
+
+        assert 'title="watcher is not running — last recorded: connected"' in html
+        assert 'title="watcher is not running — last recorded: listening"' in html
+        assert 'title="watcher is not running — last recorded: 2/2 listening"' in html
+        assert html.count("? unknown") == 3
+        assert "● connected" not in html
+        assert '<span class="label label-success">listening</span>' not in html
+        assert "2/2 listening </span>" not in html
+        assert '<span class="label label-default">disabled</span>' in html
+
+    @pytest.mark.parametrize(
+        "state", [LivenessState.OK, LivenessState.STARTING, LivenessState.UNCONFIRMED]
+    )
+    def test_statuses_are_shown_as_recorded_unless_down(self, app, view, monkeypatch, state):
+        subs = [
+            _make_single_row(id=1, dag_id="single_dag", consumer_status="listening"),
+            _make_single_row(id=3, dag_id="grp_dag", queue_name="q1", group_key="grp"),
+            _make_single_row(id=4, dag_id="grp_dag", queue_name="q2", group_key="grp"),
+        ]
+        conn = _make_conn_status_row(last_reconcile_at=_naive_utc_ago(30))
+        kwargs = _page_kwargs(
+            app, view, monkeypatch, _liveness(state), subs=subs, conn_statuses=[conn]
+        )
+        html = _normalized(_render_page(kwargs))
+
+        assert "? unknown" not in html
+        assert "alert-danger" not in html
+        assert "● connected" in html
+        assert '<span class="label label-success">listening</span>' in html
+        assert "2/2 listening </span>" in html
+
+
+class TestLivenessReadFailure:
+    def test_a_failed_read_returns_nothing_and_warns(self, monkeypatch, caplog):
+        def broken(session, now):
+            raise OperationalError("SELECT", {}, Exception("server closed the connection"))
+
+        monkeypatch.setattr(
+            "airflow_provider_rmq.watcher.dashboard_alert.read_liveness", broken
+        )
+        ctx, _ = _session_ctx()
+        with patch("airflow_provider_rmq.watcher.views.WatcherSession", return_value=ctx), \
+             caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.views"):
+            assert _read_liveness() is None
+
+        [record] = [r for r in caplog.records if r.name == "airflow_provider_rmq.watcher.views"]
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is not None
+
+    def test_the_page_stands_with_a_notice_and_recorded_statuses(self, app, view, monkeypatch):
+        sub = _make_single_row(dag_id="my_dag", consumer_status="listening")
+        kwargs = _page_kwargs(app, view, monkeypatch, None, subs=[sub])
+
+        assert kwargs["liveness_error"] == LIVENESS_UNAVAILABLE_MESSAGE
+        assert kwargs["watcher_processes"] == []
+        assert kwargs["mask_statuses"] is False
+        assert kwargs["liveness_banner"] is None
+        html = _normalized(_render_page(kwargs))
+        assert LIVENESS_UNAVAILABLE_MESSAGE in html
+        assert '<span class="label label-success">listening</span>' in html
+        assert "my_dag" in html
+
+    def test_a_heartbeat_row_in_the_database_reads_as_an_alive_process(
+        self, schema_engine, monkeypatch
+    ):
+        WatcherBase.metadata.create_all(schema_engine)
+        RealSession = sessionmaker(bind=schema_engine)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        with RealSession() as seed:
+            seed.add(
+                RMQSubscription(
+                    dag_id="d", queue_name="q", conn_id="rmq_default", source="ui", enabled=True
+                )
+            )
+            seed.commit()
+        ensure_heartbeat_table()
+        with RealSession() as seed:
+            seed.add(
+                RMQWatcherHeartbeat(
+                    id="run-1",
+                    hostname="scheduler-1",
+                    pid=4242,
+                    started_at=now - timedelta(minutes=10),
+                    last_cycle_at=now - timedelta(minutes=1),
+                    due_at=now + timedelta(minutes=5),
+                )
+            )
+            seed.commit()
+        monkeypatch.setattr("airflow_provider_rmq.watcher.views.WatcherSession", RealSession)
+
+        verdict = _read_liveness()
+
+        assert verdict is not None
+        assert verdict.state is LivenessState.OK
+        assert [(p.hostname, p.pid) for p in verdict.processes] == [("scheduler-1", 4242)]

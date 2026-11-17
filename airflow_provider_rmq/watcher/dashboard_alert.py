@@ -175,7 +175,7 @@ class _Snapshot:
     category: str
 
 
-def _subscriptions_link() -> str:
+def subscriptions_link() -> str:
     """URL of the Subscriptions page under the web UI's own base URL.
 
     An application without the page's endpoint, or a call outside a request, gets the
@@ -189,7 +189,7 @@ def _subscriptions_link() -> str:
 
 def _take_snapshot() -> _Snapshot:
     verdict = cached_verdict()
-    message = banner_text(verdict, link=_subscriptions_link()) if verdict else None
+    message = banner_text(verdict, link=subscriptions_link()) if verdict else None
     snapshot = _Snapshot(
         verdict=verdict,
         message=message,

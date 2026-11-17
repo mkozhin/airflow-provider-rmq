@@ -21,11 +21,22 @@
   {%- endif -%}
 {% endmacro %}
 
+{# A recorded status while no watcher confirms its work: the status is what the
+   watcher last wrote, and nothing keeps it current. #}
+{% macro unknown_status(last) -%}
+  <span class="label label-default"
+        title="watcher is not running — last recorded: {{ last }}">? unknown</span>
+{%- endmacro %}
+
 {% block content %}
 <div class="container-fluid">
   <div class="page-header">
     <h2>RMQ Watcher — Subscriptions</h2>
   </div>
+
+  {% if liveness_banner %}
+  <div class="alert alert-danger">{{ liveness_banner }}</div>
+  {% endif %}
 
   {# Flash messages #}
   {% with messages = get_flashed_messages(with_categories=true) %}
@@ -33,6 +44,63 @@
     <div class="alert alert-{{ 'danger' if category == 'error' else category }}">{{ message }}</div>
     {% endfor %}
   {% endwith %}
+
+  {# --- Watcher processes block --- #}
+  <div class="panel panel-default">
+    <div class="panel-heading"><h4>Watcher processes</h4></div>
+    <div class="panel-body">
+      {% if liveness_error %}
+      <p class="text-warning">⚠ {{ liveness_error }}</p>
+      {% else %}
+        {% if watcher_processes %}
+        <table class="table table-condensed table-bordered">
+          <thead>
+            <tr>
+              <th>Host</th>
+              <th>PID</th>
+              <th>Started (UTC)</th>
+              <th>Last mark (UTC)</th>
+              <th>Due (UTC)</th>
+              <th>State</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for p in watcher_processes %}
+          <tr class="{{ 'danger' if p.is_dead else '' }}">
+            <td>{{ p.hostname }}</td>
+            <td>{{ p.pid }}</td>
+            <td>{{ p.started_display }}</td>
+            <td>{{ p.last_mark_display }} ({{ p.age_display }} ago)</td>
+            <td>{{ p.due_display }}</td>
+            <td>
+              {% if p.state == 'alive' %}
+                <span class="label label-success">● alive</span>
+              {% elif p.state == 'starting' %}
+                <span class="label label-info"
+                      title="The process has started and has not completed its first cycle yet.">○ starting</span>
+              {% elif p.state == 'dead' %}
+                <span class="label label-danger"
+                      title="The process has not left its next mark by the due time and has not stopped in an orderly way: it died, hangs, or its scheduler went away without stopping it. With other processes alive, this is the watcher of one scheduler replica while the others consume the subscriptions.">✕ dead</span>
+              {% elif p.state == 'stopped' %}
+                <span class="label label-default"
+                      title="The process stopped in an orderly way on its scheduler's signal.">■ stopped</span>
+              {% else %}
+                <span class="label label-default">{{ p.state }}</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="text-muted">No watcher process has recorded a heartbeat in the last day.</p>
+        {% endif %}
+        {% if liveness_state == 'unconfirmed' %}
+        <p class="text-info">{{ unconfirmed_note }}</p>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
 
   {# --- Connections block --- #}
   <div class="panel panel-default">
@@ -57,7 +125,9 @@
         <tr>
           <td><strong>{{ cs.conn_id }}</strong></td>
           <td>
-            {% if cs.status == 'connected' %}
+            {% if mask_statuses %}
+              {{ unknown_status(cs.status) }}
+            {% elif cs.status == 'connected' %}
               <span class="label label-success">● connected</span>
             {% elif cs.status == 'error' %}
               <span class="label label-danger">✕ error</span>
@@ -174,6 +244,8 @@
             <td>
               {% if not item.enabled %}
                 <span class="label label-default">disabled</span>
+              {% elif mask_statuses %}
+                {{ unknown_status(item.display_status) }}
               {% else %}
                 <span class="label label-{{ 'success' if item.listening_count == item.total_count else 'warning' }}">
                   {{ item.display_status }}
@@ -233,6 +305,8 @@
             <td>
               {% if not item.enabled %}
                 <span class="label label-default">disabled</span>
+              {% elif mask_statuses %}
+                {{ unknown_status(item.consumer_status) }}
               {% elif item.consumer_status == 'listening' %}
                 <span class="label label-success">listening</span>
               {% elif item.consumer_status == 'connecting' %}

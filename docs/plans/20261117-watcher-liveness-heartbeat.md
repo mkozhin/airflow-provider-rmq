@@ -479,15 +479,15 @@
 - Modify: `airflow_provider_rmq/watcher/templates/rmq_watcher/subscriptions.html`
 - Modify: `tests/watcher/test_views.py`
 
-- [ ] панель «Watcher processes»: строки heartbeat за сутки с состоянием, возрастом
+- [x] панель «Watcher processes»: строки heartbeat за сутки с состоянием, возрастом
       последней отметки и сроком, мёртвые строки выделены; пояснение для `unconfirmed`;
       баннер с тем же текстом вверху страницы
-- [ ] при вердикте `down` статусы подписок и `conn_id` выводятся как `unknown` с подсказкой
+- [x] при вердикте `down` статусы подписок и `conn_id` выводятся как `unknown` с подсказкой
       о последнем записанном статусе
-- [ ] тесты: панель для одного и нескольких процессов, живой и мёртвой строки; подмена
+- [x] тесты: панель для одного и нескольких процессов, живой и мёртвой строки; подмена
       статусов при `down` и её отсутствие при `ok`/`starting`/`unconfirmed`; сбой чтения
       heartbeat не роняет страницу
-- [ ] run tests — must pass before task 7
+- [x] run tests — must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 
