@@ -55,8 +55,7 @@ read-only. Через месяц декоратор убирают — и `_sync
 не молча исполнено.
 
 **Направление решения.** Описано как задачи 6 и 7 плана
-`docs/plans/20260703-reliability-hardening.md` (см.
-[[reliability-hardening-plan-stale]]):
+`docs/plans/completed/20260703-reliability-hardening.md`:
 
 - `upsert_subscription` отказывает `ValueError` попытке `ui`-upsert поверх
   `dag_file`-строки; направление `ui → dag_file` разрешено;
