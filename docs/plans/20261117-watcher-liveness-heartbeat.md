@@ -32,14 +32,18 @@
   - `_VARIABLE_TIMEOUT = 15.0` (:57), `_STEP_TIMEOUT = 60.0` (:68), `_STOP_TIMEOUT = 30.0`
     (:132), `_CHILD_STOP_TIMEOUT = 5.0` (:165, через столько шедулер шлёт SIGKILL после
     SIGTERM), `_CYCLE_POOL_WORKERS = 4` (:175);
-  - `request_stop` (:682, вызывается из основного потока runner'а после сигнала остановки,
-    из любого потока, до старта цикла тоже); `run` (:723), `_ensure_pools` (:742),
+  - `request_stop` (:682, выставляет событие остановки и будит цикл; безопасен из любого
+    потока и до старта цикла); `run` (:723), `_ensure_pools` (:742),
     `_run_loop` (:776, перезапуск `_main` после краша в том же процессе с паузой 30 с),
     `_main` (:799: `_refresh_settings` внутри `while` перед каждым проходом,
     `incr("rmq_watcher.cycle_completed")` после прохода в бюджете, `finally: _stop_manager`
     :831-832), `_run_cycle` (:854, reconcile, начатый до остановки, доигрывает до конца;
     проглатывает `_StopRequested` :916-917), `_cycle_step` (:923, первой строкой
     `_raise_if_stopping` :956), `_refresh_settings` (:1038).
+- `airflow_provider_rmq/watcher/runner.py`: `_run_watcher` (:445) — основной поток ждёт
+  сигнал остановки и вызывает `listener.request_stop()` (:474-477), а при смене `getppid()`
+  — тоже `listener.request_stop()` (:482-486); смерть шедулера приходит и как SIGTERM через
+  `PR_SET_PDEATHSIG` (:258-277).
 - `airflow_provider_rmq/utils/executor.py`: `BoundedExecutor`, `PoolSaturated` (:16).
 - `airflow_provider_rmq/watcher/tunables.py`: `DEFAULT_RECONCILE_INTERVAL = 60`,
   `cycle_timeout`, `MIN_CYCLE_TIMEOUT = 300`, `stale_after(interval, budget)` (:68).
@@ -120,18 +124,23 @@
 - **Heartbeat — конец прохода в бюджете, срок — абсолютное время.** Строка обновляется там
   же, где растёт `cycle_completed`, и получает `due_at` — момент, к которому этот процесс
   с его действующими настройками обязан оставить следующую отметку. Фонового пинга нет —
-  он показывал бы живым зависший цикл. Webserver Variables для оценки живости не читает.
-- **Тревога — шедулер без watcher'а, а не мёртвая строка.** Webserver берёт живые
-  `SchedulerJob` из таблицы `job` и живые строки heartbeat и сверяет их по hostname: у
-  каждого живого шедулера, проработавшего дольше стартовой отсрочки, должно быть по живому
-  watcher'у. Мёртвые строки только показываются на панели и тревоги не поднимают: умерший
-  watcher при живом шедулере виден как недостача на его хосте, а шедулер, который ушёл, —
-  ушёл вместе со своей потребностью в watcher'е. Поэтому ни родословная строк, ни их
-  чистка, ни `stopped_at` на тревогу не влияют.
-- **Штатная остановка помечается при запросе.** `request_stop` записывает `stopped_at`
-  отдельным коротким потоком с ожиданием не дольше 2 с — до того, как цикл доберётся до
-  остановки менеджера, и независимо от идущего reconcile. Отметка нужна панели, чтобы
-  отличать «остановлен» от «умер».
+  он показывал бы живым зависший цикл. Живость строки webserver судит по её `due_at`;
+  Variables он читает только когда живых строк нет — чтобы понять, свежа ли отметка
+  `last_reconcile_at`.
+- **Тревога — шедулер без живого watcher'а, а не мёртвая строка.** Webserver берёт живые
+  `SchedulerJob` из таблицы `job` и строки heartbeat и сопоставляет их на каждом hostname:
+  за каждым живым шедулером, проработавшим дольше стартовой отсрочки, закрепляется строка,
+  начатая после его старта. Закреплённая живая строка — watcher работает, закреплённая
+  неживая — watcher этого шедулера умер, не закреплённой нет — watcher этого шедулера ни
+  разу не отчитался (старая версия провайдера или не стартовал). Строки, не закреплённые ни
+  за одним живым шедулером, — следы ушедших шедулеров: они показываются на панели и тревоги
+  не поднимают. Поэтому ни чистка строк, ни `stopped_at` на тревогу не влияют.
+- **Штатная остановка помечается по сигналу.** Runner после штатного сигнала остановки
+  сначала вызывает `request_stop` (событие и пробуждение цикла), затем `mark_stopped`,
+  который отдельным коротким потоком записывает `stopped_at` с ожиданием не дольше 2 с,
+  независимо от идущего reconcile. Смерть шедулера (смена `getppid()`, SIGTERM от
+  `PR_SET_PDEATHSIG`) отметку не ставит. Отметка нужна панели, чтобы отличать «остановлен»
+  от «умер».
 - **Оценка — одна чистая функция.** `assess_liveness` по строкам heartbeat, живым
   `SchedulerJob`, текущему времени, признаку «есть включённые подписки» и признаку «есть
   свежий `last_reconcile_at`» возвращает вердикт; её вызывают баннер, панель и
@@ -160,7 +169,13 @@
 | `stopped_at` | `DateTime`, nullable | штатная остановка |
 
 Время — naive UTC из процесса, как у `last_reconcile_at`. Таблица создаётся
-`ensure_table_exists` (`create_all`).
+`ensure_table_exists` (`create_all`). Ни один upsert heartbeat не пишет `stopped_at`: его
+пишет только `record_heartbeat_stop`.
+
+`Job.start_date` объявлен `UtcDateTime` и читается с часовым поясом;
+`get_alive_scheduler_jobs` приводит его к naive UTC, как `_build_conn_status_rows`
+(`views.py:327-341`) приводит `last_reconcile_at`, чтобы `assess_liveness` сравнивал
+значения одного вида.
 
 **Последняя отметка** строки — `stopped_at`, иначе `last_cycle_at`, иначе `started_at`.
 
@@ -182,37 +197,51 @@
 
 - Строка heartbeat **жива**, если `stopped_at` пуст и `now ≤ due_at`.
 - Шедулер **жив**, если его строка `job` (`job_type = "SchedulerJob"`) проходит
-  `Job.is_alive()`. Шедулер **обязан иметь watcher**, если жив и `start_date` старше
+  `Job.is_alive()`. Живой шедулер **обязан иметь watcher**, если его `start_date` старше
   стартовой отсрочки `_START_GRACE = 300` с (процессу watcher'а нужно импортировать Airflow
   и плагины до первой записи).
-- **Недостача на хосте** H: число обязанных шедулеров на H больше числа живых строк
-  heartbeat на H.
-- Хост H — **старая версия**, если на нём обязанный шедулер и на H нет ни одной строки
-  heartbeat — ни живой, ни мёртвой.
+- **Сопоставление на хосте** H: обязанные шедулеры H перебираются от самого нового к самому
+  старому, и каждый закрепляет за собой самую новую ещё не закреплённую строку H с
+  `started_at ≥ start_date`. Обязанный шедулер в итоге:
+  - **обслужен** — закреплённая строка жива;
+  - **без watcher'а** — закреплённая строка не жива (watcher умер или остановлен);
+  - **не отчитался** — закрепить нечего: watcher этого шедулера не писал heartbeat ни разу
+    (старая версия провайдера или не стартовал).
+- **Свежий `last_reconcile_at`** — моложе `_stale_after()` страницы; считается только когда
+  живых строк heartbeat нет, то есть Variables читаются лишь в этом случае.
 
-| состояние | условие | баннер |
-|---|---|---|
-| `unused` | включённых подписок нет | нет |
-| `ok` | есть живые строки, недостачи нет | нет |
-| `degraded` | есть живые строки и недостача хотя бы на одном хосте | жёлтый |
-| `legacy` | живых строк нет, все хосты с обязанными шедулерами — «старая версия», есть свежий `last_reconcile_at` | нет (на панели пояснение) |
-| `never` | строк heartbeat нет совсем, свежего `last_reconcile_at` нет | красный |
-| `down` | живых строк нет, и это не `legacy` и не `never` | красный |
+Состояния проверяются сверху вниз, первое совпавшее — вердикт:
 
-«Свежий `last_reconcile_at`» — моложе `_stale_after()` страницы; он считается только когда
-живых строк heartbeat нет, то есть Variables читаются лишь в этом случае.
+| состояние | условие | баннер | статусы подписок |
+|---|---|---|---|
+| `unused` | включённых подписок нет | нет | как есть |
+| `no_scheduler` | живых шедулеров нет и живых строк нет | красный | `unknown` |
+| `starting` | живые шедулеры есть, обязанных нет (все в отсрочке) | нет | как есть |
+| `ok` | все обязанные шедулеры обслужены | нет | как есть |
+| `degraded` | есть живые строки, и есть шедулер без watcher'а или не отчитавшийся | жёлтый | как есть |
+| `legacy` | живых строк нет, все необслуженные шедулеры — не отчитавшиеся, свежий `last_reconcile_at` есть | нет (на панели пояснение) | как есть |
+| `mixed` | живых строк нет, есть и не отчитавшиеся, и без watcher'а, свежий `last_reconcile_at` есть | жёлтый | как есть |
+| `never` | строк heartbeat нет совсем | красный | `unknown` |
+| `down` | всё остальное: живых строк нет, свежей отметки старой версии нет | красный | `unknown` |
+
+`legacy` и `mixed` требуют хотя бы одного не отчитавшегося шедулера: свежая отметка
+`last_reconcile_at` засчитывается старой версии только когда есть шедулер, чей watcher
+heartbeat не пишет. Без такого шедулера свежая отметка — след только что остановленного
+нового watcher'а и тревогу не снимает.
 
 Тексты баннера — без hostname и PID (их видят все пользователи, включая
 `AUTH_ROLE_PUBLIC`); подробности — на панели Subscriptions:
 
 - `never`: «RMQ watcher has not reported since the subscriptions were enabled — subscriptions
   are not consumed.»
-- `down`, есть живой шедулер: «RMQ watcher has not completed a cycle since `<время самой
-  свежей отметки>` — subscriptions are not consumed and event-triggered DAGs do not run.»
-- `down`, живых шедулеров нет: «No Scheduler is running the RMQ watcher since `<время>` —
-  subscriptions are not consumed.»
+- `down`: «RMQ watcher has not completed a cycle since `<время самой свежей отметки>` —
+  subscriptions are not consumed and event-triggered DAGs do not run.»
+- `no_scheduler`: «No Scheduler is running the RMQ watcher since `<время самой свежей
+  отметки>` — subscriptions are not consumed.»
 - `degraded`: «A Scheduler has no running RMQ watcher (not started, stopped responding, or an
   older provider version); other watchers are consuming.»
+- `mixed`: «A Scheduler's RMQ watcher stopped responding; a watcher of an older provider
+  version is still consuming.»
 
 Каждый текст ссылается на `/rmq-watcher/subscriptions`. Баннер видят все пользователи
 (`roles=None`).
@@ -233,12 +262,17 @@
   не UPDATE: строку, не вставленную при старте, следующий проход восстанавливает.
 - Сбой записи, `_StepInFlight`, `PoolSaturated` — WARNING, цикл продолжается;
   `_StopRequested` — тихо.
-- **Штатная остановка.** `request_stop` при первом вызове, если идентичность процесса уже
-  создана, запускает поток, который своей сессией пишет `record_heartbeat_stop`, и ждёт его
-  не дольше 2 с; повторные вызовы отметку не пишут. Это происходит до того, как цикл
-  увидит событие остановки, и не зависит от идущего reconcile. Сбой и таймаут — WARNING;
-  строка тогда просто не будет помечена остановленной. Смерть родителя (`_parent_is_gone`)
-  и краш `_main` `stopped_at` не ставят.
+- **Штатная остановка.** `request_stop` не меняется: событие остановки и пробуждение цикла.
+  Новый `mark_stopped()` при первом вызове, если идентичность процесса уже создана,
+  запускает поток, который своей сессией пишет `record_heartbeat_stop`, и ждёт его не
+  дольше 2 с; повторные вызовы отметку не пишут. Runner в ветке полученного сигнала
+  вызывает сначала `request_stop()`, затем `mark_stopped()` — только если `getppid()` всё
+  ещё равен PID шедулера: SIGTERM от `PR_SET_PDEATHSIG` приходит уже после смены
+  родителя. Ветка смены `getppid()`, `_parent_is_gone` и краш `_main` отметку не ставят.
+  Событие выставлено раньше отметки, поэтому цикл получает остановку без задержки, а
+  строка старта, ещё не вставленная к этому моменту, уже не вставится: шаг старта идёт
+  через `_cycle_step`, который при выставленном событии отказывает. Сбой и таймаут отметки
+  — WARNING; строка тогда просто не будет помечена остановленной.
 
 ### Баннер в webserver'е
 
@@ -259,7 +293,8 @@
   отбор и текст одного запроса не расходятся.
 - Кэш — неизменяемая пара `(expires_at, verdict)`, заменяемая целиком, 30 с на процесс
   воркера webserver'а; перечтение под `threading.Lock`, чтобы промах кэша не дал залп
-  запросов. Промах — SELECT по `rmq_watcher_heartbeat`, SELECT живых `SchedulerJob`,
+  запросов. Промах — SELECT по `rmq_watcher_heartbeat`, SELECT живых `SchedulerJob` (с
+  `start_date`, приведённым к naive UTC),
   `EXISTS` по включённым подпискам и, только когда живых строк heartbeat нет, чтение
   `last_reconcile_at` и `_stale_after()`.
 - Сбой чтения (нет таблицы, БД недоступна) — баннер не показывается, WARNING раз на период
@@ -267,17 +302,21 @@
 
 ### Страница Subscriptions
 
-- Панель «Watcher processes» над блоком Connections: по каждому хосту — число живых
-  шедулеров и живых watcher'ов, и строки heartbeat этого хоста (PID, started, последняя
-  отметка и её возраст, срок, состояние alive / dead / stopped); пояснение для `legacy`;
-  баннер с тем же текстом вверху страницы.
-- При вердикте `down` или `never` статусы подписок и `conn_id` выводятся как `unknown` с
-  подсказкой «watcher is not running — last recorded: `<status>`».
+- Панель «Watcher processes» над блоком Connections: по каждому хосту — живые шедулеры с
+  их состоянием сопоставления (обслужен / без watcher'а / не отчитался / в отсрочке) и
+  строки heartbeat этого хоста (PID, started, последняя отметка и её возраст, срок,
+  состояние alive / dead / stopped, закреплена ли за живым шедулером); пояснение для
+  `legacy` и `mixed`; баннер с тем же текстом вверху страницы.
+- При вердикте `no_scheduler`, `never` или `down` статусы подписок и `conn_id` выводятся
+  как `unknown` с подсказкой «watcher is not running — last recorded: `<status>`».
 
 ### Что делает документация явным
 
 - Тревога означает «у живого шедулера нет живого watcher'а» или «живых watcher'ов нет»;
-  мёртвые строки ушедших шедулеров видны на панели сутки и тревоги не поднимают.
+  строки, не закреплённые за живым шедулером, — следы ушедших шедулеров: они видны на
+  панели сутки и тревоги не поднимают.
+- Шедулер, чей watcher ни разу не писал heartbeat, при свежей отметке `last_reconcile_at`
+  считается работающим на старой версии провайдера.
 - Шедулер, у которого зависает собственный цикл, перестаёт считаться живым, и недостачу на
   его хосте баннер не показывает — об этом сообщает собственное предупреждение Airflow
   о шедулере.
@@ -323,13 +362,17 @@
       `record_heartbeat_cycle(session, identity, last_cycle_at, due_at)` — upsert
 - [ ] `prune_heartbeats(session, keep_id, older_than)` — удаление чужих строк по последней
       отметке; `record_heartbeat_stop(session, id, stopped_at)`; `get_heartbeats(session)`;
-      `get_alive_scheduler_jobs(session)` — живые `SchedulerJob` (hostname, `start_date`)
+      `get_alive_scheduler_jobs(session)` — живые `SchedulerJob` (hostname, `start_date`,
+      приведённый к naive UTC)
 - [ ] тесты: таблица создаётся `ensure_table_exists`; upsert старта поверх строки с
       `last_cycle_at` его сохраняет; upsert прохода поверх существующей и отсутствующей
       строки; запись срока не трогает `last_cycle_at`; чистка не трогает свою строку и
       свежие чужие и удаляет старые по каждой из трёх отметок; stop
 - [ ] тесты: `get_alive_scheduler_jobs` возвращает живой `SchedulerJob` и пропускает
-      завершённый, с устаревшим heartbeat и другого `job_type`
+      завершённый, с устаревшим heartbeat и другого `job_type`; `start_date` возвращается
+      naive UTC
+- [ ] тест: `assess_liveness` на строках, прочитанных из БД — настоящий `Job` и настоящая
+      строка heartbeat, — отрабатывает без `TypeError` и даёт `ok`
 - [ ] run tests — must pass before task 3
 
 ### Task 3: Оценка живости `assess_liveness`
@@ -338,32 +381,40 @@
 - Create: `airflow_provider_rmq/watcher/liveness.py`
 - Create: `tests/watcher/test_liveness.py`
 
-- [ ] `LivenessVerdict` (состояние `unused | ok | degraded | legacy | never | down`; по
-      каждому хосту — обязанные шедулеры, живые и мёртвые/остановленные строки; время для
-      текста; признак «живых шедулеров нет»)
+- [ ] `LivenessVerdict` (состояние `unused | no_scheduler | starting | ok | degraded | legacy
+      | mixed | never | down`; по каждому хосту — шедулеры с результатом сопоставления и
+      строки с признаком закрепления; время для текста)
 - [ ] `assess_liveness(heartbeats, scheduler_jobs, now, has_enabled_subscriptions,
-      has_fresh_reconcile)` — правила из Technical Details: `due_at`, стартовая отсрочка
-      шедулера, недостача по хосту, «старая версия» хоста
-- [ ] `banner_text(verdict)` и `banner_category(verdict)` — тексты без hostname и PID
-- [ ] тесты: каждое состояние таблицы; граница `due_at` (ровно `due_at` — жива); шедулер
-      моложе отсрочки не обязан иметь watcher; две реплики на одном hostname — нужна пара
-      живых строк, смерть одной даёт `degraded`
+      has_fresh_reconcile)` — правила из Technical Details: `due_at`, стартовая отсрочка,
+      сопоставление шедулеров и строк на хосте, порядок состояний сверху вниз
+- [ ] `banner_text(verdict)`, `banner_category(verdict)`, `masks_statuses(verdict)` — тексты
+      без hostname и PID, подмена статусов только для `no_scheduler`, `never`, `down`
+- [ ] тесты: каждое состояние таблицы; граница `due_at` (ровно `due_at` — жива); все живые
+      шедулеры в отсрочке — `starting` без баннера при любом `last_reconcile_at`
 - [ ] тесты: watcher умер, шедулер жив — `down` при одной реплике, `degraded` при двух;
-      после рестарта шедулера в том же контейнере (старый `SchedulerJob` не жив, новая строка
-      жива) — `ok`, хотя мёртвая строка осталась; реплика B передеплоена после смерти
-      watcher'а реплики A на том же хосте — недостача остаётся, `degraded`
-- [ ] тесты: смешанные версии — старый шедулер без строк на своём хосте и свежий
-      `last_reconcile_at`, новый шедулер остановлен — `legacy`, а не `down`; старый хост без
-      строк при живых новых watcher'ах — `degraded`; пустая таблица при свежем и устаревшем
-      `last_reconcile_at` — `legacy` и `never`; живых шедулеров нет — `down` с текстом про
-      шедулер
+      рестарт шедулера в том же контейнере (старый `SchedulerJob` не жив, новая строка
+      начата после старта нового) — `ok`, хотя мёртвая строка осталась; две реплики на
+      одном hostname — нужны две закреплённые живые строки, смерть одной даёт `degraded`;
+      реплика B передеплоена после смерти watcher'а реплики A на том же хосте — строка A
+      закреплена за A, `degraded`
+- [ ] тесты: `docker stop` единственного шедулера (строка `stopped`, `SchedulerJob` не жив,
+      свежий `last_reconcile_at`) — `no_scheduler`, а не `legacy`; живых шедулеров нет и
+      строк нет — `no_scheduler`
+- [ ] тесты: смешанные версии — старый шедулер без строк на своём хосте, новый остановлен,
+      свежий `last_reconcile_at` — `legacy`; старый и новый шедулер на одном hostname, новый
+      watcher умер, свежий `last_reconcile_at` — `mixed`, статусы не подменяются; старый
+      шедулер на одном хосте и мёртвый новый watcher на другом при свежей отметке —
+      `mixed`; не отчитавшийся шедулер при живых новых watcher'ах — `degraded`; пустая
+      таблица при свежем и устаревшем `last_reconcile_at` — `legacy` и `never`
 - [ ] run tests — must pass before task 4
 
 ### Task 4: Запись heartbeat из watcher-процесса
 
 **Files:**
 - Modify: `airflow_provider_rmq/watcher/listener.py`
+- Modify: `airflow_provider_rmq/watcher/runner.py`
 - Modify: `tests/watcher/test_listener.py`
+- Modify: `tests/watcher/test_runner.py`
 
 - [ ] `WatcherIdentity` создаётся один раз на процесс в `run` (hostname —
       `get_hostname()`); константы `_HEARTBEAT_TIMEOUT`, `_PRUNE_TIMEOUT`
@@ -376,18 +427,25 @@
       `record_heartbeat_cycle` (`last_cycle_at` — момент записи, `due_at` по формуле), затем
       шаг `"heartbeat_prune"`; `_StopRequested` — тихо, сбой, `_StepInFlight`,
       `PoolSaturated` — WARNING
-- [ ] `request_stop`: при первом вызове и созданной идентичности — поток с
+- [ ] `mark_stopped()`: при первом вызове и созданной идентичности — поток с
       `record_heartbeat_stop` своей сессией, ожидание не дольше 2 с, сбой и таймаут —
-      WARNING
+      WARNING; `request_stop` не меняется
+- [ ] runner, ветка полученного сигнала: `request_stop()`, затем `mark_stopped()` только
+      если `getppid()` равен PID шедулера; ветка смены `getppid()` — только `request_stop()`
 - [ ] тесты: строка старта несёт срок из переопределённого бюджета (Variable
       `rmq_watcher_cycle_timeout`); рост бюджета публикует новый срок до прохода и не
       двигает `last_cycle_at`; проход в бюджете двигает `last_cycle_at` и `due_at`; проход,
       упёршийся в бюджет, — нет; перезапуск `_main` после краша сохраняет `id` и
       `started_at`
-- [ ] тесты: `request_stop` пишет `stopped_at`, пока reconcile ещё идёт, и не ждёт дольше
-      2 с при зависшей записи; повторный `request_stop` второй записи не делает;
-      `request_stop` до `run` ничего не пишет; смерть родителя и краш `_main` `stopped_at`
-      не ставят; остановка не даёт WARNING о heartbeat прохода
+- [ ] тесты (`test_listener.py`): `mark_stopped` пишет `stopped_at`, пока reconcile ещё
+      идёт, и не ждёт дольше 2 с при зависшей записи; повторный вызов второй записи не
+      делает; вызов до `run` ничего не пишет; stop, пришедший до вставки строки старта, —
+      строка старта не вставляется; проход, записанный после отметки, `stopped_at` не
+      стирает; краш `_main` `stopped_at` не ставит; остановка не даёт WARNING о heartbeat
+      прохода
+- [ ] тесты (`test_runner.py`): штатный SIGTERM при живом родителе — `request_stop`, затем
+      `mark_stopped`; смена `getppid()` и SIGTERM после смены родителя — только
+      `request_stop`
 - [ ] тесты: сбой записи и сбой чистки не прерывают цикл и не мешают `cycle_completed`;
       сбой чистки не откатывает отметку; зависшая запись не подаётся повторно
 - [ ] run tests — must pass before task 5
@@ -426,22 +484,24 @@
 - Modify: `airflow_provider_rmq/watcher/templates/rmq_watcher/subscriptions.html`
 - Modify: `tests/watcher/test_views.py`
 
-- [ ] панель «Watcher processes»: по хостам — живые шедулеры и живые watcher'ы, строки
-      heartbeat с состоянием, возрастом отметки и сроком; пояснение для `legacy`; баннер с
-      тем же текстом вверху страницы
-- [ ] при вердикте `down` или `never` статусы подписок и `conn_id` выводятся как `unknown`
-      с подсказкой о последнем записанном статусе
+- [ ] панель «Watcher processes»: по хостам — живые шедулеры с результатом сопоставления,
+      строки heartbeat с состоянием, возрастом отметки, сроком и признаком закрепления;
+      пояснение для `legacy` и `mixed`; баннер с тем же текстом вверху страницы
+- [ ] при вердикте `no_scheduler`, `never` или `down` статусы подписок и `conn_id`
+      выводятся как `unknown` с подсказкой о последнем записанном статусе
 - [ ] тесты: панель для одного и нескольких хостов, мёртвая строка ушедшего шедулера
-      показана без тревоги; подмена статусов при `down`/`never` и её отсутствие при
-      `ok`/`degraded`/`legacy`
+      показана без тревоги; подмена статусов при `no_scheduler`/`never`/`down` и её
+      отсутствие при `starting`/`ok`/`degraded`/`legacy`/`mixed`
 - [ ] run tests — must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 
 - [ ] каждое состояние таблицы и каждый сценарий из Task 3 покрыт тестом (сверить по
       списку: смерть watcher'а при одной и двух репликах, рестарт шедулера в том же
-      контейнере, две реплики на одном hostname, смешанные версии, webserver новее
-      шедулера, недоступная БД, без включённых подписок, рост бюджета)
+      контейнере, две реплики на одном hostname, остановка всех шедулеров, все шедулеры в
+      отсрочке, смешанные версии на разных хостах и на одном, webserver новее шедулера,
+      недоступная БД, без включённых подписок, рост бюджета, смерть шедулера без отметки
+      остановки, `start_date` из настоящего `Job`)
 - [ ] тест отдельным интерпретатором из Task 5 проходит: плагин не загружает
       `airflow.www.utils`
 - [ ] run full test suite: `.venv/bin/python -m pytest tests/ -q`
@@ -456,7 +516,8 @@
       абзац «Liveness metric» описывает метрику как дополнение для внешнего мониторинга
 - [ ] новый `docs/adr/0012-watcher-liveness-heartbeat.md`: строка на запуск процесса, срок
       `due_at` от watcher'а, тревога как недостача watcher'ов у живых шедулеров из таблицы
-      `job`, `stopped_at` из `request_stop`, `UIAlert` с ленивым импортом; отвергнутые
+      `job` с сопоставлением шедулера и строки на хосте, `stopped_at` только по штатному
+      сигналу (`mark_stopped`), `UIAlert` с ленивым импортом; отвергнутые
       варианты — поллинг из хуков шедулера, внешний мониторинг, health-check DAG, flash на
       каждой странице, общая строка `rmq_watcher_conn_status`, фоновый пинг, тревога по
       мёртвым строкам с правилом замены по hostname
@@ -476,7 +537,8 @@
 **Manual verification (тестовый стенд, vhost `test`):**
 - одна реплика: `kill -9` watcher-процесса → красный баннер на главной не позже `due_at`;
   статусы подписок — `unknown`; рестарт шедулера → баннер исчезает
-- `docker stop` шедулера → строка со `stopped_at` на панели, баннер про отсутствие шедулера
+- `docker stop` шедулера → строка со `stopped_at` на панели, баннер `no_scheduler`;
+  `kill -9` шедулера → строка без `stopped_at` (dead), тот же баннер
 - webserver с новой версией при шедулере со старой → баннера нет, на панели пояснение
   `legacy`
 - вид баннера в светлой и тёмной теме Airflow UI
