@@ -449,28 +449,28 @@
 - Create: `tests/watcher/test_dashboard_alert.py`
 - Modify: `tests/watcher/test_plugin.py`
 
-- [ ] `dashboard_alert.py`: чтение вердикта с кэшем (неизменяемая пара, 30 с, `Lock` на
+- [x] `dashboard_alert.py`: чтение вердикта с кэшем (неизменяемая пара, 30 с, `Lock` на
       перечтение; `ensure_heartbeat_table()` на промахе, пока флаг не стоит; без таблицы —
       вердикт по одной `last_reconcile_at`; `last_reconcile_at` и порог — только без живых
       строк); сбой чтения — вердикт «не показывать» и WARNING раз на период
-- [ ] тесты: создание таблицы, не удавшееся при установке, повторяется на следующем промахе
+- [x] тесты: создание таблицы, не удавшееся при установке, повторяется на следующем промахе
       кэша; без таблицы и с устаревшей `last_reconcile_at` — `down`; отметка
       `last_reconcile_at` возрастом `I + B + 10` с ещё свежая
-- [ ] `install_dashboard_alert()`: `ensure_heartbeat_table()`, ленивый импорт `UIAlert`,
+- [x] `install_dashboard_alert()`: `ensure_heartbeat_table()`, ленивый импорт `UIAlert`,
       подкласс без вызова `UIAlert.__init__`, `should_show(*args, **kwargs)` со снимком в
       `flask.g`, `message` — `Markup` из `flask.g`, `category` из `flask.g`, перепривязка
       `DASHBOARD_UIALERTS`, без повторного экземпляра
-- [ ] `plugin.py`: колбэк `_install_liveness_alert(state)` с проверкой
+- [x] `plugin.py`: колбэк `_install_liveness_alert(state)` с проверкой
       `_serves_the_web_ui(state.app)` и `_bp.record_once(_install_liveness_alert)`
-- [ ] тесты: `should_show` истинен только для `down`; `message` — экземпляр `Markup` с
+- [x] тесты: `should_show` истинен только для `down`; `message` — экземпляр `Markup` с
       настоящей ссылкой, а подставленное время экранировано; кэш не перечитывает БД в течение
       периода; кэш, истёкший между `should_show` и `message`, не меняет текст запроса; сбой
       чтения скрывает баннер без исключения
-- [ ] тесты: установка добавляет ровно один экземпляр и сохраняет существующие элементы,
+- [x] тесты: установка добавляет ровно один экземпляр и сохраняет существующие элементы,
       в том числе заданные кортежем; CLI-приложение FAB баннер не ставит
-- [ ] тест отдельным интерпретатором (как `TestDagFileScanImportFootprint`):
+- [x] тест отдельным интерпретатором (как `TestDagFileScanImportFootprint`):
       `import airflow_provider_rmq.watcher.plugin` не загружает `airflow.www.utils`
-- [ ] run tests — must pass before task 6
+- [x] run tests — must pass before task 6
 
 ### Task 6: Панель процессов и статусы подписок на странице Subscriptions
 

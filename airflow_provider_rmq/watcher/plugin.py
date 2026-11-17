@@ -8,6 +8,7 @@ from airflow.plugins_manager import AirflowPlugin
 
 log = logging.getLogger(__name__)
 
+from airflow_provider_rmq.watcher import dashboard_alert
 from airflow_provider_rmq.watcher.listener import RMQWatcherListener
 from airflow_provider_rmq.watcher.models import ensure_table_exists
 from airflow_provider_rmq.watcher.tunables import (
@@ -214,6 +215,32 @@ def _grant_op_access(state) -> None:
 
 
 _bp.record_once(_grant_op_access)
+
+
+def _install_liveness_alert(state) -> None:
+    """Put the watcher banner on Airflow's home page, in the webserver only.
+
+    The banner belongs to the application that serves the home page, and the FAB CLI
+    commands register this blueprint too, so the callback stands aside where Airflow's
+    own web UI is absent. Nothing it does may keep the webserver from starting: a
+    failure is a warning, and the home page then simply carries no watcher banner.
+    """
+    if not _serves_the_web_ui(state.app):
+        log.debug(
+            "RMQ Watcher: this application serves no web UI — leaving the watcher "
+            "banner to the webserver"
+        )
+        return
+    try:
+        dashboard_alert.install_dashboard_alert()
+    except Exception:
+        log.warning(
+            "RMQ Watcher: failed to install the watcher banner on the home page",
+            exc_info=True,
+        )
+
+
+_bp.record_once(_install_liveness_alert)
 
 
 class RMQWatcherPlugin(AirflowPlugin):
