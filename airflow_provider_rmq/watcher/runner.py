@@ -151,8 +151,9 @@ _LOGGING_SHUTDOWN_THREAD_NAME = "rmq-watcher-logging-shutdown"
 
 #: Whole seconds from the decision to leave until the kernel ends the process with
 #: SIGALRM (:func:`_arm_hard_exit`). Longer than everything the way out waits for on
-#: purpose — the loop thread, the closing of the database connections, the logging
-#: shutdown — so a way out that runs as it should ends in :func:`os._exit` before it.
+#: purpose — the stop mark of the heartbeat row, the loop thread, the closing of the
+#: database connections, the logging shutdown — so a way out that runs as it should
+#: ends in :func:`os._exit` before it.
 _HARD_EXIT_DEADLINE = int(_EXIT_JOIN_TIMEOUT) + 15
 
 #: Seconds between two looks at the pending signals on a platform without
@@ -449,6 +450,13 @@ def _run_watcher(listener_class: type[RMQWatcherListener], parent: int) -> int:
     The main thread logs nothing between the start of the loop thread and its wait, and
     on a stop it arms the hard deadline and asks the loop to stop before it logs why: a
     logging handler that blocks costs at most the deadline, never the stop itself.
+
+    A stop signal that comes while the scheduler is still the parent is an orderly stop
+    of the scheduler, and the listener marks the run's heartbeat row stopped once the
+    loop has been asked to stop. A signal that comes after the parent changed is the
+    parent-death signal, and a parent change noticed between two waits is the same
+    death: the row is left unmarked in both cases, and its deadline runs out.
+
     Returns the exit code: 0 after a stop, 1 when the loop raised out of its thread.
     """
     listener = listener_class()
@@ -475,6 +483,8 @@ def _run_watcher(listener_class: type[RMQWatcherListener], parent: int) -> int:
         if received is not None:
             _arm_hard_exit()
             listener.request_stop()
+            if os.getppid() == parent:
+                listener.mark_stopped()
             log.info(
                 "RMQ Watcher process received %s — stopping the watcher",
                 signal.Signals(received).name,

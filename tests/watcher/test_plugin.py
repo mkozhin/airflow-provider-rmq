@@ -1,30 +1,55 @@
 """Tests for the plugin module: what it registers with Airflow, the Subscriptions
-page access it gives the Op role at webserver start, and the switch that governs it.
+page access it gives the Op role at webserver start, the switch that governs it, and
+the watcher banner it installs on the home page.
 """
 from __future__ import annotations
 
 import contextlib
 import logging
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import flask
 import pytest
 
-from airflow_provider_rmq.watcher import tunables
+from airflow_provider_rmq.watcher import dashboard_alert, tunables
 from airflow_provider_rmq.watcher.plugin import (
     _OP_PERMISSIONS,
     _WEB_UI_ENDPOINT,
     RMQWatcherPlugin,
     _bp,
     _grant_op_access,
+    _install_liveness_alert,
 )
 from airflow_provider_rmq.watcher.tunables import (
     GRANT_OP_ACCESS_OPTION,
     GRANT_OP_ACCESS_SECTION,
     read_flag,
 )
+
+
+@pytest.fixture(autouse=True)
+def dashboard_alerts(monkeypatch):
+    """Airflow's list of home-page alerts, empty for every test.
+
+    Registering the blueprint in an application that serves the web UI installs the
+    watcher banner into ``airflow.settings.DASHBOARD_UIALERTS``; each test gets its own
+    list.
+    """
+    from airflow import settings
+
+    monkeypatch.setattr(settings, "DASHBOARD_UIALERTS", [])
+    return settings
+
+
+def _watcher_alerts(settings) -> list:
+    return [
+        alert for alert in settings.DASHBOARD_UIALERTS
+        if isinstance(alert, dashboard_alert._alert_class())
+    ]
 
 
 def test_plugin_name():
@@ -854,3 +879,76 @@ class TestGrantOpAccessIsDeclared:
             app.register_blueprint(_bp)
 
         assert fallbacks == [spellings[declared.strip().lower()]]
+
+
+class TestLivenessAlertInstallation:
+    """The watcher banner is installed by the application that serves the home page."""
+
+    def test_registering_the_blueprint_installs_one_banner(self, dashboard_alerts):
+        app = _web_ui_app()
+        app.appbuilder = SimpleNamespace(sm=_FakeSecurityManager())
+
+        with patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
+            app.register_blueprint(_bp)
+
+        assert len(_watcher_alerts(dashboard_alerts)) == 1
+
+    def test_the_fab_cli_application_gets_no_banner(self, dashboard_alerts):
+        app = flask.Flask(__name__)
+        app.appbuilder = SimpleNamespace(sm=_FakeSecurityManager())
+
+        with patch("airflow_provider_rmq.watcher.plugin.read_flag", return_value=True):
+            app.register_blueprint(_bp)
+
+        assert dashboard_alerts.DASHBOARD_UIALERTS == []
+
+    def test_the_callback_outside_the_web_ui_installs_nothing(self, dashboard_alerts):
+        _install_liveness_alert(SimpleNamespace(app=SimpleNamespace(view_functions={})))
+
+        assert dashboard_alerts.DASHBOARD_UIALERTS == []
+
+    def test_a_failed_installation_does_not_stop_the_webserver(self, caplog):
+        def broken():
+            raise RuntimeError("no airflow.www")
+
+        with patch.object(dashboard_alert, "install_dashboard_alert", broken), \
+                caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.plugin"):
+            _install_liveness_alert(_state(_FakeSecurityManager()))
+
+        assert "failed to install the watcher banner" in caplog.text
+
+
+class TestPluginImportFootprint:
+    def test_importing_the_plugin_leaves_the_web_ui_utilities_unloaded(self):
+        """Every Airflow process loads the plugin module, the scheduler among them, so
+        it must not import ``airflow.www.utils``: only the webserver brings that in, when
+        it installs the banner. A fresh interpreter is the only place where
+        ``sys.modules`` says what one import pulled in."""
+        probe = (
+            "import sys\n"
+            "import airflow_provider_rmq.watcher.plugin\n"
+            "print('airflow.www.utils' in sys.modules)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().splitlines()[-1] == "False"
+
+    def test_importing_the_plugin_leaves_the_banner_module_unloaded(self):
+        """The banner's module serves the web UI only; the plugin imports it from the
+        blueprint callback the webserver runs, so the scheduler process never loads it."""
+        probe = (
+            "import sys\n"
+            "import airflow_provider_rmq.watcher.plugin\n"
+            "print('airflow_provider_rmq.watcher.dashboard_alert' in sys.modules)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().splitlines()[-1] == "False"

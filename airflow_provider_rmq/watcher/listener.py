@@ -4,14 +4,17 @@ import asyncio
 import logging
 import os
 import site
+import socket
 import subprocess
 import sys
 import sysconfig
 import threading
 import time
 import traceback
+import uuid
 from collections.abc import Collection
 from concurrent.futures import Future
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -36,25 +39,30 @@ from airflow_provider_rmq.watcher.dag_folder_listing import (
 )
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
+    WatcherIdentity,
     WatcherSession,
+    ensure_heartbeat_table,
     ensure_table_exists,
     get_active_dag_ids,
     get_enabled_subscriptions,
     is_schema_ready,
+    prune_heartbeats,
+    record_heartbeat_cycle,
+    record_heartbeat_deadline,
+    record_heartbeat_stop,
     upsert_subscription,
+    utcnow,
 )
 from airflow_provider_rmq.watcher.tunables import (
     CYCLE_TIMEOUT_VAR,
     DEFAULT_RECONCILE_INTERVAL,
     RECONCILE_INTERVAL_VAR,
+    VARIABLE_TIMEOUT,
     cycle_timeout,
     read_positive,
 )
 
 log = logging.getLogger(__name__)
-
-#: Seconds allowed for reading the tunables out of the Airflow Variables table.
-_VARIABLE_TIMEOUT = 15.0
 
 #: Seconds allowed for one schema-migration attempt.
 _MIGRATION_TIMEOUT = 30.0
@@ -66,6 +74,23 @@ _MIGRATION_TIMEOUT = 30.0
 #: consumer task and every connection with it. Three steps at this bound still fit
 #: inside the smallest cycle budget with room for the reconcile that follows them.
 _STEP_TIMEOUT = 60.0
+
+#: Seconds allowed for one heartbeat write — the start record, a new deadline or the
+#: mark of a finished pass, together with creating the heartbeat table while it is not
+#: known to exist. Every deadline the process records counts this bound twice: once for
+#: the rest of the write that records it, once for the write that has to follow.
+_HEARTBEAT_TIMEOUT = 10.0
+
+#: Seconds allowed for deleting other runs' heartbeat rows after a recorded pass.
+_PRUNE_TIMEOUT = 10.0
+
+#: Seconds :meth:`RMQWatcherListener.mark_stopped` waits for the stop mark to be written.
+#: The runner calls it on its way out, and the process does not wait on a database that
+#: does not answer for longer than this.
+_STOP_MARK_TIMEOUT = 2.0
+
+#: Name of the thread that writes the stop mark.
+_STOP_MARK_THREAD_NAME = "rmq-watcher-stop-mark"
 
 #: Cycles to skip after a failed migration attempt: one, then doubling up to the
 #: cap (an hour of cycles at the default interval).
@@ -171,7 +196,7 @@ _CHILD_STOP_TIMEOUT = 5.0
 _CHILD_REAP_TIMEOUT = 2.0
 
 #: Workers of the cycle pool: the reconcile loop's own blocking calls (schema
-#: migration, Variable reads, DAG-file scan, subscription queries).
+#: migration, Variable reads, DAG-file scan, subscription queries, heartbeat writes).
 _CYCLE_POOL_WORKERS = 4
 
 #: Workers of the consumer pool, handed to the manager. Kept apart from the cycle
@@ -218,6 +243,54 @@ def _read_active_subs(exchange_meta: dict) -> list[dict]:
                 entry.update(meta)
             active_subs.append(entry)
     return active_subs
+
+
+def _write_heartbeat(write: Any, identity: WatcherIdentity, *args: Any) -> None:
+    """Run the heartbeat write ``write`` for ``identity`` in a session of its own.
+
+    Blocking. The heartbeat table is created first while this process does not know it
+    to exist, so the first write of a run — and the next one after a creation that
+    failed — brings the table up itself.
+    """
+    ensure_heartbeat_table()
+    with WatcherSession() as session:
+        write(session, identity, *args)
+
+
+def _write_stop_mark(identity: WatcherIdentity, due_at: datetime, stopped_at: datetime) -> None:
+    """Write the stop mark of ``identity``, logging a failure. Runs in its own thread."""
+    try:
+        _write_heartbeat(record_heartbeat_stop, identity, due_at, stopped_at)
+    except Exception:
+        log.warning(
+            "RMQ Watcher: cannot mark the stop of run %s on its heartbeat row",
+            identity.id, exc_info=True,
+        )
+
+
+def _run_hostname() -> str:
+    """The host name the heartbeat row shows: Airflow's ``get_hostname()``.
+
+    Airflow resolves it through ``[core] hostname_callable``; a callable that fails
+    leaves the socket's host name, with a WARNING — the name only labels the row.
+    """
+    from airflow.utils.net import get_hostname
+
+    try:
+        return get_hostname()
+    except Exception:
+        hostname = socket.gethostname()
+        log.warning(
+            "RMQ Watcher: Airflow's get_hostname() failed — the heartbeat row shows the "
+            "host as %s", hostname, exc_info=True,
+        )
+        return hostname
+
+
+def _prune_other_heartbeats(keep_id: str, now: datetime) -> int:
+    """Delete other runs' heartbeat rows that have stopped counting at ``now``. Blocking."""
+    with WatcherSession() as session:
+        return prune_heartbeats(session, keep_id, now)
 
 
 def _read_active_dag_ids() -> set[str] | None:
@@ -390,6 +463,98 @@ class _UntrustedScan(Exception):
     """
 
 
+class _HeartbeatKeeper:
+    """The deadlines one run's heartbeat row carries, decided without I/O or a clock.
+
+    The listener runs the writes and passes the current time in; the keeper decides
+    which deadline each write carries and keeps what the next decision needs. The
+    deadlines:
+
+    - Before a pass (:meth:`deadline_before_pass`): the run's first pass records its
+      start. A later pass records a new deadline after a restart of the loop
+      (:meth:`note_restart`) — the crashed loop's pass, the consumers' stop and the
+      pause before the restart outlast the deadline the row carries — or when its
+      budget is larger than the one the stored deadline was computed with
+      (:meth:`deadline_recorded`). A restart gets its deadline once per start record
+      or marked pass (:meth:`pass_marked`): a restart that follows another restart
+      deadline with no mark in between gets none, so a loop whose passes keep running
+      out of budget leaves its row to go past due. The deadline covers the rest of the
+      write, the pass and the write that marks it: ``now + H + budget + H`` with ``H``
+      = :data:`_HEARTBEAT_TIMEOUT`.
+    - After a pass (:meth:`deadline_after_pass`): everything until the next mark — the
+      rest of the write, the prune, the wait between passes, the settings read, the
+      next pass and its write: ``now + H + P + interval + V + budget + H`` with ``P`` =
+      :data:`_PRUNE_TIMEOUT` and ``V`` = :data:`VARIABLE_TIMEOUT`.
+    - The stop mark (:meth:`stop_mark_due`) repeats the deadline of the last write.
+    """
+
+    def __init__(self) -> None:
+        # Whether the start record of this run has been attempted. A restart of the
+        # loop inside the process keeps the run, so it does not record a start.
+        self._started = False
+        # Set by :meth:`note_restart` and consumed by the next deadline decision.
+        self._restarted = False
+        # Whether the run has recorded its start or marked a pass since the last
+        # deadline decided for a restart.
+        self._restart_earned = True
+        # Cycle budget the last recorded deadline was computed with.
+        self._budget: float | None = None
+        # The deadline the last decided write carries, which the stop mark repeats.
+        self._due_at: datetime | None = None
+        # The stop mark is written once per run, by the first claim.
+        self._stop_lock = threading.Lock()
+        self._stop_claimed = False
+
+    def note_restart(self) -> None:
+        """Record that the loop restarts after a crash."""
+        self._restarted = True
+
+    def deadline_before_pass(self, budget: float, now: datetime) -> datetime | None:
+        """The deadline to record before a pass under ``budget``, or ``None`` for none."""
+        restarted, self._restarted = self._restarted, False
+        if not self._started:
+            self._started = True
+        elif restarted and self._restart_earned:
+            self._restart_earned = False
+        elif self._budget is None or budget <= self._budget:
+            return None
+        self._due_at = now + timedelta(
+            seconds=_HEARTBEAT_TIMEOUT + budget + _HEARTBEAT_TIMEOUT
+        )
+        return self._due_at
+
+    def deadline_recorded(self, budget: float) -> None:
+        """Record that the deadline decided before a pass under ``budget`` was written."""
+        self._budget = budget
+
+    def deadline_after_pass(
+        self, budget: float, reconcile_interval: float, now: datetime
+    ) -> datetime:
+        """The deadline to record with the mark of a pass that finished at ``now``."""
+        self._due_at = now + timedelta(
+            seconds=_HEARTBEAT_TIMEOUT + _PRUNE_TIMEOUT + reconcile_interval
+            + VARIABLE_TIMEOUT + budget + _HEARTBEAT_TIMEOUT
+        )
+        return self._due_at
+
+    def pass_marked(self, budget: float) -> None:
+        """Record that the mark of a pass under ``budget`` was written."""
+        self._budget = budget
+        self._restart_earned = True
+
+    def stop_mark_due(self, stopped_at: datetime) -> datetime | None:
+        """Claim the run's stop mark and return the deadline it carries.
+
+        The deadline of the last decided write, or ``stopped_at`` when none was decided.
+        ``None`` once the stop mark has been claimed. Safe from any thread.
+        """
+        with self._stop_lock:
+            if self._stop_claimed:
+                return None
+            self._stop_claimed = True
+        return self._due_at or stopped_at
+
+
 class RMQWatcherListener:
     """Airflow Listener that runs the RabbitMQ consumer loop in a child process of the scheduler.
 
@@ -416,6 +581,9 @@ class RMQWatcherListener:
       every ``reconcile_interval`` seconds, then delegates to ``RMQConsumerManager``.
     - :meth:`request_stop` sets the stop event and wakes the loop out of its wait, so
       shutdown does not wait out a reconcile interval.
+    - The run keeps one row of ``rmq_watcher_heartbeat``: a deadline before the first
+      pass, the mark of every pass that finishes within its budget with the next
+      deadline, and — through :meth:`mark_stopped` — the mark of an orderly stop.
     """
 
     def __init__(self) -> None:
@@ -516,6 +684,12 @@ class RMQWatcherListener:
         # tuple by every ``_main`` so that ``request_stop`` can never pair the live
         # loop with the previous loop's event.
         self._waker: tuple[asyncio.AbstractEventLoop, asyncio.Event] | None = None
+        # The run of the watcher process whose heartbeat row the loop keeps, created by
+        # :meth:`run`. ``None`` in every other process and before the run: nothing is
+        # written without it.
+        self._identity: WatcherIdentity | None = None
+        # Deadlines of the run's heartbeat row; the loop runs the writes it decides.
+        self._heartbeat = _HeartbeatKeeper()
 
     # ------------------------------------------------------------------
     # Listener API
@@ -697,6 +871,52 @@ class RMQWatcherListener:
         self._stop_event.set()
         self._wake_loop()
 
+    def mark_stopped(self) -> None:
+        """Record the orderly stop of this run on its heartbeat row.
+
+        The first call writes ``stopped_at`` from a thread of its own, with a session of
+        its own, and waits :data:`_STOP_MARK_TIMEOUT` seconds at most: the loop may be
+        in the middle of a reconcile, and the process leaves whether the database
+        answered or not. A failed or late write is logged and the stop goes on. Later
+        calls write nothing, and so does a call made before :meth:`run` has created the
+        run.
+
+        The write carries the run's whole identity, so it lands on a row whose start
+        record has not been committed yet, and the heartbeat writes of the loop leave
+        ``stopped_at`` as it is. The runner calls this after :meth:`request_stop`, for a
+        stop signal that comes while the scheduler is still its parent: an orderly stop
+        of the scheduler. A watcher that ends because the scheduler died leaves the row
+        unmarked, and its deadline runs out.
+        """
+        identity = self._identity
+        if identity is None:
+            return
+        stopped_at = utcnow()
+        due_at = self._heartbeat.stop_mark_due(stopped_at)
+        if due_at is None:
+            return
+        try:
+            thread = threading.Thread(
+                target=_write_stop_mark,
+                args=(identity, due_at, stopped_at),
+                name=_STOP_MARK_THREAD_NAME,
+                daemon=True,
+            )
+            thread.start()
+        except RuntimeError:
+            log.warning(
+                "RMQ Watcher: cannot start the thread that marks the stop of run %s",
+                identity.id, exc_info=True,
+            )
+            return
+        thread.join(timeout=_STOP_MARK_TIMEOUT)
+        if thread.is_alive():
+            log.warning(
+                "RMQ Watcher: the stop mark of run %s was not written within %.0fs — "
+                "stopping without it",
+                identity.id, _STOP_MARK_TIMEOUT,
+            )
+
     def _wake_loop(self) -> None:
         """Nudge the running cycle so it sees the stop event without waiting out the
         reconcile interval or the blocking step in flight.
@@ -728,14 +948,28 @@ class RMQWatcherListener:
 
         Returns once :meth:`request_stop` has been called, or the parent has changed,
         and the loop torn down.
+
+        The run's :class:`WatcherIdentity` is created here, before the loop: every
+        restart of the loop inside this process keeps it, and with it the heartbeat row.
         """
         self._parent_pid = parent_pid
+        self._identity = WatcherIdentity(
+            id=str(uuid.uuid4()),
+            hostname=_run_hostname(),
+            pid=os.getpid(),
+            started_at=utcnow(),
+        )
         log.info(
             "RMQ Watcher loop started with the default reconcile interval of %ss and "
             "a cycle budget of %.0fs; the first cycle reads %s and %s and logs any "
             "override it finds",
             self._reconcile_interval, self._cycle_timeout(),
             RECONCILE_INTERVAL_VAR, CYCLE_TIMEOUT_VAR,
+        )
+        log.info(
+            "RMQ Watcher run %s (host %s, PID %d) keeps its heartbeat in "
+            "rmq_watcher_heartbeat",
+            self._identity.id, self._identity.hostname, self._identity.pid,
         )
         self._run_loop()
 
@@ -781,6 +1015,7 @@ class RMQWatcherListener:
                 loop.run_until_complete(self._main())
             except Exception:
                 log.exception("RMQ Watcher loop crashed — restarting in 30s")
+                self._heartbeat.note_restart()
             finally:
                 # Both thread pools belong to the listener, not to the loop, so the
                 # next loop reuses them. loop.shutdown_default_executor() is
@@ -811,6 +1046,7 @@ class RMQWatcherListener:
                     break
                 await self._refresh_settings()
                 budget = self._cycle_timeout()
+                await self._record_deadline(budget)
                 started = time.monotonic()
                 try:
                     await call_with_timeout(self._run_cycle(), budget)
@@ -827,9 +1063,81 @@ class RMQWatcherListener:
                 # not all of its steps succeeded. Only a pass that ran out of budget
                 # does not.
                 incr("rmq_watcher.cycle_completed")
+                await self._record_cycle(budget)
                 await self._wait_for_next_cycle()
         finally:
             await self._stop_manager()
+
+    async def _record_deadline(self, budget: float) -> None:
+        """Record the deadline of the pass about to start, when the row needs one.
+
+        :param budget: Seconds the pass is given.
+
+        :meth:`_HeartbeatKeeper.deadline_before_pass` decides whether the row needs one
+        and which; the write leaves ``last_cycle_at`` as it is.
+        """
+        identity = self._identity
+        if identity is None:
+            return
+        due_at = self._heartbeat.deadline_before_pass(budget, utcnow())
+        if due_at is None:
+            return
+        if await self._heartbeat_step(
+            "heartbeat", _write_heartbeat, record_heartbeat_deadline, identity, due_at,
+            timeout=_HEARTBEAT_TIMEOUT,
+        ):
+            self._heartbeat.deadline_recorded(budget)
+
+    async def _record_cycle(self, budget: float) -> None:
+        """Mark the pass that has just finished within ``budget`` and prune old rows.
+
+        Nothing is written once a stop has been requested. The mark carries the deadline
+        of :meth:`_HeartbeatKeeper.deadline_after_pass`. Rows of other runs past their
+        deadline and last marked more than :data:`~.models.HEARTBEAT_WINDOW` ago are
+        deleted after the mark is committed, in a transaction of their own: a failed
+        prune leaves the mark in place.
+        """
+        identity = self._identity
+        # Checked here and not left to the step: once a stop has been requested the
+        # deadline the stop mark repeats stays the one the last write carried.
+        if identity is None or self._stop_event.is_set():
+            return
+        now = utcnow()
+        due_at = self._heartbeat.deadline_after_pass(budget, self._reconcile_interval, now)
+        if not await self._heartbeat_step(
+            "heartbeat", _write_heartbeat, record_heartbeat_cycle, identity, now, due_at,
+            timeout=_HEARTBEAT_TIMEOUT,
+        ):
+            return
+        self._heartbeat.pass_marked(budget)
+        await self._heartbeat_step(
+            "heartbeat_prune", _prune_other_heartbeats, identity.id, now,
+            timeout=_PRUNE_TIMEOUT,
+        )
+
+    async def _heartbeat_step(
+        self, name: str, fn: Any, *args: Any, timeout: float
+    ) -> bool:
+        """Run a heartbeat step through :meth:`_cycle_step`; return whether it succeeded.
+
+        A heartbeat that cannot be written is not a reason to stop consuming: a failure,
+        an attempt of the step still in flight and a saturated pool are logged and the
+        loop goes on. A stop requested before or during the step ends it quietly.
+        """
+        try:
+            await self._cycle_step(name, fn, *args, timeout=timeout)
+        except _StopRequested:
+            return False
+        except _StepInFlight as exc:
+            log.warning("RMQ Watcher: the %r step is skipped — %s", name, exc)
+            return False
+        except Exception:
+            log.warning(
+                "RMQ Watcher: the %r step failed or exceeded %ss — the watcher goes on",
+                name, timeout, exc_info=True,
+            )
+            return False
+        return True
 
     async def _wait_for_next_cycle(self) -> None:
         """Wait one reconcile interval, returning at once once the watcher is stopping.
@@ -928,8 +1236,8 @@ class RMQWatcherListener:
         :param name: Step name, used for the in-flight bookkeeping and the log line.
         :param fn: Blocking callable to run in the cycle pool.
         :param timeout: Seconds this step is given; the steps of the cycle proper leave
-            it out and share :data:`_STEP_TIMEOUT`, the tunable read and the migration
-            name one of their own.
+            it out and share :data:`_STEP_TIMEOUT`; the tunable read, the migration and
+            the heartbeat steps name one of their own.
         :returns: Whatever ``fn`` returned.
         :raises _StopRequested: A stop has been requested, before the step started or
             while its attempt was running.
@@ -973,8 +1281,8 @@ class RMQWatcherListener:
         except asyncio.TimeoutError:
             incr("rmq_watcher.cycle_step_timed_out")
             log.warning(
-                "RMQ Watcher: the %r step did not finish within %ss — ending this cycle; "
-                "its worker stays busy until the call itself returns",
+                "RMQ Watcher: the %r step did not finish within %ss; its worker stays "
+                "busy until the call itself returns",
                 name, timeout,
             )
             raise
@@ -1055,7 +1363,7 @@ class RMQWatcherListener:
         """
         try:
             interval, cycle_timeout = await self._cycle_step(
-                "settings", _read_settings, timeout=_VARIABLE_TIMEOUT
+                "settings", _read_settings, timeout=VARIABLE_TIMEOUT
             )
         except (_StepInFlight, _StopRequested):
             return

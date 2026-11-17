@@ -1,12 +1,12 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/consumer.py:1648
+where: airflow_provider_rmq/watcher/consumer.py:1649
 added: 2026-11-17
 ---
 # Подписки cooldown-DAG'а на разных `conn_id` дают только ERROR в логе
 
 Когда подписки одного cooldown-DAG'а расходятся по `conn_id`, `_report_split_cooldown`
-(`watcher/consumer.py:1648`) пишет ERROR раз на изменение набора. Подписки при этом остаются
+(`watcher/consumer.py:1649`) пишет ERROR раз на изменение набора. Подписки при этом остаются
 в активном наборе, а в их строках `consumer_status` нет `error`, объясняющего причину: если
 публикация в pending-очередь не проходит, строка показывает общий `error` с текстом
 `PublishError`, доставка возвращается в очередь (nack), консьюмер переподключается с

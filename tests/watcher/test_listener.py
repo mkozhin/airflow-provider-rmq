@@ -7,10 +7,12 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -21,7 +23,7 @@ from sqlalchemy.pool import NullPool
 
 import airflow_provider_rmq
 from airflow_provider_rmq.utils.amqp import call_with_timeout
-from airflow_provider_rmq.utils.executor import BoundedExecutor
+from airflow_provider_rmq.utils.executor import BoundedExecutor, PoolSaturated
 from airflow_provider_rmq.watcher import listener as listener_module
 from airflow_provider_rmq.watcher.dag_file_scan import _READABLE_FILE_REMEDY
 from airflow_provider_rmq.watcher.dag_folder_listing import (
@@ -44,9 +46,19 @@ from airflow_provider_rmq.watcher.listener import (
     _read_active_subs,
     _read_settings,
 )
+from airflow_provider_rmq.watcher import models
+from airflow_provider_rmq.watcher.liveness import (
+    LivenessState,
+    ProcessState,
+    assess_liveness,
+)
 from airflow_provider_rmq.watcher.models import (
     RMQSubscription,
+    RMQWatcherHeartbeat,
     WatcherBase,
+    WatcherIdentity,
+    ensure_heartbeat_table,
+    record_heartbeat_deadline,
     upsert_subscription,
 )
 from airflow_provider_rmq.watcher.runner import (
@@ -4354,7 +4366,7 @@ class TestCycleTunables:
         try:
             with patch(
                 "airflow_provider_rmq.watcher.listener._read_settings", side_effect=blocked
-            ), patch("airflow_provider_rmq.watcher.listener._VARIABLE_TIMEOUT", 0.05):
+            ), patch("airflow_provider_rmq.watcher.listener.VARIABLE_TIMEOUT", 0.05):
                 await listener._refresh_settings()
                 assert listener._reconcile_interval == 17
                 assert listener._cycle_timeout() == 300
@@ -6194,3 +6206,983 @@ class TestConcurrentSchedulerWrites:
         assert set(listener._deleted_dag_file_rows) == {
             ("a", "q", "rmq_default"), ("b", "q", "rmq_default"),
         }
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat of the watcher-process run
+# ---------------------------------------------------------------------------
+
+_H = listener_module._HEARTBEAT_TIMEOUT
+_P = listener_module._PRUNE_TIMEOUT
+_V = listener_module.VARIABLE_TIMEOUT
+
+
+@pytest.fixture
+def heartbeat_db(schema_engine):
+    """The engine standing in for Airflow's, with the listener's sessions bound to it.
+
+    The heartbeat table is not created here: the first heartbeat write creates it.
+    """
+    with patch(
+        "airflow_provider_rmq.watcher.listener.WatcherSession",
+        sessionmaker(bind=schema_engine),
+    ):
+        yield schema_engine
+
+
+def _heartbeat_rows(engine) -> dict[str, dict]:
+    """The heartbeat rows by id, as plain values."""
+    with sessionmaker(bind=engine)() as session:
+        return {
+            row.id: {
+                "hostname": row.hostname,
+                "pid": row.pid,
+                "started_at": row.started_at,
+                "last_cycle_at": row.last_cycle_at,
+                "due_at": row.due_at,
+                "stopped_at": row.stopped_at,
+            }
+            for row in session.query(RMQWatcherHeartbeat).all()
+        }
+
+
+def _the_row(engine) -> dict:
+    rows = _heartbeat_rows(engine)
+    assert len(rows) == 1, rows
+    return next(iter(rows.values()))
+
+
+def _heartbeat_listener() -> RMQWatcherListener:
+    """A cycle listener with a run identity, as :meth:`RMQWatcherListener.run` sets it."""
+    listener = _cycle_listener()
+    listener._identity = WatcherIdentity(
+        id="run-1", hostname="worker-1", pid=4321, started_at=listener_module.utcnow()
+    )
+    return listener
+
+
+def _stop_on(listener, passes: int):
+    """A reconcile stand-in that asks for the stop during pass number ``passes``."""
+    seen = []
+
+    async def reconcile(subs):
+        seen.append(1)
+        if len(seen) >= passes:
+            listener._stop_event.set()
+
+    return AsyncMock(side_effect=reconcile)
+
+
+def _stop_after_waits(listener, waits: int, on_wait=None):
+    """A between-passes wait that asks for the stop on wait number ``waits``."""
+    seen = []
+
+    async def wait():
+        seen.append(1)
+        if on_wait is not None:
+            on_wait()
+        if len(seen) >= waits:
+            listener._stop_event.set()
+
+    return AsyncMock(side_effect=wait)
+
+
+@contextlib.contextmanager
+def _heartbeat_cycle_patches(manager):
+    """Patch everything a cycle reaches outside the listener, leaving the sessions to
+    :func:`heartbeat_db`."""
+    with patch(
+        "airflow_provider_rmq.watcher.listener.RMQConsumerManager", return_value=manager
+    ), patch(
+        "airflow_provider_rmq.watcher.listener.get_enabled_subscriptions", return_value=[]
+    ), patch(
+        "airflow_provider_rmq.watcher.listener.is_schema_ready", return_value=True
+    ), patch(
+        "airflow_provider_rmq.watcher.listener._read_settings", return_value=(None, None)
+    ):
+        yield
+
+
+def _heartbeat_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == _LISTENER_LOG
+    ]
+
+
+def _spy_writes(monkeypatch) -> list[str]:
+    """Record the name of every heartbeat write the listener runs, then run it."""
+    names: list[str] = []
+    real = listener_module._write_heartbeat
+
+    def write(fn, identity, *args):
+        names.append(fn.__name__)
+        return real(fn, identity, *args)
+
+    monkeypatch.setattr(listener_module, "_write_heartbeat", write)
+    return names
+
+
+class TestHeartbeatRecords:
+    """The run's row: a deadline before the first pass, a mark after every pass that
+    finished within its budget."""
+
+    @pytest.mark.asyncio
+    async def test_the_start_row_carries_the_deadline_of_the_overridden_budget(
+        self, heartbeat_db, caplog
+    ):
+        listener = _heartbeat_listener()
+        # The real settings read, so the budget comes from rmq_watcher_cycle_timeout.
+        del listener._refresh_settings
+        manager = _fake_manager()
+        manager.reconcile = _stop_on(listener, 1)
+        before = listener_module.utcnow()
+
+        with _heartbeat_cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener._read_settings",
+            return_value=(None, 900.0),
+        ), caplog.at_level(logging.INFO, logger=_LISTENER_LOG):
+            await call_with_timeout(listener._main(), 5)
+        after = listener_module.utcnow()
+
+        row = _the_row(heartbeat_db)
+        assert listener._cycle_timeout() == 900.0
+        span = timedelta(seconds=_H + 900.0 + _H)
+        assert before + span <= row["due_at"] <= after + span
+        assert row["hostname"] == "worker-1"
+        assert row["pid"] == 4321
+        assert row["started_at"] == listener._identity.started_at
+        assert row["last_cycle_at"] is None, "a pass the stop cut short is not marked"
+        assert row["stopped_at"] is None
+        assert _heartbeat_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_larger_budget_records_a_new_deadline_before_the_pass(
+        self, heartbeat_db, monkeypatch
+    ):
+        listener = _heartbeat_listener()
+        del listener._refresh_settings
+        manager = _fake_manager()
+        rows_seen = []
+
+        async def reconcile(subs):
+            rows_seen.append((listener_module.utcnow(), _the_row(heartbeat_db)))
+            if len(rows_seen) == 2:
+                listener._stop_event.set()
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+        # The settings read puts the default interval back; the passes follow at once.
+        listener._wait_for_next_cycle = AsyncMock()
+        writes = _spy_writes(monkeypatch)
+
+        with _heartbeat_cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener._read_settings",
+            side_effect=[(None, 300.0), (None, 900.0)],
+        ):
+            await call_with_timeout(listener._main(), 5)
+
+        assert writes == [
+            "record_heartbeat_deadline", "record_heartbeat_cycle", "record_heartbeat_deadline",
+        ]
+        (_, during_first), (second_seen_at, during_second) = rows_seen
+        assert during_first["last_cycle_at"] is None
+        # The mark of the first pass stays; the deadline is the larger budget's, taken
+        # between that mark and the second reconcile.
+        first_mark = during_second["last_cycle_at"]
+        assert first_mark is not None
+        assert _the_row(heartbeat_db)["last_cycle_at"] == first_mark
+        span = timedelta(seconds=_H + 900.0 + _H)
+        assert first_mark + span <= during_second["due_at"] <= second_seen_at + span
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_or_smaller_budget_records_no_deadline_before_the_pass(
+        self, heartbeat_db, monkeypatch
+    ):
+        listener = _heartbeat_listener()
+        del listener._refresh_settings
+        manager = _fake_manager()
+        manager.reconcile = _stop_on(listener, 3)
+        # The settings read puts the default interval back; the passes follow at once.
+        listener._wait_for_next_cycle = AsyncMock()
+        writes = _spy_writes(monkeypatch)
+
+        with _heartbeat_cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener._read_settings",
+            side_effect=[(None, 600.0), (None, 600.0), (None, 300.0)],
+        ):
+            await call_with_timeout(listener._main(), 5)
+
+        assert writes == [
+            "record_heartbeat_deadline", "record_heartbeat_cycle", "record_heartbeat_cycle",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_pass_within_its_budget_moves_the_mark_and_the_deadline(
+        self, heartbeat_db
+    ):
+        listener = _heartbeat_listener()
+        listener._cycle_timeout_override = 300.0
+        listener._reconcile_interval = 7
+        manager = _fake_manager()
+        marks = []
+        listener._wait_for_next_cycle = _stop_after_waits(
+            listener, 2, on_wait=lambda: marks.append(_the_row(heartbeat_db))
+        )
+        before = listener_module.utcnow()
+
+        with _heartbeat_cycle_patches(manager):
+            await call_with_timeout(listener._main(), 5)
+
+        first, second = marks
+        assert before <= first["last_cycle_at"] <= second["last_cycle_at"]
+        for mark in marks:
+            assert mark["due_at"] - mark["last_cycle_at"] == timedelta(
+                seconds=_H + _P + 7 + _V + 300.0 + _H
+            )
+            assert mark["stopped_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_pass_that_ran_out_of_budget_marks_nothing(self, heartbeat_db):
+        listener = _heartbeat_listener()
+        listener._cycle_timeout_override = 0.05
+        manager = _fake_manager()
+        manager.reconcile = _never_returns
+
+        with _heartbeat_cycle_patches(manager), pytest.raises(asyncio.TimeoutError):
+            await listener._main()
+
+        row = _the_row(heartbeat_db)
+        assert row["last_cycle_at"] is None
+        assert row["due_at"] is not None
+
+    def test_a_restart_of_main_keeps_the_run_and_marks_no_stop(
+        self, heartbeat_db, monkeypatch
+    ):
+        """``_main`` crashes after its first mark and the loop restarts it: the run, its
+        row and its start time stay, no second start is recorded, and a crash is not an
+        orderly stop."""
+        listener = _cycle_listener()
+        listener._stop_event = _instant_stop_event()
+        manager = _fake_manager()
+        waits = []
+
+        async def wait():
+            waits.append(1)
+            if len(waits) == 1:
+                raise RuntimeError("the loop blew up")
+            listener._stop_event.set()
+
+        listener._wait_for_next_cycle = AsyncMock(side_effect=wait)
+        writes = _spy_writes(monkeypatch)
+
+        with _heartbeat_cycle_patches(manager):
+            listener.run(parent_pid=os.getppid())
+
+        # the restarted loop records a deadline before its first pass, as the start did
+        assert writes == [
+            "record_heartbeat_deadline", "record_heartbeat_cycle",
+            "record_heartbeat_deadline", "record_heartbeat_cycle",
+        ]
+        rows = _heartbeat_rows(heartbeat_db)
+        assert list(rows) == [listener._identity.id]
+        row = rows[listener._identity.id]
+        assert row["started_at"] == listener._identity.started_at
+        assert row["pid"] == os.getpid()
+        assert row["last_cycle_at"] is not None
+        assert row["stopped_at"] is None
+
+    def test_passes_that_keep_running_out_of_budget_end_with_a_dead_row(
+        self, heartbeat_db, monkeypatch
+    ):
+        """Every pass runs out of budget and the loop restarts ``_main`` each time: the
+        start and the first restart record a deadline, later restarts record none, and
+        once that deadline has passed the row is ``dead`` and, with a stale
+        ``last_reconcile_at``, the verdict is ``DOWN``."""
+        listener = _cycle_listener()
+        listener._stop_event = _instant_stop_event()
+        listener._cycle_timeout_override = 0.05
+        manager = _fake_manager()
+        passes = []
+
+        async def reconcile(subs):
+            passes.append(1)
+            if len(passes) == 4:
+                listener._stop_event.set()
+                return
+            await _never_returns()
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+        writes = _spy_writes(monkeypatch)
+
+        with _heartbeat_cycle_patches(manager):
+            listener.run(parent_pid=os.getppid())
+
+        assert len(passes) == 4
+        assert writes == ["record_heartbeat_deadline", "record_heartbeat_deadline"]
+        row = _the_row(heartbeat_db)
+        assert row["last_cycle_at"] is None
+        assert row["stopped_at"] is None
+        with sessionmaker(bind=heartbeat_db)() as session:
+            rows = session.query(RMQWatcherHeartbeat).all()
+            verdict = assess_liveness(
+                rows,
+                row["due_at"] + timedelta(seconds=1),
+                has_enabled_subscriptions=True,
+                has_fresh_reconcile=lambda: False,
+            )
+        assert [p.state for p in verdict.processes] == [ProcessState.DEAD]
+        assert verdict.state is LivenessState.DOWN
+
+    def test_a_marked_pass_earns_the_next_restart_a_deadline(
+        self, heartbeat_db, monkeypatch
+    ):
+        """A restart records a deadline once per start record or marked pass: pass 1
+        runs out of budget (restart with a deadline), pass 2 is marked and the loop
+        crashes after it (restart with a deadline), pass 3 runs out of budget (restart
+        without one)."""
+        listener = _cycle_listener()
+        listener._stop_event = _instant_stop_event()
+        listener._cycle_timeout_override = 0.05
+        manager = _fake_manager()
+        passes = []
+
+        async def reconcile(subs):
+            passes.append(1)
+            if len(passes) in (1, 3):
+                await _never_returns()
+            elif len(passes) == 4:
+                listener._stop_event.set()
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+
+        async def wait():
+            if not listener._stop_event.is_set():
+                raise RuntimeError("the loop blew up")
+
+        listener._wait_for_next_cycle = AsyncMock(side_effect=wait)
+        writes = _spy_writes(monkeypatch)
+
+        with _heartbeat_cycle_patches(manager):
+            listener.run(parent_pid=os.getppid())
+
+        assert len(passes) == 4
+        assert writes == [
+            "record_heartbeat_deadline",
+            "record_heartbeat_deadline", "record_heartbeat_cycle",
+            "record_heartbeat_deadline",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_old_rows_of_other_runs_are_pruned_after_the_mark(self, heartbeat_db):
+        listener = _heartbeat_listener()
+        now = listener_module.utcnow()
+        ensure_heartbeat_table()
+        with sessionmaker(bind=heartbeat_db)() as session:
+            for run_id, age in (("old", timedelta(days=2)), ("recent", timedelta(hours=2))):
+                record_heartbeat_deadline(
+                    session,
+                    WatcherIdentity(id=run_id, hostname="h", pid=1, started_at=now - age),
+                    now - age,
+                )
+        manager = _fake_manager()
+        listener._wait_for_next_cycle = _stop_after_waits(listener, 1)
+
+        with _heartbeat_cycle_patches(manager):
+            await call_with_timeout(listener._main(), 5)
+
+        assert set(_heartbeat_rows(heartbeat_db)) == {"run-1", "recent"}
+
+    def test_nothing_is_written_without_a_run(self):
+        """``_main`` driven without :meth:`run` — every process but the watcher's —
+        writes no heartbeat."""
+        listener = _cycle_listener()
+        manager = _fake_manager()
+        manager.reconcile = _stop_on(listener, 1)
+        write = MagicMock()
+
+        with _cycle_patches(manager), patch.object(
+            listener_module, "_write_heartbeat", write
+        ):
+            asyncio.run(listener._main())
+
+        write.assert_not_called()
+
+
+class TestHeartbeatKeeper:
+    """The deadlines the run's row carries, decided without the loop."""
+
+    NOW = models.utcnow()
+    H = listener_module._HEARTBEAT_TIMEOUT
+
+    def _keeper(self):
+        return listener_module._HeartbeatKeeper()
+
+    def _started(self, budget=60.0):
+        keeper = self._keeper()
+        assert keeper.deadline_before_pass(budget, self.NOW) is not None
+        keeper.deadline_recorded(budget)
+        return keeper
+
+    def test_the_first_pass_records_the_start(self):
+        due = self._keeper().deadline_before_pass(60.0, self.NOW)
+        assert due == self.NOW + timedelta(seconds=self.H + 60.0 + self.H)
+
+    def test_a_later_pass_under_the_same_or_a_smaller_budget_records_nothing(self):
+        keeper = self._started(60.0)
+        assert keeper.deadline_before_pass(60.0, self.NOW) is None
+        assert keeper.deadline_before_pass(30.0, self.NOW) is None
+
+    def test_a_larger_budget_records_a_deadline(self):
+        keeper = self._started(60.0)
+        due = keeper.deadline_before_pass(90.0, self.NOW)
+        assert due == self.NOW + timedelta(seconds=self.H + 90.0 + self.H)
+
+    def test_an_unwritten_start_leaves_no_budget_to_grow_from(self):
+        keeper = self._keeper()
+        keeper.deadline_before_pass(60.0, self.NOW)
+        assert keeper.deadline_before_pass(90.0, self.NOW) is None
+
+    def test_the_start_earns_one_restart_deadline(self):
+        keeper = self._started()
+        keeper.note_restart()
+        assert keeper.deadline_before_pass(60.0, self.NOW) is not None
+        keeper.deadline_recorded(60.0)
+        keeper.note_restart()
+        assert keeper.deadline_before_pass(60.0, self.NOW) is None
+
+    def test_a_restart_is_consumed_by_the_next_decision(self):
+        keeper = self._started()
+        keeper.note_restart()
+        keeper.deadline_before_pass(60.0, self.NOW)
+        keeper.deadline_recorded(60.0)
+        assert keeper.deadline_before_pass(60.0, self.NOW) is None
+
+    def test_a_marked_pass_earns_the_next_restart_a_deadline(self):
+        keeper = self._started()
+        keeper.note_restart()
+        keeper.deadline_before_pass(60.0, self.NOW)
+        keeper.deadline_recorded(60.0)
+        keeper.deadline_after_pass(60.0, 30, self.NOW)
+        keeper.pass_marked(60.0)
+        keeper.note_restart()
+        assert keeper.deadline_before_pass(60.0, self.NOW) is not None
+
+    def test_restarts_without_a_mark_get_no_further_deadline(self):
+        keeper = self._started()
+        decisions = []
+        for _ in range(4):
+            keeper.note_restart()
+            due = keeper.deadline_before_pass(60.0, self.NOW)
+            if due is not None:
+                keeper.deadline_recorded(60.0)
+            decisions.append(due is not None)
+        assert decisions == [True, False, False, False]
+
+    def test_the_deadline_after_a_pass_covers_everything_until_the_next_mark(self):
+        due = self._started().deadline_after_pass(60.0, 30, self.NOW)
+        expected = (
+            self.H + listener_module._PRUNE_TIMEOUT + 30
+            + listener_module.VARIABLE_TIMEOUT + 60.0 + self.H
+        )
+        assert due == self.NOW + timedelta(seconds=expected)
+
+    def test_the_stop_mark_repeats_the_last_decided_deadline(self):
+        keeper = self._started()
+        due = keeper.deadline_after_pass(60.0, 30, self.NOW)
+        assert keeper.stop_mark_due(self.NOW + timedelta(seconds=5)) == due
+
+    def test_the_stop_mark_before_any_deadline_carries_the_stop_time(self):
+        stopped_at = self.NOW + timedelta(seconds=5)
+        assert self._keeper().stop_mark_due(stopped_at) == stopped_at
+
+    def test_the_stop_mark_is_claimed_once(self):
+        keeper = self._started()
+        assert keeper.stop_mark_due(self.NOW) is not None
+        assert keeper.stop_mark_due(self.NOW) is None
+
+
+class TestHeartbeatStopMark:
+    """An orderly stop marks the row from a thread of its own, bounded."""
+
+    @pytest.mark.asyncio
+    async def test_the_mark_is_written_while_a_reconcile_still_runs(self, heartbeat_db):
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def reconcile(subs):
+            entered.set()
+            await release.wait()
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+
+        def stop() -> None:
+            listener.request_stop()
+            listener.mark_stopped()
+
+        with _heartbeat_cycle_patches(manager):
+            task = asyncio.ensure_future(listener._main())
+            await call_with_timeout(entered.wait(), 5)
+            started = _the_row(heartbeat_db)
+            await asyncio.to_thread(stop)
+            during = _the_row(heartbeat_db)
+            assert not task.done(), "the reconcile is still running"
+            release.set()
+            await call_with_timeout(task, 5)
+
+        assert during["stopped_at"] is not None
+        assert during["due_at"] == started["due_at"], "the stop repeats the last deadline"
+        after = _the_row(heartbeat_db)
+        assert after["stopped_at"] == during["stopped_at"]
+        assert after["last_cycle_at"] is None, "no mark once the stop has been requested"
+        assert after["due_at"] == during["due_at"]
+
+    def test_a_hung_write_is_not_waited_for_past_the_bound(self, monkeypatch, caplog):
+        assert listener_module._STOP_MARK_TIMEOUT <= 2.0
+        monkeypatch.setattr(listener_module, "_STOP_MARK_TIMEOUT", 0.1)
+        release = threading.Event()
+        monkeypatch.setattr(listener_module, "_write_heartbeat", _blocked_by(release))
+        listener = _heartbeat_listener()
+
+        try:
+            with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+                started = time.monotonic()
+                listener.mark_stopped()
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert elapsed < 1.0
+        assert any("was not written within" in m for m in _heartbeat_warnings(caplog))
+
+    def test_a_failed_write_is_logged_and_the_stop_goes_on(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            listener_module, "_write_heartbeat",
+            MagicMock(side_effect=RuntimeError("database is gone")),
+        )
+        listener = _heartbeat_listener()
+
+        with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+            listener.mark_stopped()
+
+        assert any("cannot mark the stop" in m for m in _heartbeat_warnings(caplog))
+
+    def test_a_second_call_writes_nothing(self, heartbeat_db, monkeypatch):
+        writes = _spy_writes(monkeypatch)
+        listener = _heartbeat_listener()
+
+        listener.mark_stopped()
+        first = _the_row(heartbeat_db)
+        listener.mark_stopped()
+
+        assert writes == ["record_heartbeat_stop"]
+        assert _the_row(heartbeat_db) == first
+        assert first["stopped_at"] is not None
+        assert first["due_at"] == first["stopped_at"], "no deadline written, none repeated"
+        assert first["pid"] == 4321
+
+    def test_a_call_before_run_writes_nothing(self, monkeypatch):
+        write = MagicMock()
+        monkeypatch.setattr(listener_module, "_write_heartbeat", write)
+        listener = RMQWatcherListener()
+
+        listener.mark_stopped()
+
+        write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_stop_before_the_start_record_submits_none(
+        self, heartbeat_db, monkeypatch, caplog
+    ):
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        writes = _spy_writes(monkeypatch)
+
+        async def refresh_then_stop():
+            listener.request_stop()
+            await asyncio.to_thread(listener.mark_stopped)
+
+        listener._refresh_settings = AsyncMock(side_effect=refresh_then_stop)
+
+        with _heartbeat_cycle_patches(manager), caplog.at_level(
+            logging.INFO, logger=_LISTENER_LOG
+        ):
+            await call_with_timeout(listener._main(), 5)
+
+        assert writes == ["record_heartbeat_stop"]
+        manager.reconcile.assert_not_awaited()
+        row = _the_row(heartbeat_db)
+        assert row["stopped_at"] is not None
+        assert row["last_cycle_at"] is None
+        assert _heartbeat_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_stop_during_the_start_record_ends_with_stopped_at(
+        self, heartbeat_db, monkeypatch, caplog
+    ):
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        errors: list[BaseException] = []
+        real_start = listener_module.record_heartbeat_deadline
+
+        def slow_start(*args):
+            entered.set()
+            release.wait(timeout=5)
+            try:
+                real_start(*args)
+            except BaseException as exc:
+                errors.append(exc)
+                raise
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(listener_module, "record_heartbeat_deadline", slow_start)
+
+        def stop() -> None:
+            listener.request_stop()
+            listener.mark_stopped()
+
+        try:
+            with _heartbeat_cycle_patches(manager), caplog.at_level(
+                logging.INFO, logger=_LISTENER_LOG
+            ):
+                task = asyncio.ensure_future(listener._main())
+                await call_with_timeout(asyncio.to_thread(entered.wait, 5), 5)
+                await asyncio.to_thread(stop)
+                await call_with_timeout(task, 5)
+        finally:
+            release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+
+        assert errors == []
+        row = _the_row(heartbeat_db)
+        assert row["stopped_at"] is not None, "the start record does not clear the mark"
+        manager.reconcile.assert_not_awaited()
+        assert _heartbeat_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_pass_mark_committed_after_the_stop_mark_keeps_it(
+        self, heartbeat_db, monkeypatch, caplog
+    ):
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        real_cycle = listener_module.record_heartbeat_cycle
+
+        def slow_cycle(*args):
+            entered.set()
+            release.wait(timeout=5)
+            try:
+                real_cycle(*args)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(listener_module, "record_heartbeat_cycle", slow_cycle)
+
+        def stop() -> None:
+            listener.request_stop()
+            listener.mark_stopped()
+
+        try:
+            with _heartbeat_cycle_patches(manager), caplog.at_level(
+                logging.INFO, logger=_LISTENER_LOG
+            ):
+                task = asyncio.ensure_future(listener._main())
+                await call_with_timeout(asyncio.to_thread(entered.wait, 5), 5)
+                await asyncio.to_thread(stop)
+                await call_with_timeout(task, 5)
+        finally:
+            release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+
+        row = _the_row(heartbeat_db)
+        assert row["stopped_at"] is not None
+        assert row["last_cycle_at"] is not None
+        assert _heartbeat_warnings(caplog) == [], "a stop is not a failed heartbeat"
+
+
+class TestHeartbeatFailures:
+    """A heartbeat that cannot be written never costs the loop its pass."""
+
+    @staticmethod
+    def _completed(incr):
+        return [c for c in incr.call_args_list if c == call("rmq_watcher.cycle_completed")]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_mark_neither_ends_the_loop_nor_the_metric(
+        self, heartbeat_db, monkeypatch, caplog
+    ):
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        listener._wait_for_next_cycle = _stop_after_waits(listener, 2)
+        monkeypatch.setattr(
+            listener_module, "record_heartbeat_cycle",
+            MagicMock(side_effect=RuntimeError("database is gone")),
+        )
+        prune = MagicMock(return_value=0)
+        monkeypatch.setattr(listener_module, "_prune_other_heartbeats", prune)
+
+        with _heartbeat_cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.incr"
+        ) as incr, caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+            await call_with_timeout(listener._main(), 5)
+
+        assert manager.reconcile.await_count == 2
+        assert len(self._completed(incr)) == 2
+        failures = [m for m in _heartbeat_warnings(caplog) if "'heartbeat' step" in m]
+        assert len(failures) == 2
+        prune.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_prune_keeps_the_mark(self, heartbeat_db, monkeypatch, caplog):
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        listener._wait_for_next_cycle = _stop_after_waits(listener, 2)
+        monkeypatch.setattr(
+            listener_module, "prune_heartbeats",
+            MagicMock(side_effect=RuntimeError("lock wait timeout")),
+        )
+
+        with _heartbeat_cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.incr"
+        ) as incr, caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+            await call_with_timeout(listener._main(), 5)
+
+        assert manager.reconcile.await_count == 2
+        assert len(self._completed(incr)) == 2
+        assert _the_row(heartbeat_db)["last_cycle_at"] is not None
+        assert any("'heartbeat_prune' step" in m for m in _heartbeat_warnings(caplog))
+
+    @pytest.mark.asyncio
+    async def test_a_hung_write_is_not_submitted_again(
+        self, heartbeat_db, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(listener_module, "_HEARTBEAT_TIMEOUT", 0.1)
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        listener._wait_for_next_cycle = _stop_after_waits(listener, 3)
+        release = threading.Event()
+        calls: list = []
+        monkeypatch.setattr(
+            listener_module, "record_heartbeat_cycle", _blocked_by(release, calls=calls)
+        )
+
+        try:
+            with _heartbeat_cycle_patches(manager), patch(
+                "airflow_provider_rmq.watcher.listener.incr"
+            ) as incr, caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+                await call_with_timeout(listener._main(), 5)
+        finally:
+            release.set()
+
+        assert calls == [1]
+        assert manager.reconcile.await_count == 3
+        assert len(self._completed(incr)) == 3
+        warnings = _heartbeat_warnings(caplog)
+        assert sum("the 'heartbeat' step is skipped" in m for m in warnings) == 2
+        assert any("did not finish within 0.1s" in m for m in warnings)
+        assert not any("ending this cycle" in m for m in warnings)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_table_creation_in_the_start_step_is_retried_by_the_mark(
+        self, heartbeat_db, monkeypatch, caplog
+    ):
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        listener._wait_for_next_cycle = _stop_after_waits(listener, 1)
+        creations = []
+
+        def create():
+            creations.append(1)
+            if len(creations) == 1:
+                raise RuntimeError("permission denied")
+            models.ensure_heartbeat_table()
+
+        monkeypatch.setattr(listener_module, "ensure_heartbeat_table", create)
+
+        with _heartbeat_cycle_patches(manager), caplog.at_level(
+            logging.WARNING, logger=_LISTENER_LOG
+        ):
+            await call_with_timeout(listener._main(), 5)
+
+        manager.reconcile.assert_awaited_once()
+        assert any("'heartbeat' step" in m for m in _heartbeat_warnings(caplog))
+        assert len(creations) == 2
+        assert _the_row(heartbeat_db)["last_cycle_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_hung_table_creation_in_the_start_step_is_bounded(
+        self, heartbeat_db, monkeypatch, caplog
+    ):
+        """The table creation of the start step hangs: the step gives up at its bound,
+        the pass starts, and the mark after it creates the table once the hung call has
+        returned."""
+        monkeypatch.setattr(listener_module, "_HEARTBEAT_TIMEOUT", 0.1)
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        listener._wait_for_next_cycle = _stop_after_waits(listener, 1)
+        release = threading.Event()
+        hung_returned = threading.Event()
+        creations = []
+
+        def create():
+            creations.append(1)
+            if len(creations) == 1:
+                try:
+                    release.wait(timeout=5)
+                    raise RuntimeError("lock wait timeout")
+                finally:
+                    hung_returned.set()
+            models.ensure_heartbeat_table()
+
+        monkeypatch.setattr(listener_module, "ensure_heartbeat_table", create)
+
+        async def reconcile(subs):
+            release.set()
+            assert await asyncio.to_thread(hung_returned.wait, 5)
+            # the worker hands the raised error to the step's future right after
+            await asyncio.sleep(0.2)
+
+        manager.reconcile = AsyncMock(side_effect=reconcile)
+
+        try:
+            with _heartbeat_cycle_patches(manager), caplog.at_level(
+                logging.WARNING, logger=_LISTENER_LOG
+            ):
+                await call_with_timeout(listener._main(), 5)
+        finally:
+            release.set()
+
+        manager.reconcile.assert_awaited_once()
+        assert any("did not finish within 0.1s" in m for m in _heartbeat_warnings(caplog))
+        assert len(creations) == 2
+        assert _the_row(heartbeat_db)["last_cycle_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_pool_skips_the_write_and_the_loop_goes_on(
+        self, heartbeat_db, monkeypatch, caplog
+    ):
+        listener = _heartbeat_listener()
+        manager = _fake_manager()
+        listener._wait_for_next_cycle = _stop_after_waits(listener, 2)
+        cycle_pool, _ = listener._ensure_pools()
+        real_submit = cycle_pool.submit
+
+        def submit(fn, *args):
+            if fn is listener_module._write_heartbeat:
+                raise PoolSaturated("RMQ Watcher thread pool 'rmq-watcher-cycle' is full")
+            return real_submit(fn, *args)
+
+        monkeypatch.setattr(cycle_pool, "submit", submit)
+
+        with _heartbeat_cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener.incr"
+        ) as incr, caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+            await call_with_timeout(listener._main(), 5)
+
+        assert manager.reconcile.await_count == 2
+        assert len(self._completed(incr)) == 2
+        # the start record and the marks of both passes
+        failures = [m for m in _heartbeat_warnings(caplog) if "'heartbeat' step" in m]
+        assert len(failures) == 3
+
+    @pytest.mark.asyncio
+    async def test_without_a_recorded_deadline_a_larger_budget_waits_for_a_mark(
+        self, heartbeat_db, monkeypatch
+    ):
+        """The start record and the first mark fail, so no deadline has been stored
+        to compare a budget with: the larger budget of the second pass records no
+        deadline, and the mark after that pass is the row's first write."""
+        listener = _heartbeat_listener()
+        del listener._refresh_settings
+        manager = _fake_manager()
+        listener._wait_for_next_cycle = _stop_after_waits(listener, 2)
+        writes: list[str] = []
+        real = listener_module._write_heartbeat
+
+        def write(fn, identity, *args):
+            writes.append(fn.__name__)
+            if len(writes) <= 2:
+                raise RuntimeError("database is gone")
+            return real(fn, identity, *args)
+
+        monkeypatch.setattr(listener_module, "_write_heartbeat", write)
+
+        with _heartbeat_cycle_patches(manager), patch(
+            "airflow_provider_rmq.watcher.listener._read_settings",
+            side_effect=[(None, 300.0), (None, 900.0)],
+        ):
+            await call_with_timeout(listener._main(), 5)
+
+        assert writes == [
+            "record_heartbeat_deadline", "record_heartbeat_cycle", "record_heartbeat_cycle",
+        ]
+        row = _the_row(heartbeat_db)
+        assert row["due_at"] - row["last_cycle_at"] == timedelta(
+            seconds=_H + _P + listener._reconcile_interval + _V + 900.0 + _H
+        )
+
+
+class TestHeartbeatRun:
+    """The run :meth:`RMQWatcherListener.run` creates for the heartbeat row."""
+
+    @staticmethod
+    def _stopped_listener() -> RMQWatcherListener:
+        listener = _cycle_listener()
+        listener._stop_event.set()
+        return listener
+
+    def test_the_run_takes_airflow_s_hostname_and_logs_its_row(self, monkeypatch, caplog):
+        monkeypatch.setattr("airflow.utils.net.get_hostname", lambda: "scheduler-7.example")
+        listener = self._stopped_listener()
+
+        with caplog.at_level(logging.INFO, logger=_LISTENER_LOG):
+            listener.run(parent_pid=os.getppid())
+
+        identity = listener._identity
+        assert identity.hostname == "scheduler-7.example"
+        assert identity.pid == os.getpid()
+        assert (
+            f"RMQ Watcher run {identity.id} (host scheduler-7.example, PID {os.getpid()}) "
+            "keeps its heartbeat in rmq_watcher_heartbeat"
+        ) in caplog.text
+
+    def test_a_failing_hostname_callable_falls_back_to_the_socket_name(
+        self, monkeypatch, caplog
+    ):
+        def broken():
+            raise ImportError("hostname_callable my_module:missing")
+
+        monkeypatch.setattr("airflow.utils.net.get_hostname", broken)
+        listener = self._stopped_listener()
+
+        with caplog.at_level(logging.INFO, logger=_LISTENER_LOG):
+            listener.run(parent_pid=os.getppid())
+
+        assert listener._identity.hostname == socket.gethostname()
+        warnings = [m for m in _heartbeat_warnings(caplog) if "get_hostname() failed" in m]
+        assert len(warnings) == 1
+        assert "keeps its heartbeat in rmq_watcher_heartbeat" in caplog.text
+
+    def test_a_stop_mark_thread_that_cannot_start_is_logged_once(self, monkeypatch, caplog):
+        write = MagicMock()
+        monkeypatch.setattr(listener_module, "_write_heartbeat", write)
+        listener = _heartbeat_listener()
+
+        def refuse(self):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, "start", refuse)
+
+        with caplog.at_level(logging.WARNING, logger=_LISTENER_LOG):
+            listener.mark_stopped()
+
+        warnings = [m for m in _heartbeat_warnings(caplog) if "cannot start the thread" in m]
+        assert len(warnings) == 1
+        write.assert_not_called()

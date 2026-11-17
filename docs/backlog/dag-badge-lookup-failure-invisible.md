@@ -1,6 +1,6 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/views.py:435
+where: airflow_provider_rmq/watcher/views.py:613
 added: 2026-08-09
 ---
 # Сбой lookup'а для бейджа «dag not found» не виден в UI
@@ -12,13 +12,13 @@ added: 2026-08-09
 отличить «все `dag_id` валидны» от «валидация недоступна», не заглянув в лог
 Scheduler'а.
 
-В коде это `subscriptions()` (`views.py:426-435`): исключение из
+В коде это `subscriptions()` (`views.py:604-613`): исключение из
 `get_active_dag_ids` уходит в `log.warning`, а в шаблон передаётся
-`active_dag_ids = None`. Шаблон (`templates/rmq_watcher/subscriptions.html:145`,
-`206`) при `none` просто не рисует бейдж, и ничего на странице об отказе не
+`active_dag_ids = None`. Шаблон (`templates/rmq_watcher/subscriptions.html:213`,
+`276`) при `none` просто не рисует бейдж, и ничего на странице об отказе не
 говорит. У двух соседних блоков той же страницы заметки об отказе есть: блок
-подписок на отказе чтения показывает `subscriptions_error` (`views.py:380-399`),
-блок Connections — `conn_status_error` (`views.py:400-415`). Бейдж —
+подписок на отказе чтения показывает `subscriptions_error` (`views.py:551-570`),
+блок Connections — `conn_status_error` (`views.py:571-586`). Бейдж —
 единственная часть страницы, чей отказ выглядит как «всё в порядке».
 
 **Почему это важно.** Ровно эта проблема («не должно требоваться грепать

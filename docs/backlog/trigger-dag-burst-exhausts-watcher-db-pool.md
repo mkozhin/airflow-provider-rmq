@@ -1,6 +1,6 @@
 ---
 worth: later
-where: airflow_provider_rmq/watcher/consumer.py:3739
+where: airflow_provider_rmq/watcher/consumer.py:3740
 added: 2026-09-02
 ---
 # Всплеск доставок исчерпывает пул соединений watcher'а с метабазой
@@ -8,7 +8,7 @@ added: 2026-09-02
 **Контекст.** Это про соединения с Postgres, не с RabbitMQ. Watcher работает в
 дочернем процессе шедулера (`python -c <bootstrap> airflow_provider_rmq.watcher.runner`,
 ADR 0008) и ходит в метабазу через `WatcherSession`
-(`airflow_provider_rmq/watcher/models.py:96`), привязанную к движку Airflow этого
+(`airflow_provider_rmq/watcher/models.py:157`), привязанную к движку Airflow этого
 процесса. Движок у процесса свой, и пул соединений тоже свой: с пулом шедулера
 watcher его не делит, но на каждый шедулер к базе добавляется ещё один такой пул.
 
@@ -19,15 +19,15 @@ watcher его не делит, но на каждый шедулер к баз�
 overflow 10 reached`.
 
 Что watcher делает с базой на одну доставку в immediate-режиме, всё в потоках
-пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:180`), куда их
+пула консьюмеров (`_CONSUMER_POOL_WORKERS = 32`, `listener.py:205`), куда их
 отправляют `_trigger_dag` и `_trigger_fire_dag` через `self._executor.run`
-(`consumer.py:3716-3757`):
+(`consumer.py:3717-3758`):
 
 | шаг | где | соединений |
 |---|---|---|
-| проверка `DagModel` (активен, не на паузе) | `_sync_trigger`, `consumer.py:281` | 1, отпускается до триггера |
-| `trigger_dag`: чтение `serialized_dag`, вставка `dag_run` и task instances | `consumer.py:296` | 1 на всё время вызова |
-| запись статуса подписки | `_StatusWriter.store`, `consumer.py:390` | 0 (дедуплицировано) или 1 |
+| проверка `DagModel` (активен, не на паузе) | `_sync_trigger`, `consumer.py:282` | 1, отпускается до триггера |
+| `trigger_dag`: чтение `serialized_dag`, вставка `dag_run` и task instances | `consumer.py:297` | 1 на всё время вызова |
+| запись статуса подписки | `_StatusWriter.store`, `consumer.py:391` | 0 (дедуплицировано) или 1 |
 
 Из того же пула в 15 соединений берёт и пул цикла на 4 воркера: чтение Airflow
 Connection, скан, синк, строки статусов.

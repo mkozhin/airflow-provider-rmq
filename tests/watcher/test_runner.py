@@ -73,6 +73,7 @@ class _FakeListener:
         self.run_args: tuple | None = None
         self.run_thread_name: str | None = None
         self.stop_requests = 0
+        self.stop_marks = 0
 
     def run(self, parent_pid: int) -> None:
         self.run_args = (parent_pid,)
@@ -93,6 +94,9 @@ class _FakeListener:
         self.stop_requests += 1
         if self.stops_on_request:
             self.release.set()
+
+    def mark_stopped(self) -> None:
+        self.stop_marks += 1
 
 
 def _loop_phase() -> bool:
@@ -1139,12 +1143,18 @@ def events(process, monkeypatch):
 def _recording_listener(recorded: list[str], **kwargs) -> _FakeListener:
     fake = _FakeListener(**kwargs)
     real_request_stop = fake.request_stop
+    real_mark_stopped = fake.mark_stopped
 
     def request_stop() -> None:
         recorded.append("request_stop")
         real_request_stop()
 
+    def mark_stopped() -> None:
+        recorded.append("mark_stopped")
+        real_mark_stopped()
+
     fake.request_stop = request_stop  # type: ignore[method-assign]
+    fake.mark_stopped = mark_stopped  # type: ignore[method-assign]
     return fake
 
 
@@ -1159,7 +1169,9 @@ class TestHardExitDeadline:
     def test_the_deadline_outlasts_every_bounded_wait_of_the_way_out(self):
         assert isinstance(runner._HARD_EXIT_DEADLINE, int)
         assert runner._HARD_EXIT_DEADLINE > (
-            runner._EXIT_JOIN_TIMEOUT + runner._LOGGING_SHUTDOWN_TIMEOUT
+            listener_module._STOP_MARK_TIMEOUT
+            + runner._EXIT_JOIN_TIMEOUT
+            + runner._LOGGING_SHUTDOWN_TIMEOUT
         )
 
     def test_arming_sets_the_alarm_to_the_deadline(self, alarm_calls):
@@ -1295,9 +1307,29 @@ class TestHardExitDeadline:
         assert _first(events, "prepare") < armed, "armed before any stop"
         assert events[armed] == _ARMED
         assert events[armed + 1] == "request_stop"
-        assert events[armed + 2].startswith("log RMQ Watcher process received SIGTERM")
+        assert events[armed + 2] == "mark_stopped"
+        assert events[armed + 3].startswith("log RMQ Watcher process received SIGTERM")
         assert armed < _first(events, "close_db") < _first(events, "shutdown")
         assert events[-1] == "exit 0"
+
+    def test_a_stop_signal_after_the_parent_changed_leaves_the_row_unmarked(
+        self, process, monkeypatch, events
+    ):
+        """The parent-death signal arrives once the scheduler is gone: the loop is
+        asked to stop, and the heartbeat row is left for its deadline to run out."""
+        fake = _recording_listener(events)
+        _use_listener(monkeypatch, fake)
+        process.sigtimedwait.side_effect = _SignalAfter(0)
+        process.getppid.side_effect = lambda: 1 if _loop_phase() else _PARENT
+
+        assert _run_main() == 0
+
+        armed = _first(events, "alarm")
+        assert events[armed + 1] == "request_stop"
+        assert events[armed + 2].startswith("log RMQ Watcher process received SIGTERM")
+        assert "mark_stopped" not in events
+        assert fake.stop_requests == 1
+        assert fake.stop_marks == 0
 
     def test_a_parent_change_in_the_main_wait_arms_then_stops_then_logs(
         self, process, monkeypatch, events
@@ -1319,6 +1351,7 @@ class TestHardExitDeadline:
             f"log RMQ Watcher process: the scheduler process {_PARENT} has exited "
             "(parent is now 1) — stopping the watcher"
         )
+        assert "mark_stopped" not in events
         assert fake.returned.is_set()
         assert events[-1] == "exit 0"
 
@@ -1428,6 +1461,7 @@ class TestMainLoop:
         assert fake.run_args == (_PARENT,)
         assert fake.run_thread_name == "rmq-watcher"
         assert fake.stop_requests == 1
+        assert fake.stop_marks == 1
         assert returned_at_exit == [True], "the process left before the loop returned"
         assert waits.loop_calls == 3
         waited_for, timeout = process.sigtimedwait.call_args.args
@@ -1486,6 +1520,7 @@ class TestMainLoop:
 
         assert fake.run_args == (_PARENT,)
         assert fake.stop_requests == 0
+        assert fake.stop_marks == 0
         process.shutdown.assert_called_once()
         process.close_db.assert_called_once_with()
 

@@ -1,13 +1,13 @@
 ---
 worth: yes
-where: airflow_provider_rmq/watcher/consumer.py:3836
+where: airflow_provider_rmq/watcher/consumer.py:3837
 added: 2026-09-02
 ---
 # Провайдер объявляет чужой exchange активно и не может подписаться на уже существующий
 
 **Контекст.** `_ensure_exchange_infrastructure`
-(`airflow_provider_rmq/watcher/consumer.py:3814`) объявляет exchange из декоратора
-активным `declare_exchange` (`consumer.py:3835-3843`): topic, durable, с аргументом
+(`airflow_provider_rmq/watcher/consumer.py:3815`) объявляет exchange из декоратора
+активным `declare_exchange` (`consumer.py:3836-3844`): topic, durable, с аргументом
 `alternate-exchange={exchange}.unrouted`; docstring прямо говорит «All declares are
 active (no ``passive=True``)». Exchange-режим задуман так, что
 провайдер «владеет инфраструктурой целиком». Но exchange, на который
@@ -18,7 +18,7 @@ active (no ``passive=True``)». Exchange-режим задуман так, чт�
 `alternate-exchange` — самый обычный вариант. DAG подписывается через
 `@rmq_trigger(exchange="jetstat.airflow", ...)`. Первый же declare провайдера
 отличается аргументами, брокер отвечает `PRECONDITION_FAILED` (406),
-`_provision_exchange_group` (`consumer.py:2306-2322`) пишет ERROR и выходит, не дойдя до объявления
+`_provision_exchange_group` (`consumer.py:2307-2323`) пишет ERROR и выходит, не дойдя до объявления
 `rmq_watcher.sub.{dag_id}` и биндингов. Consumer-таска подписки делает
 passive declare несуществующей очереди, получает `ChannelNotFoundEntity`, строка
 уходит в `error`. Так повторяется каждый цикл. Подписка не заработает никогда,

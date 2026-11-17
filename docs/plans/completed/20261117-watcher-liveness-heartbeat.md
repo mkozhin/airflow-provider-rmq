@@ -62,12 +62,31 @@
   отличает webserver от CLI FAB, который тоже регистрирует блюпринт); образец колбэка
   `_grant_op_access(state)` (:122) и его регистрация `_bp.record_once(_grant_op_access)`
   (:216); `on_load` (:232, `ensure_table_exists` в каждом процессе).
-- Airflow (сверено по 2.11.2): `airflow.www.utils.UIAlert` (`__init__` присваивает
-  `message`, `category`, `roles`, `html`; `message = Markup(message) if html else message`;
-  `should_show(appbuilder)`), `airflow.settings.DASHBOARD_UIALERTS`, отбор `should_show` в
-  `www/views.py` (:1070-1071), вывод `m.message` / `m.category` в
-  `www/templates/airflow/dags.html` (:84-85) с автоэкранированием — при рендере, позже отбора.
-  Для 2.9.1 сверяется в Task 1.
+- Airflow (сверено по 2.9.1 и 2.11.2, расхождений в используемом API нет):
+  - `airflow.www.utils.UIAlert`: `__init__` присваивает `category`, `roles`, `html`,
+    `message` (`Markup(message) if html else message`); `should_show(self, appbuilder)` —
+    один позиционный аргумент; `html` после `__init__` нигде не читается;
+  - `airflow.settings.DASHBOARD_UIALERTS` — модульный список; `import_local_settings`
+    копирует имена из `airflow_local_settings` в глобалы `airflow.settings`, так что там
+    может оказаться и кортеж;
+  - `views.Airflow.index` (`@expose("/home")`) на каждый запрос строит список
+    `[fm for fm in settings.DASHBOARD_UIALERTS if fm.should_show(get_airflow_app().appbuilder)]`
+    (2.9.1 `www/views.py:1001-1003`, 2.11.2 :1070-1072), читая `settings.DASHBOARD_UIALERTS`
+    через модуль (`from airflow import settings`), и передаёт его в `render_template` того же
+    вызова — отбор и рендер идут в одном контексте запроса, `flask.g` у них общий;
+  - `www/templates/airflow/dags.html` (:84-85, одинаково) выводит
+    `show_message(m.message, m.category)`; макрос `_messages.html` подставляет
+    `{{ category }}` в класс и `{{ content }}` в тело с автоэкранированием Flask для `.html`;
+  - `airflow.utils.net.get_hostname()` в обеих версиях одинаков:
+    `conf.getimport("core", "hostname_callable", fallback="airflow.utils.net.getfqdn")()`;
+  - `create_app` вызывает `init_appbuilder_views` (регистрирует `views.Airflow`, эндпоинт
+    `Airflow.index`) раньше `init_plugins` (регистрирует блюпринты плагинов) — в 2.9.1 и
+    2.11.2. FAB CLI (`airflow users` / `roles` / `sync-perm`) в 2.9.1 приходит из
+    `apache-airflow-providers-fab>=1.0.2`: `get_application_builder` вызывает
+    `init_appbuilder` и `init_plugins`, но не `init_appbuilder_views`, а индекс-вид FAB по
+    умолчанию — `IndexView.index`. Поэтому `_serves_the_web_ui(state.app)` в колбэке
+    `record_once` отличает webserver от CLI FAB одинаково для `_grant_op_access` и для
+    колбэка баннера.
 - Тесты: `tests/watcher/test_models.py`, `test_listener.py`, `test_runner.py`,
   `test_views.py`, `test_plugin.py`; образец проверки импортов отдельным интерпретатором —
   `TestDagFileScanImportFootprint` в `tests/watcher/test_dag_file_scan.py`.
@@ -265,9 +284,11 @@
   и `category` — свойства без записи, читающие снимок вердикта из `flask.g`. `message`
   возвращает `markupsafe.Markup`, собранный `Markup(template).format(...)`: ссылка остаётся
   разметкой, подставленное время экранируется.
-- `should_show(self, *args, **kwargs)` берёт вердикт из кэша, кладёт его в `flask.g` и
-  возвращает `True` только для `down`; `message` и `category` при рендере читают только
-  `flask.g` и в БД не ходят, так что отбор и текст одного запроса не расходятся.
+- `should_show(self, *args, **kwargs)` (Airflow 2.9.1–2.11.2 передаёт один позиционный
+  `appbuilder`) берёт вердикт из кэша, кладёт его в `flask.g` и возвращает `True` только для
+  `down`; `message` и `category` при рендере читают только `flask.g` и в БД не ходят, так что
+  отбор и текст одного запроса не расходятся. Атрибут `html` не задаётся: Airflow читает его
+  только в `UIAlert.__init__`.
 - Кэш — неизменяемая пара `(expires_at, verdict)`, заменяемая целиком, 30 с на процесс
   воркера webserver'а; перечтение под `threading.Lock`, чтобы промах кэша не дал залп
   запросов. Промах — пока флаг готовности не стоит, `ensure_heartbeat_table()`; затем
@@ -310,16 +331,18 @@
 **Files:**
 - Modify: `docs/plans/20261117-watcher-liveness-heartbeat.md`
 
-- [ ] по исходникам Airflow 2.9.1 (тег `2.9.1` в apache/airflow) подтвердить: атрибуты,
+- [x] по исходникам Airflow 2.9.1 (тег `2.9.1` в apache/airflow) подтвердить: атрибуты,
       которые `UIAlert.__init__` присваивает, сигнатуру `should_show`, что
       `views.Airflow.index` фильтрует `settings.DASHBOARD_UIALERTS` вызовом `should_show`
       на каждый запрос, что `dags.html` читает `m.message` и `m.category` при рендере с
       автоэкранированием, что `flask.g` доступен в обоих местах одного запроса
-- [ ] подтвердить для 2.9.1 `airflow.utils.net.get_hostname()` и то, что
+- [x] подтвердить для 2.9.1 `airflow.utils.net.get_hostname()` и то, что
       `_serves_the_web_ui(state.app)` отличает webserver от CLI FAB так же, как для
       `_grant_op_access`
-- [ ] записать расхождения с 2.11.2 в этот план (⚠️) и поправить Technical Details
-- [ ] тестов задача не добавляет: она меняет только план
+- [x] записать расхождения с 2.11.2 в этот план (⚠️) и поправить Technical Details
+      (расхождений в используемом API нет — различаются только номера строк `views.py`;
+      сверка записана в Context, уточнение `should_show` / `html` — в «Баннер в webserver'е»)
+- [x] тестов задача не добавляет: она меняет только план
 
 ### Task 2: Модель `RMQWatcherHeartbeat` и функции записи
 
@@ -327,26 +350,26 @@
 - Modify: `airflow_provider_rmq/watcher/models.py`
 - Modify: `tests/watcher/test_models.py`
 
-- [ ] frozen-dataclass `WatcherIdentity(id, hostname, pid, started_at)`
-- [ ] `HeartbeatBase`, модель `RMQWatcherHeartbeat` (колонки из Technical Details),
+- [x] frozen-dataclass `WatcherIdentity(id, hostname, pid, started_at)`
+- [x] `HeartbeatBase`, модель `RMQWatcherHeartbeat` (колонки из Technical Details),
       `ensure_heartbeat_table()`
-- [ ] `record_heartbeat_start(session, identity, due_at)`,
+- [x] `record_heartbeat_start(session, identity, due_at)`,
       `record_heartbeat_due(session, identity, due_at)`,
       `record_heartbeat_cycle(session, identity, last_cycle_at, due_at)` — upsert'ы, не
       трогающие `stopped_at`; старт не сбрасывает `last_cycle_at`
-- [ ] `record_heartbeat_stop(session, identity, due_at, stopped_at)` — upsert с полной
+- [x] `record_heartbeat_stop(session, identity, due_at, stopped_at)` — upsert с полной
       идентичностью; `prune_heartbeats(session, keep_id, older_than)` — по последней
       отметке; `get_heartbeats(session, since)`
-- [ ] тесты: `ensure_heartbeat_table` создаёт таблицу и идемпотентен; `ensure_table_exists`
+- [x] тесты: `ensure_heartbeat_table` создаёт таблицу и идемпотентен; `ensure_table_exists`
       её не создаёт; upsert старта поверх строки с `last_cycle_at` и со `stopped_at` их
       сохраняет; upsert прохода поверх существующей и отсутствующей строки; запись срока не
       трогает `last_cycle_at`; stop на существующей и на отсутствующей строке
-- [ ] тесты: вставка, упавшая на `IntegrityError` (строка с тем же `id` появилась между
+- [x] тесты: вставка, упавшая на `IntegrityError` (строка с тем же `id` появилась между
       SELECT и INSERT), повторяется как UPDATE — для stop `stopped_at` ложится, для старта
       `stopped_at` не стирается
-- [ ] тесты: чистка не трогает свою строку и свежие чужие и удаляет старые по каждой из
+- [x] тесты: чистка не трогает свою строку и свежие чужие и удаляет старые по каждой из
       трёх отметок
-- [ ] run tests — must pass before task 3
+- [x] run tests — must pass before task 3
 
 ### Task 3: Оценка живости `assess_liveness`
 
@@ -354,24 +377,24 @@
 - Create: `airflow_provider_rmq/watcher/liveness.py`
 - Create: `tests/watcher/test_liveness.py`
 
-- [ ] `LivenessVerdict` (состояние `unused | ok | starting | unconfirmed | down`; строки с
+- [x] `LivenessVerdict` (состояние `unused | ok | starting | unconfirmed | down`; строки с
       состоянием alive / starting / dead / stopped; самая свежая последняя отметка и
       признак «она — штатная остановка»)
-- [ ] `assess_liveness(heartbeats, now, has_enabled_subscriptions, has_fresh_reconcile)` —
+- [x] `assess_liveness(heartbeats, now, has_enabled_subscriptions, has_fresh_reconcile)` —
       правила из Technical Details
-- [ ] `banner_text(verdict)`, `masks_statuses(verdict)` — три текста `down` без hostname и
+- [x] `banner_text(verdict)`, `masks_statuses(verdict)` — три текста `down` без hostname и
       PID; подмена статусов только для `down`
-- [ ] тесты: каждое состояние таблицы; граница `due_at` (ровно `due_at` — жива); строка со
+- [x] тесты: каждое состояние таблицы; граница `due_at` (ровно `due_at` — жива); строка со
       `stopped_at` не жива при любом `due_at`; несколько строк — одна живая с проходом даёт
       `ok`, даже если другие мертвы; каждый из трёх текстов `down`
-- [ ] тесты сценариев: единственный watcher убит (`kill -9`) — `down` после `due_at`;
+- [x] тесты сценариев: единственный watcher убит (`kill -9`) — `down` после `due_at`;
       `docker stop` шедулера — `down` с текстом про остановку после устаревания
       `last_reconcile_at`; рестарт шедулера — `starting`, затем `ok`, мёртвая строка
       прежнего запуска не мешает; webserver обновлён раньше шедулера (строк нет, свежий
       `last_reconcile_at`) — `unconfirmed`; строк нет, отметка устарела — `down`
-- [ ] тест на строках, прочитанных из БД (`get_heartbeats` с настоящей строкой): без
+- [x] тест на строках, прочитанных из БД (`get_heartbeats` с настоящей строкой): без
       `TypeError`, `ok`
-- [ ] run tests — must pass before task 4
+- [x] run tests — must pass before task 4
 
 ### Task 4: Запись heartbeat из watcher-процесса
 
@@ -381,42 +404,42 @@
 - Modify: `tests/watcher/test_listener.py`
 - Modify: `tests/watcher/test_runner.py`
 
-- [ ] `run`: `WatcherIdentity` (hostname — `get_hostname()`); константы
+- [x] `run`: `WatcherIdentity` (hostname — `get_hostname()`); константы
       `_HEARTBEAT_TIMEOUT`, `_PRUNE_TIMEOUT`; шаг `"heartbeat"` вызывает
       `ensure_heartbeat_table()`, пока флаг готовности не стоит
-- [ ] старт: после первого `_refresh_settings` процесса, перед первым проходом — шаг
+- [x] старт: после первого `_refresh_settings` процесса, перед первым проходом — шаг
       `"heartbeat"` с `record_heartbeat_start` и `due_at = now + H + B + H`; перезапуск
       `_main` старт не пишет
-- [ ] перед проходом: если бюджет вырос против сохранённого срока — шаг `"heartbeat"` с
+- [x] перед проходом: если бюджет вырос против сохранённого срока — шаг `"heartbeat"` с
       `record_heartbeat_due`
-- [ ] конец прохода в бюджете без запрошенной остановки: шаг `"heartbeat"` с
+- [x] конец прохода в бюджете без запрошенной остановки: шаг `"heartbeat"` с
       `record_heartbeat_cycle`, затем шаг `"heartbeat_prune"`; `_StopRequested` — тихо,
       сбой, `_StepInFlight`, `PoolSaturated` — WARNING
-- [ ] `mark_stopped()`: при первом вызове и созданной идентичности — поток с
+- [x] `mark_stopped()`: при первом вызове и созданной идентичности — поток с
       `record_heartbeat_stop` своей сессией, ожидание не дольше 2 с, сбой и таймаут —
       WARNING; `request_stop` не меняется
-- [ ] runner, ветка полученного сигнала: `request_stop()`, затем `mark_stopped()` только
+- [x] runner, ветка полученного сигнала: `request_stop()`, затем `mark_stopped()` только
       если `getppid()` равен PID шедулера; ветка смены `getppid()` — только `request_stop()`
-- [ ] тесты (`test_listener.py`): строка старта несёт срок из переопределённого бюджета
+- [x] тесты (`test_listener.py`): строка старта несёт срок из переопределённого бюджета
       (Variable `rmq_watcher_cycle_timeout`); рост бюджета публикует новый срок до прохода и
       не двигает `last_cycle_at`; проход в бюджете двигает `last_cycle_at` и `due_at`;
       проход, упёршийся в бюджет, — нет; перезапуск `_main` после краша сохраняет `id` и
       `started_at`
-- [ ] тесты (`test_listener.py`): `mark_stopped` пишет `stopped_at`, пока reconcile ещё
+- [x] тесты (`test_listener.py`): `mark_stopped` пишет `stopped_at`, пока reconcile ещё
       идёт, и не ждёт дольше 2 с при зависшей записи; повторный вызов второй записи не
       делает; вызов до `run` ничего не пишет; stop, пришедший до подачи записи старта, —
       запись старта не подаётся; stop, пришедший, пока запись старта идёт в воркере, —
       итоговая строка со `stopped_at`; проход, записанный после отметки, `stopped_at` не
       стирает; краш `_main` `stopped_at` не ставит; остановка не даёт WARNING о heartbeat
       прохода
-- [ ] тесты (`test_listener.py`): сбой записи и сбой чистки не прерывают цикл и не мешают
+- [x] тесты (`test_listener.py`): сбой записи и сбой чистки не прерывают цикл и не мешают
       `cycle_completed`; сбой чистки не откатывает отметку; зависшая запись не подаётся
       повторно; сбой и зависание `ensure_heartbeat_table` внутри шага старта — WARNING по
       границе `H`, цикл стартует, следующая запись создаёт таблицу
-- [ ] тесты (`test_runner.py`): штатный SIGTERM при живом родителе — `request_stop`, затем
+- [x] тесты (`test_runner.py`): штатный SIGTERM при живом родителе — `request_stop`, затем
       `mark_stopped`; смена `getppid()` и SIGTERM после смены родителя — только
       `request_stop`
-- [ ] run tests — must pass before task 5
+- [x] run tests — must pass before task 5
 
 ### Task 5: Баннер на главной странице Airflow
 
@@ -426,28 +449,28 @@
 - Create: `tests/watcher/test_dashboard_alert.py`
 - Modify: `tests/watcher/test_plugin.py`
 
-- [ ] `dashboard_alert.py`: чтение вердикта с кэшем (неизменяемая пара, 30 с, `Lock` на
+- [x] `dashboard_alert.py`: чтение вердикта с кэшем (неизменяемая пара, 30 с, `Lock` на
       перечтение; `ensure_heartbeat_table()` на промахе, пока флаг не стоит; без таблицы —
       вердикт по одной `last_reconcile_at`; `last_reconcile_at` и порог — только без живых
       строк); сбой чтения — вердикт «не показывать» и WARNING раз на период
-- [ ] тесты: создание таблицы, не удавшееся при установке, повторяется на следующем промахе
+- [x] тесты: создание таблицы, не удавшееся при установке, повторяется на следующем промахе
       кэша; без таблицы и с устаревшей `last_reconcile_at` — `down`; отметка
       `last_reconcile_at` возрастом `I + B + 10` с ещё свежая
-- [ ] `install_dashboard_alert()`: `ensure_heartbeat_table()`, ленивый импорт `UIAlert`,
+- [x] `install_dashboard_alert()`: `ensure_heartbeat_table()`, ленивый импорт `UIAlert`,
       подкласс без вызова `UIAlert.__init__`, `should_show(*args, **kwargs)` со снимком в
       `flask.g`, `message` — `Markup` из `flask.g`, `category` из `flask.g`, перепривязка
       `DASHBOARD_UIALERTS`, без повторного экземпляра
-- [ ] `plugin.py`: колбэк `_install_liveness_alert(state)` с проверкой
+- [x] `plugin.py`: колбэк `_install_liveness_alert(state)` с проверкой
       `_serves_the_web_ui(state.app)` и `_bp.record_once(_install_liveness_alert)`
-- [ ] тесты: `should_show` истинен только для `down`; `message` — экземпляр `Markup` с
+- [x] тесты: `should_show` истинен только для `down`; `message` — экземпляр `Markup` с
       настоящей ссылкой, а подставленное время экранировано; кэш не перечитывает БД в течение
       периода; кэш, истёкший между `should_show` и `message`, не меняет текст запроса; сбой
       чтения скрывает баннер без исключения
-- [ ] тесты: установка добавляет ровно один экземпляр и сохраняет существующие элементы,
+- [x] тесты: установка добавляет ровно один экземпляр и сохраняет существующие элементы,
       в том числе заданные кортежем; CLI-приложение FAB баннер не ставит
-- [ ] тест отдельным интерпретатором (как `TestDagFileScanImportFootprint`):
+- [x] тест отдельным интерпретатором (как `TestDagFileScanImportFootprint`):
       `import airflow_provider_rmq.watcher.plugin` не загружает `airflow.www.utils`
-- [ ] run tests — must pass before task 6
+- [x] run tests — must pass before task 6
 
 ### Task 6: Панель процессов и статусы подписок на странице Subscriptions
 
@@ -456,34 +479,35 @@
 - Modify: `airflow_provider_rmq/watcher/templates/rmq_watcher/subscriptions.html`
 - Modify: `tests/watcher/test_views.py`
 
-- [ ] панель «Watcher processes»: строки heartbeat за сутки с состоянием, возрастом
+- [x] панель «Watcher processes»: строки heartbeat за сутки с состоянием, возрастом
       последней отметки и сроком, мёртвые строки выделены; пояснение для `unconfirmed`;
       баннер с тем же текстом вверху страницы
-- [ ] при вердикте `down` статусы подписок и `conn_id` выводятся как `unknown` с подсказкой
+- [x] при вердикте `down` статусы подписок и `conn_id` выводятся как `unknown` с подсказкой
       о последнем записанном статусе
-- [ ] тесты: панель для одного и нескольких процессов, живой и мёртвой строки; подмена
+- [x] тесты: панель для одного и нескольких процессов, живой и мёртвой строки; подмена
       статусов при `down` и её отсутствие при `ok`/`starting`/`unconfirmed`; сбой чтения
       heartbeat не роняет страницу
-- [ ] run tests — must pass before task 7
+- [x] run tests — must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] каждое состояние таблицы и каждый сценарий из Task 3 покрыт тестом
-- [ ] тест отдельным интерпретатором из Task 5 проходит: плагин не загружает
+- [x] каждое состояние таблицы и каждый сценарий из Task 3 покрыт тестом
+      (`tests/watcher/test_liveness.py`: `TestStates`, `TestScenarios`, `TestRowsReadFromDatabase`)
+- [x] тест отдельным интерпретатором из Task 5 проходит: плагин не загружает
       `airflow.www.utils`; `ensure_table_exists` (вызываемый `on_load` в шедулере) таблицу
       heartbeat не создаёт
-- [ ] run full test suite: `.venv/bin/python -m pytest tests/ -q`
-- [ ] run linters: `.venv/bin/ruff check airflow_provider_rmq tests` (новых ошибок нет)
+- [x] run full test suite: `.venv/bin/python -m pytest tests/ -q`
+- [x] run linters: `.venv/bin/ruff check airflow_provider_rmq tests` (новых ошибок нет)
 
 ### Task 8: [Final] Update documentation
 
-- [ ] `readme.md` и `readme_ru.md`, раздел «The watcher process»: абзац о неперезапуске
+- [x] `readme.md` и `readme_ru.md`, раздел «The watcher process»: абзац о неперезапуске
       (`readme.md:973`) описывает баннер на главной и панель на Subscriptions; новый абзац о
       heartbeat — вопрос баннера («ни один watcher не подтверждает работу»), состояния,
       задержка до `due_at` и устаревания `last_reconcile_at`, мёртвая строка реплики в HA на
       панели, суточная чистка, краткий `down` после прохода, упёршегося в бюджет; абзац
       «Liveness metric» описывает метрику как дополнение для внешнего мониторинга
-- [ ] новый `docs/adr/0012-watcher-liveness-heartbeat.md`: строка на запуск процесса, срок
+- [x] новый `docs/adr/0012-watcher-liveness-heartbeat.md`: строка на запуск процесса, срок
       `due_at` от watcher'а, вердикт «есть ли подтверждённая работа», `stopped_at` по
       штатному сигналу, отдельная декларативная база таблицы, `UIAlert` с ленивым импортом;
       отвергнутые варианты — тревога по каждому шедулеру через сопоставление строк с
@@ -491,14 +515,14 @@
       репликах на одном hostname), поллинг из хуков шедулера, внешний мониторинг,
       health-check DAG, flash на каждой странице, общая строка `rmq_watcher_conn_status`,
       фоновый пинг
-- [ ] `docs/adr/0008-watcher-child-process.md`: раздел о живости (:311) в настоящем времени
+- [x] `docs/adr/0008-watcher-child-process.md`: раздел о живости (:311) в настоящем времени
       — процесс не перезапускается, работу показывают heartbeat (ADR 0012) и метрика
-- [ ] `CHANGELOG.md`, раздел `## v2.7.0` → Added: по одной строке на пункт (баннер на
+- [x] `CHANGELOG.md`, раздел `## v2.7.0` → Added: по одной строке на пункт (баннер на
       главной, панель процессов на Subscriptions, таблица `rmq_watcher_heartbeat`)
-- [ ] `docs/backlog/watcher-child-death-unnoticed.md`: сузить до неперезапуска, отсутствия
+- [x] `docs/backlog/watcher-child-death-unnoticed.md`: сузить до неперезапуска, отсутствия
       push-уведомлений и тревоги по отдельной реплике в HA
-- [ ] ссылки в документации — только относительные
-- [ ] move this plan to `docs/plans/completed/`
+- [x] ссылки в документации — только относительные
+- [x] move this plan to `docs/plans/completed/` (left for the harness, which moves the plan after all phases)
 
 ## Post-Completion
 

@@ -51,6 +51,7 @@ from airflow_provider_rmq.watcher.models import (
     get_conn_statuses,
     set_consumer_status,
     upsert_conn_status,
+    utcnow,
 )
 from airflow_provider_rmq.watcher.orphan_tracker import OrphanTracker
 from airflow_provider_rmq.watcher.subscription_builder import _SUB_QUEUE_PREFIX
@@ -1818,7 +1819,7 @@ class RMQConsumerManager:
 
         # Naive UTC: the view compares this stamp with a naive utcnow() of its own, and
         # mixing naive and aware values raises straight from the template.
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = utcnow()
         rows = []
         for conn_id, count in counts.items():
             state = self._conns.get(conn_id)

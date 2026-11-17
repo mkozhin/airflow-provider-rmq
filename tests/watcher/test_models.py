@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -12,14 +14,23 @@ from sqlalchemy.pool import NullPool
 
 from airflow_provider_rmq.watcher import models
 from airflow_provider_rmq.watcher.models import (
+    HeartbeatBase,
     RMQConnStatus,
     RMQSubscription,
+    RMQWatcherHeartbeat,
     WatcherBase,
+    WatcherIdentity,
     delete_subscriptions_for_dag,
+    ensure_heartbeat_table,
     ensure_table_exists,
     get_active_dag_ids,
     get_conn_statuses,
     get_enabled_subscriptions,
+    get_heartbeats,
+    prune_heartbeats,
+    record_heartbeat_cycle,
+    record_heartbeat_deadline,
+    record_heartbeat_stop,
     set_consumer_status,
     upsert_conn_status,
     upsert_subscription,
@@ -593,8 +604,7 @@ class TestSchemaMigration:
                 return []
 
         engine = _Engine()
-        # ``inspect`` is imported inside the function, so the patch goes to its source.
-        with patch("sqlalchemy.inspect", return_value=_Inspector()):
+        with patch.object(models, "inspect", return_value=_Inspector()):
             complete = models._add_missing_columns(engine)
 
         assert complete is True
@@ -652,7 +662,7 @@ class TestSchemaMigration:
             def get_columns(self, table_name):
                 return []
 
-        monkeypatch.setattr("sqlalchemy.inspect", lambda engine: _BlindInspector())
+        monkeypatch.setattr(models, "inspect", lambda engine: _BlindInspector())
 
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.models"):
             ensure_table_exists()
@@ -665,7 +675,7 @@ class TestSchemaMigration:
             def get_columns(self, table_name):
                 raise OperationalError("SELECT 1", {}, Exception("no such table"))
 
-        monkeypatch.setattr("sqlalchemy.inspect", lambda engine: _BrokenInspector())
+        monkeypatch.setattr(models, "inspect", lambda engine: _BrokenInspector())
 
         with caplog.at_level(logging.WARNING, logger="airflow_provider_rmq.watcher.models"):
             ensure_table_exists()
@@ -682,3 +692,436 @@ class TestSchemaMigration:
             ensure_table_exists()
 
         assert models.is_schema_ready() is False
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat
+# ---------------------------------------------------------------------------
+
+_IDENTITY = WatcherIdentity(
+    id="00000000-0000-0000-0000-000000000001",
+    hostname="scheduler-1",
+    pid=4242,
+    started_at=_naive("2026-11-17T10:00:00"),
+)
+
+
+def _heartbeat(session, row_id: str = _IDENTITY.id) -> RMQWatcherHeartbeat:
+    """The row ``row_id`` as the database holds it, bypassing the session's cache."""
+    session.expire_all()
+    return session.query(RMQWatcherHeartbeat).filter_by(id=row_id).one()
+
+
+def _other(row_id: str, started_at: str) -> WatcherIdentity:
+    return WatcherIdentity(id=row_id, hostname="scheduler-2", pid=7, started_at=_naive(started_at))
+
+
+class TestWatcherIdentity:
+    def test_identity_is_frozen(self):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            _IDENTITY.pid = 1  # type: ignore[misc]
+
+
+class TestHeartbeatTable:
+    def test_creates_the_table_and_marks_it_ready(self, schema_engine):
+        ensure_heartbeat_table()
+
+        assert "rmq_watcher_heartbeat" in inspect(schema_engine).get_table_names()
+        assert models.is_heartbeat_table_ready() is True
+
+    def test_repeated_call_is_safe_and_short_circuits(self, schema_engine, monkeypatch):
+        ensure_heartbeat_table()
+        # a fresh process runs the creation again against the same database
+        monkeypatch.setattr(models, "_heartbeat_ready", False)
+        ensure_heartbeat_table()
+        assert models.is_heartbeat_table_ready() is True
+
+        calls = []
+        monkeypatch.setattr(
+            HeartbeatBase.metadata, "create_all", lambda *a, **kw: calls.append(a),
+        )
+        ensure_heartbeat_table()
+        assert calls == []
+
+    def test_failure_propagates_and_is_retried(self, monkeypatch, tmp_path):
+        engine = create_engine("sqlite:////nonexistent-dir/rmq.db")
+        monkeypatch.setattr("airflow.settings.engine", engine, raising=False)
+        monkeypatch.setattr(models, "_heartbeat_ready", False)
+
+        with pytest.raises(OperationalError):
+            ensure_heartbeat_table()
+        assert models.is_heartbeat_table_ready() is False
+
+        working = create_engine(f"sqlite:///{tmp_path / 'rmq.db'}")
+        monkeypatch.setattr("airflow.settings.engine", working, raising=False)
+        ensure_heartbeat_table()
+
+        assert "rmq_watcher_heartbeat" in inspect(working).get_table_names()
+        assert models.is_heartbeat_table_ready() is True
+        working.dispose()
+
+    def test_a_table_another_process_created_meanwhile_counts_as_created(
+        self, schema_engine, monkeypatch
+    ):
+        """The check finds no table, another process creates it, and the CREATE fails
+        on the table that exists by then."""
+        real_create_all = HeartbeatBase.metadata.create_all
+
+        def lose_the_race(bind, checkfirst=True):
+            real_create_all(bind, checkfirst=checkfirst)
+            raise OperationalError(
+                "CREATE TABLE rmq_watcher_heartbeat", {},
+                Exception("table rmq_watcher_heartbeat already exists"),
+            )
+
+        monkeypatch.setattr(HeartbeatBase.metadata, "create_all", lose_the_race)
+
+        ensure_heartbeat_table()
+
+        assert models.is_heartbeat_table_ready() is True
+
+    def test_a_failure_with_no_table_behind_it_propagates(self, schema_engine, monkeypatch):
+        def refuse(bind, checkfirst=True):
+            raise OperationalError("CREATE TABLE", {}, Exception("permission denied"))
+
+        monkeypatch.setattr(HeartbeatBase.metadata, "create_all", refuse)
+
+        with pytest.raises(OperationalError):
+            ensure_heartbeat_table()
+        assert models.is_heartbeat_table_ready() is False
+
+    def test_concurrent_first_creations_both_succeed(self, monkeypatch, tmp_path):
+        engine = create_engine(f"sqlite:///{tmp_path / 'rmq.db'}", poolclass=NullPool)
+        monkeypatch.setattr("airflow.settings.engine", engine, raising=False)
+        monkeypatch.setattr(models, "_heartbeat_ready", False)
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def create() -> None:
+            barrier.wait(timeout=5)
+            try:
+                ensure_heartbeat_table()
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=create) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert errors == []
+        assert models.is_heartbeat_table_ready() is True
+        assert "rmq_watcher_heartbeat" in inspect(engine).get_table_names()
+        engine.dispose()
+
+    def test_watcher_schema_does_not_create_it(self, schema_engine):
+        ensure_table_exists()
+
+        assert models.is_schema_ready() is True
+        assert "rmq_watcher_heartbeat" not in inspect(schema_engine).get_table_names()
+        assert models.is_heartbeat_table_ready() is False
+
+    def test_table_lives_on_its_own_base(self):
+        assert set(HeartbeatBase.metadata.tables) == {"rmq_watcher_heartbeat"}
+        assert "rmq_watcher_heartbeat" not in WatcherBase.metadata.tables
+
+
+class TestHeartbeatUpserts:
+    def test_start_inserts_the_row(self, heartbeat_session):
+        due = _naive("2026-11-17T10:06:00")
+        record_heartbeat_deadline(heartbeat_session, _IDENTITY, due)
+
+        row = _heartbeat(heartbeat_session)
+        assert (row.hostname, row.pid, row.started_at) == ("scheduler-1", 4242, _IDENTITY.started_at)
+        assert row.due_at == due
+        assert row.last_cycle_at is None
+        assert row.stopped_at is None
+
+    def test_start_over_a_row_keeps_last_cycle_and_stopped(self, heartbeat_session):
+        cycle = _naive("2026-11-17T10:03:00")
+        stopped = _naive("2026-11-17T10:04:00")
+        record_heartbeat_cycle(heartbeat_session, _IDENTITY, cycle, _naive("2026-11-17T10:10:00"))
+        record_heartbeat_stop(heartbeat_session, _IDENTITY, _naive("2026-11-17T10:10:00"), stopped)
+
+        record_heartbeat_deadline(heartbeat_session, _IDENTITY, _naive("2026-11-17T10:12:00"))
+
+        row = _heartbeat(heartbeat_session)
+        assert row.last_cycle_at == cycle
+        assert row.stopped_at == stopped
+        assert row.due_at == _naive("2026-11-17T10:12:00")
+
+    def test_cycle_updates_an_existing_row(self, heartbeat_session):
+        record_heartbeat_deadline(heartbeat_session, _IDENTITY, _naive("2026-11-17T10:06:00"))
+
+        cycle = _naive("2026-11-17T10:05:00")
+        due = _naive("2026-11-17T10:13:00")
+        record_heartbeat_cycle(heartbeat_session, _IDENTITY, cycle, due)
+
+        row = _heartbeat(heartbeat_session)
+        assert (row.last_cycle_at, row.due_at) == (cycle, due)
+        assert row.started_at == _IDENTITY.started_at
+        assert row.stopped_at is None
+        assert heartbeat_session.query(RMQWatcherHeartbeat).count() == 1
+
+    def test_cycle_restores_a_missing_row(self, heartbeat_session):
+        cycle = _naive("2026-11-17T10:05:00")
+        due = _naive("2026-11-17T10:13:00")
+        record_heartbeat_cycle(heartbeat_session, _IDENTITY, cycle, due)
+
+        row = _heartbeat(heartbeat_session)
+        assert (row.hostname, row.pid, row.started_at) == ("scheduler-1", 4242, _IDENTITY.started_at)
+        assert (row.last_cycle_at, row.due_at) == (cycle, due)
+
+    def test_cycle_keeps_stopped_at(self, heartbeat_session):
+        stopped = _naive("2026-11-17T10:04:00")
+        record_heartbeat_stop(heartbeat_session, _IDENTITY, _naive("2026-11-17T10:06:00"), stopped)
+
+        record_heartbeat_cycle(
+            heartbeat_session, _IDENTITY, _naive("2026-11-17T10:05:00"), _naive("2026-11-17T10:13:00"),
+        )
+
+        assert _heartbeat(heartbeat_session).stopped_at == stopped
+
+    def test_due_does_not_touch_last_cycle(self, heartbeat_session):
+        cycle = _naive("2026-11-17T10:05:00")
+        record_heartbeat_cycle(heartbeat_session, _IDENTITY, cycle, _naive("2026-11-17T10:13:00"))
+
+        record_heartbeat_deadline(heartbeat_session, _IDENTITY, _naive("2026-11-17T10:20:00"))
+
+        row = _heartbeat(heartbeat_session)
+        assert row.last_cycle_at == cycle
+        assert row.due_at == _naive("2026-11-17T10:20:00")
+        assert row.stopped_at is None
+
+    def test_stop_on_an_existing_row(self, heartbeat_session):
+        cycle = _naive("2026-11-17T10:05:00")
+        record_heartbeat_cycle(heartbeat_session, _IDENTITY, cycle, _naive("2026-11-17T10:13:00"))
+
+        stopped = _naive("2026-11-17T10:07:00")
+        record_heartbeat_stop(heartbeat_session, _IDENTITY, _naive("2026-11-17T10:13:00"), stopped)
+
+        row = _heartbeat(heartbeat_session)
+        assert row.stopped_at == stopped
+        assert row.last_cycle_at == cycle
+
+    def test_an_integrity_error_with_no_row_behind_it_propagates(self, heartbeat_session):
+        """A NOT NULL violation fails the INSERT, and the UPDATE that follows finds no
+        row: the write failed and says so instead of committing nothing."""
+        broken = dataclasses.replace(_IDENTITY, hostname=None)
+
+        with pytest.raises(IntegrityError):
+            record_heartbeat_deadline(heartbeat_session, broken, _naive("2026-11-17T10:06:00"))
+
+        assert heartbeat_session.query(RMQWatcherHeartbeat).count() == 0
+
+    def test_stop_on_a_missing_row(self, heartbeat_session):
+        stopped = _naive("2026-11-17T10:00:01")
+        due = _naive("2026-11-17T10:06:00")
+        record_heartbeat_stop(heartbeat_session, _IDENTITY, due, stopped)
+
+        row = _heartbeat(heartbeat_session)
+        assert (row.hostname, row.pid, row.started_at) == ("scheduler-1", 4242, _IDENTITY.started_at)
+        assert (row.due_at, row.stopped_at) == (due, stopped)
+        assert row.last_cycle_at is None
+
+
+class TestHeartbeatInsertRace:
+    """An INSERT that loses to another writer's commit of the same ``id`` lands as an UPDATE.
+
+    The database is a file: the competing commit has to come over a connection of its
+    own. The UPDATE that finds no row is replaced by one that lets the competitor
+    commit first and then reports zero rows — the window between the two statements.
+    """
+
+    @pytest.fixture
+    def file_sessions(self, tmp_path):
+        engine = create_engine(f"sqlite:///{tmp_path / 'watcher.db'}", poolclass=NullPool)
+        HeartbeatBase.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        yield Session
+        engine.dispose()
+
+    @staticmethod
+    def _lose_the_first_update(monkeypatch, competitor):
+        real_update = models._update_heartbeat
+        calls = []
+
+        def update(session, row_id, values):
+            calls.append(values)
+            if len(calls) == 1:
+                competitor()
+                return 0
+            return real_update(session, row_id, values)
+
+        monkeypatch.setattr(models, "_update_heartbeat", update)
+        return calls
+
+    def test_stop_lands_on_a_row_the_start_committed_meanwhile(self, file_sessions, monkeypatch):
+        due = _naive("2026-11-17T10:06:00")
+
+        def start_commits():
+            other = file_sessions()
+            record_heartbeat_deadline(other, _IDENTITY, due)
+            other.close()
+
+        calls = self._lose_the_first_update(monkeypatch, start_commits)
+
+        stopping = file_sessions()
+        stopped = _naive("2026-11-17T10:00:02")
+        record_heartbeat_stop(stopping, _IDENTITY, due, stopped)
+        stopping.close()
+
+        assert len(calls) == 3  # lost UPDATE, the competitor's own write, the retry
+        checking = file_sessions()
+        row = _heartbeat(checking)
+        assert row.stopped_at == stopped
+        assert row.due_at == due
+        checking.close()
+
+    def test_start_keeps_a_stop_committed_meanwhile(self, file_sessions, monkeypatch):
+        due = _naive("2026-11-17T10:06:00")
+        stopped = _naive("2026-11-17T10:00:02")
+
+        def stop_commits():
+            other = file_sessions()
+            record_heartbeat_stop(other, _IDENTITY, due, stopped)
+            other.close()
+
+        self._lose_the_first_update(monkeypatch, stop_commits)
+
+        starting = file_sessions()
+        record_heartbeat_deadline(starting, _IDENTITY, due)
+        starting.close()
+
+        checking = file_sessions()
+        row = _heartbeat(checking)
+        assert row.stopped_at == stopped
+        assert row.due_at == due
+        assert checking.query(RMQWatcherHeartbeat).count() == 1
+        checking.close()
+
+
+class TestHeartbeatPruneAndRead:
+    _NOW = _naive("2026-11-18T12:00:00")
+    _CUTOFF = _NOW - models.HEARTBEAT_WINDOW
+
+    def _seed(self, session):
+        old = _naive("2026-11-17T09:00:00")
+        fresh = _naive("2026-11-18T11:00:00")
+        past = _naive("2026-11-18T11:30:00")
+        ahead = _naive("2026-11-18T12:30:00")
+        # own row, old by every mark and past its deadline
+        record_heartbeat_deadline(session, _IDENTITY, past)
+        # old by started_at only
+        record_heartbeat_deadline(session, _other("old-start", "2026-11-17T09:00:00"), past)
+        # old by last_cycle_at, started even earlier
+        record_heartbeat_cycle(session, _other("old-cycle", "2026-11-16T09:00:00"), old, past)
+        # old by stopped_at
+        record_heartbeat_stop(session, _other("old-stop", "2026-11-16T09:00:00"), past, old)
+        # old by every mark, but its deadline is still ahead
+        record_heartbeat_cycle(session, _other("old-but-due", "2026-11-16T09:00:00"), old, ahead)
+        # fresh by each mark, with the older marks behind them
+        record_heartbeat_deadline(session, _other("fresh-start", "2026-11-18T11:00:00"), past)
+        record_heartbeat_cycle(session, _other("fresh-cycle", "2026-11-16T09:00:00"), fresh, past)
+        record_heartbeat_cycle(session, _other("fresh-stop", "2026-11-16T09:00:00"), old, past)
+        record_heartbeat_stop(session, _other("fresh-stop", "2026-11-16T09:00:00"), past, fresh)
+
+    def test_prune_keeps_own_fresh_and_due_rows_and_deletes_old_ones(self, heartbeat_session):
+        self._seed(heartbeat_session)
+
+        deleted = prune_heartbeats(heartbeat_session, _IDENTITY.id, self._NOW)
+
+        assert deleted == 3
+        heartbeat_session.expire_all()
+        remaining = {row.id for row in heartbeat_session.query(RMQWatcherHeartbeat)}
+        assert remaining == {
+            _IDENTITY.id, "old-but-due", "fresh-start", "fresh-cycle", "fresh-stop",
+        }
+
+    def test_get_heartbeats_reads_fresh_and_due_rows(self, heartbeat_session):
+        self._seed(heartbeat_session)
+
+        rows = get_heartbeats(heartbeat_session, self._NOW)
+
+        # the row within its deadline first, then the others by their last mark
+        assert rows[0].id == "old-but-due"
+        assert {row.id for row in rows[1:]} == {"fresh-start", "fresh-cycle", "fresh-stop"}
+
+    def test_a_mark_exactly_at_the_cutoff_is_read_and_kept(self, heartbeat_session):
+        past = self._NOW - timedelta(minutes=1)
+        record_heartbeat_cycle(
+            heartbeat_session, _other("edge", "2026-11-16T09:00:00"), self._CUTOFF, past,
+        )
+        just_older = self._CUTOFF - timedelta(seconds=1)
+        record_heartbeat_cycle(
+            heartbeat_session, _other("older", "2026-11-16T09:00:00"), just_older, past,
+        )
+
+        assert [row.id for row in get_heartbeats(heartbeat_session, self._NOW)] == ["edge"]
+        assert prune_heartbeats(heartbeat_session, _IDENTITY.id, self._NOW) == 1
+        heartbeat_session.expire_all()
+        assert {row.id for row in heartbeat_session.query(RMQWatcherHeartbeat)} == {"edge"}
+
+    def test_a_deadline_exactly_now_is_read_and_kept(self, heartbeat_session):
+        old = self._CUTOFF - timedelta(hours=1)
+        record_heartbeat_cycle(
+            heartbeat_session, _other("due-now", "2026-11-16T09:00:00"), old, self._NOW,
+        )
+
+        assert [row.id for row in get_heartbeats(heartbeat_session, self._NOW)] == ["due-now"]
+        assert prune_heartbeats(heartbeat_session, _IDENTITY.id, self._NOW) == 0
+
+    def test_rows_past_their_deadline_are_limited_to_the_latest(
+        self, heartbeat_session, monkeypatch
+    ):
+        monkeypatch.setattr(models, "HEARTBEAT_ROWS_LIMIT", 3)
+        past = self._NOW - timedelta(minutes=1)
+        for minute in range(5):
+            record_heartbeat_cycle(
+                heartbeat_session,
+                _other(f"dead-{minute}", "2026-11-18T10:00:00"),
+                self._NOW - timedelta(minutes=30 - minute),
+                past,
+            )
+        record_heartbeat_deadline(
+            heartbeat_session, _other("starting", "2026-11-18T09:00:00"),
+            self._NOW + timedelta(minutes=5),
+        )
+
+        rows = get_heartbeats(heartbeat_session, self._NOW)
+
+        assert [row.id for row in rows] == ["starting", "dead-4", "dead-3", "dead-2"]
+
+    def test_the_limit_never_drops_an_alive_row(self, heartbeat_session, monkeypatch):
+        monkeypatch.setattr(models, "HEARTBEAT_ROWS_LIMIT", 3)
+        ahead = self._NOW + timedelta(minutes=10)
+        for minute in range(5):
+            record_heartbeat_deadline(
+                heartbeat_session, _other(f"alive-{minute}", "2026-11-18T11:00:00"), ahead,
+            )
+
+        rows = get_heartbeats(heartbeat_session, self._NOW)
+
+        assert {row.id for row in rows} == {f"alive-{minute}" for minute in range(5)}
+
+    def test_stopped_rows_within_their_deadline_do_not_crowd_out_the_alive_one(
+        self, heartbeat_session
+    ):
+        ahead = self._NOW + timedelta(minutes=10)
+        record_heartbeat_cycle(
+            heartbeat_session, _other("alive", "2026-11-18T10:00:00"),
+            self._NOW - timedelta(minutes=30), ahead,
+        )
+        stopped_count = models.HEARTBEAT_ROWS_LIMIT + 5
+        for index in range(stopped_count):
+            record_heartbeat_stop(
+                heartbeat_session, _other(f"stopped-{index}", "2026-11-18T11:00:00"),
+                ahead, self._NOW - timedelta(seconds=index + 1),
+            )
+
+        rows = get_heartbeats(heartbeat_session, self._NOW)
+
+        assert rows[0].id == "alive"
+        stopped = [row.id for row in rows[1:]]
+        assert stopped == [f"stopped-{index}" for index in range(models.HEARTBEAT_ROWS_LIMIT)]

@@ -33,6 +33,10 @@ DEFAULT_RECONCILE_INTERVAL = 60
 RECONCILE_INTERVAL_VAR = "rmq_watcher_reconcile_interval"
 CYCLE_TIMEOUT_VAR = "rmq_watcher_cycle_timeout"
 
+#: Seconds the watcher loop allows for reading the tunables out of the Airflow
+#: Variables table.
+VARIABLE_TIMEOUT = 15.0
+
 #: The Airflow configuration option governing the Subscriptions page access of the Op
 #: role — ``[rmq_watcher] grant_op_access`` in ``airflow.cfg``, or the environment
 #: variable ``AIRFLOW__RMQ_WATCHER__GRANT_OP_ACCESS``.
