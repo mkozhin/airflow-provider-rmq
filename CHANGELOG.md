@@ -3,18 +3,21 @@
 ## v2.7.0
 
 ### Changed
-- `@rmq_trigger` arguments must be statically readable: literals or constants defined at the top of the same file (positional arguments and `**CONST` included). Otherwise the DAG file fails to import with `RMQTriggerNotStaticError` and the watcher skips the whole file.
+- `@rmq_trigger` arguments and `dag_id=` of `@dag(...)` must be statically readable: literals or constants defined at the top of the same file (positional arguments and `**CONST` included). Otherwise the DAG file fails to import with `RMQTriggerNotStaticError` and the watcher skips the whole file.
 - `rmq_trigger` must be imported from the provider and `dag` from Airflow (`airflow.decorators` or `airflow.models.dag`). Wrappers, aliases, `import *` and decorators placed below `@rmq_trigger` are rejected.
+- `rmq_trigger(...)` applied to a ready `DAG` object raises `TypeError`; use `@rmq_trigger(...)` above `@dag(...)`.
 - The watcher lists DAG files the way Airflow does: `.airflowignore` is respected, hidden files and directories are scanned, zip archives are not read.
 - `@rmq_trigger` in a file outside `DAGS_FOLDER` or excluded by `.airflowignore` fails the import. Tests and CI that build a `DagBag` must set `DAGS_FOLDER` to the same folder.
 - `RMQPublishOperator` waits for the broker to confirm each message (`confirm=True`), so large batches publish slower; `confirm=False` publishes without waiting.
-- `RMQPublishOperator` publishes to the default exchange (`queue_name=…` or `exchange=""`) with `mandatory=True` by default: a message no queue takes fails the task.
+- `RMQPublishOperator` with `confirm=True` publishes to the default exchange (`queue_name=…` or `exchange=""`) with `mandatory=True` by default: a message no queue takes fails the task.
+- `RMQPublishOperator(mandatory=True, confirm=False)` raises `ValueError`.
 - `RMQPublishOperator` fails the task when the broker rejects a message (nack) or closes the channel (404 on a missing exchange, 403).
 - `RMQHook.queue_declare`, `RMQHook.exchange_declare` and `RMQQueueManagementOperator` declare durable queues and exchanges by default (`durable=True`).
 - `RMQHook` does not send `global_qos` to the broker and logs a WARNING when it is set (deprecated RabbitMQ feature `global_qos`).
 - `RMQTrigger` bounds every broker call by `connect_timeout` / `rpc_timeout`; on a timeout or a lost connection it logs a WARNING and reconnects.
 - Deferrable `RMQSensor` honours its `timeout`: the task fails (or is skipped with `soft_fail=True`) when it runs out.
 - `RMQSensor` rejects `mode` values other than `poke` and `reschedule` (and the deprecated `pull`/`push`).
+- pika's WARNING about a returned message is not logged; the task fails with `UnroutableError`.
 
 ### Added
 - `RMQHook(publisher_confirms=…)` and `RMQHook.basic_publish(mandatory=…)`.
@@ -24,25 +27,28 @@
 - Airflow's home page shows every user a red banner when subscriptions are enabled and no watcher process confirms its work.
 - The Subscriptions page lists watcher processes with their state and shows recorded statuses as `unknown` while no watcher confirms its work.
 - Table `rmq_watcher_heartbeat`: one row per watcher-process run, created by the watcher process and the webserver.
-- The DAG name on the Subscriptions page links to the DAG's page in Airflow.
+- The DAG name on the Subscriptions page links to the DAG's page in Airflow when the DAG is found.
+- `RMQTrigger` names its connection `rmq-trigger:<queue>` in the RabbitMQ Management UI.
 
 ### Deprecated
 - `RMQSensor(mode="pull"|"push")`, also through `default_args`; use `trigger_mode`.
 
 ### Fixed
-- Unreadable `@rmq_trigger` arguments are no longer silently replaced by defaults.
-- An unreadable subdirectory of `DAGS_FOLDER` no longer drops its subscriptions silently: it is logged and its files are held like unreadable files.
+- An unreadable subdirectory of `DAGS_FOLDER` is logged, and its files are held like unreadable files.
 - `RMQHook` reads `heartbeat` and `blocked_connection_timeout` in Extra as numbers or numeric strings; invalid values fall back to the defaults with a WARNING.
 - `RMQHook` logs a WARNING on `"heartbeat": 0` and `"blocked_connection_timeout": 0`.
 - A `heartbeat` under one second (in `RMQHook`) or above 65535 (in `RMQHook` and on the async path) falls back to the default with a WARNING.
 - `RMQHook.queue_info` returns `consumer_count` for a missing queue as well.
 - `RMQHook.__del__` does not raise at interpreter shutdown.
 - Push-mode `RMQTrigger` notices a consumer cancelled by the broker.
-- `RMQSensor` in `reschedule` mode logs a filter-miss line for every poke.
+- Push-mode `RMQTrigger` returns unread deliveries to the queue before closing.
+- `RMQHook` used as a context manager closes its connection when opening the channel fails.
+- `RMQSensor` in `reschedule` mode logs a filter-miss line for a poke in which no message passes the filter or missed messages are dropped.
 
 ### Upgrade notes
 - RabbitMQ 4.3 or newer is required: on earlier versions a requeueing nack spends a quorum queue's `delivery-limit`, so redelivered messages can be dead-lettered or dropped.
-- Before rollout, check the production DAG folder for: files that will now fail to import, `.py` files in hidden directories, heavy directories (`.git`, `.venv`, `node_modules`) that belong in `.airflowignore`, and `@rmq_trigger` factories under `.airflowignore`.
+- Before rollout, check the production DAG folder for: files that fail to import under the rules above, `.py` files in hidden directories, heavy directories (`.git`, `.venv`, `node_modules`) that belong in `.airflowignore`, and `@rmq_trigger` factories under `.airflowignore`.
+- A `conn_id` given to `@rmq_trigger` positionally or by a constant gets a new subscription row next to the old `rmq_default` one: disable or delete the old row.
 - Publishing to the default exchange (`queue_name=…` or `exchange=""`) fails when the queue does not exist: create target queues before publishing, or set `mandatory=False`.
 - Set `execution_timeout` on publish tasks: the wait for a broker confirmation has no deadline of its own.
 - A queue declared with `durable=False` needs `exclusive=True`; otherwise `RMQHook.queue_declare` and `RMQQueueManagementOperator` raise `ValueError` (deprecated RabbitMQ feature `transient_nonexcl_queues`).
