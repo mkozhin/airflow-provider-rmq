@@ -56,14 +56,14 @@
 - Modify: `airflow_provider_rmq/watcher/templates/rmq_watcher/subscriptions.html`
 - Modify: `tests/watcher/test_views.py`
 
-- [ ] в групповой ветке `subscriptions.html` записать `{% set dag_missing = … %}` из существующего условия бейджа; при `not dag_missing` вывести `item.dag_id` ссылкой на `url_for('Airflow.dag', dag_id=item.dag_id)`, при `dag_missing` — простым текстом с бейджем
-- [ ] то же в одиночной ветке
-- [ ] в `test_views.py` заменить заглушку `url_for` на `lambda endpoint, **kw: "/" + endpoint + "?" + urlencode(sorted(kw.items()))`; существующие тесты отрисовки остаются зелёными
-- [ ] тесты: активный DAG — точный `href` на `Airflow.dag` с его `dag_id` в групповой и в одиночной строке; у групповой и одиночной строки разные `dag_id`
-- [ ] тесты: DAG с бейджем «⚠ dag not found» — ссылки нет, имя и бейдж на месте, в групповой и в одиночной строке; имя и отсутствие ссылки проверяются по первой `<td>` строки (её текст содержит `dag_id`, в ней нет `<a`), а не по всему HTML: `dag_id` встречается на странице ещё и в `confirm` кнопки Delete
-- [ ] тест: `active_dag_ids=None` — ссылка есть, бейджа нет
-- [ ] тест: `active_dag_ids` не передан в контекст — ссылка есть, бейджа нет
-- [ ] run tests: `.venv/bin/pytest tests/watcher/test_views.py -q` — must pass before task 2
+- [x] в групповой ветке `subscriptions.html` записать `{% set dag_missing = … %}` из существующего условия бейджа; при `not dag_missing` вывести `item.dag_id` ссылкой на `url_for('Airflow.dag', dag_id=item.dag_id)`, при `dag_missing` — простым текстом с бейджем
+- [x] то же в одиночной ветке
+- [x] в `test_views.py` заменить заглушку `url_for` на `lambda endpoint, **kw: "/" + endpoint + "?" + urlencode(sorted(kw.items()))`; существующие тесты отрисовки остаются зелёными
+- [x] тесты: активный DAG — точный `href` на `Airflow.dag` с его `dag_id` в групповой и в одиночной строке; у групповой и одиночной строки разные `dag_id`
+- [x] тесты: DAG с бейджем «⚠ dag not found» — ссылки нет, имя и бейдж на месте, в групповой и в одиночной строке; имя и отсутствие ссылки проверяются по первой `<td>` строки (её текст содержит `dag_id`, в ней нет `<a`), а не по всему HTML: `dag_id` встречается на странице ещё и в `confirm` кнопки Delete
+- [x] тест: `active_dag_ids=None` — ссылка есть, бейджа нет
+- [x] тест: `active_dag_ids` не передан в контекст — ссылка есть, бейджа нет
+- [x] run tests: `.venv/bin/pytest tests/watcher/test_views.py -q` — must pass before task 2
 
 ### Task 2: Verify acceptance criteria
 - [ ] verify all requirements from Overview are implemented
