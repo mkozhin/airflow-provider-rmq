@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 import ssl
 from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -414,7 +415,7 @@ class TestReturnedMessageLog:
 
     def test_prefix_matches_pika_source(self):
         source = inspect.getsource(BlockingChannel._on_puback_message_returned)
-        assert f'"{PIKA_RETURNED_MESSAGE_LOG_PREFIX}' in source
+        assert re.search(r"[\"']" + re.escape(PIKA_RETURNED_MESSAGE_LOG_PREFIX), source)
 
     def test_returned_message_record_is_dropped(self, caplog):
         impl = MagicMock(channel_number=1)
