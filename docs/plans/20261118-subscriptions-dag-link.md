@@ -66,14 +66,14 @@
 - [x] run tests: `.venv/bin/pytest tests/watcher/test_views.py -q` — must pass before task 2
 
 ### Task 2: Verify acceptance criteria
-- [ ] verify all requirements from Overview are implemented
-- [ ] verify edge cases are handled (отсутствующий DAG, неудавшийся поиск DAG'ов)
-- [ ] run full test suite: `.venv/bin/pytest -q`
-- [ ] run linter: `.venv/bin/ruff check .` — не больше 127 находок (столько на main на 2026-11-18)
+- [x] verify all requirements from Overview are implemented
+- [x] verify edge cases are handled (отсутствующий DAG, неудавшийся поиск DAG'ов)
+- [x] run full test suite: `.venv/bin/pytest -q`
+- [x] run linter: `.venv/bin/ruff check .` — не больше 127 находок (столько на main на 2026-11-18)
 
 ### Task 3: [Final] Update documentation
-- [ ] CHANGELOG v2.7.0, раздел Added: одна строка — имя DAG'а на странице Subscriptions ведёт на страницу DAG'а в Airflow
-- [ ] move this plan to `docs/plans/completed/`
+- [x] CHANGELOG v2.7.0, раздел Added: одна строка — имя DAG'а на странице Subscriptions ведёт на страницу DAG'а в Airflow
+- [x] move this plan to `docs/plans/completed/` (skipped - the harness moves the plan after all phases finish)
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
