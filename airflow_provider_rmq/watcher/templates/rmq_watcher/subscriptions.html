@@ -209,12 +209,15 @@
           {# ---- Grouped row (multiple queues, shared cooldown) ---- #}
           <tr class="{{ 'text-muted' if not item.enabled else '' }}">
             <td>
-              {{ item.dag_id }}
-              {% if active_dag_ids is defined and active_dag_ids is not none and item.dag_id not in active_dag_ids %}
+              {% set dag_missing = active_dag_ids is defined and active_dag_ids is not none and item.dag_id not in active_dag_ids %}
+              {% if dag_missing %}
+                {{ item.dag_id }}
                 <span class="label label-warning"
                       title="No active Airflow DAG found for this dag_id — a matching message will not trigger a real pipeline run. Check for a typo in dag_id, a renamed or deleted DAG, a DAG that is inactive (is_active=false), or a newly added DAG the Scheduler has not parsed yet.">
                   ⚠ dag not found
                 </span>
+              {% else %}
+                <a href="{{ url_for('Airflow.dag', dag_id=item.dag_id) }}">{{ item.dag_id }}</a>
               {% endif %}
             </td>
             <td>
@@ -272,12 +275,15 @@
           {# ---- Single-queue row (no group_key) ---- #}
           <tr class="{{ 'text-muted' if not item.enabled else '' }}">
             <td>
-              {{ item.dag_id }}
-              {% if active_dag_ids is defined and active_dag_ids is not none and item.dag_id not in active_dag_ids %}
+              {% set dag_missing = active_dag_ids is defined and active_dag_ids is not none and item.dag_id not in active_dag_ids %}
+              {% if dag_missing %}
+                {{ item.dag_id }}
                 <span class="label label-warning"
                       title="No active Airflow DAG found for this dag_id — a matching message will not trigger a real pipeline run. Check for a typo in dag_id, a renamed or deleted DAG, a DAG that is inactive (is_active=false), or a newly added DAG the Scheduler has not parsed yet.">
                   ⚠ dag not found
                 </span>
+              {% else %}
+                <a href="{{ url_for('Airflow.dag', dag_id=item.dag_id) }}">{{ item.dag_id }}</a>
               {% endif %}
             </td>
             <td>

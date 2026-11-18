@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlencode
 
 import pytest
 from flask import Flask
@@ -915,7 +916,9 @@ _subscriptions_jinja_env = Environment(
     ),
 )
 _subscriptions_jinja_env.globals["get_flashed_messages"] = lambda **kw: []
-_subscriptions_jinja_env.globals["url_for"] = lambda *a, **kw: "#"
+_subscriptions_jinja_env.globals["url_for"] = (
+    lambda endpoint, **kw: "/" + endpoint + "?" + urlencode(sorted(kw.items()))
+)
 _subscriptions_jinja_env.globals["csrf_token"] = lambda: "test-token"
 # `| tojson` is a jinja2 builtin filter (verified on 3.1.6) — no registration needed.
 
@@ -955,6 +958,28 @@ def _badge_present(html: str, text: str = "⚠ dag not found") -> bool:
         )
         is not None
     )
+
+
+def _dag_cells(html: str) -> list[str]:
+    """The first ``<td>`` of every subscription row, in row order.
+
+    The subscriptions table is the last ``<tbody>`` on the page; each of its
+    rows opens with the DAG cell.
+    """
+    rows_html = html.rsplit("<tbody>", 1)[1]
+    return [
+        re.sub(r"\s+", " ", cell).strip()
+        for cell in re.findall(r"<tr[^>]*>\s*<td>(.*?)</td>", rows_html, flags=re.DOTALL)
+    ]
+
+
+_DAG_ENDPOINT = "Airflow.dag"
+
+
+def _dag_link(dag_id: str) -> str:
+    """The anchor the DAG cell carries for an active ``dag_id`` under the
+    test ``url_for``."""
+    return f'<a href="/{_DAG_ENDPOINT}?dag_id={dag_id}">{dag_id}</a>'
 
 
 def _render_subscription_form_html(**ctx):
@@ -1119,6 +1144,90 @@ class TestSubscriptionsTemplateRendering:
         single = _make_single_row(dag_id="ghost_dag_2")
         html = _render_subscriptions_html([grouped, single], active_dag_ids=set())
         assert _badge_present(html)
+
+
+class TestSubscriptionsDagLink:
+    def test_active_dags_link_to_their_dag_page(self):
+        grouped = _make_group(dag_id="grp_dag", group_key="grp_dag")
+        single = _make_single_row(dag_id="single_dag")
+        html = _render_subscriptions_html(
+            [grouped, single], active_dag_ids={"grp_dag", "single_dag"}
+        )
+        group_cell, single_cell = _dag_cells(html)
+        assert _dag_link("grp_dag") in group_cell
+        assert _dag_link("single_dag") in single_cell
+
+    def test_grouped_row_missing_dag_shows_name_and_badge_without_link(self):
+        grouped = _make_group(dag_id="ghost_grp", group_key="ghost_grp")
+        html = _render_subscriptions_html([grouped], active_dag_ids={"other_dag"})
+        (cell,) = _dag_cells(html)
+        assert "ghost_grp" in cell
+        assert "<a" not in cell
+        assert _badge_present(cell)
+
+    def test_single_row_missing_dag_shows_name_and_badge_without_link(self):
+        single = _make_single_row(dag_id="ghost_single")
+        html = _render_subscriptions_html([single], active_dag_ids={"other_dag"})
+        (cell,) = _dag_cells(html)
+        assert "ghost_single" in cell
+        assert "<a" not in cell
+        assert _badge_present(cell)
+
+    def test_failed_dag_lookup_links_every_row_without_badge(self):
+        grouped = _make_group(dag_id="grp_dag", group_key="grp_dag")
+        single = _make_single_row(dag_id="single_dag")
+        html = _render_subscriptions_html([grouped, single], active_dag_ids=None)
+        group_cell, single_cell = _dag_cells(html)
+        assert _dag_link("grp_dag") in group_cell
+        assert _dag_link("single_dag") in single_cell
+        assert not _badge_present(html)
+
+    def test_active_dag_ids_missing_from_context_links_every_row_without_badge(self):
+        grouped = _make_group(dag_id="grp_dag", group_key="grp_dag")
+        single = _make_single_row(dag_id="single_dag")
+        html = _render_subscriptions_html([grouped, single])
+        group_cell, single_cell = _dag_cells(html)
+        assert _dag_link("grp_dag") in group_cell
+        assert _dag_link("single_dag") in single_cell
+        assert not _badge_present(html)
+
+    def test_active_grouped_row_and_missing_single_row_each_get_their_own_cell(self):
+        grouped = _make_group(dag_id="grp_dag", group_key="grp_dag")
+        single = _make_single_row(dag_id="ghost_single")
+        html = _render_subscriptions_html([grouped, single], active_dag_ids={"grp_dag"})
+        group_cell, single_cell = _dag_cells(html)
+        assert _dag_link("grp_dag") in group_cell
+        assert not _badge_present(group_cell)
+        assert "ghost_single" in single_cell
+        assert "<a" not in single_cell
+        assert _badge_present(single_cell)
+
+    def test_missing_grouped_row_and_active_single_row_each_get_their_own_cell(self):
+        grouped = _make_group(dag_id="ghost_grp", group_key="ghost_grp")
+        single = _make_single_row(dag_id="single_dag")
+        html = _render_subscriptions_html([grouped, single], active_dag_ids={"single_dag"})
+        group_cell, single_cell = _dag_cells(html)
+        assert "ghost_grp" in group_cell
+        assert "<a" not in group_cell
+        assert _badge_present(group_cell)
+        assert _dag_link("single_dag") in single_cell
+        assert not _badge_present(single_cell)
+
+    def test_the_link_endpoint_is_one_airflow_registers_for_its_dag_page(self):
+        """``Airflow.dag`` names a real view of the installed Airflow taking ``dag_id``.
+
+        The test ``url_for`` builds a URL for any endpoint, while the webserver's raises
+        ``BuildError`` for an unknown one and the whole Subscriptions page fails to
+        render. FAB takes the endpoint from the view class name and records each
+        ``@expose`` rule on the method, so both are read off the installed views.
+        """
+        views = pytest.importorskip("airflow.www.views")
+
+        assert _DAG_ENDPOINT == f"{views.Airflow.__name__}.{views.Airflow.dag.__name__}"
+        assert getattr(views.Airflow, "endpoint", None) is None
+        assert callable(views.Airflow.dag)
+        rules = [rule for rule, _methods in views.Airflow.dag._urls]
+        assert any(re.search(r"<(?:\w+:)?dag_id>", rule) for rule in rules)
 
 
 # ---------------------------------------------------------------------------

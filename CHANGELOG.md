@@ -24,6 +24,7 @@
 - Airflow's home page shows every user a red banner when subscriptions are enabled and no watcher process confirms its work.
 - The Subscriptions page lists watcher processes with their state and shows recorded statuses as `unknown` while no watcher confirms its work.
 - Table `rmq_watcher_heartbeat`: one row per watcher-process run, created by the watcher process and the webserver.
+- The DAG name on the Subscriptions page links to the DAG's page in Airflow.
 
 ### Deprecated
 - `RMQSensor(mode="pull"|"push")`, also through `default_args`; use `trigger_mode`.
